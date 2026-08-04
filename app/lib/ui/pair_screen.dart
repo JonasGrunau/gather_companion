@@ -320,7 +320,9 @@ class _CameraUnavailable extends StatelessWidget {
               Icon(Icons.no_photography_outlined, size: 30, color: t.mutedForeground),
               const SizedBox(height: 14),
               Text(
-                denied ? 'Gather cannot use the camera' : 'The camera is not available',
+                denied
+                    ? 'Gather Companion cannot use the camera'
+                    : 'The camera is not available',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,

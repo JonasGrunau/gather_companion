@@ -1,14 +1,17 @@
-# Gather V2 companion
+# Gather Companion
 
 Know when someone walks up to you — or starts following you — in your live
 Gather V2 session, on your phone.
+
+Not affiliated with Gather. This is a third-party companion that reads the
+Gather V2 desktop client running on your own Mac.
 
 Two pieces:
 
 | | what it is | where it runs |
 |---|---|---|
 | `bridge/` | `npx gather-v2-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your Mac |
-| `app/` | a Flutter **iOS** app showing a live event log and who is around you | your iPhone |
+| `app/` | **Gather Companion** — a Flutter **iOS** app showing a live event log and who is around you | your iPhone |
 
 ```
  GatherV2.app ──▶ log file      ──▶┐
@@ -289,10 +292,15 @@ app decodes these into a sealed class hierarchy.
 
 ---
 
-## The app
+## The app — Gather Companion
 
 iOS only — there is no desktop or Android target, by design. The bridge is the
-Mac half; the app is the phone half.
+Mac half; Gather Companion is the phone half. It says so wherever there is room
+to — in-app header, `MaterialApp.title`, permission copy — because "Gather"
+alone would read as Gather's own client. The one exception is the home-screen
+label (`CFBundleDisplayName`), which iOS clips to about ten characters:
+"Gather Companion" came out as "GatherCom…", so the tile says **Gather** and the
+app introduces itself properly once opened.
 
 ```sh
 cd app && flutter run -d "iPhone 17 Pro"      # simulator
@@ -350,6 +358,19 @@ when it happened. The list underneath is history.
 The palette is Gather's own: `#4257DA`, read out of `app.v2.gather.town`'s
 stylesheet (`--theme-color-accent`) rather than picked by eye, with the tint ramp
 around it and Inter to match.
+
+**The icon** is a proximity ping on a 32×32 pixel grid: you are the white block
+in the middle, the ring is the radius the bridge watches, and the green marker on
+it is somebody who just walked into range. Pixel geometry nods at the medium — a
+tile-grid virtual office — while borrowing nothing from Gather's own mark; the
+dark indigo tile is the app's own `background`, not Gather's blue square. It is
+drawn by `app/tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
+spirit as the bridge's hand-rolled `qr.js`), which writes all fifteen asset-catalog
+sizes from one source of truth:
+
+```sh
+node app/tool/make_icons.mjs --preview
+```
 
 **Notifications, honestly:** local notifications fire while the app is running —
 foreground, or the short window iOS allows after backgrounding. Once iOS suspends

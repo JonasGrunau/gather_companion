@@ -6,8 +6,11 @@
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<!-- Home-screen label only. iOS clips it to about ten characters, and
+	     "Gather Companion" came out as "GatherCom…"; the full name lives in the
+	     app itself. -->
 	<key>CFBundleDisplayName</key>
-	<string>Gather Companion</string>
+	<string>Gather</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -49,6 +52,13 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!-- Answers App Store Connect's export-compliance question up front. The app
+	     ships no encryption of its own: it talks plain http/ws to a bridge on
+	     your own LAN. Omitting this strands every upload in "Missing
+	     Compliance", where it cannot be installed from TestFlight until
+	     answered by hand. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>Scanning the pairing square shown by the bridge on your Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>

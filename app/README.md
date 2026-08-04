@@ -1,17 +1,25 @@
-# gather_companion
+# Gather Companion
 
-A new Flutter project.
+The iOS half of the project: a live event log for your Gather V2 session — who
+is next to you, who is following you. It pairs with `gather-v2-bridge` running
+on your Mac and shows what that bridge sees.
 
-## Getting Started
+Not affiliated with Gather.
 
-This project is a starting point for a Flutter application.
+```sh
+flutter run -d "iPhone 17 Pro"   # simulator
+flutter test                     # widget + golden tests
+flutter analyze
+```
 
-A few resources to get you started if this is your first Flutter project:
+The full story — protocol, pairing, limits — is in the [root README](../README.md).
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## Icon
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+`tool/make_icons.mjs` draws the app icon and writes every size in
+`ios/Runner/Assets.xcassets/AppIcon.appiconset`. It is generated rather than
+committed as an opaque blob, so the design can be reviewed and re-rendered:
+
+```sh
+node tool/make_icons.mjs --preview   # also writes tool/icon-preview.png
+```

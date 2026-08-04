@@ -85,7 +85,16 @@ class _TopBar extends StatelessWidget {
               children: [
                 Row(
                   children: [
-                    Text('Gather', style: Theme.of(context).textTheme.titleLarge),
+                    // Flexible because the name is long enough to crowd the
+                    // header buttons on a 320pt phone.
+                    Flexible(
+                      child: Text(
+                        'Gather Companion',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleLarge,
+                      ),
+                    ),
                     const SizedBox(width: 8),
                     _LiveDot(live: state.link.isLive),
                   ],

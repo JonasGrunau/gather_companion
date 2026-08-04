@@ -47,7 +47,7 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Gather',
+      title: 'Gather Companion',
       debugShowCheckedModeBanner: false,
       theme: buildGatherTheme(),
       home: ListenableBuilder(
