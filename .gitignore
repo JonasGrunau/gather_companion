@@ -1,0 +1,20 @@
+# Local tooling state (oh-my-claudecode session/mission scratch). Not project code,
+# and it appears in several subdirectories, so match it at any depth.
+.omc/
+
+# Node — the bridge is deliberately dependency-free, but devDependencies or a
+# stray install must never land here.
+node_modules/
+npm-debug.log*
+
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+*.iml
+
+# macOS
+.DS_Store
+
+# Anything a run leaves behind
+*.log

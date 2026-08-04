@@ -1,0 +1,26 @@
+name: gather_companion
+description: "Live event log for your Gather V2 session — who is next to you, who is following you."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_local_notifications: ^19.0.0
+  gather_events:
+    path: ../packages/gather_events
+  mobile_scanner: ^7.4.0
+  shared_preferences: ^2.3.3
+  web_socket_channel: ^3.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

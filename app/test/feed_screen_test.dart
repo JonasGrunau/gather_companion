@@ -1,0 +1,165 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_companion/src/app_state.dart';
+import 'package:gather_companion/src/bridge_client.dart';
+import 'package:gather_companion/theme/gather_theme.dart';
+import 'package:gather_companion/ui/feed_screen.dart';
+import 'package:gather_events/gather_events.dart';
+
+/// Widget-level checks for the two things the screen exists to say: who is next
+/// to you, and who is following you.
+///
+/// Being followed cannot be produced by the log collector at all, so it would
+/// otherwise only ever be seen by arranging for a colleague to follow you — which
+/// is no way to know whether the card renders.
+void main() {
+  final at = DateTime(2026, 8, 4, 12, 30);
+
+  PresenceSnapshot snapshotWith(List<PlayerRef> players) => PresenceSnapshot(
+        self: const SelfState(spaceId: 'space-1'),
+        players: players,
+        health: const CollectorHealth(logTail: true, cdp: true),
+        at: at,
+      );
+
+  /// A state that believes it is connected, which is the normal case.
+  AppState connected(PresenceSnapshot snapshot) => AppState()
+    ..debugApplyLink(const LinkStatus(LinkState.live))
+    ..debugApplySnapshot(snapshot);
+
+  Widget wrap(AppState state) => MaterialApp(
+        theme: buildGatherTheme(),
+        home: ListenableBuilder(
+          listenable: state,
+          builder: (context, _) => FeedScreen(state: state, onUnpair: () {}),
+        ),
+      );
+
+  testWidgets('an empty room says so rather than looking broken', (tester) async {
+    await tester.pumpWidget(wrap(connected(snapshotWith(const []))));
+    await tester.pump();
+
+    expect(find.text('Nobody next to you'), findsOneWidget);
+    expect(find.text('All quiet'), findsOneWidget);
+  });
+
+  testWidgets('a quiet feed with no link says "not connected", not "all quiet"', (tester) async {
+    // The difference matters: silence because nothing happened is reassuring,
+    // silence because the bridge is unreachable is not.
+    final state = AppState()..debugApplySnapshot(snapshotWith(const []));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // The strip carries the connection state; the feed says only that it is
+    // empty, so the screen does not say the same thing twice.
+    expect(find.text('Not connected'), findsOneWidget);
+    expect(find.text('No activity yet'), findsOneWidget);
+    expect(find.text('All quiet'), findsNothing);
+  });
+
+  testWidgets('people standing next to you are listed with a count', (tester) async {
+    final state = connected(snapshotWith([
+        PlayerRef(id: 'a', name: 'Ada', isNear: true, nearSince: at),
+        PlayerRef(id: 'b', name: 'Bram', isNear: true, nearSince: at),
+        // Present in the space but not near: must not appear here.
+        const PlayerRef(id: 'c', name: 'Cleo'),
+      ]));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('Next to you'), findsOneWidget);
+    expect(find.text('2'), findsOneWidget);
+    expect(find.text('Ada'), findsOneWidget);
+    expect(find.text('Bram'), findsOneWidget);
+    expect(find.text('Cleo'), findsNothing);
+  });
+
+  testWidgets('being followed shows the alert card by name', (tester) async {
+    final state = connected(snapshotWith([
+        PlayerRef(
+          id: 'a',
+          name: 'Ada',
+          isNear: true,
+          isFollowingMe: true,
+          followingMeSince: DateTime.now().subtract(const Duration(minutes: 3)),
+        ),
+      ]));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('Ada is following you'), findsOneWidget);
+    expect(find.text('for 3 min'), findsOneWidget);
+  });
+
+  testWidgets('several followers collapse into one line', (tester) async {
+    final state = connected(snapshotWith([
+        const PlayerRef(id: 'a', name: 'Ada', isFollowingMe: true),
+        const PlayerRef(id: 'b', name: 'Bram', isFollowingMe: true),
+      ]));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('2 people are following you'), findsOneWidget);
+    expect(find.text('Ada, Bram'), findsOneWidget);
+  });
+
+  testWidgets('the background tier is hidden until asked for', (tester) async {
+    final state = connected(snapshotWith(const []));
+    // One notable, two ambient.
+    state
+      ..debugApplyEvent(ProximityEvent(
+        at: at,
+        source: EventSource.cdp,
+        playerId: 'a',
+        near: true,
+        distance: 2,
+      ))
+      ..debugApplyEvent(PlayerSpaceEvent(
+        at: at,
+        source: EventSource.log,
+        playerId: 'b',
+        joined: true,
+      ))
+      ..debugApplyEvent(MediaChangedEvent(
+        at: at,
+        source: EventSource.log,
+        playerId: 'c',
+        track: MediaTrack.audio,
+        paused: true,
+      ));
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.textContaining('is next to you'), findsOneWidget);
+    expect(find.textContaining('joined the space'), findsNothing);
+    expect(find.text('Show 2 background events'), findsOneWidget);
+
+    await tester.tap(find.text('Show 2 background events'));
+    await tester.pump();
+
+    expect(find.textContaining('joined the space'), findsOneWidget);
+    expect(find.textContaining('muted'), findsOneWidget);
+    expect(find.text('Hide background activity'), findsOneWidget);
+  });
+
+  testWidgets('log-only mode admits what it cannot see', (tester) async {
+    final state = connected(PresenceSnapshot(
+        self: const SelfState(),
+        players: const [],
+        health: const CollectorHealth(logTail: true),
+        at: at,
+      ));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.textContaining('Log-only mode'), findsOneWidget);
+  });
+
+  testWidgets('full mode does not nag about fidelity', (tester) async {
+    await tester.pumpWidget(wrap(connected(snapshotWith(const []))));
+    await tester.pump();
+
+    expect(find.textContaining('Log-only mode'), findsNothing);
+  });
+}
