@@ -1,36 +1,74 @@
+<div align="center">
+
+<img src="app/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png" width="104" alt="Gather Companion — a proximity ping on a pixel grid">
+
 # Gather Companion
 
-Know when someone walks up to you — or starts following you — in your live
-Gather V2 session, on your phone.
+**Know when someone walks up to you — or starts following you — in your live Gather V2 session.**
 
-Not affiliated with Gather. This is a third-party companion that reads the
-Gather V2 desktop client running on your own computer.
+[![npm](https://img.shields.io/npm/v/gather-app-bridge?color=4257DA&labelColor=1a1a2e&label=gather-app-bridge)](https://www.npmjs.com/package/gather-app-bridge)
+[![license](https://img.shields.io/badge/license-MIT-4257DA?labelColor=1a1a2e)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A5%2022-4257DA?labelColor=1a1a2e)](package.json)
+[![dependencies](https://img.shields.io/badge/dependencies-zero-4257DA?labelColor=1a1a2e)](bridge/)
 
-Two pieces:
+*Not affiliated with Gather.* A third-party companion that reads the Gather V2
+desktop client running on your own computer, and tells your phone about it.
+
+</div>
+
+---
+
+## 🧭 How the pieces fit
 
 | | what it is | where it runs |
 |---|---|---|
-| `bridge/` | `npx gather-app-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your computer |
-| `app/` | **Gather Companion** — a Flutter app showing a live event log and who is around you | your phone |
+| 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency background daemon that watches the Gather desktop client and serves events over your LAN | your **computer** |
+| 📱 `app/` | **Gather Companion** — a Flutter app showing a live event log and who is around you right now | your **phone** |
+
+Two collectors read the same client in two different ways, and both feed one
+stream:
 
 ```
- Gather desktop ──▶ log file      ──▶┐
- (running on                         ├─▶ gather-app-bridge ──WS──▶ phone app
-  your computer) ──▶ devtools (CDP) ──▶┘        :7799
+                        ┌─────────────────────────┐
+                        │  Gather V2 desktop app  │
+                        └────────────┬────────────┘
+                                     │
+                 ┌───────────────────┴───────────────────┐
+                 │                                       │
+                 ▼                                       ▼
+        ┌─────────────────┐                     ┌─────────────────┐
+        │    main.log     │                     │  devtools (CDP) │
+        │    log-only     │                     │    full mode    │
+        └────────┬────────┘                     └────────┬────────┘
+                 │ proximity, no names                   │ names, tiles,
+                 │ follows only guessed                  │ real follows
+                 └───────────────────┬───────────────────┘
+                                     ▼
+                        ┌─────────────────────────┐
+                        │    gather-app-bridge    │  ← your computer
+                        │          :7799          │
+                        └────────────┬────────────┘
+                                     │ WebSocket over your LAN
+                                     ▼
+                        ┌─────────────────────────┐
+                        │    Gather Companion     │  ← your phone
+                        └─────────────────────────┘
 ```
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
-On the computer that has Gather open:
+**1.** On the computer that has Gather open:
 
 ```sh
 npx gather-app-bridge
 ```
 
 That installs it as a background service — starts at login, restarts if it dies,
-survives sleep. Then pair your phone:
+survives sleep.
+
+**2.** Pair your phone:
 
 ```sh
 npx gather-app-bridge pair
@@ -39,7 +77,7 @@ npx gather-app-bridge pair
 It draws a QR square in the terminal. Scan it in the app and you are done; the
 code and address are printed underneath for a phone whose camera is refused.
 
-Then check what it can see:
+**3.** Check what it can actually see:
 
 ```sh
 npx gather-app-bridge doctor
@@ -47,36 +85,36 @@ npx gather-app-bridge doctor
 
 ---
 
-## The two fidelity levels
+## 🎚️ The two fidelity levels
 
 This is the one thing worth understanding, because it decides whether
-"*someone is following me*" works.
+"*someone is following me*" works at all.
 
-### Log-only mode — works immediately, no setup
+### 📄 Log-only mode — works immediately, no setup
 
 The desktop client forwards its renderer's console output into
 `~/Library/Logs/GatherV2/main.log`, and the Electron main process traces every
 IPC message it receives. The bridge tails that file. No flags, no injection, no
 configuration.
 
-You get:
+**You get:**
 
-- **who came near you** — Gather only opens audio/video with people close enough
-  to hear you, so remote-participant join/leave is a faithful proximity signal.
-  In a sample session 29 people joined the space but only 13 ever got a media
-  connection: those 13 are the ones who actually walked up. Reported as
+- ✅ **who came near you** — Gather only opens audio/video with people close
+  enough to hear you, so remote-participant join/leave is a faithful proximity
+  signal. In a sample session 29 people joined the space but only 13 ever got a
+  media connection: those 13 are the ones who actually walked up. Reported as
   `confidence: "inferred"`.
-- who joined and left the space
-- who muted, unmuted, or started sharing their screen
-- your own mic/camera/screenshare state
-- the *type* of every notification Gather raised
+- ✅ who joined and left the space
+- ✅ who muted, unmuted, or started sharing their screen
+- ✅ your own mic/camera/screenshare state
+- ✅ the *type* of every notification Gather raised
 
-You do **not** get: display names (only uuids), coordinates, or reliable
+**You do not get:** ❌ display names (only uuids), ❌ coordinates, ❌ reliable
 follow detection. Following lives in the web app's state and never reaches the
 log — the only follow-related line the client writes is its own pathfinding when
 *you* follow someone else.
 
-### Full mode — one extra flag on the Gather client
+### 🔍 Full mode — one extra flag on the Gather client
 
 Quit Gather completely — it holds a single-instance lock, so launching a second
 copy just focuses the first — then start it with a devtools port. On macOS:
@@ -94,6 +132,7 @@ apply to it, because Chromium parses `argv` before any app code runs. Nothing is
 patched and nothing is modified — `app.asar` is integrity-checked and could not be
 patched even if we wanted to.
 
+> [!WARNING]
 > **Know the tradeoff before you leave this on.** While that port is open, *any*
 > local process can drive your authenticated Gather session over `127.0.0.1:9222`
 > — read the space, move your avatar, send chat as you. It binds to loopback only;
@@ -101,17 +140,17 @@ patched even if we wanted to.
 > `--remote-debugging-address`. If you would not trust every process on the
 > machine with your Gather account, run in log-only mode instead.
 
-Now you additionally get:
+**Now you additionally get:**
 
-- **who is following you**, read from the field that actually means it, not
+- 🎯 **who is following you**, read from the field that actually means it, not
   guessed. Reported as `confidence: "observed"`.
-- display names
-- tile coordinates and real distances
-- adjacency via Gather's own cluster model
+- 🏷️ display names
+- 📐 tile coordinates and real distances
+- 🧩 adjacency via Gather's own cluster model
 
 ---
 
-## How full mode reads the protocol
+## 🔬 How full mode reads the protocol
 
 The bridge does **not** poke at the app's internals. The production bundle
 deliberately keeps its MobX stores off `window` (`exposeManagers: {prod: false}`),
@@ -121,9 +160,10 @@ Instead it enables CDP's Network domain and reads the WebSocket frames the clien
 is **already exchanging** with `wss://game-router.v2.gather.town/gather-game-v2`,
 decodes the msgpack, and interprets the model deltas.
 
-Consequences worth stating: no second session is opened, no credentials are
-handled, and you do not appear twice in the space. The bridge is a passive
-reader of a stream that already exists.
+> [!NOTE]
+> Consequences worth stating: no second session is opened, no credentials are
+> handled, and you do not appear twice in the space. The bridge is a passive
+> reader of a stream that already exists.
 
 This was captured and verified against a live authenticated session. The
 handshake, in order:
@@ -144,14 +184,14 @@ are exactly three ops:
 { op: 'replace',     model: 'SpaceUser', id, path, data }           // one field
 ```
 
-- **following** — a `replace` on *their* row's `/followTargetId` set to *my* id.
-  There is no "follow started" server event; the official client derives it the
-  same way (`SpaceUser.followers` filters by `followTargetId === this.id`).
+- 🎯 **following** — a `replace` on *their* row's `/followTargetId` set to *my*
+  id. There is no "follow started" server event; the official client derives it
+  the same way (`SpaceUser.followers` filters by `followTargetId === this.id`).
   `followTargetId` and `clusterId` are optional columns, so they are *absent*
   rather than null when unset.
-- **adjacency** — `position` compared with my own, requiring the same `floorId`.
-  Position mutates component-wise, so walking arrives as `/position/x` and
-  `/position/y`; a teleport replaces `/position` wholesale with an ext-0
+- 📐 **adjacency** — `position` compared with my own, requiring the same
+  `floorId`. Position mutates component-wise, so walking arrives as `/position/x`
+  and `/position/y`; a teleport replaces `/position` wholesale with an ext-0
   `Position` value object. Both shapes are handled.
 
 Identity — which row is mine — comes from the `Connection` model, which carries
@@ -168,7 +208,7 @@ The Firebase uid itself is read from Firebase's own IndexedDB store
 Bots and recording clients (`isBot`, `type: 'RecordingClient'`) are filtered out —
 every real space has them and they are not people standing next to you.
 
-### Cold start, and `resync`
+### ❄️ Cold start, and `resync`
 
 The full state dump is sent **once per connection**. A bridge that attaches to a
 client which has been running for days therefore sees heartbeats and nothing else
@@ -188,7 +228,7 @@ itself on any natural reconnect — a sleep, a network blip, a Gather restart.
 
 ---
 
-## Commands
+## ⌨️ Commands
 
 ```
 npx gather-app-bridge                install as a background service and pair
@@ -203,10 +243,10 @@ npx gather-app-bridge restart|stop|start|uninstall
 npx gather-app-bridge replay [file]  parse a log file and summarise it
 ```
 
-Options: `--port <n>` (default 7799), `--cdp-port <n>` (default 9222),
+**Options:** `--port <n>` (default `7799`), `--cdp-port <n>` (default `9222`),
 `--token <s>`, `--log-file <path>`.
 
-### Watching the stream from a terminal
+### 👁️ Watching the stream from a terminal
 
 You do not need the phone to see what the bridge is doing:
 
@@ -241,16 +281,16 @@ be notified about still shows up. Frames marked `kind: "raw"` rather than
 For what is being decoded but *discarded entirely* (the other 42 models, frame
 type counts), look at `cdpStats` in `GET /collectors`.
 
-### Staying up
+### ♾️ Staying up
 
 On macOS it installs as a `LaunchAgent` (`com.jonasgrunau.gather-app-bridge`) with
 `RunAtLoad` and `KeepAlive`, so it starts at login and comes back if it crashes.
 Two details that matter over months of uptime:
 
-- The package is **copied into `~/.gather-app-bridge/bridge`** at install time. `npx`
-  runs out of a cache npm may prune, and a global install disappears on the next
-  `npm uninstall` — either would leave launchd pointing at nothing.
-- It resolves a **version-independent `node`** (`/opt/homebrew/bin/node` and
+- 📦 The package is **copied into `~/.gather-app-bridge/bridge`** at install time.
+  `npx` runs out of a cache npm may prune, and a global install disappears on the
+  next `npm uninstall` — either would leave launchd pointing at nothing.
+- 🔗 It resolves a **version-independent `node`** (`/opt/homebrew/bin/node` and
   friends) rather than `process.execPath`, which under nvm/asdf points at a
   version-pinned path that vanishes on the next Node upgrade.
 
@@ -260,7 +300,7 @@ the CDP collector reconnects with backoff.
 
 ---
 
-## HTTP / WebSocket API
+## 📡 HTTP / WebSocket API
 
 Everything except `/health` needs `?token=<token>`.
 
@@ -282,7 +322,7 @@ Every event carries `type`, `at`, `source` (`log` \| `cdp` \| `bridge`) and
 replays exactly what was missed, which is what keeps the phone's log complete
 across screen locks.
 
-Event types: `proximity.entered/left`, `follow.started/stopped`,
+**Event types:** `proximity.entered/left`, `follow.started/stopped`,
 `player.joinedSpace/leftSpace`, `audio.range`, `media.changed`,
 `media.connection`, `player.moved`, `chat.message`, `self.changed`,
 `space.changed`, `notification.shown`, `bridge.status`.
@@ -292,7 +332,7 @@ app decodes these into a sealed class hierarchy.
 
 ---
 
-## The app — Gather Companion
+## 📱 The app — Gather Companion
 
 The bridge is the computer half; Gather Companion is the phone half. It says so
 wherever there is room to — in-app header, `MaterialApp.title`, permission copy —
@@ -315,18 +355,18 @@ To sideload on iOS: open `app/ios/Runner.xcodeproj` in Xcode, set a signing team
 on the `Runner` target, then `flutter run -d <device>`. A free Apple ID works for
 personal device installs.
 
-Build notes worth knowing:
+**Build notes worth knowing:**
 
-- **iOS 15.5 minimum**, required by `mobile_scanner`. The same package needs
+- 📐 **iOS 15.5 minimum**, required by `mobile_scanner`. The same package needs
   Android 5.0 / API 21 and camera permission in the manifest.
-- **Swift Package Manager, not CocoaPods** on the iOS side. `mobile_scanner` 7.x
-  is a Swift package, and leaving the old CocoaPods integration in place breaks
-  the build with a misleading *"missing expected TARGET_BUILD_DIR"*. If you ever
-  re-add a pod-based plugin, expect to sort that out. Version 7 also dropped
+- 📦 **Swift Package Manager, not CocoaPods** on the iOS side. `mobile_scanner`
+  7.x is a Swift package, and leaving the old CocoaPods integration in place
+  breaks the build with a misleading *"missing expected TARGET_BUILD_DIR"*. If you
+  ever re-add a pod-based plugin, expect to sort that out. Version 7 also dropped
   GoogleMLKit, which had no arm64 simulator slices — on 6.x the app simply could
   not run on an arm64 simulator at all.
-- **Desktop targets have no camera scanner.** `mobile_scanner` is mobile-only, so
-  a desktop build has to fall back to the type-the-code path, which already
+- 🖥️ **Desktop targets have no camera scanner.** `mobile_scanner` is mobile-only,
+  so a desktop build has to fall back to the type-the-code path, which already
   exists and is a first-class route rather than a fallback.
 
 While working on the feed, `--dart-define=GATHER_PAIR=host:port:token` skips the
@@ -340,7 +380,7 @@ Your phone and computer have to be on the same network. Phone platforms ask for
 local-network permission the first time, and for the camera the first time you
 scan.
 
-### Pairing
+### 🔗 Pairing
 
 Modelled on Superset's flow: scan the square, or type the eight characters. The
 long token is never typed or shown — the QR carries a short code which the app
@@ -351,19 +391,21 @@ The alphabet excludes `0`, `1`, `I`, `L` and `O`, so there is nothing to misread
 A character outside it is refused rather than guessed at — pairing on a
 misread code would be worse than asking someone to look again.
 
-### What the feed shows
+### 📋 What the feed shows
 
 Only what is worth reading. Events are classified into three tiers:
 
 | tier | what | shown |
 |---|---|---|
-| **alert** | someone started following you | yes, on a Gather-blue card |
-| **notable** | someone arrived next to you or moved away, screen sharing, chat, Gather's own notifications | yes |
-| **ambient** | mic and camera toggles, transport state, roster churn, your own device state | behind "Show N background events" |
+| 🔵 **alert** | someone started following you | yes, on a Gather-blue card |
+| ⚪ **notable** | someone arrived next to you or moved away, screen sharing, chat, Gather's own notifications | yes |
+| ▫️ **ambient** | mic and camera toggles, transport state, roster churn, your own device state | behind "Show N background events" |
 
 The top of the screen answers *now* — who is next to you, who is following you —
 straight from the bridge's snapshot, so it is right even if the app was closed
 when it happened. The list underneath is history.
+
+### 🎨 Palette and icon
 
 The palette is Gather's own: `#4257DA`, read out of `app.v2.gather.town`'s
 stylesheet (`--theme-color-accent`) rather than picked by eye, with the tint ramp
@@ -375,28 +417,30 @@ it is somebody who just walked into range. Pixel geometry nods at the medium —
 tile-grid virtual office — while borrowing nothing from Gather's own mark; the
 dark indigo tile is the app's own `background`, not Gather's blue square. It is
 drawn by `app/tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
-spirit as the bridge's hand-rolled `qr.js`), which writes all fifteen asset-catalog
-sizes from one source of truth:
+spirit as the bridge's hand-rolled `qr.js`), which writes all fifteen
+asset-catalog sizes from one source of truth:
 
 ```sh
 node app/tool/make_icons.mjs --preview
 ```
 
-**Notifications, honestly:** local notifications fire while the app is running —
-foreground, or the short window the OS allows after backgrounding. Once the OS
-suspends the app the WebSocket is gone and nothing can be delivered until you open
-it again, at which point the bridge replays everything missed, so the *log* stays
-complete even though the *alerts* do not. Waking a locked phone would need a push
-service driven from the computer, which means a developer account and push
-credentials on each platform.
+### 🔔 Notifications, honestly
+
+Local notifications fire while the app is running — foreground, or the short
+window the OS allows after backgrounding. Once the OS suspends the app the
+WebSocket is gone and nothing can be delivered until you open it again, at which
+point the bridge replays everything missed, so the *log* stays complete even
+though the *alerts* do not. Waking a locked phone would need a push service driven
+from the computer, which means a developer account and push credentials on each
+platform.
 
 ---
 
-## Tests
+## 🧪 Tests
 
 ```sh
 npm test          # bridge: parser, msgpack, protocol, end-to-end over a real WS
-cd app && flutter analyze
+cd app && flutter analyze && flutter test
 ```
 
 The parser tests use log lines copied verbatim from a real
@@ -409,15 +453,15 @@ npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 
 ---
 
-## Scope and caveats
+## ⚠️ Scope and caveats
 
-- **The bridge runs on macOS today.** It reads macOS log paths and installs a
+- 🖥️ **The bridge runs on macOS today.** It reads macOS log paths and installs a
   LaunchAgent. Everything above that line — the wire format, the collectors, the
   app — is platform-neutral; porting means new log/config paths and a service
   installer per platform, not a new protocol.
-- **Log-only mode cannot detect being followed.** Stated in the app UI too, so a
-  quiet screen is never mistaken for "nobody is following me".
-- **The wire format is verified, not inferred.** Captured from a live
+- 🙈 **Log-only mode cannot detect being followed.** Stated in the app UI too, so
+  a quiet screen is never mistaken for "nobody is following me".
+- ✅ **The wire format is verified, not inferred.** Captured from a live
   authenticated session: the handshake order, the three patch ops, both envelope
   keys (`fullStatePatches`, `patches`), the `Connection` identity row and the
   `SpaceUser` field set. Replaying that capture resolves the right own-row id and
@@ -425,28 +469,37 @@ npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
   on the wire is a follow actually starting — `followTargetId` is an optional
   column and nobody was following during capture — so that one path rests on the
   SDK's own model definition rather than an observation.
-- `GameProtocolReader.stats()` reports frame types and unrecognised-frame counts,
-  so a future format change shows up as a number rather than as silence. Check it
-  via `GET /collectors` (`cdpStats`).
-- **Wire-format drift.** The web app redeploys constantly. The *field* names
+- 📊 `GameProtocolReader.stats()` reports frame types and unrecognised-frame
+  counts, so a future format change shows up as a number rather than as silence.
+  Check it via `GET /collectors` (`cdpStats`).
+- 🌊 **Wire-format drift.** The web app redeploys constantly. The *field* names
   (`followTargetId`, `position`, `clusterId`, `floorId`) are Prisma columns and
   change rarely; the msgpack framing and patch envelope are internal and could
   change with any deploy. `bridge.status` events tell the app when a collector goes
   quiet, so drift shows up as a visibly degraded state rather than silence.
-- **Cold start needs a resync in full mode.** The state dump is sent once per
+- ❄️ **Cold start needs a resync in full mode.** The state dump is sent once per
   connection, so a freshly attached bridge holds nothing until the client
   reconnects. It reports itself unhealthy rather than showing an empty room, and
-  `npx gather-app-bridge resync` fixes it in about two seconds. The log collector is
-  unaffected, which is a reason to leave it running rather than treat it as a mere
-  fallback.
-- **Log-only mode depends on flags Gather controls.** The verbose renderer stream
-  exists because `disable_logger_info: false` and `DesktopDetailedDiagnosticLogs`
-  are set in `flags.json`, and those are server-pushed gates. If Gather turns them
-  off, `replay` will show the event counts collapse.
-- **Read-only.** Nothing here writes to Gather, sends actions, or modifies the
+  `npx gather-app-bridge resync` fixes it in about two seconds. The log collector
+  is unaffected, which is a reason to leave it running rather than treat it as a
+  mere fallback.
+- 🚩 **Log-only mode depends on flags Gather controls.** The verbose renderer
+  stream exists because `disable_logger_info: false` and
+  `DesktopDetailedDiagnosticLogs` are set in `flags.json`, and those are
+  server-pushed gates. If Gather turns them off, `replay` will show the event
+  counts collapse.
+- 🔒 **Read-only.** Nothing here writes to Gather, sends actions, or modifies the
   desktop client. `app.asar` integrity validation is enabled, so patching the
   client is not possible anyway.
-- Reverse-engineered from your own installed client for interoperability. There
+- 🔎 Reverse-engineered from your own installed client for interoperability. There
   is no public Gather 2.0 API that exposes presence: the documented HTTP API is
   Classic-only and explicitly unsupported, and `@gathertown/gather-game-client`
   was last published in 2023 and does not speak v2.
+
+---
+
+<div align="center">
+
+MIT · not affiliated with Gather · built for the people who keep walking up behind you
+
+</div>
