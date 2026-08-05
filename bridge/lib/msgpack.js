@@ -6,7 +6,7 @@
  *
  * Hand-written rather than pulling in `@msgpack/msgpack` for one structural
  * reason: `install` copies only `bridge/lib` and `bridge/bin` into
- * ~/.gather-bridge and runs that copy straight from launchd, with no
+ * ~/.gather-app-bridge and runs that copy straight from launchd, with no
  * node_modules to resolve. Every dependency would have to be vendored into that
  * copy or the LaunchAgent breaks. A self-contained decoder keeps that property.
  *

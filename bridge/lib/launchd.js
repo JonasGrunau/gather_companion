@@ -9,7 +9,7 @@ import { LABEL, installDir, logFile, plistFile, stateDir } from './paths.js';
  * Root of the package as shipped (the directory containing `bridge/`).
  *
  * Found by walking up rather than hard-coding `../..`, because the installed
- * copy in ~/.gather-bridge/bridge is one level shallower than the repo layout.
+ * copy in ~/.gather-app-bridge/bridge is one level shallower than the repo layout.
  */
 export const packageRoot = findPackageRoot(dirname(fileURLToPath(import.meta.url)));
 
@@ -32,7 +32,7 @@ export const supported = process.platform === 'darwin';
 /**
  * Installs the bridge as a login-time LaunchAgent.
  *
- * The package is copied into ~/.gather-bridge/bridge first. `npx` runs out of a
+ * The package is copied into ~/.gather-app-bridge/bridge first. `npx` runs out of a
  * cache npm is free to prune, and a global install disappears on the next
  * `npm uninstall` — either would leave launchd pointing at nothing. A private
  * copy is the only version of this that still works in six months.
@@ -55,7 +55,7 @@ export function install({ port }) {
   // The copy is outside any package; ESM needs this to load .js as modules.
   writeFileSync(
     join(installDir, 'package.json'),
-    `${JSON.stringify({ name: 'gather-bridge-installed', private: true, type: 'module' }, null, 2)}\n`,
+    `${JSON.stringify({ name: 'gather-app-bridge-installed', private: true, type: 'module' }, null, 2)}\n`,
   );
 
   const entry = join(installDir, 'bin', 'gather-bridge.js');

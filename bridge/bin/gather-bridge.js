@@ -233,7 +233,7 @@ function cmdLogs() {
 function cmdUninstall() {
   const wasInstalled = launchd.uninstall();
   console.log(wasInstalled ? green('  bridge uninstalled') : dim('  bridge was not installed'));
-  console.log(dim('  pairing token kept in ~/.gather-bridge.json'));
+  console.log(dim('  pairing token kept in ~/.gather-app-bridge.json'));
 }
 
 function cmdToken() {

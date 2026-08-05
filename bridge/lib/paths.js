@@ -3,10 +3,10 @@ import { homedir, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
-export const LABEL = 'de.safenow.gather-bridge';
+export const LABEL = 'com.jonasgrunau.gather-app-bridge';
 
 /** Everything the daemon owns: its installed copy and its log. */
-export const stateDir = join(homedir(), '.gather-bridge');
+export const stateDir = join(homedir(), '.gather-app-bridge');
 export const installDir = join(stateDir, 'bridge');
 export const logFile = join(stateDir, 'bridge.log');
 export const plistFile = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
@@ -16,7 +16,7 @@ export const plistFile = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.pl
  * `uninstall` deletes the whole install directory, and a phone that is already
  * paired must not have to be paired again after a reinstall.
  */
-export const configFile = join(homedir(), '.gather-bridge.json');
+export const configFile = join(homedir(), '.gather-app-bridge.json');
 
 /**
  * Where the Gather V2 desktop client writes its log.

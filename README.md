@@ -243,11 +243,11 @@ type counts), look at `cdpStats` in `GET /collectors`.
 
 ### Staying up
 
-Installed as a `LaunchAgent` (`de.safenow.gather-bridge`) with `RunAtLoad` and
+Installed as a `LaunchAgent` (`com.jonasgrunau.gather-app-bridge`) with `RunAtLoad` and
 `KeepAlive`, so it starts at login and comes back if it crashes. Two details that
 matter over months of uptime:
 
-- The package is **copied into `~/.gather-bridge/bridge`** at install time. `npx`
+- The package is **copied into `~/.gather-app-bridge/bridge`** at install time. `npx`
   runs out of a cache npm may prune, and a global install disappears on the next
   `npm uninstall` — either would leave launchd pointing at nothing.
 - It resolves a **version-independent `node`** (`/opt/homebrew/bin/node` and

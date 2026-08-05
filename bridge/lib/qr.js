@@ -2,7 +2,7 @@
  * A QR code for a pairing payload, drawn into a terminal. No dependencies.
  *
  * The bridge ships with none and must keep it that way — the installed copy in
- * `~/.gather-bridge/bridge` is run straight from launchd with no
+ * `~/.gather-app-bridge/bridge` is run straight from launchd with no
  * `node_modules` to resolve — so this is ISO/IEC 18004 by hand rather than a
  * library. That stays affordable by fixing everything the payload allows:
  *

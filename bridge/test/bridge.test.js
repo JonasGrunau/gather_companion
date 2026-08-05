@@ -91,7 +91,7 @@ test('unauthenticated clients are rejected', async () => {
 
 test('health needs no token but says nothing sensitive', async () => {
   const body = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
-  assert.equal(body.name, 'gather-v2-bridge');
+  assert.equal(body.name, 'gather-app-bridge');
   assert.equal(body.token, undefined);
 });
 

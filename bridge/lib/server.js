@@ -118,11 +118,11 @@ export class BridgeServer {
     if (url.pathname === '/health') {
       return json(200, {
         ok: true,
-        // Wire identity, deliberately *not* renamed alongside the `gather-app-bridge`
-        // command: `isOurs()` compares against it, so changing the string would make
-        // a new CLI declare an already-running older daemon foreign and refuse the
-        // port. It is a protocol constant, not a product name.
-        name: 'gather-v2-bridge',
+        // Wire identity: `isOurs()` compares against it to tell "my daemon holds
+        // this port" from "something else does". Renamed with the command while
+        // nothing was installed anywhere — changing it once daemons exist in the
+        // wild would make a new CLI declare an older running one foreign.
+        name: 'gather-app-bridge',
         uptimeSeconds: Math.round((Date.now() - this._startedAt) / 1000),
       });
     }
