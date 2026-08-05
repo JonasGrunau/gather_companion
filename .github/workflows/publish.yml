@@ -88,10 +88,10 @@ jobs:
       # `404 PUT`, which reads like a missing package rather than an auth problem.
       # The one line that matters is `npm verbose oidc`.
       #
-      # No --provenance flag, and note that trusted publishing did NOT attach
-      # provenance on its own: 0.1.1 published green and
-      # `/-/npm/v1/attestations/gather-app-bridge@0.1.1` still 404s. If provenance
-      # is wanted, it needs the flag spelled out — untested here, so it goes in
-      # with a release rather than on its own.
+      # --provenance is explicit because trusted publishing did *not* attach it on
+      # its own: 0.1.1 published green and its attestations endpoint still 404s,
+      # against a 200 for a package that has them. OIDC covers the signing
+      # identity, so no extra credential is involved — the flag just asks for the
+      # attestation to be built and uploaded.
       - if: steps.shipped.outputs.publish == 'true'
-        run: npm publish --loglevel verbose
+        run: npm publish --provenance --loglevel verbose
