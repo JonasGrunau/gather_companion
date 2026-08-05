@@ -11,25 +11,18 @@
 # reports a claims mismatch as `404 ... package not found`, which reads like the
 # package or the entry is missing rather than like an auth failure.
 #
-# Publishing fires on any push to main that touches the tool. The version in
-# package.json is therefore the decision, not the act of tagging: bump it and the
-# next push ships. Leave it alone and the run *skips* rather than failing — npm
-# versions are immutable, so a second publish of the same one is an error, and a
-# bridge fix pushed without a bump must not paint main red.
+# Publishing is deliberately tag-driven rather than firing on every push to main:
+# a version is a decision, and `git push --tags` is where you make it. An ordinary
+# bridge fix can land on main without shipping anything.
 #
-# This file is deliberately absent from `paths`: editing the workflow is not
-# shipping the tool, and self-triggering on every edit is how you get runs nobody
-# asked for. `workflow_dispatch` covers re-running after a registry failure or a
-# credential fix.
+# `workflow_dispatch` covers re-running a version after a registry failure or a
+# credential fix, without inventing a second tag for the same release.
 name: publish
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'bridge/**'
-      - 'package.json'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -62,10 +55,22 @@ jobs:
           npm install -g npm@latest
           npm --version
 
+      # A tag that disagrees with package.json publishes a version nobody asked
+      # for, and npm versions are immutable. Fail loudly instead.
+      - name: Check the tag matches package.json
+        if: github.ref_type == 'tag'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+
       # The registry is the only authority on what has already shipped, so ask it
-      # rather than inferring from tags or history. This is what turns "pushed a
-      # bridge fix without bumping the version" into a skipped publish instead of
-      # an immutable-version error.
+      # rather than inferring from the tag. This is what makes a re-run idempotent:
+      # re-dispatching a release that already published, or re-pushing a moved tag,
+      # skips instead of dying on an immutable-version error.
       - name: Has this version shipped already?
         id: shipped
         run: |
@@ -79,8 +84,8 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Unconditional: a bridge change that breaks the tests should be loud even
-      # on a push that publishes nothing.
+      # Unconditional: a tagged release whose tests fail should be loud even when
+      # the publish itself is going to be skipped as already-shipped.
       - run: npm test
 
       # Verbose on purpose. npm reports OIDC failures at verbose level *only* — at
