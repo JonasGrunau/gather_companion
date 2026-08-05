@@ -99,6 +99,22 @@ class BridgeClient {
     connect();
   }
 
+  /// Resolves when the link is live again, or when [timeout] runs out.
+  ///
+  /// Pull-to-refresh needs something real to await. Without this the refresh
+  /// future completed on the next microtask and the indicator snapped shut
+  /// before the socket had even opened, which reads as a stutter rather than as
+  /// a refresh.
+  Future<void> whenLive({Duration timeout = const Duration(seconds: 6)}) async {
+    if (_current.isLive || _disposed) return;
+    try {
+      await status.firstWhere((s) => s.isLive).timeout(timeout);
+    } catch (_) {
+      // Timed out, or the client was disposed mid-wait. Either way the caller
+      // only wanted to know when to stop spinning.
+    }
+  }
+
   /// Recent history, for a client that has never connected before.
   ///
   /// The socket only replays from a sequence number, so a first connection would

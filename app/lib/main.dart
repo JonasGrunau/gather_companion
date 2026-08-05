@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -41,7 +43,7 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
     // iOS tears the socket down while the app is suspended. Coming back to the
     // foreground has to reconnect, which also replays everything missed.
-    if (lifecycle == AppLifecycleState.resumed) _state.reconnect();
+    if (lifecycle == AppLifecycleState.resumed) unawaited(_state.reconnect());
   }
 
   @override
@@ -53,18 +55,35 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
       home: ListenableBuilder(
         listenable: _state,
         builder: (context, _) {
-          if (!_state.isLoaded) {
-            return Scaffold(
-              backgroundColor: GatherTokens.dark.background,
-              body: Center(
-                child: CircularProgressIndicator(color: GatherTokens.dark.brand),
+          final (phase, screen) = switch (_state) {
+            AppState(isLoaded: false) => (
+              // Deliberately empty, and deliberately the same colour as the
+              // launch storyboard. Booting is a preferences read — a few frames —
+              // and a spinner that appears and disappears inside that window is
+              // pure flicker. Holding the launch screen's own surface makes the
+              // handover invisible instead.
+              _Phase.booting,
+              ColoredBox(
+                color: GatherTokens.dark.background,
+                child: const SizedBox.expand(),
               ),
-            );
-          }
-          if (!_state.isConfigured) return PairScreen(state: _state);
-          return FeedScreen(state: _state, onUnpair: _state.unpair);
+            ),
+            AppState(isConfigured: false) => (_Phase.pairing, PairScreen(state: _state)),
+            _ => (_Phase.feed, FeedScreen(state: _state, onUnpair: _state.unpair)),
+          };
+
+          // Keyed by phase, never by state identity: a ValueKey that changed on
+          // every notification would restart this transition on every socket
+          // frame and make the whole screen strobe.
+          return AnimatedSwitcher(
+            duration: const Duration(milliseconds: 220),
+            switchInCurve: Curves.easeOut,
+            child: KeyedSubtree(key: ValueKey(phase), child: screen),
+          );
         },
       ),
     );
   }
 }
+
+enum _Phase { booting, pairing, feed }

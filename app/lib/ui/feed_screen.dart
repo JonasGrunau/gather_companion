@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:gather_events/gather_events.dart';
 
@@ -31,28 +33,41 @@ class FeedScreen extends StatelessWidget {
         child: Column(
           children: [
             _TopBar(state: state, onUnpair: onUnpair),
-            if (!state.link.isLive) _LinkStrip(status: state.link),
+            _LinkStrip(status: state.link),
             Expanded(
               child: RefreshIndicator(
                 color: t.brand,
                 backgroundColor: t.card,
-                onRefresh: () async => state.reconnect(),
-                child: ListView(
-                  padding: const EdgeInsets.only(bottom: 32),
-                  children: [
-                    _AroundYou(state: state),
-                    if (feed.isEmpty)
-                      _EmptyFeed(connected: state.link.isLive)
+                onRefresh: state.reconnect,
+                child: CustomScrollView(
+                  // Without this a short feed cannot be over-scrolled, so
+                  // pull-to-refresh silently does nothing on a quiet screen.
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  slivers: [
+                    SliverToBoxAdapter(child: _AroundYou(state: state)),
+                    // Nothing at all while the backlog is in flight: showing
+                    // "No activity yet" and replacing it a moment later is the
+                    // kind of flicker that makes an app look broken on open.
+                    if (feed.isEmpty && state.isPriming)
+                      const SliverToBoxAdapter(child: SizedBox.shrink())
+                    else if (feed.isEmpty)
+                      SliverToBoxAdapter(child: _EmptyFeed(connected: state.link.isLive))
                     else ...[
-                      const _SectionLabel('Activity'),
-                      for (final entry in feed)
-                        _EventRow(
-                          event: entry.event,
-                          look: entry.look,
+                      const SliverToBoxAdapter(child: _SectionLabel('Activity')),
+                      // Lazy on purpose. Every row used to be constructed on
+                      // every rebuild — a thousand of them in a long session,
+                      // for the handful actually on screen.
+                      SliverList.builder(
+                        itemCount: feed.length,
+                        itemBuilder: (context, i) => _EventRow(
+                          event: feed[i].event,
+                          look: feed[i].look,
                           state: state,
                         ),
+                      ),
                     ],
-                    _BackgroundToggle(state: state),
+                    SliverToBoxAdapter(child: _BackgroundToggle(state: state)),
+                    const SliverToBoxAdapter(child: SizedBox(height: 32)),
                   ],
                 ),
               ),
@@ -173,8 +188,79 @@ class _LiveDot extends StatelessWidget {
 
 /// Only present when the link is unhealthy — no permanent "connected" chrome
 /// taking up a row.
-class _LinkStrip extends StatelessWidget {
+///
+/// Stateful for one reason: *when* to appear. A healthy launch walks
+/// idle → connecting → live in well under a second, and a banner that inserts a
+/// row and removes it again in that window shoves the whole feed down and back
+/// — the jump reads as a glitch, not as information. So an unhealthy link has to
+/// persist past [_grace] before it earns the space, and the row animates in
+/// rather than appearing between two frames. Recovery is instant: nobody needs
+/// easing on good news.
+class _LinkStrip extends StatefulWidget {
   const _LinkStrip({required this.status});
+
+  final LinkStatus status;
+
+  @override
+  State<_LinkStrip> createState() => _LinkStripState();
+}
+
+class _LinkStripState extends State<_LinkStrip> {
+  static const _grace = Duration(milliseconds: 600);
+
+  bool _visible = false;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(_LinkStrip old) {
+    super.didUpdateWidget(old);
+    if (old.status.state != widget.status.state) _sync();
+  }
+
+  void _sync() {
+    if (widget.status.isLive) {
+      _timer?.cancel();
+      _timer = null;
+      if (_visible) setState(() => _visible = false);
+      return;
+    }
+    if (_visible || _timer != null) return;
+    _timer = Timer(_grace, () {
+      if (!mounted) return;
+      setState(() {
+        _visible = true;
+        _timer = null;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: _visible
+          ? _LinkStripBody(status: widget.status)
+          : const SizedBox(width: double.infinity),
+    );
+  }
+}
+
+class _LinkStripBody extends StatelessWidget {
+  const _LinkStripBody({required this.status});
 
   final LinkStatus status;
 

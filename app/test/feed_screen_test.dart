@@ -50,6 +50,16 @@ void main() {
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
+    // Not straight away: a launch that connects quickly must not flash a banner
+    // in and out, so an unhealthy link has to persist before it takes a row.
+    expect(find.text('Not connected'), findsNothing);
+    expect(find.text('All quiet'), findsNothing);
+
+    // Explicit pumps rather than pumpAndSettle: the strip carries an
+    // indeterminate spinner, so the tree is never quiescent.
+    await tester.pump(const Duration(milliseconds: 700)); // past the grace
+    await tester.pump(const Duration(milliseconds: 300)); // past the reveal
+
     // The strip carries the connection state; the feed says only that it is
     // empty, so the screen does not say the same thing twice.
     expect(find.text('Not connected'), findsOneWidget);
@@ -161,5 +171,17 @@ void main() {
     await tester.pump();
 
     expect(find.textContaining('Log-only mode'), findsNothing);
+  });
+
+  test('a refresh lasts long enough to be seen', () async {
+    // Regression: `reconnect()` used to return void, so the pull-to-refresh
+    // future completed on the next microtask and the indicator snapped shut
+    // within a frame or two of appearing — a twitch rather than a refresh.
+    final state = AppState();
+    final watch = Stopwatch()..start();
+    await state.reconnect();
+    watch.stop();
+
+    expect(watch.elapsedMilliseconds, greaterThanOrEqualTo(400));
   });
 }

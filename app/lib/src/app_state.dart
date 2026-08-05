@@ -29,6 +29,15 @@ class AppState extends ChangeNotifier {
   LinkStatus _link = const LinkStatus(LinkState.idle);
   bool _loaded = false;
 
+  /// Whether the first history fetch is still outstanding.
+  ///
+  /// Starts true — a state that never attaches (tests, an unpaired app) has
+  /// nothing to wait for. [_attach] clears it, and priming sets it again, so the
+  /// feed can hold back its "nothing here" card for the moment between opening
+  /// the app and the backlog landing. Without that, opening onto a busy room
+  /// showed "No activity yet" and then yanked it away.
+  bool _primed = true;
+
   /// Whether the ambient tier is on screen. Off by default: the point of the feed
   /// is the handful of things worth reading.
   bool _showEverything = false;
@@ -41,6 +50,9 @@ class AppState extends ChangeNotifier {
   bool get isConfigured => _settings.isComplete;
   bool get isLoaded => _loaded;
   bool get showEverything => _showEverything;
+
+  /// True while the backlog is still on its way and there is nothing to show yet.
+  bool get isPriming => !_primed && _log.isEmpty;
   String? get bridgeName => _bridgeName;
 
   List<PlayerRef> get nearby {
@@ -56,21 +68,45 @@ class AppState extends ChangeNotifier {
   /// in the UI, because it changes what a quiet screen means.
   bool get hasRichData => _snapshot.health.hasRichData;
 
-  /// The feed, already classified and filtered.
-  List<({GatherEvent event, EventLook look})> get feed {
+  /// The classified feed, rebuilt only when something it depends on changes.
+  ///
+  /// This used to classify every event in the log — up to [_logLimit] of them —
+  /// on *every* rebuild, and [hiddenCount] then did a second full pass. Since the
+  /// whole app hangs off one `ListenableBuilder`, that ran again for every socket
+  /// frame, every status tick and every frame of the refresh indicator, which is
+  /// what made a busy room stutter. The cache is invalidated by anything that can
+  /// change the outcome, including a new snapshot: names are resolved during
+  /// classification, so an event logged before its player was known still gets
+  /// its label filled in the moment the roster arrives.
+  List<({GatherEvent event, EventLook look})>? _feed;
+  int _hidden = 0;
+
+  void _invalidateFeed() => _feed = null;
+
+  void _classify() {
     final out = <({GatherEvent event, EventLook look})>[];
+    var hidden = 0;
     for (final event in _log) {
       final look = lookOf(event, nameFor);
-      if (!_showEverything && look.relevance == Relevance.ambient) continue;
+      if (look.relevance == Relevance.ambient) {
+        hidden++;
+        if (!_showEverything) continue;
+      }
       out.add((event: event, look: look));
     }
-    return out;
+    _feed = out;
+    _hidden = _showEverything ? 0 : hidden;
+  }
+
+  List<({GatherEvent event, EventLook look})> get feed {
+    if (_feed == null) _classify();
+    return _feed!;
   }
 
   /// How many ambient events are being held back, so the toggle can say so.
   int get hiddenCount {
-    if (_showEverything) return 0;
-    return _log.where((e) => lookOf(e, nameFor).relevance == Relevance.ambient).length;
+    if (_feed == null) _classify();
+    return _hidden;
   }
 
   /// Development shortcut past the scanner: `--dart-define=GATHER_PAIR=host:port:token`.
@@ -115,6 +151,7 @@ class AppState extends ChangeNotifier {
         await _notifier.requestPermission();
         _log.clear();
         _snapshot = PresenceSnapshot.empty;
+        _invalidateFeed();
         notifyListeners();
         _attach();
         return null;
@@ -127,19 +164,37 @@ class AppState extends ChangeNotifier {
     _bridgeName = null;
     _snapshot = PresenceSnapshot.empty;
     _log.clear();
+    _invalidateFeed();
     _detach();
     notifyListeners();
   }
 
   void setShowEverything(bool value) {
     _showEverything = value;
+    _invalidateFeed();
     notifyListeners();
   }
 
-  void reconnect() => _client?.reconnect();
+  /// Reconnects, and resolves only once there is something to show for it.
+  ///
+  /// The floor is what makes pull-to-refresh feel like an action rather than a
+  /// twitch: a local bridge answers in ~50ms, and an indicator that appears and
+  /// vanishes inside two frames reads as a rendering fault. The ceiling lives in
+  /// [BridgeClient.whenLive], so an unreachable Mac releases the spinner instead
+  /// of pinning it open.
+  Future<void> reconnect() async {
+    // The floor is outside the null check on purpose: the gesture should feel
+    // the same whether or not there is a socket behind it.
+    final floor = Future<void>.delayed(const Duration(milliseconds: 450));
+    final client = _client;
+    if (client == null) return floor;
+    client.reconnect();
+    await Future.wait([client.whenLive(), floor]);
+  }
 
   void clearLog() {
     _log.clear();
+    _invalidateFeed();
     notifyListeners();
   }
 
@@ -159,6 +214,7 @@ class AppState extends ChangeNotifier {
       ..add(client.snapshots.listen(_onSnapshot))
       ..add(client.events.listen(_onEvent))
       ..add(client.status.listen(_onStatus));
+    _primed = false;
     client.connect();
     _primeHistory(client);
   }
@@ -168,11 +224,18 @@ class AppState extends ChangeNotifier {
   Future<void> _primeHistory(BridgeClient client) async {
     if (_log.isNotEmpty) return;
     final history = await client.recentHistory();
-    if (_client != client || history.isEmpty) return;
+    if (_client != client) return;
+    _primed = true;
+    if (history.isEmpty) {
+      // Nothing to add, but the feed still has to be told to stop waiting.
+      notifyListeners();
+      return;
+    }
     // Oldest last, matching the newest-first order the list view expects.
     for (final event in history) {
       _log.add(event);
     }
+    _invalidateFeed();
     notifyListeners();
   }
 
@@ -215,6 +278,9 @@ class AppState extends ChangeNotifier {
 
   void _onSnapshot(PresenceSnapshot snapshot) {
     _snapshot = snapshot;
+    // Names live in the snapshot and are resolved during classification, so a
+    // new roster can relabel events that are already in the log.
+    _invalidateFeed();
     notifyListeners();
   }
 
@@ -226,6 +292,7 @@ class AppState extends ChangeNotifier {
   void _onEvent(GatherEvent event) {
     _log.insert(0, event);
     if (_log.length > _logLimit) _log.removeRange(_logLimit, _log.length);
+    _invalidateFeed();
     // Fire and forget: a failed notification must never break the log.
     _notifier.consider(event, nameFor);
     notifyListeners();
