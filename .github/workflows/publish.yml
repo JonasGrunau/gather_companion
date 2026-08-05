@@ -5,14 +5,25 @@
 # The trusted-publisher entry on npmjs.com is bound to this repository *and this
 # filename* — renaming this file breaks publishing until the entry is updated.
 #
-# Publishing is deliberately tag-driven rather than firing on every push to main:
-# a version is a decision, and `git push --tags` is where you make it.
+# Publishing fires on any push to main that touches the tool. The version in
+# package.json is therefore the decision, not the act of tagging: bump it and the
+# next push ships. Leave it alone and the run *skips* rather than failing — npm
+# versions are immutable, so a second publish of the same one is an error, and a
+# bridge fix pushed without a bump must not paint main red.
+#
+# This file is deliberately absent from `paths`: editing the workflow is not
+# shipping the tool, and self-triggering on every edit is how you get runs nobody
+# asked for. `workflow_dispatch` covers re-running after a registry failure or a
+# credential fix.
 name: publish
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'bridge/**'
+      - 'package.json'
   workflow_dispatch:
 
 permissions:
@@ -45,21 +56,28 @@ jobs:
           npm install -g npm@latest
           npm --version
 
-      # A tag that disagrees with package.json publishes a version nobody asked
-      # for, and npm versions are immutable. Fail loudly instead.
-      - name: Check the tag matches package.json
-        if: github.ref_type == 'tag'
+      # The registry is the only authority on what has already shipped, so ask it
+      # rather than inferring from tags or history. This is what turns "pushed a
+      # bridge fix without bumping the version" into a skipped publish instead of
+      # an immutable-version error.
+      - name: Has this version shipped already?
+        id: shipped
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          pkg="$(node -p "require('./package.json').version")"
-          if [ "$tag" != "$pkg" ]; then
-            echo "::error::tag v$tag does not match package.json version $pkg"
-            exit 1
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "::notice::$name@$version is already on npm — skipping publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::publishing $name@$version"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "publishing $pkg"
 
+      # Unconditional: a bridge change that breaks the tests should be loud even
+      # on a push that publishes nothing.
       - run: npm test
 
       # No --provenance flag: trusted publishing attaches provenance on its own
       # for a public package from a public repo.
-      - run: npm publish
+      - if: steps.shipped.outputs.publish == 'true'
+        run: npm publish
