@@ -579,7 +579,13 @@ class _EventRow extends StatelessWidget {
         ),
       ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        // With a subline the text block is taller than the avatar, so the avatar
+        // belongs beside the title rather than floating in the middle of the
+        // block. Without one there is nothing to align to, and a single short
+        // line pinned to the top of a 30px avatar reads as a layout fault — a
+        // wave, or an observed follow, carries no supporting text at all.
+        crossAxisAlignment:
+            look.detail == null ? CrossAxisAlignment.center : CrossAxisAlignment.start,
         children: [
           if (look.subject != null)
             _Avatar(id: look.subject!, label: state.nameFor(look.subject!))
