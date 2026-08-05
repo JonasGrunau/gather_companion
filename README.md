@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="app/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png" width="104" alt="Gather Companion — a proximity ping on a pixel grid">
+<img src="docs/icon.png" width="104" alt="Gather Companion — a proximity ping on a pixel grid">
 
 # Gather Companion
 
 **Know when someone walks up to you — or starts following you — in your live Gather V2 session.**
 
-[![npm](https://img.shields.io/npm/v/gather-app-bridge?color=4257DA&labelColor=1a1a2e&label=gather-app-bridge)](https://www.npmjs.com/package/gather-app-bridge)
-[![license](https://img.shields.io/badge/license-MIT-4257DA?labelColor=1a1a2e)](LICENSE)
-[![node](https://img.shields.io/badge/node-%E2%89%A5%2022-4257DA?labelColor=1a1a2e)](package.json)
-[![dependencies](https://img.shields.io/badge/dependencies-zero-4257DA?labelColor=1a1a2e)](bridge/)
+[![npm](https://img.shields.io/npm/v/gather-app-bridge?label=gather-app-bridge)](https://www.npmjs.com/package/gather-app-bridge)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen)](package.json)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](bridge/)
 
 *Not affiliated with Gather.* A third-party companion that reads the Gather V2
 desktop client running on your own computer, and tells your phone about it.
@@ -417,12 +417,18 @@ it is somebody who just walked into range. Pixel geometry nods at the medium —
 tile-grid virtual office — while borrowing nothing from Gather's own mark; the
 dark indigo tile is the app's own `background`, not Gather's blue square. It is
 drawn by `app/tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
-spirit as the bridge's hand-rolled `qr.js`), which writes all fifteen
-asset-catalog sizes from one source of truth:
+spirit as the bridge's hand-rolled `qr.js`), which writes three sets from one
+source of truth: all fifteen asset-catalog sizes, the launch mark on alpha, and
+the squircled `docs/icon.png` at the top of this page.
 
 ```sh
 node app/tool/make_icons.mjs --preview
 ```
+
+The catalogue sizes stay full-bleed squares because iOS applies the squircle
+itself — a tile that arrived pre-rounded would be masked twice and come out with
+chewed corners. The documentation copy carries the mask in its pixels instead,
+since GitHub strips the CSS that would otherwise round it.
 
 ### 🔔 Notifications, honestly
 

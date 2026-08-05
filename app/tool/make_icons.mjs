@@ -14,8 +14,9 @@
  * (a tile-grid virtual office) without borrowing anything from Gather's own
  * mark; the palette is the app's own `GatherTokens.dark`.
  *
- * Writes both sets: the opaque app icon, and the same mark on alpha for the
- * launch screen, so the tap and the launch are one continuous gesture.
+ * Writes three sets: the opaque app icon, the same mark on alpha for the launch
+ * screen so the tap and the launch are one continuous gesture, and a
+ * squircle-masked copy for the READMEs.
  *
  *   node app/tool/make_icons.mjs [--preview]
  */
@@ -111,17 +112,60 @@ function background(t) {
 }
 
 /**
- * Renders the mark at `size`×`size`, supersampled `SS`× per axis so the cell
+ * The opaque tile at one continuous point: ground, bloom, and the mark over it.
+ *
+ * Factored out because the masked render needs exactly these colours but has to
+ * count coverage while it accumulates them, and two copies of this compositing
+ * would be two places to get it wrong.
+ */
+function ground(u, v) {
+  const bg = background(v);
+  const gl = glow(u, v);
+  for (let i = 0; i < 3; i++) bg[i] = bg[i] * (1 - gl) + BRAND[i] * gl;
+  const c = MAP[Math.min(GRID - 1, Math.floor(v * GRID))][
+    Math.min(GRID - 1, Math.floor(u * GRID))
+  ];
+  if (!c) return bg;
+  const a = c[3];
+  return [
+    c[0] * a + bg[0] * (1 - a),
+    c[1] * a + bg[1] * (1 - a),
+    c[2] * a + bg[2] * (1 - a),
+  ];
+}
+
+/**
+ * Apple's icon silhouette is not a rounded rectangle — it is a squircle, whose
+ * curvature is continuous where a rounded rect's jumps. The usual approximation
+ * is the superellipse |u|ⁿ + |v|ⁿ = 1 at n ≈ 5, which is close enough that the
+ * difference is invisible at README size.
+ *
+ * Only the documentation render uses it. The asset-catalogue sizes stay
+ * full-bleed squares on purpose: iOS applies this mask itself, and a tile that
+ * arrived pre-rounded would be masked twice and come out with chewed corners.
+ */
+const SQUIRCLE_N = 5;
+
+function insideSquircle(u, v) {
+  return Math.abs(u) ** SQUIRCLE_N + Math.abs(v) ** SQUIRCLE_N <= 1;
+}
+
+/**
+ * Renders the mark at `size`×`size`, supersampled `ss`× per axis so the cell
  * edges land smooth at 29px instead of chewed.
  *
  * With `transparent`, the ground and its bloom are left out and only the mark is
  * drawn, on alpha. That is what the launch screen needs: the storyboard already
  * paints the background colour, so an opaque tile would sit on it as a visible
  * square instead of the mark appearing to float on the same surface.
+ *
+ * With `mask`, the full tile is drawn but clipped to the squircle, and the
+ * coverage of each edge pixel becomes its alpha — the rounded corners live in
+ * the pixels because GitHub strips the CSS that would otherwise do this.
  */
-function render(size, { transparent = false } = {}) {
-  const SS = 4;
-  const stride = transparent ? 4 : 3;
+function render(size, { transparent = false, mask = false, ss = 4 } = {}) {
+  const SS = ss;
+  const stride = transparent || mask ? 4 : 3;
   const px = Buffer.alloc(size * size * stride);
   for (let py = 0; py < size; py++) {
     for (let pxi = 0; pxi < size; pxi++) {
@@ -129,6 +173,29 @@ function render(size, { transparent = false } = {}) {
       let g = 0;
       let b = 0;
       let alpha = 0;
+      if (mask) {
+        let inside = 0;
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const u = (pxi + (sx + 0.5) / SS) / size;
+            const v = (py + (sy + 0.5) / SS) / size;
+            if (!insideSquircle(u * 2 - 1, v * 2 - 1)) continue;
+            inside++;
+            const c = ground(u, v);
+            r += c[0];
+            g += c[1];
+            b += c[2];
+          }
+        }
+        const o = (py * size + pxi) * 4;
+        // Unpremultiplied, which is what PNG stores: the colour is the average of
+        // the subsamples that landed inside, and the alpha is how many did.
+        px[o] = inside ? Math.round(r / inside) : 0;
+        px[o + 1] = inside ? Math.round(g / inside) : 0;
+        px[o + 2] = inside ? Math.round(b / inside) : 0;
+        px[o + 3] = Math.round((inside / (SS * SS)) * 255);
+        continue;
+      }
       if (transparent) {
         for (let sy = 0; sy < SS; sy++) {
           for (let sx = 0; sx < SS; sx++) {
@@ -157,22 +224,10 @@ function render(size, { transparent = false } = {}) {
         for (let sx = 0; sx < SS; sx++) {
           const u = (pxi + (sx + 0.5) / SS) / size;
           const v = (py + (sy + 0.5) / SS) / size;
-          const bg = background(v);
-          const gl = glow(u, v);
-          for (let i = 0; i < 3; i++) bg[i] = bg[i] * (1 - gl) + BRAND[i] * gl;
-          const c = MAP[Math.min(GRID - 1, Math.floor(v * GRID))][
-            Math.min(GRID - 1, Math.floor(u * GRID))
-          ];
-          if (c) {
-            const a = c[3];
-            r += c[0] * a + bg[0] * (1 - a);
-            g += c[1] * a + bg[1] * (1 - a);
-            b += c[2] * a + bg[2] * (1 - a);
-          } else {
-            r += bg[0];
-            g += bg[1];
-            b += bg[2];
-          }
+          const c = ground(u, v);
+          r += c[0];
+          g += c[1];
+          b += c[2];
         }
       }
       const n = SS * SS;
@@ -279,6 +334,20 @@ for (const [name, size] of Object.entries(LAUNCH)) {
   );
   console.log(`  ${name.padEnd(30)} ${size}×${size}  (alpha)`);
 }
+
+// The READMEs show the icon as a phone would: squircled, on alpha, so it sits on
+// either GitHub theme. Written into `docs/` rather than next to the catalogue
+// because it is documentation, not an app asset — and generated here rather than
+// hand-rounded so it cannot drift from what the app actually ships. Supersampled
+// harder than the catalogue sizes: this one is a single large render, and its
+// curve is the whole point.
+const docs = join(here, '..', '..', 'docs');
+mkdirSync(docs, { recursive: true });
+writeFileSync(
+  join(docs, 'icon.png'),
+  encodePng(512, render(512, { mask: true, ss: 8 }), { alpha: true }),
+);
+console.log(`  ${'docs/icon.png'.padEnd(30)} 512×512  (squircle, alpha)`);
 
 if (process.argv.includes('--preview')) {
   const out = join(here, 'icon-preview.png');
