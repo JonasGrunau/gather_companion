@@ -77,7 +77,24 @@ jobs:
       # on a push that publishes nothing.
       - run: npm test
 
+      # TEMPORARY — diagnosing why npm falls back to token auth instead of OIDC.
+      # Remove once publishing works. Prints only whether secrets exist, never
+      # their values.
+      - name: Diagnose OIDC availability
+        run: |
+          echo "npm:  $(npm --version)"
+          echo "node: $(node --version)"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL set:   ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "npmrc in use: ${NPM_CONFIG_USERCONFIG:-default}"
+          echo "--- npmrc contents, tokens redacted ---"
+          sed -E 's/(_authToken=).*/\1<redacted>/' "${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}" || true
+          echo "--- what the OIDC claims would say ---"
+          echo "repository:       ${GITHUB_REPOSITORY}"
+          echo "repository_owner: ${GITHUB_REPOSITORY_OWNER}"
+          echo "workflow_ref:     ${GITHUB_WORKFLOW_REF}"
+
       # No --provenance flag: trusted publishing attaches provenance on its own
       # for a public package from a public repo.
       - if: steps.shipped.outputs.publish == 'true'
-        run: npm publish
+        run: npm publish --loglevel verbose
