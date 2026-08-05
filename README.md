@@ -459,6 +459,57 @@ npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 
 ---
 
+## 🏷️ Releasing
+
+One tag ships both halves. Bump the version in `package.json`, commit, then:
+
+```sh
+git tag -a v0.2.0 -m "gather-app-bridge 0.2.0"
+git push --tags
+```
+
+`.github/workflows/publish.yml` runs the bridge tests and `flutter analyze`/
+`flutter test` as a gate, then — only if both are green — publishes
+`gather-app-bridge` to npm and uploads a signed build to TestFlight. The tag is
+the version for both: `v0.2.0` becomes `0.2.0` on npm and `0.2.0` in App Store
+Connect, with the workflow's run number as the build number. **`version:` in
+`app/pubspec.yaml` is not read by a release** — it only affects a local
+`flutter run`.
+
+A failed run can be re-run from the Actions tab, or re-dispatched with
+`gh workflow run publish.yml`; npm skips a version that already shipped, and a
+re-run gets a fresh build number, so neither half objects to going twice.
+
+**Things worth knowing before touching any of this:**
+
+- 📛 **The workflow file must stay `publish.yml`.** npm's trusted-publisher entry
+  matches the file *path*, not the workflow's `name:`. Renaming it fails the
+  publish with `404 … package not found`, which reads like a missing package.
+- 🔑 **Six repository secrets.** npm needs none — it authenticates with OIDC.
+  The app needs the App Store Connect key for the upload (`ASC_KEY_ID`,
+  `ASC_ISSUER_ID`, `ASC_KEY_P8`) and its signing assets
+  (`APPLE_DIST_CERT_P12` — base64 of a `.p12`, `APPLE_DIST_CERT_PASSWORD`,
+  `APPLE_PROVISIONING_PROFILE` — base64 of a `.mobileprovision`).
+- ✍️ **Signing is manual, on purpose.** Automatic signing wants to update the
+  Xcode-managed profile during export, which is a *cloud signing* operation, and
+  an App Store Connect API key is never permitted to do one — it fails with
+  `Cloud signing permission error` however the key is scoped. It works on a Mac
+  only because Xcode has an Apple ID session, which a runner does not. Naming an
+  explicit certificate and profile in `app/ios/ExportOptions.plist` removes the
+  problem: nothing has to be created at build time.
+- 📅 **The certificate and profile expire 2027-08-05** and are reissued together
+  — `Apple Distribution` for team `JQ4STVWTQ3`, and the App Store profile
+  *Gather Companion App Store* bound to it. Reissue both, refresh the three
+  `APPLE_*` secrets, and re-import the `.p12` locally.
+- 📱 **To upload from your own Mac instead**, `app/tool/upload-testflight.sh
+  --build` does the same thing, reading the issuer from
+  `~/.appstoreconnect/issuer_id` and exporting through the same
+  `ExportOptions.plist`. CI runs that same script. It needs the distribution
+  certificate in your login keychain and the profile in
+  `~/Library/MobileDevice/Provisioning Profiles`.
+
+---
+
 ## ⚠️ Scope and caveats
 
 - 🖥️ **The bridge runs on macOS today.** It reads macOS log paths and installs a

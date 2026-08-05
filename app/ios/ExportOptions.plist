@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	How the archive is turned into an uploadable IPA.
+
+	`flutter build ipa` generates one of these into build/ and throws it away, so
+	until now nothing was pinned. CI cannot use the generated one — it drives
+	xcodebuild directly — and a second, slightly different set of options is
+	exactly the sort of difference that only shows up in a rejected upload. So it
+	lives here, and both the release workflow and tool/upload-testflight.sh export
+	through it.
+
+	Signing is MANUAL, which is not Flutter's default and is deliberate.
+
+	Automatic signing cannot work in CI here. It asks Apple to update the
+	Xcode-managed "iOS Team Store Provisioning Profile", and that is a cloud
+	signing operation, which an App Store Connect API key is not permitted to
+	perform — it fails with `Cloud signing permission error` no matter how the key
+	is scoped. Locally it succeeds only because Xcode has an Apple ID session,
+	which a runner has no equivalent of. Naming an explicit certificate and
+	profile sidesteps cloud signing altogether: nothing has to be created at build
+	time, so the API key is needed only for the upload itself.
+
+	The profile is "Gather Companion App Store" (App Store, bound to the Apple
+	Distribution certificate for JQ4STVWTQ3). Both it and the certificate expire
+	2027-08-05 and are then reissued together.
+
+	manageAppVersionAndBuildNumber must stay false, or Xcode rewrites the build
+	number during export and the workflow's run number stops being the build
+	number.
+-->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>teamID</key>
+	<string>JQ4STVWTQ3</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>Apple Distribution</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.jonasgrunau.gatherCompanion</key>
+		<string>Gather Companion App Store</string>
+	</dict>
+	<key>destination</key>
+	<string>export</string>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+	<key>uploadSymbols</key>
+	<true/>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>generateAppStoreInformation</key>
+	<false/>
+	<key>testFlightInternalTestingOnly</key>
+	<false/>
+</dict>
+</plist>

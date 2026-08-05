@@ -1,9 +1,15 @@
-# Publishes gather-app-bridge to npm via trusted publishing (OIDC).
+# One tag ships both halves: the bridge to npm, the app to TestFlight.
+#
+# The file is still called publish.yml even though the workflow is now called
+# `release`, because npm's trusted-publisher entry is bound to this repository
+# *and this filename* — it matches the `job_workflow_ref` OIDC claim, which
+# carries the path, not the `name:` below. Renaming the file breaks publishing
+# until the entry on npmjs.com is updated; renaming the workflow is free.
+#
+# ── the npm half ──────────────────────────────────────────────────────────────
 #
 # No NPM_TOKEN anywhere: npm mints a short-lived credential from the OIDC token
 # GitHub hands this workflow, which is why `id-token: write` is load-bearing.
-# The trusted-publisher entry on npmjs.com is bound to this repository *and this
-# filename* — renaming this file breaks publishing until the entry is updated.
 #
 # The owner field in that entry is CASE-SENSITIVE and npm does not normalise it:
 # it must read `JonasGrunau`, matching the `repository_owner` OIDC claim, not
@@ -11,13 +17,46 @@
 # reports a claims mismatch as `404 ... package not found`, which reads like the
 # package or the entry is missing rather than like an auth failure.
 #
-# Publishing is deliberately tag-driven rather than firing on every push to main:
-# a version is a decision, and `git push --tags` is where you make it. An ordinary
-# bridge fix can land on main without shipping anything.
+# ── the iOS half ──────────────────────────────────────────────────────────────
 #
-# `workflow_dispatch` covers re-running a version after a registry failure or a
-# credential fix, without inventing a second tag for the same release.
-name: publish
+# Signing is manual, against an explicit certificate and profile, and that is
+# worth explaining because automatic signing is the obvious thing to reach for
+# and it cannot work here.
+#
+# Automatic signing asks Apple to update the Xcode-managed "iOS Team Store
+# Provisioning Profile" during export. That is a *cloud signing* operation, and
+# an App Store Connect API key is not permitted to perform one: it fails with
+# `Cloud signing permission error` regardless of how the key is scoped. This was
+# tested against a key with Admin access and full Certificates, Identifiers &
+# Profiles access, with and without a warm profile cache — same error every time.
+# It works on a developer Mac only because Xcode has an Apple ID session there,
+# which a runner has no equivalent of.
+#
+# So nothing is created at build time. The certificate arrives as a .p12 in the
+# secrets, the profile arrives alongside it, and the API key is left with the one
+# job it can actually do here: the upload.
+#
+# The build is also deliberately not `flutter build ipa`, because that would use
+# Flutter's own generated export options rather than ios/ExportOptions.plist.
+# `--config-only` writes the project configuration and xcodebuild is driven
+# directly.
+#
+# The certificate and profile both expire 2027-08-05 and are reissued together;
+# see the Releasing section of the README for how.
+#
+# ── the version ───────────────────────────────────────────────────────────────
+#
+# The tag is the single source of truth. `v0.2.0` publishes the bridge as 0.2.0
+# and builds the app as 0.2.0, with the run number as CFBundleVersion. Nothing
+# reads `version:` in app/pubspec.yaml any more — it only matters to a local
+# `flutter run` — so a release never edits a file.
+#
+# Publishing is tag-driven rather than firing on every push to main: a version is
+# a decision, and `git push --tags` is where you make it. `workflow_dispatch`
+# covers re-running a release after a registry or upload failure, without
+# inventing a second tag for the same version; on a dispatch the version comes
+# from package.json instead of the tag.
+name: release
 
 on:
   push:
@@ -29,11 +68,72 @@ permissions:
   id-token: write # required — this is what trusted publishing authenticates with
   contents: read
 
+# Two tags pushed together would otherwise race for the same build number.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    # macOS because the package is darwin-only (`"os": ["darwin"]`): it drives
+  # The gate. Neither half ships if anything here is red, so a tag can never
+  # produce a release that exists on npm but not in TestFlight, or vice versa.
+  test:
+    # macOS because the bridge is darwin-only (`"os": ["darwin"]`): it drives
     # launchd and reads the Gather client's macOS log paths. The tests happen to
-    # be platform-neutral today, but CI should run where users run.
+    # be platform-neutral today, but CI should run where users run — and the app
+    # cannot be built anywhere else regardless.
+    runs-on: macos-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          # Nothing to cache — the package has no dependencies, and there is no
+          # lockfile, so `npm ci` would fail where `npm test` does not.
+          package-manager-cache: false
+
+      # Pinned to .tool-versions. A Flutter upgrade should be a commit, not
+      # something that happens to a release because an action resolved `stable`
+      # differently that morning.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.5'
+          channel: stable
+          cache: true
+
+      # A tag that disagrees with package.json publishes a version nobody asked
+      # for, and npm versions are immutable. Fail here, before either half runs.
+      - name: Work out the version being released
+        id: version
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_TYPE" = 'tag' ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$pkg" ]; then
+              echo "::error::tag v$version does not match package.json version $pkg"
+              exit 1
+            fi
+          else
+            version="$pkg"
+          fi
+          echo "::notice::releasing $version (build ${{ github.run_number }})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Bridge tests
+        run: npm test
+
+      - name: App analysis and tests
+        working-directory: app
+        run: |
+          flutter analyze
+          flutter test
+
+  npm:
+    needs: test
     runs-on: macos-latest
 
     steps:
@@ -43,8 +143,6 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-          # Nothing to cache — the package has no dependencies, and there is no
-          # lockfile, so `npm ci` would fail where `npm test` does not.
           package-manager-cache: false
 
       # Trusted publishing needs npm >= 11.5.1. Node 24 ships a new enough npm
@@ -54,18 +152,6 @@ jobs:
         run: |
           npm install -g npm@latest
           npm --version
-
-      # A tag that disagrees with package.json publishes a version nobody asked
-      # for, and npm versions are immutable. Fail loudly instead.
-      - name: Check the tag matches package.json
-        if: github.ref_type == 'tag'
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          pkg="$(node -p "require('./package.json').version")"
-          if [ "$tag" != "$pkg" ]; then
-            echo "::error::tag v$tag does not match package.json version $pkg"
-            exit 1
-          fi
 
       # The registry is the only authority on what has already shipped, so ask it
       # rather than inferring from the tag. This is what makes a re-run idempotent:
@@ -84,10 +170,6 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Unconditional: a tagged release whose tests fail should be loud even when
-      # the publish itself is going to be skipped as already-shipped.
-      - run: npm test
-
       # Verbose on purpose. npm reports OIDC failures at verbose level *only* — at
       # default level a rejected token exchange is invisible and all you see is
       # `404 PUT`, which reads like a missing package rather than an auth problem.
@@ -100,3 +182,139 @@ jobs:
       # attestation to be built and uploaded.
       - if: steps.shipped.outputs.publish == 'true'
         run: npm publish --provenance --loglevel verbose
+
+  ios:
+    needs: test
+    runs-on: macos-latest
+
+    defaults:
+      run:
+        working-directory: app
+
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+      # CFBundleVersion. Monotonic by construction, which is the only thing App
+      # Store Connect asks of it — it rejects a build number it has already seen
+      # for a version, and never compares it to anything else.
+      BUILD_NUMBER: ${{ github.run_number }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.5'
+          channel: stable
+          cache: true
+
+      # Pinned for the same reason as Flutter: a runner-image roll should not be
+      # able to change the toolchain a release was built with.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # The certificate goes into a keychain created for this run rather than the
+      # login keychain, so nothing outlives the job and no unlock password has to
+      # be guessed. The partition list is what stops codesign blocking on a UI
+      # prompt that nobody is there to answer.
+      - name: Install the signing certificate and profile
+        env:
+          CERT_P12: ${{ secrets.APPLE_DIST_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DIST_CERT_PASSWORD }}
+          PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+        run: |
+          keychain=release.keychain
+          password="$(openssl rand -base64 18)"
+
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+
+          p12="$(mktemp)"
+          printf '%s' "$CERT_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -f pkcs12
+          rm -f "$p12"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+
+          # Fails the job here, rather than 10 minutes later in the export, if the
+          # secret is malformed or the certificate has expired.
+          security find-identity -v -p codesigning "$keychain" | grep -q 'Apple Distribution' \
+            || { echo '::error::no Apple Distribution identity after import'; exit 1; }
+
+          profiles="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profiles"
+          printf '%s' "$PROFILE" | base64 --decode > "$profiles/gather.mobileprovision"
+
+      # Reconstructs the layout that already works on a developer Mac: altool
+      # searches ~/.appstoreconnect/private_keys by convention, and
+      # tool/upload-testflight.sh reads the issuer from ~/.appstoreconnect/issuer_id.
+      # Matching it means CI runs the same upload script a human does, rather than
+      # a second implementation that drifts.
+      - name: Install the App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s' "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          printf '%s\n' "$ASC_ISSUER_ID" > ~/.appstoreconnect/issuer_id
+          chmod 600 ~/.appstoreconnect/issuer_id ~/.appstoreconnect/private_keys/*.p8
+
+      # Writes ios/Flutter/Generated.xcconfig — including FLUTTER_BUILD_NAME and
+      # FLUTTER_BUILD_NUMBER, which Info.plist interpolates — and stops before
+      # building anything, so the archive below is not duplicated work.
+      - name: Configure the Xcode project for this release
+        run: |
+          flutter build ios --config-only --release \
+            --build-name="$VERSION" \
+            --build-number="$BUILD_NUMBER"
+
+      # Archived unsigned, because a command-line build setting applies to every
+      # target in the workspace and the Flutter plugins are Swift packages, which
+      # reject one outright: "mobile_scanner does not support provisioning
+      # profiles". Signing the Runner target alone from the command line is not
+      # expressible, so nothing is signed here and the export below signs the app
+      # in one place instead.
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            CODE_SIGNING_ALLOWED=NO
+
+      # No -allowProvisioningUpdates and no authentication key: the certificate
+      # and profile are both already on disk, so there is nothing to fetch, and
+      # asking for one is what triggers the cloud signing failure described above.
+      #
+      # Exports to build/ios/ipa, which is where `flutter build ipa` puts it
+      # locally, so the upload script finds gather_companion.ipa unchanged.
+      - name: Export the IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -exportPath build/ios/ipa
+
+      - name: Upload to TestFlight
+        run: tool/upload-testflight.sh
+
+      # Kept on failure too: when App Store Connect rejects an upload, the
+      # packaging log is the difference between reading why and rebuilding blind.
+      - name: Keep the IPA and packaging logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gather_companion-${{ needs.test.outputs.version }}-${{ github.run_number }}
+          path: |
+            app/build/ios/ipa/*.ipa
+            app/build/ios/ipa/*.plist
+            app/build/ios/ipa/*.log
+          retention-days: 7
+          if-no-files-found: ignore

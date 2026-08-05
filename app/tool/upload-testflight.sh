@@ -11,13 +11,19 @@
 # Deliberately not in the repo: the issuer is account-level and shared with the
 # Superset app, so it belongs in $HOME, not in a checkout that gets pushed.
 #
+# The release workflow runs this too, after writing the same two files into the
+# runner's $HOME from repository secrets. Keeping one implementation means the
+# upload a human does and the upload CI does cannot drift apart.
+#
 #   app/tool/upload-testflight.sh [--build]
 #
 #     --build   run `flutter build ipa` first, instead of uploading whatever is
 #               already sitting in build/ios/ipa
 set -euo pipefail
 
-KEY_ID='9FVGFF4ZJ8' # Gather Companion. Superset is Y8BLV9TS8M, same issuer.
+# Gather Companion. Superset is Y8BLV9TS8M, same issuer. Overridable because CI
+# supplies whichever key its secret holds.
+KEY_ID="${ASC_KEY_ID:-9FVGFF4ZJ8}"
 ISSUER_FILE="$HOME/.appstoreconnect/issuer_id"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,8 +38,10 @@ if [ ! -f "$ISSUER_FILE" ]; then
   exit 1
 fi
 
+# Exports through the committed options rather than the ones Flutter generates,
+# so a build from this machine is packaged the same way a release from CI is.
 if [ "${1:-}" = '--build' ]; then
-  ( cd "$app" && flutter build ipa )
+  ( cd "$app" && flutter build ipa --export-options-plist ios/ExportOptions.plist )
 fi
 
 if [ ! -f "$ipa" ]; then
