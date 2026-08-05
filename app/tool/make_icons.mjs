@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Draws the Gather Companion app icon and writes every size the iOS asset
- * catalogue asks for.
+ * Draws the Gather Companion app icon and launch mark, and writes every size the
+ * iOS asset catalogue asks for.
  *
  * The icon is generated rather than committed as an opaque blob so the design is
  * reviewable and re-renderable: change a constant here, re-run, and every size
@@ -9,10 +9,13 @@
  * CRC table, in the same spirit as the bridge's hand-rolled `qr.js`.
  *
  * The mark is a proximity ping on a 32×32 pixel grid: you are the white block in
- * the middle, the two rings are the radius the bridge watches, and the green
- * marker on the outer ring is somebody who just walked into it. Pixel geometry
- * nods at the medium (a tile-grid virtual office) without borrowing anything
- * from Gather's own mark; the palette is the app's own `GatherTokens.dark`.
+ * the middle, the ring is the radius the bridge watches, and the green marker on
+ * it is somebody who just walked into range. Pixel geometry nods at the medium
+ * (a tile-grid virtual office) without borrowing anything from Gather's own
+ * mark; the palette is the app's own `GatherTokens.dark`.
+ *
+ * Writes both sets: the opaque app icon, and the same mark on alpha for the
+ * launch screen, so the tap and the launch are one continuous gesture.
  *
  *   node app/tool/make_icons.mjs [--preview]
  */
@@ -108,17 +111,48 @@ function background(t) {
 }
 
 /**
- * Renders the icon at `size`×`size`, supersampled `SS`× per axis so the cell
+ * Renders the mark at `size`×`size`, supersampled `SS`× per axis so the cell
  * edges land smooth at 29px instead of chewed.
+ *
+ * With `transparent`, the ground and its bloom are left out and only the mark is
+ * drawn, on alpha. That is what the launch screen needs: the storyboard already
+ * paints the background colour, so an opaque tile would sit on it as a visible
+ * square instead of the mark appearing to float on the same surface.
  */
-function render(size) {
+function render(size, { transparent = false } = {}) {
   const SS = 4;
-  const px = Buffer.alloc(size * size * 3);
+  const stride = transparent ? 4 : 3;
+  const px = Buffer.alloc(size * size * stride);
   for (let py = 0; py < size; py++) {
     for (let pxi = 0; pxi < size; pxi++) {
       let r = 0;
       let g = 0;
       let b = 0;
+      let alpha = 0;
+      if (transparent) {
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const u = (pxi + (sx + 0.5) / SS) / size;
+            const v = (py + (sy + 0.5) / SS) / size;
+            const c = MAP[Math.min(GRID - 1, Math.floor(v * GRID))][
+              Math.min(GRID - 1, Math.floor(u * GRID))
+            ];
+            if (!c) continue;
+            // Accumulate premultiplied, so a subsample that is half-covered
+            // contributes half its colour rather than all of it.
+            r += c[0] * c[3];
+            g += c[1] * c[3];
+            b += c[2] * c[3];
+            alpha += c[3];
+          }
+        }
+        const o = (py * size + pxi) * 4;
+        px[o] = alpha > 0 ? Math.round(r / alpha) : 0;
+        px[o + 1] = alpha > 0 ? Math.round(g / alpha) : 0;
+        px[o + 2] = alpha > 0 ? Math.round(b / alpha) : 0;
+        px[o + 3] = Math.round((alpha / (SS * SS)) * 255);
+        continue;
+      }
       for (let sy = 0; sy < SS; sy++) {
         for (let sx = 0; sx < SS; sx++) {
           const u = (pxi + (sx + 0.5) / SS) / size;
@@ -151,7 +185,9 @@ function render(size) {
   return px;
 }
 
-// ── PNG encoder (8-bit RGB, no alpha — App Store rejects transparent icons) ──
+// ── PNG encoder (8-bit truecolour) ─────────────────────────────────────────
+// Icons are written without an alpha channel because App Store Connect rejects
+// a transparent marketing icon; the launch mark needs one.
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -177,17 +213,17 @@ function chunk(type, data) {
   return Buffer.concat([len, body, crc]);
 }
 
-function encodePng(size, rgb) {
+function encodePng(size, pixels, { alpha = false } = {}) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type: truecolour
-  const stride = size * 3;
+  ihdr[9] = alpha ? 6 : 2; // colour type: truecolour, with an alpha channel or without
+  const stride = size * (alpha ? 4 : 3);
   const raw = Buffer.alloc((stride + 1) * size);
   for (let y = 0; y < size; y++) {
     raw[y * (stride + 1)] = 0; // filter: none
-    rgb.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+    pixels.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
   }
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -222,6 +258,26 @@ for (const [name, size] of Object.entries(TARGETS)) {
   if (!cache.has(size)) cache.set(size, encodePng(size, render(size)));
   writeFileSync(join(iconset, name), cache.get(size));
   console.log(`  ${name.padEnd(30)} ${size}×${size}`);
+}
+
+// The launch screen shows the same mark on alpha, so tapping the icon and
+// watching the app open is one continuous gesture rather than two unrelated
+// pictures. The storyboard centres these at their natural point size, so 112pt
+// here is 112pt on screen.
+const LAUNCH = {
+  'LaunchImage.png': 112,
+  'LaunchImage@2x.png': 224,
+  'LaunchImage@3x.png': 336,
+};
+
+const launchset = join(here, '..', 'ios', 'Runner', 'Assets.xcassets', 'LaunchImage.imageset');
+mkdirSync(launchset, { recursive: true });
+for (const [name, size] of Object.entries(LAUNCH)) {
+  writeFileSync(
+    join(launchset, name),
+    encodePng(size, render(size, { transparent: true }), { alpha: true }),
+  );
+  console.log(`  ${name.padEnd(30)} ${size}×${size}  (alpha)`);
 }
 
 if (process.argv.includes('--preview')) {
