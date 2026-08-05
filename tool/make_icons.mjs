@@ -18,7 +18,7 @@
  * screen so the tap and the launch are one continuous gesture, and a
  * squircle-masked copy for the READMEs.
  *
- *   node app/tool/make_icons.mjs [--preview]
+ *   node tool/make_icons.mjs [--preview]
  */
 
 import { deflateSync } from 'node:zlib';

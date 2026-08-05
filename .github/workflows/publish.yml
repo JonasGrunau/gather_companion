@@ -48,7 +48,7 @@
 #
 # The tag is the single source of truth. `v0.2.0` publishes the bridge as 0.2.0
 # and builds the app as 0.2.0, with the run number as CFBundleVersion. Nothing
-# reads `version:` in app/pubspec.yaml any more — it only matters to a local
+# reads `version:` in pubspec.yaml any more — it only matters to a local
 # `flutter run` — so a release never edits a file.
 #
 # Publishing is tag-driven rather than firing on every push to main: a version is
@@ -127,7 +127,6 @@ jobs:
         run: npm test
 
       - name: App analysis and tests
-        working-directory: app
         run: |
           flutter analyze
           flutter test
@@ -186,10 +185,6 @@ jobs:
   ios:
     needs: test
     runs-on: macos-latest
-
-    defaults:
-      run:
-        working-directory: app
 
     env:
       VERSION: ${{ needs.test.outputs.version }}
@@ -313,8 +308,8 @@ jobs:
         with:
           name: gather_companion-${{ needs.test.outputs.version }}-${{ github.run_number }}
           path: |
-            app/build/ios/ipa/*.ipa
-            app/build/ios/ipa/*.plist
-            app/build/ios/ipa/*.log
+            build/ios/ipa/*.ipa
+            build/ios/ipa/*.plist
+            build/ios/ipa/*.log
           retention-days: 7
           if-no-files-found: ignore

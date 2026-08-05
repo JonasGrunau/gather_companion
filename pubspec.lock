@@ -155,7 +155,7 @@ packages:
   gather_events:
     dependency: "direct main"
     description:
-      path: "../packages/gather_events"
+      path: "packages/gather_events"
       relative: true
     source: path
     version: "0.1.0"

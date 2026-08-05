@@ -15,7 +15,7 @@
 # runner's $HOME from repository secrets. Keeping one implementation means the
 # upload a human does and the upload CI does cannot drift apart.
 #
-#   app/tool/upload-testflight.sh [--build]
+#   tool/upload-testflight.sh [--build]
 #
 #     --build   run `flutter build ipa` first, instead of uploading whatever is
 #               already sitting in build/ios/ipa
@@ -27,8 +27,8 @@ KEY_ID="${ASC_KEY_ID:-9FVGFF4ZJ8}"
 ISSUER_FILE="$HOME/.appstoreconnect/issuer_id"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-app="$(dirname "$here")"
-ipa="$app/build/ios/ipa/gather_companion.ipa"
+root="$(dirname "$here")"
+ipa="$root/build/ios/ipa/gather_companion.ipa"
 
 if [ ! -f "$ISSUER_FILE" ]; then
   echo "No issuer ID at $ISSUER_FILE" >&2
@@ -41,7 +41,7 @@ fi
 # Exports through the committed options rather than the ones Flutter generates,
 # so a build from this machine is packaged the same way a release from CI is.
 if [ "${1:-}" = '--build' ]; then
-  ( cd "$app" && flutter build ipa --export-options-plist ios/ExportOptions.plist )
+  ( cd "$root" && flutter build ipa --export-options-plist ios/ExportOptions.plist )
 fi
 
 if [ ! -f "$ipa" ]; then

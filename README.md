@@ -23,7 +23,7 @@ desktop client running on your own computer, and tells your phone about it.
 | | what it is | where it runs |
 |---|---|---|
 | 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency background daemon that watches the Gather desktop client and serves events over your LAN | your **computer** |
-| 📱 `app/` | **Gather Companion** — a Flutter app showing a live event log and who is around you right now | your **phone** |
+| 📱 `lib/`, `ios/` | **Gather Companion** — a Flutter app showing a live event log and who is around you right now | your **phone** |
 
 Two collectors read the same client in two different ways, and both feed one
 stream:
@@ -344,14 +344,14 @@ app introduces itself properly once opened.
 Nothing in `lib/` is platform-specific: it is plain Flutter over an HTTP and
 WebSocket contract, so the same code targets phones and desktops. Only the iOS
 runner is scaffolded so far — `flutter create --platforms=android,windows,linux .`
-from `app/` adds the rest, and the icon generator needs a matching output path
+at the repository root adds the rest, and the icon generator needs a matching output path
 per platform.
 
 ```sh
-cd app && flutter run -d <device>
+flutter run -d <device>
 ```
 
-To sideload on iOS: open `app/ios/Runner.xcodeproj` in Xcode, set a signing team
+To sideload on iOS: open `ios/Runner.xcodeproj` in Xcode, set a signing team
 on the `Runner` target, then `flutter run -d <device>`. A free Apple ID works for
 personal device installs.
 
@@ -416,13 +416,13 @@ in the middle, the ring is the radius the bridge watches, and the green marker o
 it is somebody who just walked into range. Pixel geometry nods at the medium — a
 tile-grid virtual office — while borrowing nothing from Gather's own mark; the
 dark indigo tile is the app's own `background`, not Gather's blue square. It is
-drawn by `app/tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
+drawn by `tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
 spirit as the bridge's hand-rolled `qr.js`), which writes three sets from one
 source of truth: all fifteen asset-catalog sizes, the launch mark on alpha, and
 the squircled `docs/icon.png` at the top of this page.
 
 ```sh
-node app/tool/make_icons.mjs --preview
+node tool/make_icons.mjs --preview
 ```
 
 The catalogue sizes stay full-bleed squares because iOS applies the squircle
@@ -446,7 +446,7 @@ platform.
 
 ```sh
 npm test          # bridge: parser, msgpack, protocol, end-to-end over a real WS
-cd app && flutter analyze && flutter test
+flutter analyze && flutter test
 ```
 
 The parser tests use log lines copied verbatim from a real
@@ -473,7 +473,7 @@ git push --tags
 `gather-app-bridge` to npm and uploads a signed build to TestFlight. The tag is
 the version for both: `v0.2.0` becomes `0.2.0` on npm and `0.2.0` in App Store
 Connect, with the workflow's run number as the build number. **`version:` in
-`app/pubspec.yaml` is not read by a release** — it only affects a local
+`pubspec.yaml` is not read by a release** — it only affects a local
 `flutter run`.
 
 A failed run can be re-run from the Actions tab, or re-dispatched with
@@ -495,13 +495,13 @@ re-run gets a fresh build number, so neither half objects to going twice.
   an App Store Connect API key is never permitted to do one — it fails with
   `Cloud signing permission error` however the key is scoped. It works on a Mac
   only because Xcode has an Apple ID session, which a runner does not. Naming an
-  explicit certificate and profile in `app/ios/ExportOptions.plist` removes the
+  explicit certificate and profile in `ios/ExportOptions.plist` removes the
   problem: nothing has to be created at build time.
 - 📅 **The certificate and profile expire 2027-08-05** and are reissued together
   — `Apple Distribution` for team `JQ4STVWTQ3`, and the App Store profile
   *Gather Companion App Store* bound to it. Reissue both, refresh the three
   `APPLE_*` secrets, and re-import the `.p12` locally.
-- 📱 **To upload from your own Mac instead**, `app/tool/upload-testflight.sh
+- 📱 **To upload from your own Mac instead**, `tool/upload-testflight.sh
   --build` does the same thing, reading the issuer from
   `~/.appstoreconnect/issuer_id` and exporting through the same
   `ExportOptions.plist`. CI runs that same script. It needs the distribution
