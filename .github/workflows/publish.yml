@@ -1,0 +1,65 @@
+# Publishes gather-app-bridge to npm via trusted publishing (OIDC).
+#
+# No NPM_TOKEN anywhere: npm mints a short-lived credential from the OIDC token
+# GitHub hands this workflow, which is why `id-token: write` is load-bearing.
+# The trusted-publisher entry on npmjs.com is bound to this repository *and this
+# filename* — renaming this file breaks publishing until the entry is updated.
+#
+# Publishing is deliberately tag-driven rather than firing on every push to main:
+# a version is a decision, and `git push --tags` is where you make it.
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required — this is what trusted publishing authenticates with
+  contents: read
+
+jobs:
+  publish:
+    # macOS because the package is darwin-only (`"os": ["darwin"]`): it drives
+    # launchd and reads the Gather client's macOS log paths. The tests happen to
+    # be platform-neutral today, but CI should run where users run.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          # Nothing to cache — the package has no dependencies, and there is no
+          # lockfile, so `npm ci` would fail where `npm test` does not.
+          package-manager-cache: false
+
+      # Trusted publishing needs npm >= 11.5.1. Node 24 ships a new enough npm
+      # today; upgrading explicitly means a runner-image change cannot silently
+      # drop us onto an older CLI that falls back to asking for a token.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # A tag that disagrees with package.json publishes a version nobody asked
+      # for, and npm versions are immutable. Fail loudly instead.
+      - name: Check the tag matches package.json
+        if: github.ref_type == 'tag'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing $pkg"
+
+      - run: npm test
+
+      # No --provenance flag: trusted publishing attaches provenance on its own
+      # for a public package from a public repo.
+      - run: npm publish

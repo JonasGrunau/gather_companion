@@ -6,10 +6,10 @@
   "author": "Jonas Grunau",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/JonasGrunau/gather-v2-app.git"
+    "url": "git+https://github.com/JonasGrunau/gather_companion.git"
   },
-  "homepage": "https://github.com/JonasGrunau/gather-v2-app#readme",
-  "bugs": "https://github.com/JonasGrunau/gather-v2-app/issues",
+  "homepage": "https://github.com/JonasGrunau/gather_companion#readme",
+  "bugs": "https://github.com/JonasGrunau/gather_companion/issues",
   "type": "module",
   "bin": {
     "gather-app-bridge": "bridge/bin/gather-bridge.js"
