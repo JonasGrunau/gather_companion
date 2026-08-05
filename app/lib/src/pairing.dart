@@ -145,9 +145,18 @@ Future<PairResult> claimPairing({
       (parsed['detail'] as String?) ?? 'That code was refused (${response.statusCode}).',
     );
   } on SocketException {
+    // The permission comes first on purpose. From iOS 14 the *first* connection
+    // to a private address is what raises the "find devices on your network"
+    // prompt, and that attempt fails while the prompt is still open — so the
+    // honest first answer to this error is "allow it and tap pair again", not
+    // "check your Wi-Fi". Once refused, the prompt never returns and only
+    // Settings will do.
     return const PairFailure(
-      'Could not reach that Mac. Check both devices are on the same Wi-Fi, and '
-      'that the bridge is running.',
+      'Could not reach that Mac. If iOS just asked whether this app may find '
+      'devices on your network, allow it and pair again — the first try fails '
+      'while that prompt is open. You can also turn it on under Settings › '
+      'Privacy & Security › Local Network. Otherwise check that both devices '
+      'are on the same Wi-Fi and that the bridge is running.',
     );
   } on HttpException {
     return const PairFailure('The bridge did not answer properly. Try pairing again.');
