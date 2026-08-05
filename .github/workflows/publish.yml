@@ -5,6 +5,12 @@
 # The trusted-publisher entry on npmjs.com is bound to this repository *and this
 # filename* — renaming this file breaks publishing until the entry is updated.
 #
+# The owner field in that entry is CASE-SENSITIVE and npm does not normalise it:
+# it must read `JonasGrunau`, matching the `repository_owner` OIDC claim, not
+# `jonasgrunau`. Getting that wrong cost six red runs, because the registry
+# reports a claims mismatch as `404 ... package not found`, which reads like the
+# package or the entry is missing rather than like an auth failure.
+#
 # Publishing fires on any push to main that touches the tool. The version in
 # package.json is therefore the decision, not the act of tagging: bump it and the
 # next push ships. Leave it alone and the run *skips* rather than failing — npm
@@ -77,24 +83,15 @@ jobs:
       # on a push that publishes nothing.
       - run: npm test
 
-      # TEMPORARY — diagnosing why npm falls back to token auth instead of OIDC.
-      # Remove once publishing works. Prints only whether secrets exist, never
-      # their values.
-      - name: Diagnose OIDC availability
-        run: |
-          echo "npm:  $(npm --version)"
-          echo "node: $(node --version)"
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL set:   ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
-          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
-          echo "npmrc in use: ${NPM_CONFIG_USERCONFIG:-default}"
-          echo "--- npmrc contents, tokens redacted ---"
-          sed -E 's/(_authToken=).*/\1<redacted>/' "${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}" || true
-          echo "--- what the OIDC claims would say ---"
-          echo "repository:       ${GITHUB_REPOSITORY}"
-          echo "repository_owner: ${GITHUB_REPOSITORY_OWNER}"
-          echo "workflow_ref:     ${GITHUB_WORKFLOW_REF}"
-
-      # No --provenance flag: trusted publishing attaches provenance on its own
-      # for a public package from a public repo.
+      # Verbose on purpose. npm reports OIDC failures at verbose level *only* — at
+      # default level a rejected token exchange is invisible and all you see is
+      # `404 PUT`, which reads like a missing package rather than an auth problem.
+      # The one line that matters is `npm verbose oidc`.
+      #
+      # No --provenance flag, and note that trusted publishing did NOT attach
+      # provenance on its own: 0.1.1 published green and
+      # `/-/npm/v1/attestations/gather-app-bridge@0.1.1` still 404s. If provenance
+      # is wanted, it needs the flag spelled out — untested here, so it goes in
+      # with a release rather than on its own.
       - if: steps.shipped.outputs.publish == 'true'
         run: npm publish --loglevel verbose
