@@ -1,12 +1,18 @@
 {
-  "name": "gather-v2-bridge",
+  "name": "gather-app-bridge",
   "version": "0.1.0",
   "description": "Watches the Gather V2 desktop client on your Mac and streams presence events — who is standing next to you, who is following you — to the Gather Companion iPhone app over your LAN.",
   "license": "MIT",
   "author": "Jonas Grunau",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonasGrunau/gather-v2-app.git"
+  },
+  "homepage": "https://github.com/JonasGrunau/gather-v2-app#readme",
+  "bugs": "https://github.com/JonasGrunau/gather-v2-app/issues",
   "type": "module",
   "bin": {
-    "gather-v2-bridge": "bridge/bin/gather-bridge.js"
+    "gather-app-bridge": "bridge/bin/gather-bridge.js"
   },
   "engines": {
     "node": ">=22"
@@ -14,7 +20,8 @@
   "files": [
     "bridge/bin",
     "bridge/lib",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test \"bridge/test/*.test.js\"",

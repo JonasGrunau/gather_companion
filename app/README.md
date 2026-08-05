@@ -1,7 +1,7 @@
 # Gather Companion
 
 The iOS half of the project: a live event log for your Gather V2 session — who
-is next to you, who is following you. It pairs with `gather-v2-bridge` running
+is next to you, who is following you. It pairs with `gather-app-bridge` running
 on your Mac and shows what that bridge sees.
 
 Not affiliated with Gather.

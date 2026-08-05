@@ -287,7 +287,7 @@ class _AroundYou extends StatelessWidget {
                   const SizedBox(height: 12),
                   Text(
                     'Log-only mode: no names, and being followed can only be '
-                    'guessed. Run gather-v2-bridge doctor on your Mac to turn the '
+                    'guessed. Run gather-app-bridge doctor on your Mac to turn the '
                     'rest on.',
                     style: TextStyle(fontSize: 11.5, height: 1.45, color: t.faint),
                   ),

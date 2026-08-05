@@ -381,7 +381,7 @@ class _Hint extends StatelessWidget {
           const SizedBox(height: 8),
           // Must match INVOKE in bridge/bin/gather-bridge.js. Dart cannot import
           // that constant, so this copy is kept in step by hand.
-          const _Command(text: 'npx gather-v2-bridge pair'),
+          const _Command(text: 'npx gather-app-bridge pair'),
           const SizedBox(height: 10),
           Text(
             'Run that on the Mac that has Gather open. It prints a square to point '

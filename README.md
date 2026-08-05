@@ -10,12 +10,12 @@ Two pieces:
 
 | | what it is | where it runs |
 |---|---|---|
-| `bridge/` | `npx gather-v2-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your Mac |
+| `bridge/` | `npx gather-app-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your Mac |
 | `app/` | **Gather Companion** — a Flutter **iOS** app showing a live event log and who is around you | your iPhone |
 
 ```
  GatherV2.app ──▶ log file      ──▶┐
- (running on                       ├─▶ gather-v2-bridge ──WS──▶ iPhone app
+ (running on                       ├─▶ gather-app-bridge ──WS──▶ iPhone app
   your Mac)   ──▶ devtools (CDP) ──▶┘        :7799
 ```
 
@@ -26,14 +26,14 @@ Two pieces:
 On the Mac that has Gather open:
 
 ```sh
-npx gather-v2-bridge
+npx gather-app-bridge
 ```
 
 That installs a LaunchAgent — starts at login, restarts if it dies, survives
 sleep. Then pair your phone:
 
 ```sh
-npx gather-v2-bridge pair
+npx gather-app-bridge pair
 ```
 
 It draws a QR square in the terminal. Scan it in the app and you are done; the
@@ -42,7 +42,7 @@ code and address are printed underneath for a phone whose camera is refused.
 Then check what it can see:
 
 ```sh
-npx gather-v2-bridge doctor
+npx gather-app-bridge doctor
 ```
 
 ---
@@ -179,7 +179,7 @@ real state it reports the CDP collector as *not* healthy, with
 `attached but holding no state (heartbeats only)`. To fix it immediately:
 
 ```sh
-npx gather-v2-bridge resync
+npx gather-app-bridge resync
 ```
 
 That reloads the Gather renderer, costing about two seconds of reconnect, and the
@@ -191,16 +191,16 @@ itself on any natural reconnect — a sleep, a network blip, a Gather restart.
 ## Commands
 
 ```
-npx gather-v2-bridge                install as a background service and pair
-npx gather-v2-bridge run            run in the foreground instead
-npx gather-v2-bridge status         is it alive, and who is around right now
-npx gather-v2-bridge pair           show a QR square for the phone to scan
-npx gather-v2-bridge doctor         what can it see, and how to see more
-npx gather-v2-bridge resync         force a full state resync (reloads the renderer)
-npx gather-v2-bridge logs -f        follow the daemon log
-npx gather-v2-bridge token          show the pairing details again
-npx gather-v2-bridge restart|stop|start|uninstall
-npx gather-v2-bridge replay [file]  parse a log file and summarise it
+npx gather-app-bridge                install as a background service and pair
+npx gather-app-bridge run            run in the foreground instead
+npx gather-app-bridge status         is it alive, and who is around right now
+npx gather-app-bridge pair           show a QR square for the phone to scan
+npx gather-app-bridge doctor         what can it see, and how to see more
+npx gather-app-bridge resync         force a full state resync (reloads the renderer)
+npx gather-app-bridge logs -f        follow the daemon log
+npx gather-app-bridge token          show the pairing details again
+npx gather-app-bridge restart|stop|start|uninstall
+npx gather-app-bridge replay [file]  parse a log file and summarise it
 ```
 
 Options: `--port <n>` (default 7799), `--cdp-port <n>` (default 9222),
@@ -211,12 +211,12 @@ Options: `--port <n>` (default 7799), `--cdp-port <n>` (default 9222),
 You do not need the phone to see what the bridge is doing:
 
 ```sh
-npx gather-v2-bridge watch                        # attach to the live feed
-npx gather-v2-bridge watch --history 20           # last 20 events, then follow
-npx gather-v2-bridge watch --filter follow,proximity
-npx gather-v2-bridge watch --json | jq .          # one event per line, pipeable
-npx gather-v2-bridge watch --raw                  # everything, unfiltered
-npx gather-v2-bridge watch --host 192.168.1.20    # a bridge on another machine
+npx gather-app-bridge watch                        # attach to the live feed
+npx gather-app-bridge watch --history 20           # last 20 events, then follow
+npx gather-app-bridge watch --filter follow,proximity
+npx gather-app-bridge watch --json | jq .          # one event per line, pipeable
+npx gather-app-bridge watch --raw                  # everything, unfiltered
+npx gather-app-bridge watch --host 192.168.1.20    # a bridge on another machine
 ```
 
 It uses the same contract as the app — snapshot first, then live events, resuming
@@ -393,7 +393,7 @@ The parser tests use log lines copied verbatim from a real
 whole log file after a client update:
 
 ```sh
-npx gather-v2-bridge replay ~/Library/Logs/GatherV2/main.log
+npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 ```
 
 ---
@@ -422,7 +422,7 @@ npx gather-v2-bridge replay ~/Library/Logs/GatherV2/main.log
 - **Cold start needs a resync in full mode.** The state dump is sent once per
   connection, so a freshly attached bridge holds nothing until the client
   reconnects. It reports itself unhealthy rather than showing an empty room, and
-  `npx gather-v2-bridge resync` fixes it in about two seconds. The log collector is
+  `npx gather-app-bridge resync` fixes it in about two seconds. The log collector is
   unaffected, which is a reason to leave it running rather than treat it as a mere
   fallback.
 - **Log-only mode depends on flags Gather controls.** The verbose renderer stream

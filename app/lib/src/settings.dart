@@ -2,7 +2,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// Where the Mac-side bridge lives, and the token that pairs us with it.
 ///
-/// `gather-v2-bridge install` prints both. They are stored on the device so the
+/// `gather-app-bridge install` prints both. They are stored on the device so the
 /// app reconnects on its own after a restart.
 class BridgeSettings {
   const BridgeSettings({required this.host, required this.port, required this.token});

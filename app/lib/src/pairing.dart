@@ -5,7 +5,7 @@ import 'settings.dart';
 
 /// What the bridge draws on the terminal, as read by the camera or typed in.
 ///
-/// The shape is `HOST:PORT:CODE`, matching what `gather-v2-bridge pair` prints.
+/// The shape is `HOST:PORT:CODE`, matching what `gather-app-bridge pair` prints.
 /// Only the code is secret; the address is there because there is no relay in the
 /// middle to look the Mac up, so the phone has to be told where to knock.
 class PairPayload {

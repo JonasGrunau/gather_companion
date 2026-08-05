@@ -55,7 +55,7 @@ const ATTACHABLE = new Set(['page', 'webview', 'iframe', 'other']);
  * The desktop client must have been started with `--remote-debugging-port`. That
  * is a stock Chromium switch which Electron passes straight through; Gather's own
  * `DesktopCliEnableDebugSwitches` gate does not apply to it, because Chromium
- * parses argv before any app code runs. `gather-v2-bridge doctor` prints the
+ * parses argv before any app code runs. `gather-app-bridge doctor` prints the
  * exact command.
  *
  * Reconnects indefinitely: sleep, a Gather restart, or a quit-and-relaunch all

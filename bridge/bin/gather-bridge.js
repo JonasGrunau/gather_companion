@@ -28,7 +28,7 @@ const argv = process.argv.slice(2);
 const command = parseCommand(argv, launchd.supported ? 'install' : 'run');
 
 /** Name of the binary npm links on install. */
-const CLI = 'gather-v2-bridge';
+const CLI = 'gather-app-bridge';
 const INVOKE = `npx ${CLI}`;
 
 const GATHER_BINARY = '/Applications/GatherV2.app/Contents/MacOS/GatherV2';
@@ -654,7 +654,7 @@ async function pingBridge(port) {
     });
     if (!res.ok) return false;
     const body = await res.json();
-    return body?.name === 'gather-v2-bridge';
+    return body?.name === 'gather-app-bridge';
   } catch {
     return false;
   }
@@ -721,7 +721,7 @@ function version() {
 
 function usage() {
   console.log(`
-  ${bold('gather-v2-bridge')} — stream Gather V2 presence to your phone
+  ${bold('gather-app-bridge')} — stream Gather V2 presence to your phone
 
   ${bold('Usage')}
     ${INVOKE}                    install as a background service and pair

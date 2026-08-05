@@ -118,6 +118,10 @@ export class BridgeServer {
     if (url.pathname === '/health') {
       return json(200, {
         ok: true,
+        // Wire identity, deliberately *not* renamed alongside the `gather-app-bridge`
+        // command: `isOurs()` compares against it, so changing the string would make
+        // a new CLI declare an already-running older daemon foreign and refuse the
+        // port. It is a protocol constant, not a product name.
         name: 'gather-v2-bridge',
         uptimeSeconds: Math.round((Date.now() - this._startedAt) / 1000),
       });
@@ -140,8 +144,8 @@ export class BridgeServer {
         });
       }
       const detail = {
-        'no-code': 'No pairing code is active. Run `npx gather-v2-bridge pair` on the Mac.',
-        expired: 'That code has expired. Run `npx gather-v2-bridge pair` again.',
+        'no-code': 'No pairing code is active. Run `npx gather-app-bridge pair` on the Mac.',
+        expired: 'That code has expired. Run `npx gather-app-bridge pair` again.',
         wrong: 'That code is not right.',
       }[outcome];
       return json(outcome === 'wrong' ? 403 : 409, { ok: false, reason: outcome, detail });
