@@ -1,5 +1,5 @@
 /**
- * The wire format between the bridge and the iPhone app.
+ * The wire format between the bridge and the phone app.
  *
  * Every event is `{ type, at, source, confidence, ...payload }`:
  *

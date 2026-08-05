@@ -138,13 +138,13 @@ export class BridgeServer {
           ok: true,
           token: this.token,
           port: this.port,
-          // First label only: hostnames arrive as "Mac.local" on some networks and
-          // "Mac.fritz.box" on others, and neither domain belongs on a phone screen.
+          // First label only: hostnames arrive as "studio.local" on some networks and
+          // "studio.fritz.box" on others, and neither domain belongs on a phone screen.
           name: hostname().split('.')[0],
         });
       }
       const detail = {
-        'no-code': 'No pairing code is active. Run `npx gather-app-bridge pair` on the Mac.',
+        'no-code': 'No pairing code is active. Run `npx gather-app-bridge pair` on the computer.',
         expired: 'That code has expired. Run `npx gather-app-bridge pair` again.',
         wrong: 'That code is not right.',
       }[outcome];

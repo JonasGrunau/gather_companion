@@ -9,7 +9,7 @@ import '../theme/gather_theme.dart';
 /// option.
 ///
 /// Two fields, because there is no relay in the middle: the code proves the person
-/// was looking at the terminal, and the address says which Mac to knock on. The
+/// was looking at the terminal, and the address says which computer to knock on. The
 /// bridge prints both under the square for exactly this path.
 ///
 /// Returns true when pairing succeeded.

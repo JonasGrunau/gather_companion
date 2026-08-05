@@ -180,7 +180,7 @@ class AppState extends ChangeNotifier {
   /// The floor is what makes pull-to-refresh feel like an action rather than a
   /// twitch: a local bridge answers in ~50ms, and an indicator that appears and
   /// vanishes inside two frames reads as a rendering fault. The ceiling lives in
-  /// [BridgeClient.whenLive], so an unreachable Mac releases the spinner instead
+  /// [BridgeClient.whenLive], so an unreachable computer releases the spinner instead
   /// of pinning it open.
   Future<void> reconnect() async {
     // The floor is outside the null check on purpose: the gesture should feel
@@ -260,7 +260,7 @@ class AppState extends ChangeNotifier {
   }
 
   /// Test seam: feeds a snapshot in as though the bridge had sent it, so the
-  /// screens can be exercised without a Mac on the other end.
+  /// screens can be exercised without a computer on the other end.
   @visibleForTesting
   void debugApplySnapshot(PresenceSnapshot snapshot) {
     _loaded = true;

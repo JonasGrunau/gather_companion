@@ -18,16 +18,16 @@ class LinkStatus {
   bool get isLive => state == LinkState.live;
 }
 
-/// Talks to the Mac-side bridge over a single WebSocket.
+/// Talks to the computer-side bridge over a single WebSocket.
 ///
 /// Two things make this more than a socket wrapper:
 ///
 ///  * **Catch-up by sequence.** Every event the bridge publishes carries a
 ///    monotonic `seq`, and reconnecting with `?since=<lastSeq>` replays exactly
-///    what was missed. An iPhone drops the socket every time it is locked, so
+///    what was missed. A phone drops the socket every time it is locked, so
 ///    without this the event log would quietly lose whatever happened while the
 ///    screen was off.
-///  * **Ping-driven liveness.** A WebSocket to a sleeping Mac does not error, it
+///  * **Ping-driven liveness.** A WebSocket to a sleeping computer does not error, it
 ///    just goes silent. `pingInterval` makes the socket fail fast so the retry
 ///    loop can do its job.
 class BridgeClient {
@@ -184,7 +184,7 @@ class BridgeClient {
 
     _retry?.cancel();
     _retry = Timer(_backoff, connect);
-    // Cap the backoff: the Mac waking up should be picked up quickly, and the
+    // Cap the backoff: the computer waking up should be picked up quickly, and the
     // socket is cheap.
     _backoff = Duration(
       milliseconds: (_backoff.inMilliseconds * 2).clamp(1000, 15000),

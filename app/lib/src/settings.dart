@@ -1,6 +1,6 @@
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Where the Mac-side bridge lives, and the token that pairs us with it.
+/// Where the computer-side bridge lives, and the token that pairs us with it.
 ///
 /// `gather-app-bridge install` prints both. They are stored on the device so the
 /// app reconnects on its own after a restart.
@@ -63,7 +63,7 @@ class BridgeSettings {
     await prefs.setString(_tokenKey, token.trim());
   }
 
-  /// What the Mac calls itself, shown as "paired with …".
+  /// What the computer calls itself, shown as "paired with …".
   static Future<String?> loadName() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_nameKey);

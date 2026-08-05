@@ -6,10 +6,10 @@ import '../src/pairing.dart';
 import '../theme/gather_theme.dart';
 import 'type_code_dialog.dart';
 
-/// Pairing with the Mac by looking at the square its bridge printed.
+/// Pairing with the computer by looking at the square its bridge printed.
 ///
 /// The camera opens straight away: this screen is only ever reached when there is
-/// a Mac to pair with, so asking first would be a tap in front of the only thing
+/// a computer to pair with, so asking first would be a tap in front of the only thing
 /// anyone came here to do. The instruction sits under the frame rather than in
 /// front of it, because the person who has already run the command needs the
 /// viewfinder and the person who has not needs the sentence.
@@ -63,8 +63,8 @@ class _PairScreenState extends State<PairScreen> {
   Future<void> _claim(PairPayload payload) async {
     if (!payload.hasAddress) {
       setState(() => _error =
-          'That square has no address in it, so this phone cannot tell which Mac '
-          'to reach. Update the bridge, or type the code and address in.');
+          'That square has no address in it, so this phone cannot tell which '
+          'computer to reach. Update the bridge, or type the code and address in.');
       return;
     }
 
@@ -149,7 +149,7 @@ class _Header extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Pair with your Mac', style: Theme.of(context).textTheme.titleLarge),
+                Text('Pair with your computer', style: Theme.of(context).textTheme.titleLarge),
                 const SizedBox(height: 3),
                 Text(
                   'Point the camera at the square in your terminal',
@@ -384,7 +384,7 @@ class _Hint extends StatelessWidget {
           const _Command(text: 'npx gather-app-bridge pair'),
           const SizedBox(height: 10),
           Text(
-            'Run that on the Mac that has Gather open. It prints a square to point '
+            'Run that on the computer that has Gather open. It prints a square to point '
             'this at.',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12.5, height: 1.5, color: t.faint),

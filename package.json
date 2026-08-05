@@ -1,7 +1,7 @@
 {
   "name": "gather-app-bridge",
   "version": "0.1.1",
-  "description": "Watches the Gather V2 desktop client on your Mac and streams presence events — who is standing next to you, who is following you — to the Gather Companion iPhone app over your LAN.",
+  "description": "Watches the Gather V2 desktop client on your computer and streams presence events — who is standing next to you, who is following you — to the Gather Companion phone app over your LAN.",
   "license": "MIT",
   "author": "Jonas Grunau",
   "repository": {

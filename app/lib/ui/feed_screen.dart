@@ -155,7 +155,7 @@ class _TopBar extends StatelessWidget {
                 ),
               ),
               const PopupMenuItem(value: 'clear', child: Text('Clear activity')),
-              const PopupMenuItem(value: 'unpair', child: Text('Forget this Mac')),
+              const PopupMenuItem(value: 'unpair', child: Text('Forget this computer')),
             ],
           ),
         ],
@@ -373,7 +373,7 @@ class _AroundYou extends StatelessWidget {
                   const SizedBox(height: 12),
                   Text(
                     'Log-only mode: no names, and being followed can only be '
-                    'guessed. Run gather-app-bridge doctor on your Mac to turn the '
+                    'guessed. Run gather-app-bridge doctor on your computer to turn the '
                     'rest on.',
                     style: TextStyle(fontSize: 11.5, height: 1.45, color: t.faint),
                   ),
@@ -704,7 +704,7 @@ class _EmptyFeed extends StatelessWidget {
             connected
                 ? 'Nothing worth interrupting you for. Anyone walking up to you, or '
                     'following you, shows up here.'
-                : 'Waiting for the bridge on your Mac.',
+                : 'Waiting for the bridge on your computer.',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12.5, height: 1.5, color: t.faint),
           ),

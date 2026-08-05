@@ -4,33 +4,33 @@ Know when someone walks up to you — or starts following you — in your live
 Gather V2 session, on your phone.
 
 Not affiliated with Gather. This is a third-party companion that reads the
-Gather V2 desktop client running on your own Mac.
+Gather V2 desktop client running on your own computer.
 
 Two pieces:
 
 | | what it is | where it runs |
 |---|---|---|
-| `bridge/` | `npx gather-app-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your Mac |
-| `app/` | **Gather Companion** — a Flutter **iOS** app showing a live event log and who is around you | your iPhone |
+| `bridge/` | `npx gather-app-bridge` — a background daemon that watches the Gather desktop client and serves events over your LAN | your computer |
+| `app/` | **Gather Companion** — a Flutter app showing a live event log and who is around you | your phone |
 
 ```
- GatherV2.app ──▶ log file      ──▶┐
- (running on                       ├─▶ gather-app-bridge ──WS──▶ iPhone app
-  your Mac)   ──▶ devtools (CDP) ──▶┘        :7799
+ Gather desktop ──▶ log file      ──▶┐
+ (running on                         ├─▶ gather-app-bridge ──WS──▶ phone app
+  your computer) ──▶ devtools (CDP) ──▶┘        :7799
 ```
 
 ---
 
 ## Quick start
 
-On the Mac that has Gather open:
+On the computer that has Gather open:
 
 ```sh
 npx gather-app-bridge
 ```
 
-That installs a LaunchAgent — starts at login, restarts if it dies, survives
-sleep. Then pair your phone:
+That installs it as a background service — starts at login, restarts if it dies,
+survives sleep. Then pair your phone:
 
 ```sh
 npx gather-app-bridge pair
@@ -78,8 +78,8 @@ log — the only follow-related line the client writes is its own pathfinding wh
 
 ### Full mode — one extra flag on the Gather client
 
-Quit Gather completely (`⌘Q` — it holds a single-instance lock, so launching a
-second copy just focuses the first), then start it with a devtools port:
+Quit Gather completely — it holds a single-instance lock, so launching a second
+copy just focuses the first — then start it with a devtools port. On macOS:
 
 ```sh
 "/Applications/GatherV2.app/Contents/MacOS/GatherV2" \
@@ -243,9 +243,9 @@ type counts), look at `cdpStats` in `GET /collectors`.
 
 ### Staying up
 
-Installed as a `LaunchAgent` (`com.jonasgrunau.gather-app-bridge`) with `RunAtLoad` and
-`KeepAlive`, so it starts at login and comes back if it crashes. Two details that
-matter over months of uptime:
+On macOS it installs as a `LaunchAgent` (`com.jonasgrunau.gather-app-bridge`) with
+`RunAtLoad` and `KeepAlive`, so it starts at login and comes back if it crashes.
+Two details that matter over months of uptime:
 
 - The package is **copied into `~/.gather-app-bridge/bridge`** at install time. `npx`
   runs out of a cache npm may prune, and a global install disappears on the next
@@ -294,41 +294,51 @@ app decodes these into a sealed class hierarchy.
 
 ## The app — Gather Companion
 
-iOS only — there is no desktop or Android target, by design. The bridge is the
-Mac half; Gather Companion is the phone half. It says so wherever there is room
-to — in-app header, `MaterialApp.title`, permission copy — because "Gather"
-alone would read as Gather's own client. The one exception is the home-screen
-label (`CFBundleDisplayName`), which iOS clips to about ten characters:
+The bridge is the computer half; Gather Companion is the phone half. It says so
+wherever there is room to — in-app header, `MaterialApp.title`, permission copy —
+because "Gather" alone would read as Gather's own client. The one exception is
+the home-screen label, which the launcher clips to about ten characters:
 "Gather Companion" came out as "GatherCom…", so the tile says **Gather** and the
 app introduces itself properly once opened.
 
+Nothing in `lib/` is platform-specific: it is plain Flutter over an HTTP and
+WebSocket contract, so the same code targets phones and desktops. Only the iOS
+runner is scaffolded so far — `flutter create --platforms=android,windows,linux .`
+from `app/` adds the rest, and the icon generator needs a matching output path
+per platform.
+
 ```sh
-cd app && flutter run -d "iPhone 17 Pro"      # simulator
+cd app && flutter run -d <device>
 ```
 
-To put it on your iPhone: open `app/ios/Runner.xcodeproj` in Xcode, set a signing
-team on the `Runner` target, then `flutter run -d <device>`. A free Apple ID works
-for personal device installs.
+To sideload on iOS: open `app/ios/Runner.xcodeproj` in Xcode, set a signing team
+on the `Runner` target, then `flutter run -d <device>`. A free Apple ID works for
+personal device installs.
 
-Two build notes worth knowing:
+Build notes worth knowing:
 
-- **iOS 15.5 minimum**, required by `mobile_scanner`.
-- **Swift Package Manager, not CocoaPods.** `mobile_scanner` 7.x is a Swift
-  package, and leaving the old CocoaPods integration in place breaks the build
-  with a misleading *"missing expected TARGET_BUILD_DIR"*. If you ever re-add a
-  pod-based plugin, expect to sort that out. Version 7 also dropped GoogleMLKit,
-  which had no arm64 simulator slices — on 6.x the app simply could not run on an
-  Apple Silicon simulator at all.
+- **iOS 15.5 minimum**, required by `mobile_scanner`. The same package needs
+  Android 5.0 / API 21 and camera permission in the manifest.
+- **Swift Package Manager, not CocoaPods** on the iOS side. `mobile_scanner` 7.x
+  is a Swift package, and leaving the old CocoaPods integration in place breaks
+  the build with a misleading *"missing expected TARGET_BUILD_DIR"*. If you ever
+  re-add a pod-based plugin, expect to sort that out. Version 7 also dropped
+  GoogleMLKit, which had no arm64 simulator slices — on 6.x the app simply could
+  not run on an arm64 simulator at all.
+- **Desktop targets have no camera scanner.** `mobile_scanner` is mobile-only, so
+  a desktop build has to fall back to the type-the-code path, which already
+  exists and is a first-class route rather than a fallback.
 
 While working on the feed, `--dart-define=GATHER_PAIR=host:port:token` skips the
-scanner, which the simulator has no camera for:
+scanner, which a simulator or emulator has no camera for:
 
 ```sh
-flutter run -d "iPhone 17 Pro" --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
+flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
 ```
 
-Your phone and Mac have to be on the same network. iOS asks for local-network
-permission the first time, and for the camera the first time you scan.
+Your phone and computer have to be on the same network. Phone platforms ask for
+local-network permission the first time, and for the camera the first time you
+scan.
 
 ### Pairing
 
@@ -373,11 +383,12 @@ node app/tool/make_icons.mjs --preview
 ```
 
 **Notifications, honestly:** local notifications fire while the app is running —
-foreground, or the short window iOS allows after backgrounding. Once iOS suspends
-the app the WebSocket is gone and nothing can be delivered until you open it
-again, at which point the bridge replays everything missed, so the *log* stays
-complete even though the *alerts* do not. Waking a locked phone would need APNs
-push from the Mac, which means an Apple Developer account and a push certificate.
+foreground, or the short window the OS allows after backgrounding. Once the OS
+suspends the app the WebSocket is gone and nothing can be delivered until you open
+it again, at which point the bridge replays everything missed, so the *log* stays
+complete even though the *alerts* do not. Waking a locked phone would need a push
+service driven from the computer, which means a developer account and push
+credentials on each platform.
 
 ---
 
@@ -400,7 +411,10 @@ npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 
 ## Scope and caveats
 
-- **macOS only.** The bridge reads macOS paths and installs a LaunchAgent.
+- **The bridge runs on macOS today.** It reads macOS log paths and installs a
+  LaunchAgent. Everything above that line — the wire format, the collectors, the
+  app — is platform-neutral; porting means new log/config paths and a service
+  installer per platform, not a new protocol.
 - **Log-only mode cannot detect being followed.** Stated in the app UI too, so a
   quiet screen is never mistaken for "nobody is following me".
 - **The wire format is verified, not inferred.** Captured from a live

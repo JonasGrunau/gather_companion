@@ -41,7 +41,7 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    // iOS tears the socket down while the app is suspended. Coming back to the
+    // The OS tears the socket down while the app is suspended. Coming back to the
     // foreground has to reconnect, which also replays everything missed.
     if (lifecycle == AppLifecycleState.resumed) unawaited(_state.reconnect());
   }

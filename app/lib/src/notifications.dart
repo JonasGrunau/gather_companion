@@ -5,12 +5,12 @@ import 'package:gather_events/gather_events.dart';
 ///
 /// A deliberate limitation, stated plainly rather than papered over: these fire
 /// only while the app is running — in the foreground, or during the short window
-/// iOS grants a backgrounded app before it suspends the WebSocket. Once iOS
+/// the OS grants a backgrounded app before it suspends the WebSocket. Once the OS
 /// suspends the app the socket is gone and nothing can be delivered until you
 /// open it again, at which point the bridge replays everything that was missed
 /// (see `BridgeClient.lastSeq`), so the *log* stays complete even though the
-/// alerts do not. Waking a locked phone would need APNs push from the Mac, which
-/// means an Apple Developer account and a push certificate.
+/// alerts do not. Waking a locked phone would need a push service driven from the
+/// computer, which means a developer account and push credentials per platform.
 class Notifier {
   Notifier({this.notifyOnFollow = true, this.notifyOnProximity = true});
 

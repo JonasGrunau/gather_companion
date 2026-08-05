@@ -7,7 +7,7 @@ import 'settings.dart';
 ///
 /// The shape is `HOST:PORT:CODE`, matching what `gather-app-bridge pair` prints.
 /// Only the code is secret; the address is there because there is no relay in the
-/// middle to look the Mac up, so the phone has to be told where to knock.
+/// middle to look the computer up, so the phone has to be told where to knock.
 class PairPayload {
   const PairPayload({required this.code, this.host, this.port});
 
@@ -85,7 +85,7 @@ class PairSuccess extends PairResult {
 
   final BridgeSettings settings;
 
-  /// What the Mac calls itself, for the "paired with…" line.
+  /// What the computer calls itself, for the "paired with…" line.
   final String name;
 }
 
@@ -145,18 +145,18 @@ Future<PairResult> claimPairing({
       (parsed['detail'] as String?) ?? 'That code was refused (${response.statusCode}).',
     );
   } on SocketException {
-    // The permission comes first on purpose. From iOS 14 the *first* connection
-    // to a private address is what raises the "find devices on your network"
-    // prompt, and that attempt fails while the prompt is still open — so the
+    // The permission comes first on purpose. Where the platform gates local
+    // network access, the *first* connection to a private address is what raises
+    // the prompt, and that attempt fails while the prompt is still open — so the
     // honest first answer to this error is "allow it and tap pair again", not
-    // "check your Wi-Fi". Once refused, the prompt never returns and only
-    // Settings will do.
+    // "check your Wi-Fi". Once refused, the prompt never returns and only the
+    // system settings will do.
     return const PairFailure(
-      'Could not reach that Mac. If iOS just asked whether this app may find '
-      'devices on your network, allow it and pair again — the first try fails '
-      'while that prompt is open. You can also turn it on under Settings › '
-      'Privacy & Security › Local Network. Otherwise check that both devices '
-      'are on the same Wi-Fi and that the bridge is running.',
+      'Could not reach that computer. If your phone just asked whether this app '
+      'may find devices on your network, allow it and pair again — the first try '
+      'fails while that prompt is open, and it can be turned back on in the '
+      'system settings for this app. Otherwise check that both devices are on '
+      'the same Wi-Fi and that the bridge is running.',
     );
   } on HttpException {
     return const PairFailure('The bridge did not answer properly. Try pairing again.');

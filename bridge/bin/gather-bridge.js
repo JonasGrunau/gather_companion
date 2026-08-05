@@ -689,7 +689,7 @@ function printPairing({ port, token, up }) {
   line('port', String(port));
   line('token', token);
   console.log('');
-  console.log('  In the iPhone app, enter:');
+  console.log('  In the phone app, enter:');
   console.log(`    ${bold(`${host}:${port}`)}`);
   console.log(`    ${bold(token)}`);
   if (hosts.length > 1) {
