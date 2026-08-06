@@ -5,12 +5,14 @@ import { EventEmitter } from 'node:events';
  * Minimal RFC 6455 server, just enough for this bridge.
  *
  * Deliberately dependency-free: `install` copies the package into
- * ~/.superset-bridge/bridge and runs it straight from launchd, so a
+ * ~/.gather-app-bridge/bridge and runs it straight from launchd, so a
  * self-contained tree with no node_modules to resolve is what makes that copy
  * safe.
  *
- * Only the server half lives here — the outbound connection to Superset's
- * /events uses Node's built-in WebSocket client (Node 22+).
+ * Only the server half lives here — the half the phone connects to. Every
+ * outbound socket the bridge opens (the CDP collector attaching to the devtools
+ * endpoint, `watch` attaching to a running bridge) uses Node's built-in
+ * WebSocket client instead, which needs no framing code of our own.
  */
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
