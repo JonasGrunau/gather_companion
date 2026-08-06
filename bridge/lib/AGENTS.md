@@ -83,6 +83,30 @@ same style rather than inventing plausible-looking lines.
 - Defensive decoding: unknown shapes are counted in `stats()` rather than thrown,
   so wire-format drift surfaces as a number instead of silence.
 
+### Two signals that look real and are not
+
+Both of these were shipped, both were wrong, and both are the kind of thing that
+gets "fixed" back by someone reading the log and trusting it. `presence.test.js`
+pins them.
+
+- **`setStreamPausedState <id> <track> false` does not mean that person is
+  sending.** It is logged when the client *subscribes* to a remote track, which
+  happens on proximity. Gather never logs the matching `true`: across `main.log`
+  and `main.old.log`, 249 such lines, 74 `screen false`, 175 `video false`, zero
+  `true` in either direction. The video and screen track sets were the same 17
+  people — the client unpauses a participant's whole track set at once. Reading
+  it as "on" latches a flag nothing can clear, so everyone who walks past you is
+  reported as screen sharing forever. Only a pause is trusted, and it can only
+  turn state off. `SpaceUser` carries no media columns at all, so there is no
+  second source: **remote mic, camera and screen state are not observable.**
+- **A `SpaceUser` row with `connected: false` is furniture.** The full state dump
+  carries every member of the space, not just the ones online — 80 rows, 25
+  connected, 54 of the rest still holding the coordinates where their owner
+  logged off, which is usually their desk. Name, position, floor, all present and
+  indistinguishable from someone standing next to you. `applyRoster` must gate
+  proximity on `connected !== false`, or walking past an empty desk announces its
+  owner. `null` still counts as judgeable: unknown is not absent.
+
 ## Dependencies
 
 ### Internal

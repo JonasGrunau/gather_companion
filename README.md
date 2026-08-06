@@ -398,7 +398,7 @@ Only what is worth reading. Events are classified into three tiers:
 | tier | what | shown |
 |---|---|---|
 | 🔵 **alert** | someone started following you | yes, on a Gather-blue card |
-| ⚪ **notable** | someone arrived next to you or moved away, screen sharing, chat, Gather's own notifications | yes |
+| ⚪ **notable** | someone arrived next to you or moved away, Gather's own notifications | yes |
 | ▫️ **ambient** | mic and camera toggles, transport state, roster churn, your own device state | behind "Show N background events" |
 
 The top of the screen answers *now* — who is next to you, who is following you —

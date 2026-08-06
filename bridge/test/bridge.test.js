@@ -76,6 +76,9 @@ function collect({ done, timeoutMs = 6000, since = 0 }) {
 
 const eventsOf = (frames) => frames.filter((f) => f.kind === 'event').map((f) => f.event);
 
+/** `OTHER`'s row inside a snapshot frame, when it is there yet. */
+const playerIn = (frame) => frame.snapshot?.players?.find((p) => p.id === OTHER);
+
 test('unauthenticated clients are rejected', async () => {
   const res = await fetch(`http://127.0.0.1:${port}/state`);
   assert.equal(res.status, 401);
@@ -153,9 +156,10 @@ test('leaving clears proximity', async () => {
   assert.equal(state.players.find((p) => p.id === PLAYER).isNear, false);
 });
 
-test('screen sharing is surfaced but mic flicker is not', async () => {
+test('subscribing to a neighbour\'s tracks is not a screen share', async () => {
   const pending = collect({
-    done: (f) => eventsOf(f).some((e) => e.type === 'media.changed'),
+    done: (f) =>
+      f.some((x) => x.kind === 'snapshot' && playerIn(x)?.micOn === false),
   });
   await new Promise((r) => setTimeout(r, 250));
   appendFileSync(logPath, `${line.micOff(OTHER)}\n${line.screenOn(OTHER)}\n`);
@@ -163,14 +167,18 @@ test('screen sharing is surfaced but mic flicker is not', async () => {
   const media = eventsOf(await pending).filter((e) => e.type === 'media.changed');
   assert.deepEqual(
     media.map((m) => m.track),
-    ['screen'],
-    'muting is state, not news; screen sharing is news',
+    [],
+    'a mute is state and not news, and an unpaused track is neither',
   );
 
   const state = await (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
   const player = state.players.find((p) => p.id === OTHER);
   assert.equal(player.micOn, false, 'the mute still has to be recorded in state');
-  assert.equal(player.screensharing, true);
+  // Gather unpauses audio, video and screen together the moment it subscribes to
+  // someone who came near, and never logs the matching pause. Across every such
+  // line in two real logs the video and screen track sets were the same 17
+  // people, so `screen false` says "we subscribed", not "they are sharing".
+  assert.equal(player.screensharing, false);
 });
 
 test('a reconnecting client can replay what it missed', async () => {

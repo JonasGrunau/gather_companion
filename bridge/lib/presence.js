@@ -12,7 +12,7 @@
  *    following whom, by name.
  */
 
-import { bridgeStatus, emptySelf, follow, newPlayer, proximity } from './events.js';
+import { bridgeStatus, emptySelf, follow, newPlayer, playerMoved, proximity } from './events.js';
 
 /** How close, in tiles, counts as "standing next to me" when we have coordinates. */
 export const ADJACENT_TILES = 3;
@@ -24,6 +24,9 @@ export const ADJACENT_TILES = 3;
  * "arrived" and "left" indefinitely — and every flap is a notification.
  */
 export const LEAVE_TILES = 4.5;
+
+/** Which player field each media track drives. Nothing else is a media track. */
+const MEDIA_KEYS = { audio: 'micOn', video: 'cameraOn', screen: 'screensharing' };
 
 export class PresenceTracker {
   constructor({ followDetector = null } = {}) {
@@ -134,11 +137,23 @@ export class PresenceTracker {
 
       case 'media.changed': {
         const p = this._player(event.playerId);
-        const value = !event.paused;
-        const key =
-          event.track === 'audio' ? 'micOn' : event.track === 'video' ? 'cameraOn' : 'screensharing';
-        if (p[key] === value) return none;
-        p[key] = value;
+        // An unrecognised track name must not fall through onto screensharing —
+        // that is the loudest field in the app and the least safe default.
+        const key = MEDIA_KEYS[event.track];
+        if (!key) return none;
+
+        // Only a *pause* is trustworthy here. Gather logs
+        // `setStreamPausedState <id> <track> false` when the client subscribes to
+        // a remote track — which happens on proximity, not when the person
+        // actually starts sending — and never logs the matching `true`. Verified
+        // against every such line in main.log and main.old.log: 249 samples, 74
+        // `screen false`, 175 `video false`, zero `true`, ever. So reading "not
+        // paused" as "on" latches a flag that nothing can ever clear, and
+        // everyone who walks past you is reported as sharing their screen
+        // forever. Turning state *off* on a pause stays sound.
+        if (event.paused !== true) return none;
+        if (p[key] === false) return none;
+        p[key] = false;
         // Only screen sharing is worth a line in the feed; mic and camera
         // flicker constantly as people talk.
         return {
@@ -283,6 +298,13 @@ export class PresenceTracker {
         p.name = row.name;
         stateChanged = true;
       }
+      // Whether they actually changed tiles, decided before the row overwrites
+      // what we held. A first sighting is not a move — on the initial state dump
+      // every player would otherwise "move" from nowhere to where they stand.
+      const hadPosition = p.x != null && p.y != null;
+      const moved =
+        hadPosition && ((row.x != null && row.x !== p.x) || (row.y != null && row.y !== p.y));
+
       if (row.x != null) p.x = row.x;
       if (row.y != null) p.y = row.y;
 
@@ -291,6 +313,16 @@ export class PresenceTracker {
           ? Math.hypot(row.x - this._selfPosition[0], row.y - this._selfPosition[1])
           : null;
       if (distance != null) p.distance = distance;
+
+      // A row that is not connected is a stale avatar left wherever that person
+      // logged off — which, for most people, is their desk. It keeps its name and
+      // its coordinates, so on distance alone it is indistinguishable from
+      // somebody standing next to you, and walking past an empty desk reports its
+      // owner as having walked up. The full state dump carries every member of
+      // the space, not just the ones online: 80 rows here, 25 of them connected,
+      // 54 of the rest still holding coordinates. Only the connected ones can be
+      // standing anywhere. `null` stays judgeable — unknown is not absent.
+      const online = row.connected !== false;
 
       // Gather's own proximity predicate requires the same floor before any
       // distance comparison — two people on the same tile of different floors are
@@ -305,12 +337,21 @@ export class PresenceTracker {
         this._selfClusterId != null && row.clusterId != null && row.clusterId === this._selfClusterId;
       const closeEnough =
         distance != null && distance <= (p.isNear ? LEAVE_TILES : ADJACENT_TILES);
-      const near = sameFloor && (sameCluster || closeEnough);
+      const near = online && sameFloor && (sameCluster || closeEnough);
 
       // With neither a position nor a cluster there is nothing to judge on. Say
       // nothing rather than reporting everyone as having walked off — the log
-      // collector may well know they are near.
-      const canJudge = sameCluster || distance != null;
+      // collector may well know they are near. Going offline is always judgeable:
+      // whatever we thought before, they are not standing there now.
+      const canJudge = !online || sameCluster || distance != null;
+
+      // Someone next to you shifting around is worth saying out loud; the other
+      // seventy-nine rows changing tiles four times a second is not, and the
+      // snapshot already carries every position for anyone who wants the map. So
+      // this is deliberately scoped to the people the app is actually watching.
+      if (moved && online && p.isNear) {
+        emit.push(playerMoved({ at, playerId: row.id, x: p.x, y: p.y, distance }));
+      }
 
       if (knowSelf && canJudge && near !== p.isNear) {
         p.isNear = near;
