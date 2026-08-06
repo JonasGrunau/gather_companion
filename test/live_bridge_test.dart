@@ -42,7 +42,7 @@ void main() {
     final events = <GatherEvent>[];
     client.snapshots.listen(snapshots.add);
     client.events.listen(events.add);
-    await client.connect();
+    client.connect();
 
     await _until(() => snapshots.isNotEmpty, 'a snapshot on connect');
     expect(snapshots.first.players, isA<List<PlayerRef>>());

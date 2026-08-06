@@ -30,6 +30,10 @@ class LinkStatus {
 ///  * **Ping-driven liveness.** A WebSocket to a sleeping computer does not error, it
 ///    just goes silent. `pingInterval` makes the socket fail fast so the retry
 ///    loop can do its job.
+///  * **One socket, enforced by generation.** Resuming, pulling to refresh and a
+///    firing retry timer all want to reconnect, and on a phone they routinely
+///    want it at the same moment. [_generation] is what makes the last one win;
+///    see [_abandon] for what goes wrong without it.
 class BridgeClient {
   // A named parameter cannot be a private initializing formal, so the field is
   // assigned the long way round.
@@ -52,6 +56,10 @@ class BridgeClient {
   Duration _backoff = const Duration(seconds: 1);
   bool _disposed = false;
 
+  /// Bumped every time a socket is given up on. A socket only speaks for the
+  /// client while its generation is still the current one.
+  int _generation = 0;
+
   /// Highest sequence number we have seen, so a reconnect can resume from it.
   int lastSeq = 0;
 
@@ -69,10 +77,24 @@ class BridgeClient {
     if (!_status.isClosed) _status.add(status);
   }
 
-  Future<void> connect() async {
+  /// Opens a socket, replacing whatever was there.
+  ///
+  /// Deliberately synchronous all the way to `_sub`. It used to `await` the
+  /// teardown of the old socket first, which opened a window: a second
+  /// `connect()` arriving inside that window found `_channel` already nulled,
+  /// tore down nothing, and both calls then went on to open a socket. The
+  /// second one won the fields and the first was orphaned — still open, still
+  /// subscribed, invisible to `dispose()`. It cost nothing until it died, at
+  /// which point its `onDone` reached back through these very callbacks and
+  /// tore down the *healthy* socket, which is what "reopen the app and it can't
+  /// connect" actually was. Two overlapping resumes are ordinary on iOS, so the
+  /// window was hit routinely and the orphans accumulated one per launch.
+  void connect() {
     if (_disposed || !_settings.isComplete) return;
     _retry?.cancel();
-    await _teardown();
+    _retry = null;
+    _abandon();
+    final generation = _generation;
 
     _emitStatus(const LinkStatus(LinkState.connecting));
 
@@ -84,13 +106,19 @@ class BridgeClient {
       );
       _channel = channel;
       _sub = channel.stream.listen(
-        _onFrame,
-        onError: (Object error) => _scheduleRetry(error.toString()),
-        onDone: () => _scheduleRetry('bridge closed the connection'),
+        (raw) {
+          if (generation == _generation) _onFrame(raw);
+        },
+        onError: (Object error) {
+          if (generation == _generation) _scheduleRetry(error.toString());
+        },
+        onDone: () {
+          if (generation == _generation) _scheduleRetry('bridge closed the connection');
+        },
         cancelOnError: true,
       );
     } catch (error) {
-      _scheduleRetry(error.toString());
+      if (generation == _generation) _scheduleRetry(error.toString());
     }
   }
 
@@ -179,7 +207,7 @@ class BridgeClient {
 
   void _scheduleRetry(String detail) {
     if (_disposed) return;
-    _teardown();
+    _abandon();
     _emitStatus(LinkStatus(LinkState.retrying, detail));
 
     _retry?.cancel();
@@ -191,19 +219,36 @@ class BridgeClient {
     );
   }
 
-  Future<void> _teardown() async {
+  /// Gives up on the current socket and makes it stop counting.
+  ///
+  /// The generation bump is the load-bearing part: it fires before anything
+  /// asynchronous, so a socket that is already mid-failure cannot report the
+  /// failure against its replacement. Closing is not awaited on purpose — a
+  /// socket we have stopped listening to must not be able to delay, or fail,
+  /// the one taking its place. On a phone this is usually a socket the OS
+  /// suspended, and how long its close takes is not our business.
+  void _abandon() {
+    _generation++;
     final sub = _sub;
     final channel = _channel;
     _sub = null;
     _channel = null;
-    await sub?.cancel();
-    await channel?.sink.close();
+    if (sub != null) unawaited(sub.cancel());
+    if (channel != null) unawaited(_closeQuietly(channel));
+  }
+
+  static Future<void> _closeQuietly(IOWebSocketChannel channel) async {
+    try {
+      await channel.sink.close();
+    } catch (_) {
+      // Already gone. There is nobody left to tell.
+    }
   }
 
   Future<void> dispose() async {
     _disposed = true;
     _retry?.cancel();
-    await _teardown();
+    _abandon();
     await _events.close();
     await _snapshots.close();
     await _status.close();
