@@ -1,0 +1,404 @@
+/**
+ * Reads presence by connecting to Gather ourselves.
+ *
+ * This is the alternative to `cdp.js`. Where the CDP collector eavesdrops on the
+ * desktop client's socket, this one authenticates and opens its own — which
+ * removes every awkward constraint the CDP path carries:
+ *
+ *   - no `--remote-debugging-port`, so nothing leaves a debug port open on the
+ *     user's authenticated session;
+ *   - no dependency on the desktop client running at all;
+ *   - **no `resync`**. The full state dump is sent once per *connection*, which
+ *     is why attaching to a long-running client yields heartbeats only and needs
+ *     a renderer reload to shake state loose. When the connection is ours, every
+ *     connect is a fresh dump. The whole problem disappears.
+ *
+ * ## Observer mode, and why this is safe
+ *
+ * `loadSpaceUser` materialises our SpaceUser and starts the state dump.
+ * `enterSpace` is a *separate* action, and it is what actually puts an avatar in
+ * the room. **We never send it.** The result is a connection with
+ * `Connection.entered: false` that receives the complete roster while being
+ * invisible to everyone in the space.
+ *
+ * This also settles the old fear that a second connection would evict the user's
+ * own session (close 4031, `cdp.js:37-41`). Measured 2026-08-06: neither an
+ * observer connection *nor* an entered one disturbed the desktop client's socket.
+ * `Connection` is per-connection but `SpaceUser` is per-person-per-space, so two
+ * connections drive the same avatar and there is nothing to collide with.
+ *
+ * So `enterSpace` is omitted because it is **unnecessary and not free**, not
+ * because it is dangerous: entering increments the user's `numTimesEnteredSpace`
+ * on every reconnect and marks them present for idle/availability purposes. A
+ * collector that only reads should not touch either.
+ *
+ * ## Handshake
+ *
+ * Captured off the desktop client's own outbound frames via CDP
+ * `Network.webSocketFrameSent`, so these shapes are observed, not guessed:
+ *
+ *   {type:'Authenticate',   credential:{type:'JWT', jwt:<idToken>}}
+ *   {type:'ConnectToSpace', spaceId}
+ *   {type:'Subscribe'}                              // takes no arguments
+ *   {type:'Action', txnId, action:'loadSpaceUser',
+ *                   args:['SpaceUser', null, {connectionTarget, clientPlatform}]}
+ *
+ * A wrong-shaped `Authenticate` is the trap: Gather does not reject it, it simply
+ * never replies and keeps heartbeating, so the failure looks like a network
+ * problem rather than an auth one. If this collector ever reports "connected but
+ * holding no state" while frames flow, suspect the frame shape first.
+ */
+
+import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
+
+import { GameProtocolReader } from './game-protocol.js';
+import { decode, encode } from './msgpack.js';
+import { getIdToken, gatherUid, recentSpaces, uidFromIdToken } from './gather-auth.js';
+import { readGatherSpace } from './paths.js';
+
+const GAME_SOCKET = 'wss://game-router.v2.gather.town/gather-game-v2';
+
+/** Matches the CDP collector, so roster publishing is coalesced the same way. */
+const PUBLISH_INTERVAL_MS = 250;
+
+/**
+ * The desktop client heartbeats roughly once a second. We are far less chatty
+ * because nothing depends on our liveness being noticed quickly; an unauthenticated
+ * probe survived 25s sending none at all, so 10s is comfortably inside tolerance.
+ */
+const HEARTBEAT_INTERVAL_MS = 10_000;
+
+/**
+ * How long after the handshake we stay quiet about holding no state.
+ *
+ * A server heartbeat usually lands before the first `FullStateChunk`, so without
+ * this the collector would announce failure on every connect and immediately
+ * retract it. Long enough to cover a slow dump, short enough that a genuinely
+ * rejected handshake is still reported promptly.
+ */
+const HANDSHAKE_GRACE_MS = 5000;
+
+/** What we tell Gather we are. Mirrors the desktop client — see docs/gather-api.md. */
+const CONNECTION_TARGET = 'OfficeView';
+const CLIENT_PLATFORM = 'Desktop';
+
+export class DirectCollector extends EventEmitter {
+  constructor({
+    spaceId = null,
+    socketUrl = GAME_SOCKET,
+    // Injected so tests can run against a fake game server without touching
+    // Gather or the developer's real session. Production always uses the default.
+    getToken = getIdToken,
+    log = () => {},
+  } = {}) {
+    super();
+    this.log = log;
+    /** Overridable so tests can point at a fake game server instead of Gather. */
+    this.socketUrl = socketUrl;
+    this._getToken = getToken;
+    /** Explicitly configured space, if any; otherwise resolved per connect. */
+    this.configuredSpaceId = spaceId;
+    this.spaceId = spaceId;
+    this.reader = new GameProtocolReader({ log });
+
+    this._ws = null;
+    this._retryTimer = null;
+    this._publishTimer = null;
+    this._heartbeatTimer = null;
+    this._backoffMs = 1000;
+    this._stopped = false;
+    this._healthy = false;
+    this._lastDetail = null;
+    this._dirty = false;
+    this._frames = 0;
+    this._connects = 0;
+    this._lastClose = null;
+    this._handshakeAt = 0;
+  }
+
+  get healthy() {
+    return this._healthy;
+  }
+
+  get detail() {
+    return this._lastDetail;
+  }
+
+  /**
+   * Whether we hold state, as opposed to merely being connected. Same discipline
+   * as the CDP collector: an empty roster reported as healthy would let the app
+   * render a confident "nobody is following you" out of nothing.
+   */
+  get hasState() {
+    return this.reader.users.size > 0;
+  }
+
+  stats() {
+    return {
+      ...this.reader.stats(),
+      frames: this._frames,
+      connects: this._connects,
+      spaceId: this.spaceId,
+      authUserId: this.reader.authUserId,
+      lastClose: this._lastClose,
+      entered: false,
+    };
+  }
+
+  start() {
+    this._stopped = false;
+    this._connect();
+  }
+
+  stop() {
+    this._stopped = true;
+    this._clearTimers();
+    this._closeSocket();
+  }
+
+  /**
+   * Reconnects, which is all a resync is here: the server replays the full state
+   * dump on every new connection. Kept so the HTTP surface behaves the same
+   * whichever collector is running.
+   */
+  async resync() {
+    if (this._stopped) return { ok: false, detail: 'collector stopped' };
+    this.log('direct: reconnecting to force a fresh state dump');
+    this._clearTimers();
+    this._closeSocket();
+    this._backoffMs = 1000;
+    this._connect();
+    return { ok: true, detail: 'reconnecting; a full state dump follows immediately' };
+  }
+
+  _clearTimers() {
+    if (this._retryTimer) clearTimeout(this._retryTimer);
+    if (this._publishTimer) clearInterval(this._publishTimer);
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
+    this._retryTimer = null;
+    this._publishTimer = null;
+    this._heartbeatTimer = null;
+  }
+
+  _closeSocket() {
+    const ws = this._ws;
+    this._ws = null;
+    if (!ws) return;
+    try {
+      ws.close();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  _setHealth(healthy, detail) {
+    const changed = healthy !== this._healthy || detail !== this._lastDetail;
+    this._healthy = healthy;
+    this._lastDetail = detail ?? null;
+    if (changed) this.emit('status', { healthy, detail: this._lastDetail });
+  }
+
+  _scheduleRetry() {
+    if (this._stopped || this._retryTimer) return;
+    const wait = this._backoffMs;
+    this._backoffMs = Math.min(this._backoffMs * 2, 30_000);
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
+      this._connect();
+    }, wait);
+    this._retryTimer.unref?.();
+  }
+
+  /**
+   * Which space to watch.
+   *
+   * Prefers configuration, then the space the desktop client last opened — which
+   * costs nothing and is almost always right — and only then asks the API.
+   */
+  async _resolveSpaceId() {
+    if (this.configuredSpaceId) return this.configuredSpaceId;
+
+    const local = readGatherSpace().spaceId;
+    if (local) return local;
+
+    const spaces = await recentSpaces({ log: this.log });
+    if (spaces.length === 0) return null;
+    // Most recently visited first; `lastVisited` is an ISO string.
+    spaces.sort((a, b) => String(b.lastVisited ?? '').localeCompare(String(a.lastVisited ?? '')));
+    return spaces[0].id;
+  }
+
+  async _connect() {
+    if (this._stopped) return;
+    this._clearTimers();
+    this._closeSocket();
+
+    let token;
+    let spaceId;
+    try {
+      token = await this._getToken({ log: this.log });
+      spaceId = await this._resolveSpaceId();
+    } catch (error) {
+      this._setHealth(false, `gather auth failed: ${error.message}`);
+      this._scheduleRetry();
+      return;
+    }
+    if (this._stopped) return;
+
+    if (!spaceId) {
+      this._setHealth(false, 'no space to watch — open a space in Gather once, or pass --space');
+      this._scheduleRetry();
+      return;
+    }
+    this.spaceId = spaceId;
+
+    // The token is the identity; the stored uid is only a cache of it. Reading
+    // the token first means a stale or mismatched config cannot silently point us
+    // at the wrong account — which would leave `selfId` unresolved and make
+    // "following me" unanswerable.
+    const authUserId = uidFromIdToken(token) ?? gatherUid();
+
+    // A fresh reader per connection: the dump we are about to receive is
+    // complete, so carrying rows over from a previous connection would only keep
+    // ghosts of people who have since left.
+    this.reader = new GameProtocolReader({ log: this.log });
+    this.reader.authUserId = authUserId;
+    this._frames = 0;
+
+    const url =
+      `${this.socketUrl}?spaceId=${encodeURIComponent(spaceId)}` +
+      `&authUserId=${encodeURIComponent(authUserId ?? '')}`;
+    this.reader.noteSocketUrl(url);
+
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (error) {
+      this._setHealth(false, `game socket connect failed: ${error.message}`);
+      this._scheduleRetry();
+      return;
+    }
+    ws.binaryType = 'arraybuffer';
+    this._ws = ws;
+    this._connects++;
+    this._setHealth(false, 'connecting to the game server');
+
+    ws.addEventListener('open', () => {
+      if (this._ws !== ws) return;
+      this._backoffMs = 1000;
+      this.log(`direct: connected to space ${spaceId} as observer`);
+      try {
+        for (const frame of this._handshake(token, spaceId)) ws.send(encode(frame));
+      } catch (error) {
+        // encode() refuses rather than sending something Gather would ignore.
+        this._setHealth(false, `handshake encode failed: ${error.message}`);
+        this._closeSocket();
+        this._scheduleRetry();
+        return;
+      }
+      this._handshakeAt = Date.now();
+      this._setHealth(false, 'handshake sent; waiting for state');
+
+      this._publishTimer = setInterval(() => this._flush(), PUBLISH_INTERVAL_MS);
+      this._publishTimer.unref?.();
+      this._heartbeatTimer = setInterval(() => this._heartbeat(), HEARTBEAT_INTERVAL_MS);
+      this._heartbeatTimer.unref?.();
+    });
+
+    ws.addEventListener('message', (event) => {
+      if (this._ws !== ws) return;
+      this._onFrame(event.data);
+    });
+
+    ws.addEventListener('close', (event) => {
+      if (this._ws !== ws) return;
+      this._lastClose = { code: event.code, reason: event.reason || null };
+      this._clearTimers();
+      this._ws = null;
+      // 4031 is the duplicate-connection code the gateway was long believed to
+      // use. Observer connections do not trigger it, so seeing it here would mean
+      // something about Gather's rules changed and is worth saying out loud.
+      const suffix = event.code === 4031 ? ' — duplicate connection rejected' : '';
+      this._setHealth(false, `game socket closed (${event.code})${suffix}`);
+      this._scheduleRetry();
+    });
+
+    ws.addEventListener('error', () => {
+      if (this._ws !== ws) return;
+      // `close` always follows, and it carries the code; retry from there.
+      this.log('direct: game socket error');
+    });
+  }
+
+  /**
+   * The frames that get us subscribed as an observer.
+   *
+   * Deliberately does not include `enterSpace`. That is the line between watching
+   * a space and being in it, and this collector only ever watches.
+   */
+  _handshake(token, spaceId) {
+    return [
+      { type: 'Authenticate', credential: { type: 'JWT', jwt: token } },
+      { type: 'ConnectToSpace', spaceId },
+      { type: 'Subscribe' },
+      {
+        type: 'Action',
+        txnId: randomUUID(),
+        action: 'loadSpaceUser',
+        args: [
+          'SpaceUser',
+          null,
+          { connectionTarget: CONNECTION_TARGET, clientPlatform: CLIENT_PLATFORM },
+        ],
+      },
+    ];
+  }
+
+  _heartbeat() {
+    const ws = this._ws;
+    if (!ws || ws.readyState !== 1) return;
+    try {
+      ws.send(encode({ type: 'Heartbeat', timestamp: Date.now(), origin: 'Client' }));
+    } catch {
+      // A failed heartbeat means the socket is going; `close` handles it.
+    }
+  }
+
+  _onFrame(data) {
+    let frame;
+    try {
+      frame = decode(Buffer.from(data));
+    } catch {
+      // Not msgpack. Should not happen on this socket, but never throw in a
+      // message handler.
+      return;
+    }
+    if (frame == null || typeof frame !== 'object') return;
+    this._frames++;
+    if (this.reader.ingest(frame)) this._dirty = true;
+  }
+
+  _flush() {
+    if (this._frames > 0) {
+      const stats = this.reader.stats();
+      if (this.hasState) {
+        this._setHealth(true, `${stats.users} space users, ${this._frames} frames (observer)`);
+      } else if (Date.now() - this._handshakeAt >= HANDSHAKE_GRACE_MS) {
+        // Frames arriving but still no state means the handshake was not
+        // accepted — Gather stays silent rather than rejecting, so say so.
+        this._setHealth(
+          false,
+          `connected but holding no state (${this._frames} frames, heartbeats only) — ` +
+            'the handshake was not accepted',
+        );
+      }
+      // Inside the grace window we leave the status alone: a server heartbeat
+      // routinely arrives before the first FullStateChunk, and announcing failure
+      // there would emit a spurious unhealthy event on every single connect.
+    }
+    if (!this._dirty) return;
+    this._dirty = false;
+    this.emit('roster', this.reader.roster());
+  }
+}

@@ -1,8 +1,13 @@
 /**
- * MessagePack decoder, with the extension types Gather V2 registers.
+ * MessagePack codec, with the extension types Gather V2 registers.
  *
- * Decode only — the bridge reads the desktop client's existing, already
- * authenticated stream and never speaks on it.
+ * Decoding is the deep half: it must understand everything Gather's server
+ * sends, including five extension types. Encoding is deliberately shallow —
+ * see `encode` at the bottom — because the only frames we ever send are the
+ * handshake and a heartbeat, which are plain maps of strings and numbers.
+ *
+ * The CDP collector still only decodes; `DirectCollector` is what needs to
+ * speak (`direct.js`).
  *
  * Hand-written rather than pulling in `@msgpack/msgpack` for one structural
  * reason: `install` copies only `bridge/lib` and `bridge/bin` into
@@ -298,4 +303,117 @@ function toSafeNumber(big) {
     return Number(big);
   }
   return big;
+}
+
+/**
+ * MessagePack encoder, scoped to what we actually send.
+ *
+ * The bridge sends exactly four frame shapes — `Authenticate`, `ConnectToSpace`,
+ * `Subscribe` and `Heartbeat`, plus one `Action` — and every value in them is a
+ * string, number, boolean, null, array or plain object. So this handles that and
+ * nothing else: no extension types, no Date, no bigint, no Map, no binary.
+ *
+ * Refusing loudly matters more than being general. Gather ignores a frame it
+ * cannot parse — no error, no close, just silence and heartbeats — so a value
+ * that got silently mangled here would surface as an unexplained failure to
+ * connect. Anything unexpected therefore throws rather than guessing.
+ *
+ * Widest-format-always would be simpler still, but Gather's server rejects
+ * nothing on width, so the compact forms below are free.
+ */
+export function encode(value) {
+  if (value === null || value === undefined) return Buffer.from([0xc0]);
+  if (value === true) return Buffer.from([0xc3]);
+  if (value === false) return Buffer.from([0xc2]);
+
+  if (typeof value === 'number') return encodeNumber(value);
+  if (typeof value === 'string') return encodeString(value);
+  if (Array.isArray(value)) return encodeArray(value);
+
+  if (typeof value === 'object') {
+    // Only plain objects. A Date, Map, Set, Buffer or class instance has no
+    // enumerable own keys worth speaking of, so `encodeMap` would happily emit
+    // an empty map and Gather would ignore the frame in silence. Refuse instead.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new TypeError(
+        `msgpack encode: refusing to encode a ${value.constructor?.name ?? 'non-plain'} ` +
+          'as a map — convert it to a plain value first',
+      );
+    }
+    return encodeMap(value);
+  }
+
+  throw new TypeError(`msgpack encode: unsupported value of type ${typeof value}`);
+}
+
+function encodeNumber(value) {
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`msgpack encode: ${value} is not a finite number`);
+  }
+  if (Number.isInteger(value)) {
+    if (value >= 0 && value <= 0x7f) return Buffer.from([value]);
+    if (value < 0 && value >= -32) return Buffer.from([0x100 + value]);
+    if (value >= 0 && value <= 0xffffffff) {
+      const out = Buffer.alloc(5);
+      out[0] = 0xce; // uint32
+      out.writeUInt32BE(value, 1);
+      return out;
+    }
+    // Timestamps are past 2^32 ms, so int64 is the common case here, not a corner.
+    const out = Buffer.alloc(9);
+    out[0] = 0xd3; // int64
+    out.writeBigInt64BE(BigInt(value), 1);
+    return out;
+  }
+  const out = Buffer.alloc(9);
+  out[0] = 0xcb; // float64
+  out.writeDoubleBE(value, 1);
+  return out;
+}
+
+function encodeString(value) {
+  const body = Buffer.from(value, 'utf8');
+  if (body.length < 32) return Buffer.concat([Buffer.from([0xa0 | body.length]), body]);
+  if (body.length <= 0xff) {
+    return Buffer.concat([Buffer.from([0xd9, body.length]), body]);
+  }
+  if (body.length <= 0xffff) {
+    const head = Buffer.alloc(3);
+    head[0] = 0xda; // str16
+    head.writeUInt16BE(body.length, 1);
+    return Buffer.concat([head, body]);
+  }
+  // str32. A Firebase ID token is ~1 KB so str16 covers it, but a token is the
+  // one field where truncation would be silent and maddening — so handle it.
+  const head = Buffer.alloc(5);
+  head[0] = 0xdb;
+  head.writeUInt32BE(body.length, 1);
+  return Buffer.concat([head, body]);
+}
+
+function encodeArray(value) {
+  const items = value.map(encode);
+  if (value.length < 16) {
+    return Buffer.concat([Buffer.from([0x90 | value.length]), ...items]);
+  }
+  const head = Buffer.alloc(3);
+  head[0] = 0xdc; // array16
+  head.writeUInt16BE(value.length, 1);
+  return Buffer.concat([head, ...items]);
+}
+
+function encodeMap(value) {
+  // `undefined` is dropped rather than encoded as nil: an absent optional field
+  // and a field explicitly set to null are different things to Gather, and the
+  // handshake relies on omitting fields we have no value for.
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined);
+  const parts = keys.flatMap((key) => [encodeString(key), encode(value[key])]);
+  if (keys.length < 16) {
+    return Buffer.concat([Buffer.from([0x80 | keys.length]), ...parts]);
+  }
+  const head = Buffer.alloc(3);
+  head[0] = 0xde; // map16
+  head.writeUInt16BE(keys.length, 1);
+  return Buffer.concat([head, ...parts]);
 }

@@ -37,6 +37,11 @@ before(async () => {
     token: TOKEN,
     port: 0, // ask the OS for a free port
     cdpPort: 1, // nothing listens here; the CDP collector stays down on purpose
+    // Forces the CDP fallback. Without this the server would pick the direct
+    // collector on any machine where `adopt` has been run, and the suite would
+    // start authenticating to Gather and reading a real space — making results
+    // depend on whose laptop it ran on. Tests must never leave the machine.
+    direct: false,
     logSource: logPath,
     log: () => {},
   });

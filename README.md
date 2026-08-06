@@ -25,25 +25,24 @@ desktop client running on your own computer, and tells your phone about it.
 | 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency background daemon that watches the Gather desktop client and serves events over your LAN | your **computer** |
 | 📱 `lib/`, `ios/` | **Gather Companion** — a Flutter app showing a live event log and who is around you right now | your **phone** |
 
-Two collectors read the same client in two different ways, and both feed one
-stream:
+The log collector always runs. Alongside it, exactly one *rich* collector runs —
+`DirectCollector` if a Gather session has been adopted, `CdpCollector` otherwise:
 
 ```
-                        ┌─────────────────────────┐
-                        │  Gather V2 desktop app  │
-                        └────────────┬────────────┘
-                                     │
-                 ┌───────────────────┴───────────────────┐
-                 │                                       │
-                 ▼                                       ▼
-        ┌─────────────────┐                     ┌─────────────────┐
-        │    main.log     │                     │  devtools (CDP) │
-        │    log-only     │                     │    full mode    │
-        └────────┬────────┘                     └────────┬────────┘
-                 │ proximity, no names                   │ names, tiles,
-                 │ follows only guessed                  │ real follows
-                 └───────────────────┬───────────────────┘
-                                     ▼
+        ┌─────────────────────────┐      ┌─────────────────────────┐
+        │  Gather V2 desktop app  │      │   Gather's own servers  │
+        └────────────┬────────────┘      └────────────┬────────────┘
+                     │                                │
+        ┌────────────┴────────────┐                   │ authenticated
+        ▼                         ▼                   ▼ observer socket
+┌─────────────────┐      ┌─────────────────┐   ┌─────────────────┐
+│    main.log     │      │  devtools (CDP) │   │     direct      │
+│    log-only     │      │    fallback     │   │   preferred     │
+└────────┬────────┘      └────────┬────────┘   └────────┬────────┘
+         │ mic/cam/screen,        │ names, tiles,       │ names, tiles,
+         │ proximity, no names    │ real follows        │ real follows
+         └────────────────────────┴──────────┬──────────┘
+                                             ▼
                         ┌─────────────────────────┐
                         │    gather-app-bridge    │  ← your computer
                         │          :7799          │
@@ -77,7 +76,18 @@ npx gather-app-bridge pair
 It draws a QR square in the terminal. Scan it in the app and you are done; the
 code and address are printed underneath for a phone whose camera is refused.
 
-**3.** Check what it can actually see:
+**3.** Turn on full fidelity — names, coordinates, real follow detection:
+
+```sh
+npx gather-app-bridge adopt
+npx gather-app-bridge restart
+```
+
+This reuses the Gather session your desktop app is already signed in with. No
+login, no second account, nothing visible to your colleagues. See
+[Direct mode](#-direct-mode--the-bridge-connects-to-gather-itself).
+
+**4.** Check what it can actually see:
 
 ```sh
 npx gather-app-bridge doctor
@@ -85,10 +95,20 @@ npx gather-app-bridge doctor
 
 ---
 
-## 🎚️ The two fidelity levels
+## 🎚️ The three fidelity levels
 
 This is the one thing worth understanding, because it decides whether
 "*someone is following me*" works at all.
+
+| | Log-only | **Direct** (recommended) | CDP |
+|---|---|---|---|
+| Setup | none | `adopt`, once | relaunch Gather with a debug port |
+| Names, coordinates, real follow | ❌ | ✅ | ✅ |
+| Mic / camera / screenshare | ✅ | ✅ *(from the log)* | ✅ *(from the log)* |
+| Needs the desktop app running | yes | only for mic/cam/screen | yes |
+| Needs a debug port open | no | **no** | yes |
+| Full state on demand | — | ✅ every connect | ❌ needs a renderer reload |
+| Visible to colleagues | no | no | no |
 
 ### 📄 Log-only mode — works immediately, no setup
 
@@ -114,7 +134,43 @@ follow detection. Following lives in the web app's state and never reaches the
 log — the only follow-related line the client writes is its own pathfinding when
 *you* follow someone else.
 
-### 🔍 Full mode — one extra flag on the Gather client
+### 🛰️ Direct mode — the bridge connects to Gather itself
+
+```sh
+npx gather-app-bridge adopt
+npx gather-app-bridge restart
+```
+
+`adopt` copies the Gather session the desktop app is *already signed in with* —
+Firebase keeps it in the renderer's IndexedDB — into the bridge's own config. There
+is no login to perform and no second account to create. Refresh tokens are
+long-lived, so this is a one-time read: afterwards the bridge mints its own ID
+tokens and never touches the desktop client again.
+
+It then opens its own game socket in **observer mode**. The distinction that makes
+this safe is that Gather splits joining a space into two actions: `loadSpaceUser`
+starts the state dump, and `enterSpace` puts an avatar in the room. The bridge
+sends the first and never the second, so it receives the entire roster — names,
+tile coordinates, clusters, `followTargetId` — while remaining invisible to
+everyone in the space, with `Connection.entered: false`.
+
+It also does **not** disturb your own session. That was the long-standing fear:
+Gather's gateway was believed to evict a duplicate `spaceId` + `authUserId` with
+close code 4031. Measured on 2026-08-06 against a live 111-person space, with the
+desktop client joined and watched over CDP throughout: the client's socket was
+never closed and never dropped a frame. (Two connections that have *both* entered
+the space were not tested, which is exactly why observer mode is not optional.)
+
+And because the full state dump is sent once per *connection*, and the connection
+is ours, `resync` is just a reconnect — the cold-start problem below simply does
+not arise.
+
+Protocol details, the REST surface, and what is still unverified:
+[`docs/gather-api.md`](docs/gather-api.md).
+
+### 🔍 CDP mode — one extra flag on the Gather client
+
+The original route, still the fallback when no session has been adopted.
 
 Quit Gather completely — it holds a single-instance lock, so launching a second
 copy just focuses the first — then start it with a devtools port. On macOS:
@@ -210,21 +266,21 @@ every real space has them and they are not people standing next to you.
 
 ### ❄️ Cold start, and `resync`
 
-The full state dump is sent **once per connection**. A bridge that attaches to a
-client which has been running for days therefore sees heartbeats and nothing else
-until somebody moves, and people who never move stay invisible.
+The full state dump is sent **once per connection** — which is a problem only when
+the connection is somebody else's.
 
-The bridge is honest about this rather than showing an empty room: until it holds
-real state it reports the CDP collector as *not* healthy, with
-`attached but holding no state (heartbeats only)`. To fix it immediately:
+**In CDP mode** the bridge attaches to a socket the client opened, possibly days
+ago, so it sees heartbeats and nothing else until somebody moves; people who never
+move stay invisible. It is honest about this rather than showing an empty room:
+until it holds real state it reports the collector as *not* healthy, with
+`attached but holding no state (heartbeats only)`. `npx gather-app-bridge resync`
+reloads the Gather renderer — about two seconds of reconnect — and the server
+resends the whole dump while the bridge is watching. A natural reconnect (sleep, a
+network blip, a Gather restart) does the same thing by itself.
 
-```sh
-npx gather-app-bridge resync
-```
-
-That reloads the Gather renderer, costing about two seconds of reconnect, and the
-server resends the whole dump while the bridge is watching. It also happens by
-itself on any natural reconnect — a sleep, a network blip, a Gather restart.
+**In direct mode this does not happen.** The connection is ours, so every connect
+is a fresh dump, and `resync` is simply a reconnect — no renderer reload, and
+nothing about the user's own client is touched.
 
 ---
 
@@ -235,8 +291,9 @@ npx gather-app-bridge                install as a background service and pair
 npx gather-app-bridge run            run in the foreground instead
 npx gather-app-bridge status         is it alive, and who is around right now
 npx gather-app-bridge pair           show a QR square for the phone to scan
+npx gather-app-bridge adopt          reuse your Gather session (best fidelity)
 npx gather-app-bridge doctor         what can it see, and how to see more
-npx gather-app-bridge resync         force a full state resync (reloads the renderer)
+npx gather-app-bridge resync         force a full state resync
 npx gather-app-bridge logs -f        follow the daemon log
 npx gather-app-bridge token          show the pairing details again
 npx gather-app-bridge restart|stop|start|uninstall
@@ -244,7 +301,8 @@ npx gather-app-bridge replay [file]  parse a log file and summarise it
 ```
 
 **Options:** `--port <n>` (default `7799`), `--cdp-port <n>` (default `9222`),
-`--token <s>`, `--log-file <path>`.
+`--token <s>`, `--log-file <path>`, `--space <uuid>` (watch a specific space),
+`--no-direct` (force the CDP collector even when a session has been adopted).
 
 ### 👁️ Watching the stream from a terminal
 
@@ -534,24 +592,39 @@ re-run gets a fresh build number, so neither half objects to going twice.
   change rarely; the msgpack framing and patch envelope are internal and could
   change with any deploy. `bridge.status` events tell the app when a collector goes
   quiet, so drift shows up as a visibly degraded state rather than silence.
-- ❄️ **Cold start needs a resync in full mode.** The state dump is sent once per
-  connection, so a freshly attached bridge holds nothing until the client
-  reconnects. It reports itself unhealthy rather than showing an empty room, and
-  `npx gather-app-bridge resync` fixes it in about two seconds. The log collector
-  is unaffected, which is a reason to leave it running rather than treat it as a
-  mere fallback.
+- ❄️ **Cold start needs a resync in CDP mode only.** The state dump is sent once
+  per connection, so a bridge that attached to someone else's socket holds nothing
+  until the client reconnects. It reports itself unhealthy rather than showing an
+  empty room, and `npx gather-app-bridge resync` fixes it in about two seconds.
+  Direct mode does not have this problem: every connect is a fresh dump.
 - 🚩 **Log-only mode depends on flags Gather controls.** The verbose renderer
   stream exists because `disable_logger_info: false` and
   `DesktopDetailedDiagnosticLogs` are set in `flags.json`, and those are
   server-pushed gates. If Gather turns them off, `replay` will show the event
   counts collapse.
-- 🔒 **Read-only.** Nothing here writes to Gather, sends actions, or modifies the
-  desktop client. `app.asar` integrity validation is enabled, so patching the
-  client is not possible anyway.
-- 🔎 Reverse-engineered from your own installed client for interoperability. There
-  is no public Gather 2.0 API that exposes presence: the documented HTTP API is
-  Classic-only and explicitly unsupported, and `@gathertown/gather-game-client`
-  was last published in 2023 and does not speak v2.
+- ✍️ **Direct mode does write to the socket** — this used to say "read-only", and
+  that is no longer the whole truth. `DirectCollector` sends five frame shapes and
+  nothing else: `Authenticate`, `ConnectToSpace`, `Subscribe`, one
+  `Action{loadSpaceUser}`, and a heartbeat every ten seconds. It mutates no game
+  state: it does not move, chat, follow, or change any setting, and it never sends
+  `enterSpace`, so no avatar appears. The desktop client itself is still never
+  modified — `app.asar` integrity validation is enabled, so patching it is not
+  possible anyway. The CDP collector remains strictly read-only.
+- 🔑 **Direct mode stores a Gather credential.** `adopt` copies a Firebase refresh
+  token out of the desktop client's IndexedDB into `~/.gather-app-bridge.json` at
+  `0600` — the same file and permissions as the pairing token. It is your own
+  session, on your own machine, and grants the bridge no more than the desktop app
+  beside it already has; it is sent only to Google's token endpoint and Gather's own
+  hosts. It is still a credential on disk, which is worth knowing before you run
+  `adopt` on a shared machine.
+- 🔎 Reverse-engineered from your own installed client for interoperability, and
+  written up in [`docs/gather-api.md`](docs/gather-api.md) — 217 REST endpoints, the
+  auth flow, the game protocol, and an explicit list of what is still unverified.
+  There is still no *public* Gather 2.0 API that exposes presence: the documented
+  HTTP API is Classic-only and explicitly unsupported, `@gathertown/gather-game-client`
+  was last published in 2023 and does not speak v2, and the private v2 REST API —
+  though now mapped — contains no roster, no positions and no presence of any kind.
+  The game socket is the only route, which is why both rich collectors use it.
 
 ---
 

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { flagValue, parseCommand, parsePort } from '../lib/cli-args.js';
 import { DEFAULT_CDP_PORT, probeCdp } from '../lib/cdp.js';
+import { adoptDesktopSession, gatherUid, hasGatherSession } from '../lib/gather-auth.js';
 import { playerIdOf } from '../lib/events.js';
 import * as launchd from '../lib/launchd.js';
 import { GatherLogParser } from '../lib/log-parser.js';
@@ -71,6 +72,8 @@ async function main() {
       return cmdUninstall();
     case 'token':
       return cmdToken();
+    case 'adopt':
+      return cmdAdopt();
     case 'doctor':
       return cmdDoctor();
     case 'resync':
@@ -139,11 +142,15 @@ async function cmdRun() {
   const token = ensureToken(flagValue(argv, '--token'));
   const cdpPort = Number(flagValue(argv, '--cdp-port') ?? DEFAULT_CDP_PORT);
   const logSource = flagValue(argv, '--log-file') ?? gatherLogFile;
+  // `--no-direct` forces the CDP collector even when a session has been adopted,
+  // which is the escape hatch if Gather ever changes the handshake.
+  const direct = argv.includes('--no-direct') ? false : null;
+  const spaceId = flagValue(argv, '--space') ?? null;
   ensureStateDir();
   rotateLogIfLarge();
 
   const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
-  const server = new BridgeServer({ token, port, cdpPort, logSource, log });
+  const server = new BridgeServer({ token, port, cdpPort, logSource, direct, spaceId, log });
 
   try {
     await server.start();
@@ -205,8 +212,11 @@ async function cmdStatus() {
     const collectors = await getJson(port, '/collectors', config.token);
     if (collectors) {
       line('log collector', collectors.health?.logTail ? green('live') : red('down'));
+      // `health.cdp` is the "rich collector is live" flag whichever one won, so
+      // label it by what is actually running rather than by the field name.
+      const kind = collectors.richCollector === 'direct' ? 'direct collector' : 'cdp collector';
       line(
-        'cdp collector',
+        kind,
         collectors.health?.cdp ? green('live') : dim(collectors.cdpDetail ?? 'not attached'),
       );
     }
@@ -250,11 +260,46 @@ function cmdToken() {
  * observed — only guessed from movement. This prints the exact command that
  * fixes that.
  */
+/**
+ * Copies the desktop client's Gather session into the bridge's own config.
+ *
+ * One read, then independence: refresh tokens are long-lived, so from here on the
+ * bridge mints its own and needs neither the desktop client nor a debug port.
+ */
+async function cmdAdopt() {
+  console.log('');
+  try {
+    const { uid, file } = await adoptDesktopSession({ log: () => {} });
+    console.log(`  ${green('Adopted your Gather session.')}`);
+    console.log(`  ${dim(`account ${String(uid).slice(0, 8)}… · read from ${file}`)}`);
+    console.log('');
+    console.log('  The bridge will now connect to Gather directly, as an observer:');
+    console.log('  it reads the whole space — names, positions, who is following you —');
+    console.log('  without joining it, so nobody sees an extra avatar.');
+    console.log('');
+    console.log(`  ${bold('What this replaces:')} the devtools port. You no longer need to`);
+    console.log('  relaunch GatherV2 with --remote-debugging-port, and the bridge keeps');
+    console.log('  working when the desktop app is closed.');
+    console.log('');
+    console.log(`  Restart to pick it up:  ${bold(`${INVOKE} restart`)}`);
+    console.log('');
+  } catch (error) {
+    console.log(`  ${red('Could not adopt a Gather session.')}`);
+    console.log(`  ${error.message}`);
+    console.log('');
+    console.log('  Sign in to the GatherV2 desktop app, then run this again.');
+    console.log(`  Until then the bridge falls back to ${bold('doctor')}'s devtools route.`);
+    console.log('');
+    process.exit(1);
+  }
+}
+
 async function cmdDoctor() {
   const cdpPort = Number(flagValue(argv, '--cdp-port') ?? DEFAULT_CDP_PORT);
   const running = isGatherRunning();
   const cdp = await probeCdp(cdpPort);
   const space = readGatherSpace();
+  const adopted = hasGatherSession();
 
   console.log('');
   console.log(`  ${bold('Gather bridge — doctor')}`);
@@ -263,13 +308,33 @@ async function cmdDoctor() {
   line('GatherV2 running', running ? green('yes') : yellow('no'));
   line('log file', existsSync(gatherLogFile) ? green(gatherLogFile) : yellow('not created yet'));
   line('last space', space.spaceId ?? dim('unknown'));
+  line(
+    'gather session',
+    adopted ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : yellow('not adopted'),
+  );
   line('devtools port', cdp ? green(`open on ${cdpPort}`) : yellow(`closed on ${cdpPort}`));
   console.log('');
+
+  if (adopted) {
+    console.log(green('  Full fidelity, the direct way.'));
+    console.log('  The bridge connects to Gather itself as an observer: names,');
+    console.log('  positions, cluster adjacency and real follow detection, with no');
+    console.log('  devtools port and no need for the desktop app to be running.');
+    console.log('');
+    console.log(dim('  Mic, camera and screenshare still come from the log — they are not'));
+    console.log(dim('  part of Gather\'s game state, so nothing can change that.'));
+    console.log('');
+    return;
+  }
 
   if (cdp) {
     console.log(green('  Full fidelity available.'));
     console.log('  Names, positions, cluster-based adjacency and real follow');
-    console.log('  detection are all readable.');
+    console.log('  detection are all readable over devtools.');
+    console.log('');
+    console.log(`  ${bold('Simpler option:')} run ${bold(`${INVOKE} adopt`)} once and the bridge`);
+    console.log('  connects to Gather directly instead — no devtools port, and it keeps');
+    console.log('  working with the desktop app closed.');
     console.log('');
     return;
   }
@@ -283,7 +348,12 @@ async function cmdDoctor() {
   console.log('  reliable "someone is following me" — that field lives in the web');
   console.log('  app\'s own state, not in the log.');
   console.log('');
-  console.log(`  ${bold('To enable it:')}`);
+  console.log(`  ${bold('To enable it — easiest route:')}`);
+  console.log(`    Run ${bold(`${INVOKE} adopt`)}. It reuses the Gather session the desktop`);
+  console.log('    app is already signed in with, and the bridge then connects to Gather');
+  console.log('    directly. No relaunching, no devtools port, works app-closed.');
+  console.log('');
+  console.log(`  ${bold('Or, the devtools route:')}`);
   console.log('    1. Quit GatherV2 completely (Cmd+Q — it holds a single-instance lock,');
   console.log('       so launching a second copy just focuses the first one).');
   console.log('    2. Start it with the devtools port open:');
@@ -728,8 +798,9 @@ function usage() {
     ${INVOKE} run                run in the foreground (no launchd)
     ${INVOKE} status             is it alive, and who is around
     ${INVOKE} pair               show a QR square for the phone to scan
+    ${INVOKE} adopt              reuse your signed-in Gather session (best fidelity)
     ${INVOKE} doctor             what can it see, and how to see more
-    ${INVOKE} resync             force a full state resync (reloads the renderer)
+    ${INVOKE} resync             force a full state resync
     ${INVOKE} logs [-f]          daemon log
     ${INVOKE} token              show pairing details again
     ${INVOKE} start|stop|restart
@@ -746,6 +817,8 @@ function usage() {
   ${bold('Options')}
     --port <n>        LAN port to serve on (default ${DEFAULT_PORT})
     --cdp-port <n>    Gather's devtools port (default ${DEFAULT_CDP_PORT})
+    --space <uuid>    watch a specific space (run; default: last one you opened)
+    --no-direct       force the CDP collector instead of connecting directly (run)
     --token <s>       use a specific pairing token
     --log-file <p>    tail a different Gather log (run)
     --host <h>        bridge to attach to (watch, default 127.0.0.1)

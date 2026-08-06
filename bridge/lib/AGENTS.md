@@ -14,12 +14,14 @@ platform plumbing — launchd installation, paths, pairing codes.
 
 | File | Description |
 |------|-------------|
-| `server.js` | `BridgeServer` — owns both collectors, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
+| `server.js` | `BridgeServer` — owns the collectors, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
 | `presence.js` | `PresenceTracker` (folds events into current state, suppresses duplicates, decides what a human should see) and `FollowDetector` (infers following from movement when `followTargetId` is unavailable). Exports `ADJACENT_TILES` / `LEAVE_TILES`. |
 | `events.js` | Every event constructor, and therefore the wire format. `{type, at, source, confidence, ...payload}`. Also `newPlayer()` / `emptySelf()` snapshot shapes. |
-| `cdp.js` | `CdpCollector` — attaches to the Chrome DevTools browser endpoint, discovers every target, enables the Network domain, and routes binary WebSocket frames to the protocol reader. Also `probeCdp()`. |
+| `direct.js` | `DirectCollector` — **the preferred rich collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
+| `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
+| `cdp.js` | `CdpCollector` — the **fallback** rich collector. Attaches to the Chrome DevTools browser endpoint, discovers every target, enables the Network domain, and routes binary WebSocket frames to the protocol reader. Also `probeCdp()`. |
 | `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster and resolves which row is *me*. |
-| `msgpack.js` | Hand-written MessagePack **decoder**, including Gather's five extension types. |
+| `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
 | `log-parser.js` | `GatherLogParser` — regexes over `main.log`, both the `(webapp)` and `(main)` scopes, plus `parseInspect()` for `util.inspect` bodies. |
 | `log-tail.js` | `LogTail` — follows a growing file across rotation, truncation and machine sleep. |
 | `ws.js` | Minimal RFC 6455 **server** (handshake, framing, backpressure limits). |
@@ -36,6 +38,23 @@ platform plumbing — launchd installation, paths, pairing codes.
 - **No dependencies, ever.** `launchd.install()` copies this directory verbatim
   and runs it with no `node_modules`. `msgpack.js`, `ws.js` and `qr.js` exist
   precisely because of that; each says so in its header.
+- **`direct.js` must never send `enterSpace`.** `loadSpaceUser` gets the state
+  dump; `enterSpace` is a separate action and is what puts an avatar in the space.
+  Omitting it is what makes the collector invisible to colleagues *and* what keeps
+  it from colliding with the user's own desktop session. A duplicate connection was
+  measured harmless in observer mode only — two *entered* connections were never
+  tested. `bridge/test/direct.test.js` guards this.
+- **A wrong handshake fails silently.** Gather does not reject a frame it cannot
+  parse: it keeps heartbeating and says nothing. So `msgpack.js`'s encoder refuses
+  values it cannot represent faithfully rather than emitting something plausible,
+  and `direct.js` reports "connected but holding no state" instead of "healthy".
+  If the roster is ever empty while frames flow, suspect the frame shape.
+- **The status event always says `collector: 'cdp'`**, whichever collector is
+  running, because `PresenceTracker` sets health by that name (`presence.js:220`)
+  and the app's `CollectorHealth.cdp` drives `hasRichData`. Saying `direct` would
+  make shipped app builds show the "log-only mode: no names" banner while the
+  bridge held full names. The real collector goes in `detail` and in
+  `/collectors.richCollector`.
 - **`events.js` is a published contract.** Field names are mirrored in
   `packages/gather_events/lib/src/events.dart` and documented in the root
   `README.md`. Renaming one breaks the app with no compile error.

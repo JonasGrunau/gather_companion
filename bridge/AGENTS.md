@@ -10,22 +10,32 @@ watches the Gather V2 desktop client running on the same machine and serves what
 it sees over the LAN as HTTP and WebSocket. Installed as a macOS LaunchAgent by
 default, so it starts at login and survives crashes and sleep.
 
-Two collectors read the same client at different fidelities and feed one
-`PresenceTracker`:
+The log collector always runs; exactly one *rich* collector runs alongside it.
+Both feed one `PresenceTracker`:
 
 ```
   ~/Library/Logs/GatherV2/main.log ──▶ LogTail ──▶ GatherLogParser ──┐
-                                                                     ├─▶ PresenceTracker ──▶ WS clients
-  Gather renderer (CDP, optional) ───▶ CdpCollector ─────────────────┘
+                                                                    ├─▶ PresenceTracker ──▶ WS clients
+  Gather's game server ──▶ DirectCollector   (preferred) ────────────┘
+  Gather renderer ──────▶ CdpCollector       (fallback)
 ```
 
 - **Log-only mode** works with no setup. Proximity is *inferred* from Gather's
   proximity-gated media connections. No names, no coordinates, and being followed
   cannot be detected at all.
-- **Full mode** needs the client started with `--remote-debugging-port`. The
-  collector reads the msgpack game-protocol frames the client is already
-  exchanging and gets names, tile coordinates, cluster adjacency, and real
-  `followTargetId`-based follow detection.
+- **Direct mode** is the default once `gather-app-bridge adopt` has copied the
+  desktop client's Gather session. The bridge connects to Gather itself as an
+  observer — full roster, no debug port, and it keeps working with the desktop app
+  closed. Every connection replays the full state dump, so `resync` is just a
+  reconnect.
+- **CDP mode** is the fallback for machines that have not run `adopt`. Needs the
+  client started with `--remote-debugging-port`, and because the state dump is sent
+  once per *connection*, it needs a renderer reload to shake state loose.
+
+Both rich modes give names, tile coordinates, cluster adjacency and real
+`followTargetId`-based follow detection. Neither gives mic/camera/screenshare:
+those are not in Gather's game state at all, so the log parser stays load-bearing
+no matter what.
 
 ## Subdirectories
 

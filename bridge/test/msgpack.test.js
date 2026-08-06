@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { MSGPACK_UNDEFINED, decode } from '../lib/msgpack.js';
+import { MSGPACK_UNDEFINED, decode, encode } from '../lib/msgpack.js';
 
 /**
  * A minimal encoder, test-only.
@@ -180,4 +180,69 @@ test('truncated input fails loudly instead of returning junk', () => {
   // A fixstr header claiming five bytes, with only two present.
   assert.throws(() => decode(Buffer.from([0xa5, 0x61, 0x62])), /truncated/);
   assert.throws(() => decode(Buffer.from([0xc1])), /never valid/);
+});
+
+// ---- encoder ---------------------------------------------------------------
+//
+// `enc()` above stays because it can build *extension* fixtures, which the
+// library's encoder deliberately cannot. These tests cover the real `encode`,
+// which exists so `DirectCollector` can speak the handshake.
+
+test('encode round-trips every value the handshake contains', () => {
+  const cases = [
+    null,
+    true,
+    false,
+    0,
+    42,
+    -17,
+    70000,
+    1786019052906, // a real millisecond timestamp: past 2^32, so the int64 path
+    1.5,
+    'hi',
+    'x'.repeat(200),
+    { type: 'Heartbeat', timestamp: 1786019052906, origin: 'Client' },
+    { type: 'Subscribe' },
+    { type: 'ConnectToSpace', spaceId: '11111111-1111-4111-8111-111111111111' },
+    {
+      type: 'Action',
+      txnId: 'd1d83e68-7650-4e59-8ff4-0522bc2bd38e',
+      action: 'loadSpaceUser',
+      args: ['SpaceUser', null, { connectionTarget: 'OfficeView', clientPlatform: 'Desktop' }],
+    },
+  ];
+  for (const value of cases) {
+    assert.deepEqual(decode(encode(value)), value, `round-trip failed for ${JSON.stringify(value)}`);
+  }
+});
+
+test('encode survives a token-sized string', () => {
+  // The Authenticate frame carries a ~1 KB JWT. Picking a string header too small
+  // would truncate it, and Gather answers a malformed frame with silence rather
+  // than an error — so this is the one length that must not be got wrong.
+  const jwt = `ey${'a'.repeat(1500)}`;
+  assert.equal(decode(encode({ credential: { type: 'JWT', jwt } })).credential.jwt, jwt);
+});
+
+test('encode drops undefined members rather than sending nil', () => {
+  // An absent optional field and an explicit null are different to Gather, and
+  // the handshake relies on being able to omit.
+  assert.deepEqual(decode(encode({ a: 1, b: undefined })), { a: 1 });
+  assert.deepEqual(decode(encode({ a: null })), { a: null });
+});
+
+test('encode refuses what it cannot faithfully represent', () => {
+  // A Date or Map has no enumerable own keys, so encoding it as a map would emit
+  // an empty object and Gather would ignore the frame without complaint. Failing
+  // loudly here is the whole point.
+  for (const bad of [new Date(), new Map([['a', 1]]), new Set([1]), Buffer.from('x'), 1n]) {
+    assert.throws(() => encode(bad), /msgpack encode/, `should have refused ${typeof bad}`);
+  }
+});
+
+test('encode handles maps and arrays past the fixed-width headers', () => {
+  const wide = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, i]));
+  assert.deepEqual(decode(encode(wide)), wide);
+  const long = Array.from({ length: 300 }, (_, i) => i);
+  assert.deepEqual(decode(encode(long)), long);
 });

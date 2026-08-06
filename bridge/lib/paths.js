@@ -35,6 +35,22 @@ export const gatherConfigFile = join(
   'config.json',
 );
 
+/**
+ * Where the client's renderer persists its Firebase session.
+ *
+ * `gather-auth.js` reads a refresh token out of here once, to adopt the signed-in
+ * session instead of running its own login. Read-only, and only ever read while
+ * the direct collector is being set up.
+ */
+export const gatherIdbDir = join(
+  homedir(),
+  'Library',
+  'Application Support',
+  'GatherV2',
+  'IndexedDB',
+  'https_app.v2.gather.town_0.indexeddb.leveldb',
+);
+
 export function readConfig() {
   try {
     const j = JSON.parse(readFileSync(configFile, 'utf8'));

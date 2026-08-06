@@ -35,9 +35,19 @@ rather than evidence that the code matches its own assumptions.
 - `bridge.test.js` uses a temp directory and a fixed test token, and drives the
   server over the loopback interface. It is a real integration test — if it gets
   slow or flaky, fix the cause rather than mocking the transport.
-- `msgpack.test.js`'s `enc()` helper is deliberately test-only. Do not promote it
-  into `lib/` — the bridge never writes to Gather's socket, and an encoder in the
-  shipped tree would invite someone to.
+- `msgpack.test.js`'s `enc()` helper is still test-only, but the reason has
+  narrowed. `lib/msgpack.js` now exports a real `encode`, because `DirectCollector`
+  does write to Gather's socket. `enc()` survives only because it can build
+  *extension-type* fixtures, which the library encoder deliberately refuses. Test
+  the library `encode` for anything the bridge actually sends.
+- **Tests must never leave the machine.** `bridge.test.js` passes `direct: false`
+  so the server cannot pick the direct collector and start authenticating to
+  Gather; `direct.test.js` injects `getToken` and points at a local fake game
+  server. A test whose result depends on whether the developer has run `adopt` is
+  broken, however green it looks.
+- `direct.test.js` hand-rolls its WebSocket framing on purpose: `lib/ws.js`
+  surfaces only *text* frames, since it exists to serve JSON to phones, and the
+  game protocol is binary. Do not add binary support to `ws.js` for tests' sake.
 
 ### Testing Requirements
 
