@@ -28,7 +28,10 @@ class GatherCredentialStore {
                 // backups and off any other device restored from one.
                 accessibility: KeychainAccessibility.first_unlock_this_device,
               ),
-              aOptions: AndroidOptions(encryptedSharedPreferences: true),
+              // No `encryptedSharedPreferences` flag any more: since 10.x the Android
+              // implementation always encrypts (AES-GCM with RSA-OAEP key wrapping),
+              // so the option that used to opt into it has gone.
+              aOptions: AndroidOptions(),
             );
 
   final FlutterSecureStorage _storage;

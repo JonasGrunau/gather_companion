@@ -36,7 +36,14 @@ Bundle id `com.jonasgrunau.gatherCompanion`, team `JQ4STVWTQ3`, minimum iOS 15.5
 ### Working In This Directory
 
 - **Swift Package Manager, not CocoaPods.** `mobile_scanner` 7.x is a Swift
-  package. There is no `Podfile` and re-adding the CocoaPods integration breaks
+  package, and every other plugin here was chosen or pinned to keep it that way —
+  `flutter_secure_storage` is on 11.x specifically because 9.x has no SPM support
+  and adding it silently reintroduces a `Podfile`, a `Pods` project and Pods
+  wiring in `project.pbxproj`. If pods ever come back and are then removed again,
+  run `flutter clean`: the generated plugin package keeps a stale
+  `platforms: [.iOS("13.0")]` from the pods round-trip and Firebase's SPM products
+  demand 15.0, which fails the archive with a confusing version error.
+  There is no `Podfile` and re-adding the CocoaPods integration breaks
   the build with a misleading *"missing expected TARGET_BUILD_DIR"*. Version 7
   also dropped GoogleMLKit, which had no arm64 simulator slices — on 6.x the app
   could not run on an arm64 simulator at all.
