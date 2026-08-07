@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:gather_client/gather_client.dart';
+
 import 'settings.dart';
 
 /// What the bridge draws on the terminal, as read by the camera or typed in.
@@ -81,12 +83,31 @@ sealed class PairResult {
 }
 
 class PairSuccess extends PairResult {
-  const PairSuccess(this.settings, this.name);
+  const PairSuccess(
+    this.settings,
+    this.name, {
+    this.gather = GatherCredentials.empty,
+    this.spaceId,
+  });
 
   final BridgeSettings settings;
 
   /// What the computer calls itself, for the "paired with…" line.
   final String name;
+
+  /// The Gather session the bridge adopted, handed over so the phone can read
+  /// presence itself rather than through the computer.
+  ///
+  /// Empty when the bridge has no session of its own — which is a real outcome
+  /// worth reporting rather than a failure, because everything else about pairing
+  /// worked and the fix is one command on the Mac.
+  final GatherCredentials gather;
+
+  /// Which space to watch first. The collector re-resolves this itself afterwards.
+  final String? spaceId;
+
+  /// Whether this phone can now talk to Gather on its own.
+  bool get canReachGather => gather.isComplete;
 }
 
 class PairFailure extends PairResult {
@@ -129,6 +150,17 @@ Future<PairResult> claimPairing({
     }
 
     if (response.statusCode == 200 && parsed['token'] is String) {
+      // The bridge hands over its own Gather session alongside its token. A bridge
+      // older than this app build sends no `gather` key at all, which reads as "no
+      // session" — the app then says so instead of silently never connecting.
+      final gather = parsed['gather'];
+      final session = gather is Map
+          ? GatherCredentials(
+              refreshToken: gather['refreshToken'] as String? ?? '',
+              uid: gather['uid'] as String?,
+            )
+          : GatherCredentials.empty;
+
       return PairSuccess(
         BridgeSettings(
           host: host,
@@ -138,6 +170,8 @@ Future<PairResult> claimPairing({
           token: parsed['token'] as String,
         ),
         (parsed['name'] as String?) ?? host,
+        gather: session,
+        spaceId: gather is Map ? gather['spaceId'] as String? : null,
       );
     }
 

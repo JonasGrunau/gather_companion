@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_companion/src/app_state.dart';
-import 'package:gather_companion/src/bridge_client.dart';
+import 'package:gather_companion/src/event_log.dart';
+import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/feed_screen.dart';
 import 'package:gather_events/gather_events.dart';
@@ -23,7 +24,7 @@ void main() {
       );
 
   /// A state that believes it is connected, which is the normal case.
-  AppState connected(PresenceSnapshot snapshot) => AppState()
+  AppState connected(PresenceSnapshot snapshot) => AppState(eventLog: EventLogStore.disabled())
     ..debugApplyLink(const LinkStatus(LinkState.live))
     ..debugApplySnapshot(snapshot);
 
@@ -46,7 +47,7 @@ void main() {
   testWidgets('a quiet feed with no link says "not connected", not "all quiet"', (tester) async {
     // The difference matters: silence because nothing happened is reassuring,
     // silence because the bridge is unreachable is not.
-    final state = AppState()..debugApplySnapshot(snapshotWith(const []));
+    final state = AppState(eventLog: EventLogStore.disabled())..debugApplySnapshot(snapshotWith(const []));
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
@@ -228,7 +229,7 @@ void main() {
     // Regression: `reconnect()` used to return void, so the pull-to-refresh
     // future completed on the next microtask and the indicator snapped shut
     // within a frame or two of appearing — a twitch rather than a refresh.
-    final state = AppState();
+    final state = AppState(eventLog: EventLogStore.disabled());
     final watch = Stopwatch()..start();
     await state.reconnect();
     watch.stop();

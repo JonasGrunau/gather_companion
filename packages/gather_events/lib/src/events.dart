@@ -158,6 +158,7 @@ sealed class GatherEvent {
           notificationType: json['notificationType'] as String? ?? 'unknown',
           title: json['title'] as String?,
           body: json['body'] as String?,
+          senderId: json['senderId'] as String?,
         ),
       'bridge.status' => BridgeStatusEvent(
           at: at,
@@ -423,14 +424,27 @@ class NotificationShownEvent extends GatherEvent {
     required this.notificationType,
     this.title,
     this.body,
+    this.senderId,
   });
 
   final String notificationType;
   final String? title;
   final String? body;
 
+  /// Who did it, for the kinds that come off Gather's own event bus.
+  ///
+  /// A wave read from `DeltaState.events[]` carries `payload.senderId`, so it can
+  /// be attributed to a person. The same wave scraped from the desktop client's log
+  /// cannot — the IPC line has only a type — which is why this is nullable and why
+  /// the wording falls back to "Someone" without it.
+  final String? senderId;
+
   @override
   String get type => 'notification.shown';
+
+  /// The sender, so the feed can label a wave with a name like any other event.
+  @override
+  String? get playerId => senderId;
 
   @override
   String get summary => title == null
@@ -442,6 +456,7 @@ class NotificationShownEvent extends GatherEvent {
         'notificationType': notificationType,
         'title': title,
         'body': body,
+        'senderId': senderId,
       };
 }
 

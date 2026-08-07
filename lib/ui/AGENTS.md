@@ -31,7 +31,7 @@ needed to be shared twice yet.
 - **`_PartyCard` renders the snapshot, never its own memory.** The bridge stops
   party mode by itself — on its 15-minute timer, when it loses Gather, when the
   daemon exits — so a button holding local state would keep glowing through all
-  three. `AppState.partyMode` overrides the snapshot only while a tap is in
+  three. `AppState.partyMode` now reads the local party mode directly, so a tap is
   flight, and that override is cleared by the snapshot that agrees with it rather
   than by the HTTP response, because the two race.
 - **The gradient animates only while it is actually hopping.** This is the one
@@ -87,7 +87,7 @@ Wrap screens in the real theme (`buildGatherTheme()`) in tests; the widgets read
 ### Internal
 
 `../src/app_state.dart`, `../src/relevance.dart`, `../src/pairing.dart`,
-`../src/bridge_client.dart`, `../theme/gather_theme.dart`,
+`../src/link_status.dart`, `../theme/gather_theme.dart`,
 `package:gather_events`.
 
 ### External

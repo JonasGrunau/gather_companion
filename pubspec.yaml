@@ -11,6 +11,11 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
   flutter_local_notifications: ^19.0.0
+  # The user's whole Gather identity now lives on the phone, so it goes in the
+  # keychain rather than in a preferences plist that device backups include.
+  flutter_secure_storage: ^9.2.4
+  gather_client:
+    path: packages/gather_client
   gather_events:
     path: packages/gather_events
   mobile_scanner: ^7.4.0

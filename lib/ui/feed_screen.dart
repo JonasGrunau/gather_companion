@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:gather_events/gather_events.dart';
 
 import '../src/app_state.dart';
-import '../src/bridge_client.dart';
+import '../src/link_status.dart';
 import '../src/relevance.dart';
 import '../theme/gather_theme.dart';
 
@@ -269,11 +269,15 @@ class _LinkStripBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final (text, tint) = switch (status.state) {
-      LinkState.connecting => ('Connecting to the bridge…', t.warn),
-      LinkState.retrying => ('Reconnecting…', t.danger),
-      _ => ('Not connected', t.faint),
-    };
+    // A dead credential is the one state here that asks the user to *do* something,
+    // so it gets sentence and loses the spinner. Everything else is us working on it.
+    final (text, tint) = status.needsPairing
+        ? ('Gather signed this device out — pair again', t.danger)
+        : switch (status.state) {
+            LinkState.connecting => ('Connecting to Gather…', t.warn),
+            LinkState.retrying => ('Reconnecting to Gather…', t.danger),
+            _ => ('Not connected', t.faint),
+          };
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(kGutter, 0, kGutter, 8),
@@ -285,11 +289,14 @@ class _LinkStripBody extends StatelessWidget {
       ),
       child: Row(
         children: [
-          SizedBox(
-            width: 12,
-            height: 12,
-            child: CircularProgressIndicator(strokeWidth: 1.6, color: tint),
-          ),
+          if (!status.needsPairing)
+            SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 1.6, color: tint),
+            )
+          else
+            Icon(Icons.link_off_rounded, size: 13, color: tint),
           const SizedBox(width: 10),
           Expanded(
             child: Text(

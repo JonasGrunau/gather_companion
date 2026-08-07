@@ -1,0 +1,15 @@
+name: gather_client
+description: Gather V2's game protocol, spoken directly — msgpack, the game socket, and the presence fold.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.12.0
+
+dependencies:
+  gather_events:
+    path: ../gather_events
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.6

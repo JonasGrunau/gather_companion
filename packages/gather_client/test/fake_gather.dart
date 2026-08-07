@@ -1,0 +1,273 @@
+/// A fake Gather game server, the Dart counterpart of `bridge/test/fake-gather.js`.
+///
+/// A real `HttpServer` doing a real WebSocket upgrade, so [DirectCollector] runs its
+/// production socket path — `WebSocket.connect`, binary frames, close codes and all.
+/// Mocking the socket would leave the one part most likely to be wrong untested.
+///
+/// It speaks just enough of the protocol to be worth testing against: the handshake
+/// is recorded verbatim so assertions can check what the collector sent, and state
+/// is only dumped for a connection that actually authenticated — because Gather's
+/// distinguishing behaviour is that it stays *silent* on a bad handshake rather
+/// than rejecting it.
+library;
+
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:gather_client/gather_client.dart';
+
+/// The default dump: me, and one other person.
+List<Map<String, Object?>> defaultPatches() => [
+      {
+        'op': 'addmodel',
+        'model': 'Connection',
+        'data': {
+          'id': 'conn-1',
+          'spaceId': 'space-1',
+          'authUserId': 'uid-1',
+          'spaceUserId': 'me-1',
+          'entered': false,
+          'target': 'OfficeView',
+        },
+      },
+      {
+        'op': 'addmodel',
+        'model': 'Space',
+        'data': {'id': 'space-1', 'name': 'Test Space'},
+      },
+      {
+        'op': 'addmodel',
+        'model': 'SpaceUser',
+        'data': {
+          'id': 'me-1',
+          'name': 'Me',
+          'position': {r'$type': 'Position', 'x': 10, 'y': 10},
+          'floorId': 'floor-1',
+          'connected': true,
+          'isBot': false,
+        },
+      },
+      {
+        'op': 'addmodel',
+        'model': 'SpaceUser',
+        'data': {
+          'id': 'them-1',
+          'name': 'Neighbour',
+          'position': {r'$type': 'Position', 'x': 11, 'y': 10},
+          'floorId': 'floor-1',
+          'connected': true,
+          'isBot': false,
+        },
+      },
+    ];
+
+/// One `WaveEvent`, shaped exactly as captured from a live space on 2026-08-07.
+///
+/// The two halves live in different places on purpose, because they do in the real
+/// envelope: who waved is `payload.senderId`, who they waved *at* is
+/// `options.targetUserIds`.
+Map<String, Object?> waveEvent({
+  String senderId = 'them-1',
+  String targetId = 'me-1',
+  String sentTime = '2026-08-07T14:22:20.563Z',
+}) =>
+    {
+      'payload': {'eventName': 'WaveEvent', 'senderId': senderId, 'sentTime': sentTime},
+      'options': {
+        'targetUserIds': [targetId],
+      },
+    };
+
+class FakeConnection {
+  FakeConnection(this.socket, this.url);
+
+  final WebSocket socket;
+  final String url;
+
+  /// Every frame the client sent, decoded.
+  final List<Map<String, Object?>> received = [];
+  bool authenticated = false;
+  bool dumped = false;
+
+  void send(Map<String, Object?> frame) {
+    if (socket.readyState == WebSocket.open) socket.add(msgpackEncode(frame));
+  }
+
+  /// Push a delta after the dump, the way the real server does.
+  void delta(List<Map<String, Object?>> patches) =>
+      send({'type': 'DeltaState', 'sequenceNumber': 2, 'patches': patches});
+
+  /// Push interaction events onto Gather's event bus.
+  ///
+  /// A real wave arrives in a `DeltaState` whose `patches` array is **empty** —
+  /// which is why the bus went unread for so long, and so exactly what a test needs.
+  void bus(List<Map<String, Object?>> events) => send({
+        'type': 'DeltaState',
+        'sequenceNumber': 3,
+        'patches': <Object?>[],
+        'actionReturns': <Object?>[],
+        'events': events,
+      });
+}
+
+class FakeGatherServer {
+  FakeGatherServer._(this._server, this.url);
+
+  final HttpServer _server;
+
+  /// `ws://127.0.0.1:<port>` — pass straight to [DirectCollector.socketUrl].
+  final String url;
+
+  final List<FakeConnection> connections = [];
+  final _connected = StreamController<FakeConnection>.broadcast();
+
+  /// Fires as each client finishes its handshake and gets its dump.
+  Stream<FakeConnection> get onDumped => _connected.stream;
+
+  FakeConnection? get latest => connections.isEmpty ? null : connections.last;
+
+  static Future<FakeGatherServer> start({
+    bool requireAuth = true,
+    List<Map<String, Object?>> Function()? patches,
+  }) async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final fake = FakeGatherServer._(server, 'ws://127.0.0.1:${server.port}');
+
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      final conn = FakeConnection(socket, request.uri.toString());
+      fake.connections.add(conn);
+
+      // The real server heartbeats before the first state chunk, which is what makes
+      // a premature "handshake rejected" verdict so tempting.
+      conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+
+      socket.listen((data) {
+        if (data is! List<int>) return;
+        final Object? decoded;
+        try {
+          decoded = msgpackDecode(Uint8List.fromList(data));
+        } on Object {
+          return;
+        }
+        if (decoded is! Map<String, Object?>) return;
+        conn.received.add(decoded);
+
+        if (decoded['type'] == 'Authenticate') {
+          final credential = decoded['credential'];
+          conn.authenticated = credential is Map &&
+              credential['type'] == 'JWT' &&
+              (credential['jwt'] as String?)?.isNotEmpty == true;
+        }
+        if (decoded['action'] == 'loadSpaceUser') {
+          // Stay silent when unauthenticated, as Gather does.
+          if (requireAuth && !conn.authenticated) return;
+          conn.send({'type': 'SpaceStatus', 'warmInGatewayServer': true});
+          conn.send({
+            'type': 'FullStateChunk',
+            'sequenceNumber': 1,
+            'fullStatePatches': (patches ?? defaultPatches)(),
+          });
+          conn.dumped = true;
+          if (!fake._connected.isClosed) fake._connected.add(conn);
+        }
+      }, onError: (Object _) {});
+    });
+
+    return fake;
+  }
+
+  Future<void> close() async {
+    for (final c in connections) {
+      try {
+        await c.socket.close();
+      } on Object {
+        /* gone */
+      }
+    }
+    await _connected.close();
+    await _server.close(force: true);
+  }
+}
+
+/// A syntactically valid JWT carrying a chosen uid.
+///
+/// The collector reads the uid straight out of the token, so this also keeps tests
+/// from depending on whatever session the developer happens to have paired.
+String fakeJwt({String uid = 'uid-1', Duration validFor = const Duration(hours: 1)}) {
+  final exp = DateTime.now().add(validFor).millisecondsSinceEpoch ~/ 1000;
+  final claims = _b64({'user_id': uid, 'exp': exp});
+  return 'eyJhbGciOiJub25lIn0.$claims.sig';
+}
+
+String _b64(Map<String, Object?> claims) {
+  final json = claims.entries
+      .map((e) => '"${e.key}":${e.value is String ? '"${e.value}"' : e.value}')
+      .join(',');
+  return base64UrlNoPad('{$json}');
+}
+
+String base64UrlNoPad(String text) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  final bytes = text.codeUnits;
+  final out = StringBuffer();
+  for (var i = 0; i < bytes.length; i += 3) {
+    final b0 = bytes[i];
+    final b1 = i + 1 < bytes.length ? bytes[i + 1] : null;
+    final b2 = i + 2 < bytes.length ? bytes[i + 2] : null;
+    out.write(chars[b0 >> 2]);
+    out.write(chars[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]);
+    if (b1 != null) out.write(chars[((b1 & 0x0f) << 2) | ((b2 ?? 0) >> 6)]);
+    if (b2 != null) out.write(chars[b2 & 0x3f]);
+  }
+  return out.toString();
+}
+
+/// A [GatherHttp] that never touches the network.
+///
+/// A suite that reached Google would be slow, flaky, and would burn the developer's
+/// real session.
+class FakeGatherHttp implements GatherHttp {
+  FakeGatherHttp({
+    this.idToken,
+    this.status = 200,
+    this.errorCode,
+    this.spaces = const {},
+  });
+
+  String? idToken;
+  int status;
+  String? errorCode;
+  Map<String, Object?> spaces;
+
+  int refreshes = 0;
+
+  @override
+  Future<({int status, Map<String, Object?> body})> postForm(
+    Uri uri,
+    Map<String, String> fields,
+  ) async {
+    refreshes++;
+    if (status != 200) {
+      return (
+        status: status,
+        body: {
+          'error': {'message': errorCode ?? 'SOMETHING_ELSE'},
+        },
+      );
+    }
+    return (
+      status: 200,
+      body: {
+        'id_token': idToken ?? fakeJwt(),
+        'refresh_token': fields['refresh_token'],
+        'user_id': 'uid-1',
+      },
+    );
+  }
+
+  @override
+  Future<({int status, Object? body})> getJson(Uri uri, String bearer) async =>
+      (status: 200, body: spaces);
+}

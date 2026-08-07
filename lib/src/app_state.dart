@@ -1,9 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
-import 'bridge_client.dart';
+import 'credentials.dart';
+import 'event_log.dart';
+import 'link_status.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
@@ -12,21 +15,54 @@ import 'settings.dart';
 
 /// Everything the UI reads. One object, so the whole app is a single
 /// `ListenableBuilder` away from being correct.
+///
+/// ## What changed, and why it is simpler
+///
+/// This used to hold a `BridgeClient` — a WebSocket to a computer on the same wifi,
+/// with sequence-based catch-up, ping-driven liveness and a generation counter to
+/// stop overlapping resumes from orphaning sockets. All of that existed because the
+/// phone could not talk to Gather.
+///
+/// It can. So the socket is now to Gather itself, and the bridge is left with two
+/// jobs: handing over the credential at pairing, and pushing when this app is not
+/// running. Three consequences worth knowing:
+///
+///  * **The computer can be asleep.** Presence works on cellular, from anywhere.
+///  * **Party mode is instant.** It runs here, against a socket we already hold, so
+///    the optimistic-UI dance that hid a LAN round trip is gone entirely.
+///  * **The feed is ours.** There is no 500-event ring on the bridge to replay, so
+///    [EventLogStore] keeps one on the phone. Activity while the app was closed is
+///    gone unless a push recorded it.
 class AppState extends ChangeNotifier {
-  // A named parameter cannot be a private initializing formal, so the field is
-  // assigned the long way round — same as `BridgeClient`.
-  AppState({Notifier? notifier, PushRegistrar? push})
-      : _notifier = notifier ?? Notifier(),
+  // A named parameter cannot be a private initializing formal, so the fields are
+  // assigned the long way round.
+  AppState({
+    Notifier? notifier,
+    PushRegistrar? push,
+    GatherCredentialStore? credentials,
+    EventLogStore? eventLog,
+    // Test seam: lets a suite drive a fake Gather without a network.
+    DirectCollector Function(GatherAuth auth, String? spaceId)? buildCollector,
+  })  : _notifier = notifier ?? Notifier(),
         // ignore: prefer_initializing_formals
-        _push = push;
+        _push = push,
+        _credentialStore = credentials ?? GatherCredentialStore(),
+        _eventLog = eventLog ?? EventLogStore(),
+        _buildCollector = buildCollector ?? _realCollector;
+
+  static DirectCollector _realCollector(GatherAuth auth, String? spaceId) =>
+      DirectCollector(auth: auth, spaceId: spaceId);
 
   final Notifier _notifier;
   Notifier get notifier => _notifier;
 
+  final GatherCredentialStore _credentialStore;
+  final EventLogStore _eventLog;
+  final DirectCollector Function(GatherAuth auth, String? spaceId) _buildCollector;
+
   /// Built lazily and never eagerly: `FirebaseMessaging.instance` throws when
-  /// Firebase was not initialised, which is the normal state in widget tests and
-  /// on a build without a `GoogleService-Info.plist`. Push is an enhancement, so
-  /// its absence has to be survivable rather than fatal.
+  /// Firebase was not initialised, which is the normal state in widget tests and on a
+  /// build without a `GoogleService-Info.plist`.
   PushRegistrar? _push;
   StreamSubscription<String>? _pushRefresh;
 
@@ -38,96 +74,77 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  BridgeClient? _client;
+  // ---- the Gather connection -------------------------------------------------
+
+  DirectCollector? _collector;
+  PartyMode? _party;
+  final PresenceTracker _tracker = PresenceTracker();
   final _subs = <StreamSubscription<dynamic>>[];
 
+  /// Where the bridge is, for push registration only. Nothing renders from it.
+  BridgeSettings _settings = BridgeSettings.empty;
+  GatherCredentials _credentials = GatherCredentials.empty;
+  String? _spaceId;
+
   /// Newest first, so the list view needs no reversing.
-  final List<GatherEvent> _log = [];
+  List<GatherEvent> _log = [];
   static const _logLimit = 1000;
 
-  BridgeSettings _settings = BridgeSettings.empty;
   PresenceSnapshot _snapshot = PresenceSnapshot.empty;
   LinkStatus _link = const LinkStatus(LinkState.idle);
   bool _loaded = false;
-
-  /// Whether the first history fetch is still outstanding.
-  ///
-  /// Starts true — a state that never attaches (tests, an unpaired app) has
-  /// nothing to wait for. [_attach] clears it, and priming sets it again, so the
-  /// feed can hold back its "nothing here" card for the moment between opening
-  /// the app and the backlog landing. Without that, opening onto a busy room
-  /// showed "No activity yet" and then yanked it away.
-  bool _primed = true;
-
-  /// Whether the ambient tier is on screen. Off by default: the point of the feed
-  /// is the handful of things worth reading.
   bool _showEverything = false;
-
   String? _bridgeName;
 
   BridgeSettings get settings => _settings;
   PresenceSnapshot get snapshot => _snapshot;
   LinkStatus get link => _link;
-  bool get isConfigured => _settings.isComplete;
   bool get isLoaded => _loaded;
   bool get showEverything => _showEverything;
-
-  /// True while the backlog is still on its way and there is nothing to show yet.
-  bool get isPriming => !_primed && _log.isEmpty;
   String? get bridgeName => _bridgeName;
+
+  /// Whether this phone can read Gather on its own.
+  ///
+  /// The Gather credential, not the bridge token, because that is what the feed needs.
+  /// A pairing that produced no session leaves the app here, which is correct: the fix
+  /// is one command on the Mac, and pretending otherwise would show an empty feed
+  /// with no explanation.
+  bool get isConfigured => _credentials.isComplete;
+
+  /// Whether the bridge can wake this phone while the app is closed.
+  ///
+  /// Independent of [isConfigured] on purpose: presence works without it, and losing
+  /// push is a degradation rather than a failure.
+  bool get canBeWoken => _settings.isComplete;
+
+  /// True while the persisted feed is still being read off disk.
+  bool _primed = true;
+  bool get isPriming => !_primed && _log.isEmpty;
 
   /// Who is following me — the only thing this app claims to know about anyone.
   ///
-  /// Sorted by name so the chips keep their places between snapshots. Roster
-  /// order is Gather's own map iteration and shuffles for reasons that have
-  /// nothing to do with people, which reads as flicker.
+  /// Sorted by name so the chips keep their places between snapshots. Roster order is
+  /// Gather's own map iteration and shuffles for reasons that have nothing to do with
+  /// people, which reads as flicker.
   List<PlayerRef> get followers {
     final list = _snapshot.players.where((p) => p.isFollowingMe).toList()
       ..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return list;
   }
 
-  /// Whether the bridge currently has the high-fidelity collector attached. Shown
+  /// Whether we are holding real state, as opposed to merely being connected. Shown
   /// in the UI, because it changes what a quiet screen means.
   bool get hasRichData => _snapshot.health.hasRichData;
 
-  /// Party mode as the bridge last reported it.
   PartyState get party => _snapshot.party;
 
-  /// What the button should show: what we asked for while that is still in
-  /// flight, and the truth the rest of the time.
-  ///
-  /// A round trip to the computer takes long enough that a button waiting for it
-  /// feels broken, and party mode is a toy — it has to answer the tap instantly.
-  /// [_partyWanted] is cleared by the snapshot that agrees with it rather than by
-  /// the HTTP response, because the two race and the snapshot is the one that is
-  /// actually true.
-  bool get partyMode => _partyWanted ?? _snapshot.party.active;
+  /// Party mode runs in this process now, so what it says is what is true — no
+  /// optimistic override, and nothing to reconcile against a later snapshot.
+  bool get partyMode => _snapshot.party.active;
+  bool get partyPending => false;
 
-  /// Whether a toggle is still on its way to the bridge.
-  bool get partyPending => _partyWanted != null;
+  // ---- feed classification ---------------------------------------------------
 
-  bool? _partyWanted;
-
-  /// Gives up on waiting for a snapshot to confirm the toggle.
-  ///
-  /// [_partyWanted] is normally cleared by the snapshot that agrees with it, which
-  /// arrives in well under a second. If the socket dies in the gap between the
-  /// command landing and that snapshot, no such snapshot is ever coming — and the
-  /// switch would sit there lit, pending for ever, asserting a state nothing has
-  /// confirmed. Falling back to the truth is better than showing a wish.
-  Timer? _partyWantedTimer;
-
-  /// The classified feed, rebuilt only when something it depends on changes.
-  ///
-  /// This used to classify every event in the log — up to [_logLimit] of them —
-  /// on *every* rebuild, and [hiddenCount] then did a second full pass. Since the
-  /// whole app hangs off one `ListenableBuilder`, that ran again for every socket
-  /// frame, every status tick and every frame of the refresh indicator, which is
-  /// what made a busy room stutter. The cache is invalidated by anything that can
-  /// change the outcome, including a new snapshot: names are resolved during
-  /// classification, so an event logged before its player was known still gets
-  /// its label filled in the moment the roster arrives.
   List<({GatherEvent event, EventLook look})>? _feed;
   int _hidden = 0;
 
@@ -153,30 +170,33 @@ class AppState extends ChangeNotifier {
     return _feed!;
   }
 
-  /// How many ambient events are being held back, so the toggle can say so.
   int get hiddenCount {
     if (_feed == null) _classify();
     return _hidden;
   }
 
-  /// Development shortcut past the scanner: `--dart-define=GATHER_PAIR=host:port:token`.
+  /// Development shortcut past the scanner:
+  /// `--dart-define=GATHER_PAIR=host:port:token:refreshToken`.
   ///
-  /// The simulator has no camera, so without this there is no way to reach the
-  /// feed while working on it. Empty in any normal build.
+  /// The simulator has no camera, so without this there is no way to reach the feed
+  /// while working on it. Empty in any normal build.
   static const _devPair = String.fromEnvironment('GATHER_PAIR');
 
   Future<void> boot() async {
     _settings = await BridgeSettings.load();
     _bridgeName = await BridgeSettings.loadName();
+    _credentials = await _credentialStore.load();
+    _spaceId = await _credentialStore.loadSpaceId();
 
-    if (!_settings.isComplete && _devPair.isNotEmpty) {
+    if (!_credentials.isComplete && _devPair.isNotEmpty) {
       final parts = _devPair.split(':');
-      if (parts.length == 3) {
+      if (parts.length >= 4) {
         _settings = BridgeSettings(
           host: parts[0],
           port: int.tryParse(parts[1]) ?? BridgeSettings.defaultPort,
           token: parts[2],
         );
+        _credentials = GatherCredentials(refreshToken: parts[3]);
         _bridgeName = 'dev · ${parts[0]}';
       }
     }
@@ -184,22 +204,64 @@ class AppState extends ChangeNotifier {
     _loaded = true;
     await _notifier.init();
     notifyListeners();
-    if (_settings.isComplete) _attach();
+
+    if (_credentials.isComplete) {
+      _attach();
+      unawaited(_loadPersistedFeed());
+    }
   }
 
-  /// Trades a scanned or typed pairing code for the bridge's token.
+  /// Fills the feed from disk, so opening the app does not show an empty screen.
+  Future<void> _loadPersistedFeed() async {
+    _primed = false;
+    final stored = await _eventLog.load();
+    if (stored.isEmpty) {
+      _primed = true;
+      notifyListeners();
+      return;
+    }
+    // Anything the live connection already produced stays on top.
+    final seen = _log.map((e) => '${e.type}@${e.at.toIso8601String()}').toSet();
+    _log = [
+      ..._log,
+      ...stored.where((e) => !seen.contains('${e.type}@${e.at.toIso8601String()}')),
+    ];
+    if (_log.length > _logLimit) _log = _log.sublist(0, _logLimit);
+    _primed = true;
+    _invalidateFeed();
+    notifyListeners();
+  }
+
+  /// Trades a scanned or typed pairing code for both credentials.
+  ///
+  /// Returns null when it took, or a sentence to put in front of the user.
   Future<String?> pair({required String host, required int port, required String code}) async {
     final result = await claimPairing(host: host, port: port, code: code);
     switch (result) {
       case PairFailure(:final message):
         return message;
-      case PairSuccess(:final settings, :final name):
+      case PairSuccess(:final settings, :final name, :final gather, :final spaceId):
         _settings = settings;
         _bridgeName = name;
         await settings.save();
         await BridgeSettings.saveName(name);
+
+        if (!gather.isComplete) {
+          // Pairing worked; the bridge simply has no Gather session to give. Say so
+          // rather than landing on a feed that can never fill.
+          notifyListeners();
+          return 'Paired with $name, but it has no Gather session yet. '
+              'Run `npx gather-app-bridge adopt` on the computer, then pair again.';
+        }
+
+        _credentials = gather;
+        _spaceId = spaceId;
+        await _credentialStore.save(gather);
+        await _credentialStore.saveSpaceId(spaceId);
+
         await _notifier.requestPermission();
-        _log.clear();
+        _log = [];
+        await _eventLog.clear();
         _snapshot = PresenceSnapshot.empty;
         _invalidateFeed();
         notifyListeners();
@@ -210,60 +272,53 @@ class AppState extends ChangeNotifier {
 
   Future<void> unpair() async {
     await BridgeSettings.clear();
+    await _credentialStore.clear();
+    await _eventLog.clear();
     _settings = BridgeSettings.empty;
+    _credentials = GatherCredentials.empty;
+    _spaceId = null;
     _bridgeName = null;
     _snapshot = PresenceSnapshot.empty;
-    _partyWantedTimer?.cancel();
-    _partyWantedTimer = null;
-    _partyWanted = null;
-    _log.clear();
+    _log = [];
     _invalidateFeed();
-    _detach();
+    await _detach();
+    _link = const LinkStatus(LinkState.idle);
     notifyListeners();
   }
 
-  /// Asks the bridge to start or stop teleporting me around the map.
+  /// Starts or stops teleporting my avatar around the map.
   ///
-  /// Returns null when it took, or a sentence to put in front of the user. The
-  /// bridge refuses rather than pretending when it has no Gather connection, so
-  /// the failure is worth showing rather than swallowing.
+  /// Synchronous in everything but signature: party mode runs in this process against
+  /// a socket already open, so there is nothing to wait for and nothing to be
+  /// optimistic about. The `Future` stays so the call sites do not have to change.
   Future<String?> setPartyMode(bool on) async {
-    final client = _client;
-    if (client == null) return 'Not connected to the bridge.';
+    final party = _party;
+    if (party == null) return 'Not connected to Gather.';
 
-    _partyWanted = on;
-    _partyWantedTimer?.cancel();
-    _partyWantedTimer = Timer(const Duration(seconds: 6), () {
-      if (_partyWanted == null) return;
-      _partyWanted = null;
-      notifyListeners();
-    });
-    notifyListeners();
-
-    final error = await client.setParty(on);
-    if (error != null) {
-      // Snap back: nothing changed on the other end, so the button must not go
-      // on claiming otherwise while it waits for a snapshot that will not come.
-      _clearPartyWanted();
+    if (!on) {
+      _onPartyChanged(party.stop('switched off'));
+      return null;
     }
-    return error;
+    final result = party.start();
+    _onPartyChanged(result.state);
+    return result.ok ? null : (result.state.detail ?? 'Party mode could not start.');
   }
 
-  void _clearPartyWanted() {
-    _partyWantedTimer?.cancel();
-    _partyWantedTimer = null;
-    if (_partyWanted == null) return;
-    _partyWanted = null;
-    notifyListeners();
-  }
-
-  /// Confirms the link is really up, and reconnects only if it is not.
+  /// Confirms the connection is really up, and reconnects only if it is not.
   ///
-  /// What iOS resume calls. See [BridgeClient.verify] for why this is not just a
-  /// reconnect.
+  /// What iOS resume calls. A suspended app's socket dies without an error, so the
+  /// held connection may be a corpse — but tearing down a healthy one on every resume
+  /// would mean a fresh state dump every time the user glances at their phone.
   Future<void> verifyLink() async {
-    await _client?.verify();
+    final collector = _collector;
+    if (collector == null) return;
+    if (collector.healthy && collector.hasState) return;
+    await collector.resync();
   }
+
+  /// Writes the feed to disk now. Called on the way to the background, where a
+  /// pending debounce would otherwise never fire.
+  Future<void> persistNow() => _eventLog.flush();
 
   void setShowEverything(bool value) {
     _showEverything = value;
@@ -274,23 +329,19 @@ class AppState extends ChangeNotifier {
   /// Reconnects, and resolves only once there is something to show for it.
   ///
   /// The floor is what makes pull-to-refresh feel like an action rather than a
-  /// twitch: a local bridge answers in ~50ms, and an indicator that appears and
-  /// vanishes inside two frames reads as a rendering fault. The ceiling lives in
-  /// [BridgeClient.whenLive], so an unreachable computer releases the spinner instead
-  /// of pinning it open.
+  /// twitch: a reconnect can complete in well under a frame, and an indicator that
+  /// appears and vanishes inside two frames reads as a rendering fault.
   Future<void> reconnect() async {
-    // The floor is outside the null check on purpose: the gesture should feel
-    // the same whether or not there is a socket behind it.
     final floor = Future<void>.delayed(const Duration(milliseconds: 450));
-    final client = _client;
-    if (client == null) return floor;
-    client.reconnect();
-    await Future.wait([client.whenLive(), floor]);
+    final collector = _collector;
+    if (collector == null) return floor;
+    await Future.wait([collector.resync(), floor]);
   }
 
   void clearLog() {
-    _log.clear();
+    _log = [];
     _invalidateFeed();
+    unawaited(_eventLog.clear());
     notifyListeners();
   }
 
@@ -302,27 +353,71 @@ class AppState extends ChangeNotifier {
     return id.length <= 8 ? id : id.substring(0, 8);
   }
 
+  // ---- wiring ----------------------------------------------------------------
+
   void _attach() {
-    _detach();
-    final client = BridgeClient(settings: _settings);
-    _client = client;
+    unawaited(_detach());
+
+    final auth = GatherAuth(
+      credentials: _credentials,
+      // Google may rotate the refresh token. Persisting the new one immediately is
+      // what keeps a phone working across the rotation instead of silently holding a
+      // credential that has been superseded.
+      onRotated: (next) async {
+        _credentials = next;
+        await _credentialStore.save(next);
+      },
+    );
+
+    final collector = _collector = _buildCollector(auth, _spaceId);
+    final party = _party = PartyMode(collector: () => _collector);
+
     _subs
-      ..add(client.snapshots.listen(_onSnapshot))
-      ..add(client.parties.listen(_onParty))
-      ..add(client.events.listen(_onEvent))
-      ..add(client.status.listen(_onStatus));
-    _primed = false;
-    client.connect();
-    _primeHistory(client);
+      ..add(collector.rosters.listen((roster) {
+        // Party mode first, so a hop fired from this same roster is judged against the
+        // freshest positions we hold rather than the previous ones.
+        party.noteRoster(roster);
+        final out = _tracker.applyRoster(roster);
+        _onFold(out);
+      }))
+      ..add(collector.interactions.listen((event) {
+        _onFold(_tracker.applyInteraction(event));
+      }))
+      ..add(collector.statuses.listen(_onCollectorStatus))
+      ..add(party.changes.listen(_onPartyChanged))
+      ..add(party.progress.listen(_onPartyProgress));
+
+    collector.start();
     unawaited(_registerForPush());
   }
 
-  /// Hands this phone's push token to the bridge, and keeps it current.
+  Future<void> _detach() async {
+    final subs = List.of(_subs);
+    final collector = _collector;
+    final party = _party;
+    _subs.clear();
+    _collector = null;
+    _party = null;
+
+
+    for (final sub in subs) {
+      await sub.cancel();
+    }
+    await party?.dispose();
+    await collector?.dispose();
+  }
+
+  /// Hands this phone's push token to the bridge, if it happens to be reachable.
   ///
-  /// Done on every attach rather than once at pairing: registration is
-  /// idempotent, tokens rotate, and the bridge forgets a device it was told is
-  /// dead — so the only way to be reliably reachable is to say so regularly.
+  /// Opportunistic on purpose, and the only thing that still needs the computer at
+  /// all. FCM tokens rotate — a reinstall, a restore from backup, Firebase's own
+  /// schedule — so registering once at pairing would let push die silently months
+  /// later. Registering on every attach is idempotent and costs one request.
+  ///
+  /// A failure is not reported: the phone is frequently on a different network from
+  /// the computer, and that is a normal state, not a fault.
   Future<void> _registerForPush() async {
+    if (!_settings.isComplete) return;
     final registrar = _pushRegistrar();
     if (registrar == null) return;
     await registrar.register(_settings);
@@ -331,115 +426,99 @@ class AppState extends ChangeNotifier {
     });
   }
 
-  /// Fills the feed with recent history on a first connection, so the app does
-  /// not open on an empty screen when the bridge has been running for hours.
-  Future<void> _primeHistory(BridgeClient client) async {
-    if (_log.isNotEmpty) return;
-    final history = await client.recentHistory();
-    if (_client != client) return;
-    _primed = true;
-    if (history.isEmpty) {
-      // Nothing to add, but the feed still has to be told to stop waiting.
+  void _onFold(FoldResult out) {
+    for (final event in out.emit) {
+      _log.insert(0, event);
+      // Fire and forget: a failed notification must never break the log.
+      _notifier.consider(event, nameFor);
+    }
+    if (_log.length > _logLimit) _log = _log.sublist(0, _logLimit);
+
+    if (out.emit.isNotEmpty) {
+      _invalidateFeed();
+      _eventLog.save(_log);
+    }
+    if (out.emit.isNotEmpty || out.stateChanged) {
+      // Names are resolved during classification, so a new roster can relabel events
+      // already in the log.
+      _invalidateFeed();
+      _snapshot = _tracker.snapshot();
       notifyListeners();
-      return;
     }
-    // Oldest last, matching the newest-first order the list view expects.
-    for (final event in history) {
-      _log.add(event);
-    }
-    _invalidateFeed();
+  }
+
+  void _onCollectorStatus(CollectorStatus status) {
+    _tracker.setHealth(CollectorHealth(
+      gather: status.healthy,
+      // `cdp` is a compatibility alias, not a second collector: `hasRichData` reads
+      // `gather || cdp`, and mirroring keeps a build that predates the rename honest.
+      cdp: status.healthy,
+      detail: status.detail,
+    ));
+
+    _link = switch (status) {
+      CollectorStatus(needsPairing: true) =>
+        LinkStatus(LinkState.idle, status.detail, true),
+      CollectorStatus(healthy: true) => LinkStatus(LinkState.live, status.detail),
+      _ => LinkStatus(LinkState.retrying, status.detail),
+    };
+
+    // A party cannot run without Gather, and a switch left glowing through a dropped
+    // connection would be asserting something untrue.
+    if (!status.healthy) _party?.stop(status.detail ?? 'lost the connection to Gather');
+
+    _snapshot = _tracker.snapshot();
     notifyListeners();
   }
 
-  /// Drops the current client, clearing the fields *synchronously*.
-  ///
-  /// The synchronous part matters. This used to be `async` with `_client = null`
-  /// after an await, which meant the null landed a microtask *after* [_attach]
-  /// had already installed the replacement — quietly wiping it. Everything that
-  /// then checked `_client` broke without failing: history priming bailed out on
-  /// its identity check, and the reconnect button became a no-op. Disposal itself
-  /// can finish in the background; the bookkeeping cannot.
-  void _detach() {
-    final subs = List.of(_subs);
-    final client = _client;
-    _subs.clear();
-    _client = null;
-
-    for (final sub in subs) {
-      sub.cancel();
-    }
-    client?.dispose();
+  void _onPartyChanged(PartyState party) {
+    _tracker.setParty(party);
+    _snapshot = _tracker.snapshot();
+    notifyListeners();
   }
 
-  /// Test seam: feeds a snapshot in as though the bridge had sent it, so the
-  /// screens can be exercised without a computer on the other end.
+  /// Party mode's counter, without the roster around it.
+  ///
+  /// Deliberately no `_invalidateFeed()`: nothing here can relabel an event, and
+  /// reclassifying the whole log once a second is exactly the cost this exists to
+  /// avoid.
+  void _onPartyProgress(PartyState party) {
+    _tracker.setParty(party);
+    _snapshot = _snapshot.withParty(party);
+    notifyListeners();
+  }
+
+  // ---- test seams ------------------------------------------------------------
+
+  /// Feeds a snapshot in as though Gather had sent it, so the screens can be
+  /// exercised without a connection.
   @visibleForTesting
   void debugApplySnapshot(PresenceSnapshot snapshot) {
     _loaded = true;
-    _onSnapshot(snapshot);
+    _snapshot = snapshot;
+    _invalidateFeed();
+    notifyListeners();
   }
 
   /// Test seam for a single event. Notifications no-op until [Notifier.init].
   @visibleForTesting
-  void debugApplyEvent(GatherEvent event) => _onEvent(event);
+  void debugApplyEvent(GatherEvent event) =>
+      _onFold(FoldResult(emit: [event], stateChanged: false));
 
-  /// Test seam for the link state, which changes what an empty feed means: with
-  /// no connection the screen says so rather than claiming all is quiet.
+  /// Test seam for the link state, which changes what an empty feed means: with no
+  /// connection the screen says so rather than claiming all is quiet.
   @visibleForTesting
-  void debugApplyLink(LinkStatus status) => _onStatus(status);
-
-  void _onSnapshot(PresenceSnapshot snapshot) {
-    _snapshot = snapshot;
-    _confirmParty(snapshot.party);
-    // Names live in the snapshot and are resolved during classification, so a
-    // new roster can relabel events that are already in the log.
-    _invalidateFeed();
-    notifyListeners();
-  }
-
-  /// Party mode's own frame: the hop counter, without the roster around it.
-  void _onParty(PartyState party) {
-    _snapshot = _snapshot.withParty(party);
-    _confirmParty(party);
-    // Deliberately no `_invalidateFeed()`: nothing here can relabel an event, and
-    // reclassifying the whole log once a second is exactly the cost this frame
-    // exists to avoid.
-    notifyListeners();
-  }
-
-  /// Stops overriding the button once the bridge agrees with what we asked for.
-  ///
-  /// From here on the bridge is the only thing the button reads — which is what
-  /// lets it go dark on its own when party mode times out or the bridge loses
-  /// Gather. Does not notify: both callers do that themselves.
-  void _confirmParty(PartyState party) {
-    if (_partyWanted != party.active) return;
-    _partyWantedTimer?.cancel();
-    _partyWantedTimer = null;
-    _partyWanted = null;
-  }
-
-  void _onStatus(LinkStatus status) {
+  void debugApplyLink(LinkStatus status) {
     _link = status;
-    notifyListeners();
-  }
-
-  void _onEvent(GatherEvent event) {
-    _log.insert(0, event);
-    if (_log.length > _logLimit) _log.removeRange(_logLimit, _log.length);
-    _invalidateFeed();
-    // Fire and forget: a failed notification must never break the log.
-    _notifier.consider(event, nameFor);
     notifyListeners();
   }
 
   @override
   void dispose() {
-    _detach();
-    _partyWantedTimer?.cancel();
-    _partyWantedTimer = null;
-    // Outside _detach on purpose: token rotation is about this device, not about
-    // any one socket, so it must survive a reconnect and only end with the app.
+    unawaited(_detach());
+    _eventLog.dispose();
+    // Outside `_detach` on purpose: token rotation is about this device, not about any
+    // one connection, so it must survive a reconnect and only end with the app.
     _pushRefresh?.cancel();
     _pushRefresh = null;
     super.dispose();
