@@ -76,7 +76,7 @@ export function encodeFrame(opcode, payload = Buffer.alloc(0)) {
 
 /** Emits `message` (string) and `close`. */
 export class WsConnection extends EventEmitter {
-  constructor(socket) {
+  constructor(socket, { now = () => Date.now() } = {}) {
     super();
     this.socket = socket;
     this.closed = false;
@@ -84,10 +84,37 @@ export class WsConnection extends EventEmitter {
     this._fragments = [];
     this._fragmentOpcode = 0;
     this._fragmentLength = 0;
+    this._now = now;
+
+    /**
+     * When this peer was last heard from, in any form.
+     *
+     * A phone does not close its socket when it vanishes — iOS suspends the app,
+     * or the Wi-Fi hands over to cellular, and the TCP connection simply stops
+     * being answered. Nothing in that is an error, so `close` never fires and the
+     * daemon keeps a dead client on its fan-out list indefinitely: the observed
+     * symptom was `client connected (2 total)` where only one phone existed.
+     * Whoever holds this connection is expected to ping it and drop it when this
+     * stops moving.
+     */
+    this.lastSeenAt = now();
 
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('error', () => this._teardown());
     socket.on('close', () => this._teardown());
+  }
+
+  /**
+   * Asks the peer to prove it is still there. The answering pong lands in
+   * `_onData` like any other frame and moves [lastSeenAt] on its own.
+   */
+  ping() {
+    if (this.closed) return;
+    try {
+      this.socket.write(encodeFrame(0x9));
+    } catch {
+      this._teardown();
+    }
   }
 
   send(text) {
@@ -130,6 +157,10 @@ export class WsConnection extends EventEmitter {
   }
 
   _onData(chunk) {
+    // Any byte at all is proof of life — a data frame, a ping, or the pong
+    // answering ours. Recorded before parsing, so a peer that is talking but
+    // sending something we reject still counts as present.
+    this.lastSeenAt = this._now();
     this._buf = this._buf.length ? Buffer.concat([this._buf, chunk]) : chunk;
     while (!this.closed && this._readFrame()) {
       /* keep draining */

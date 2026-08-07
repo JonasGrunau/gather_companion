@@ -19,6 +19,32 @@ export const DEFAULT_PORT = 7799;
 const HISTORY = 500;
 
 /**
+ * Never send a phone two snapshots closer together than this.
+ *
+ * The snapshot is the whole roster — 79 players and ~23 KiB in the measured
+ * space — and it is republished whenever anything in it changes. Measured against
+ * a real space that came to 0.86 snapshots per second, ~1.1 MB per minute, for a
+ * screen that shows the one person standing next to you. The phone spent that
+ * budget decoding rosters and rebuilding its widget tree, which is what "the
+ * connection is fragile" actually looked like from the outside.
+ *
+ * Coalescing rather than dropping: the flush reads live state, so several changes
+ * inside one window collapse into a single publish that reflects all of them.
+ */
+const SNAPSHOT_MIN_INTERVAL_MS = 500;
+
+/** How often to ask each phone to prove it is still on the other end. */
+const PING_INTERVAL_MS = 15_000;
+
+/**
+ * Drop a client we have not heard a single byte from in this long.
+ *
+ * Comfortably more than two ping intervals, so one lost packet on a phone's Wi-Fi
+ * is not a disconnection.
+ */
+const CLIENT_IDLE_TIMEOUT_MS = 45_000;
+
+/**
  * The daemon: Gather in, one WebSocket out.
  *
  * ```
@@ -82,9 +108,10 @@ export class BridgeServer {
     // until `start()`, and it is replaced outright whenever the bridge
     // reconnects to Gather.
     this.party = new PartyMode({ collector: () => this._collector, log });
-    // Only switching on and off is worth a push. The hop count rides along on
-    // whatever snapshot goes out next — see `_snapshot()`.
+    // Switching on and off changes what the whole card says, so it goes out as a
+    // snapshot. The hop counter ticking does not, and gets a frame of its own.
     this.party.on('change', () => this._publishSnapshot());
+    this.party.on('progress', (state) => this._publishParty(state));
 
     /** @type {Set<import('./ws.js').WsConnection>} */
     this._clients = new Set();
@@ -100,12 +127,19 @@ export class BridgeServer {
     this._tail = null;
     this._startedAt = Date.now();
 
+    /** Pending coalesced snapshot publish, and when the last one went out. */
+    this._snapshotTimer = null;
+    this._snapshotAt = 0;
+    /** Pings the phones and drops the ones that stopped answering. */
+    this._keepalive = null;
+
     const space = readGatherSpace();
     if (space.spaceId) this.tracker.apply({ type: 'space.changed', at: new Date().toISOString(), source: 'bridge', confidence: 'observed', spaceId: space.spaceId, spaceName: null });
   }
 
   async start() {
     await this._startHttp();
+    this._startKeepalive();
     this._startCollector();
     this._startNotificationTail();
   }
@@ -114,6 +148,10 @@ export class BridgeServer {
     this.party.stop('the bridge stopped');
     this._collector?.stop();
     this._tail?.stop();
+    if (this._snapshotTimer) clearTimeout(this._snapshotTimer);
+    this._snapshotTimer = null;
+    if (this._keepalive) clearInterval(this._keepalive);
+    this._keepalive = null;
     for (const client of this._clients) client.close(1001);
     this._clients.clear();
     this._rawClients.clear();
@@ -136,6 +174,35 @@ export class BridgeServer {
         resolve();
       });
     });
+  }
+
+  /**
+   * Pings every client, and drops the ones that have gone quiet.
+   *
+   * A phone never says goodbye. iOS suspends the app, or Wi-Fi hands over to
+   * cellular, and the socket simply stops being answered — no error, no close
+   * frame, nothing for the daemon to notice. Without this the fan-out list only
+   * ever grew: the log showed `client connected (2 total)` on a bridge with one
+   * phone, and every publish after that wrote into a socket nobody was reading
+   * until 8 MiB of backlog finally tripped `MAX_BACKLOG`.
+   */
+  _startKeepalive() {
+    this._keepalive = setInterval(() => this._sweepClients(), PING_INTERVAL_MS);
+    this._keepalive.unref?.();
+  }
+
+  /** One pass of the above. Separate so a test can run it without a clock. */
+  _sweepClients(now = Date.now()) {
+    for (const client of this._clients) {
+      if (now - client.lastSeenAt > CLIENT_IDLE_TIMEOUT_MS) {
+        // Deleting the current element of a Set mid-iteration is well defined, and
+        // `close` fires the handler that does the removing.
+        client.close(1001);
+        this.log(`dropped a client that stopped answering (${this._clients.size} left)`);
+        continue;
+      }
+      client.ping();
+    }
   }
 
   _authorised(url) {
@@ -304,10 +371,13 @@ export class BridgeServer {
       this._clients.delete(client);
       this._rawClients.delete(client);
     });
+    client.on('message', (text) => this._onCommand(client, text));
 
     // First frame is always a full snapshot, so the app can paint without
-    // replaying history.
-    client.send(JSON.stringify({ kind: 'snapshot', seq: this._seq, snapshot: this.tracker.snapshot() }));
+    // replaying history. Through `_snapshot()` rather than the tracker directly,
+    // so a phone connecting while party mode is already running sees that instead
+    // of waiting for the next change to find out.
+    client.send(JSON.stringify({ kind: 'snapshot', seq: this._seq, snapshot: this._snapshot() }));
 
     // A reconnecting phone asks for what it missed.
     const since = Number(url.searchParams.get('since') ?? 0);
@@ -318,6 +388,55 @@ export class BridgeServer {
     }
 
     this.log(`client connected${raw ? ' (raw)' : ''} (${this._clients.size} total)`);
+  }
+
+  /**
+   * A command from a phone, over the socket it already has.
+   *
+   * Party mode used to be reachable only over HTTP, which meant the one thing the
+   * app can *do* rode a brand new TCP connection every time — a second chance for
+   * the same flaky Wi-Fi to fail, on a link whose WebSocket was demonstrably up.
+   * On a phone that is not a theoretical difference: a connection that has been
+   * open and passing traffic for a minute is far likelier to work than one being
+   * opened from cold.
+   *
+   * `/party` stays, because `curl` is how you switch it off when your phone is the
+   * thing that went flat.
+   *
+   * No token check: the socket proved the token at upgrade, and nothing can reach
+   * this without one.
+   */
+  _onCommand(client, text) {
+    let msg;
+    try {
+      msg = JSON.parse(text);
+    } catch {
+      return; // Not ours. Say nothing rather than teaching a scanner our shape.
+    }
+    if (!msg || typeof msg !== 'object') return;
+
+    // Echoed back so the app can match an answer to the tap that caused it,
+    // instead of assuming the next ack it sees is the one it is waiting for.
+    const id = typeof msg.id === 'number' ? msg.id : null;
+    const reply = (ok, detail = null) =>
+      client.send(JSON.stringify({ kind: 'ack', id, ok, detail: ok ? null : detail }));
+
+    switch (msg.cmd) {
+      // Liveness the app can ask for directly. On resume it needs to know whether
+      // the socket it is holding survived being suspended, and waiting ~20s for a
+      // ping to time out means either stale data on screen or tearing down a
+      // perfectly good connection to be sure.
+      case 'ping':
+        return reply(true);
+
+      case 'party': {
+        const result = msg.on === true ? this.party.start() : this.party.stop('switched off');
+        return reply(result.ok !== false, result.detail);
+      }
+
+      default:
+        return reply(false, `unknown command ${String(msg.cmd).slice(0, 40)}`);
+    }
   }
 
   // ---- fan-out ---------------------------------------------------------------
@@ -352,8 +471,52 @@ export class BridgeServer {
     return this.tracker.snapshot();
   }
 
+  /**
+   * Publishes the snapshot, no more often than [SNAPSHOT_MIN_INTERVAL_MS].
+   *
+   * Coalescing, not sampling: a call inside the quiet window schedules one flush
+   * and further calls join it, and the flush reads live state — so the phone gets
+   * every change, just batched. Nothing is lost, only the redundant intermediate
+   * rosters that nobody could have rendered in the meantime.
+   */
   _publishSnapshot() {
     if (this._clients.size === 0) return;
+    if (this._snapshotTimer) return; // A flush is already coming; it will see this.
+
+    const wait = this._snapshotAt + SNAPSHOT_MIN_INTERVAL_MS - Date.now();
+    if (wait <= 0) {
+      this._flushSnapshot();
+      return;
+    }
+    this._snapshotTimer = setTimeout(() => {
+      this._snapshotTimer = null;
+      this._flushSnapshot();
+    }, wait);
+    this._snapshotTimer.unref?.();
+  }
+
+  /**
+   * Party mode's own state, and nothing else.
+   *
+   * The hop counter is on screen while somebody watches it, and a snapshot is the
+   * wrong envelope for it: 22 KiB of roster to deliver a number that changed by
+   * four. This is about 80 bytes, which is what makes a live counter affordable at
+   * all — the alternatives were a frozen one or reintroducing the flood the rest of
+   * this work removed.
+   *
+   * The tracker is updated too, so the next snapshot for any other reason agrees
+   * with what the phone was just told.
+   */
+  _publishParty(state) {
+    if (this._clients.size === 0) return;
+    this.tracker.setParty(state);
+    const frame = JSON.stringify({ kind: 'party', seq: this._seq, party: state });
+    for (const client of this._clients) client.send(frame);
+  }
+
+  _flushSnapshot() {
+    if (this._clients.size === 0) return;
+    this._snapshotAt = Date.now();
     const frame = JSON.stringify({
       kind: 'snapshot',
       seq: this._seq,

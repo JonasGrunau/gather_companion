@@ -316,6 +316,19 @@ class PresenceSnapshot {
   List<PlayerRef> get followers =>
       players.where((p) => p.isFollowingMe).toList();
 
+  /// The same world, with party mode's counters moved on.
+  ///
+  /// The bridge sends the hop counter on its own small frame rather than
+  /// republishing the roster for it — see `BridgeServer._publishParty`. This is
+  /// how that frame is folded in.
+  PresenceSnapshot withParty(PartyState party) => PresenceSnapshot(
+        self: self,
+        players: players,
+        health: health,
+        at: at,
+        party: party,
+      );
+
   Map<String, Object?> toJson() => {
         'type': 'presence.snapshot',
         'at': at.toIso8601String(),

@@ -217,8 +217,20 @@ export class PresenceTracker {
       if (row.speaking != null && row.speaking !== p.speaking) {
         // State only, never an event: voice activity toggles every few seconds
         // while someone talks, and a feed of that is unreadable.
+        //
+        // It is also only a *state change* for somebody the app draws. The app
+        // shows the talking indicator on the people standing next to you and the
+        // ones following you, and on nobody else — but the measured space holds 79
+        // rows, so counting every one of them made a stranger three rooms away
+        // clearing their throat publish a 23 KiB roster to every phone. That was
+        // the bulk of an observed 0.86 snapshots/second, ~1.1 MB/minute, which is
+        // what made the link feel fragile: the phone spent its time decoding
+        // rosters and rebuilding its whole widget tree. Whoever is invisible keeps
+        // the new value on the player record, so it is already correct in the
+        // snapshot that goes out when they *do* walk up.
+        const visible = p.isNear || p.isFollowingMe;
         p.speaking = row.speaking;
-        stateChanged = true;
+        if (visible) stateChanged = true;
       }
       // Whether they actually changed tiles, decided before the row overwrites
       // what we held. A first sighting is not a move — on the initial state dump
@@ -234,7 +246,11 @@ export class PresenceTracker {
         this._selfPosition && row.x != null && row.y != null
           ? Math.hypot(row.x - this._selfPosition[0], row.y - this._selfPosition[1])
           : null;
-      if (distance != null) p.distance = distance;
+      // Rounded for the wire only. The full-precision `distance` is what the
+      // near/far thresholds below compare against, so this cannot move anyone
+      // across a boundary — it just stops `19.4164878389476` costing 19 bytes per
+      // player per snapshot to say "about 19 tiles away".
+      if (distance != null) p.distance = Math.round(distance * 10) / 10;
 
       // A row that is not connected is a stale avatar left wherever that person
       // logged off — which, for most people, is their desk. It keeps its name and

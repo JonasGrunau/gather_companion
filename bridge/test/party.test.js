@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PartyMode, SAFE_TILES } from '../lib/party.js';
+import { MIN_JUMP_TILES, PartyMode, SAFE_TILES } from '../lib/party.js';
 
 const ME = '11111111-1111-1111-1111-111111111111';
 const FLOOR = 'ffffffff-0000-0000-0000-000000000000';
@@ -218,6 +218,143 @@ test('a teleport the collector refuses is reported, not counted', () => {
 
   assert.equal(p.state().hops, 0);
   assert.match(p.state().detail, /not connected to Gather/);
+});
+
+// ---- how the hopping looks --------------------------------------------------
+
+/**
+ * A grid of parked avatars, which is a grid of safe tiles.
+ *
+ * Spread over 0..40 in both axes and all logged off, so every tile is a candidate
+ * and nobody can be walked into — leaving the choice of tile as the only variable.
+ */
+function danceFloor({ step = 8, span = 40 } = {}) {
+  const rows = [person(ME, 0, 0)];
+  let n = 0;
+  for (let x = 0; x <= span; x += step) {
+    for (let y = 0; y <= span; y += step) {
+      if (x === 0 && y === 0) continue;
+      rows.push(person(`p${n++}`.padEnd(4, '0'), x, y, { connected: false }));
+    }
+  }
+  return roster(rows);
+}
+
+test('every hop carries you most of the way across the floor', () => {
+  const collector = fakeCollector();
+  // Real randomness: the guarantee has to hold for any draw, not a chosen one.
+  const p = party(collector, { maxDurationMs: 60_000, random: Math.random });
+  const floor = danceFloor();
+  p.noteRoster(floor);
+
+  p.start();
+  // Feed our own new position back after each hop, exactly as a roster would, so
+  // "far from where I was" is measured against where we actually are.
+  for (let i = 0; i < 40; i++) {
+    const last = collector.sent.at(-1);
+    p.noteRoster(roster([person(ME, last.x, last.y), ...floor.rows.slice(1)]));
+    p._tick();
+  }
+  p.stop();
+
+  // Where we stood, in order: the tile we started on, then every tile we hopped
+  // to. Consecutive pairs are therefore exactly the jumps that were made.
+  const seen = [{ x: 0, y: 0 }, ...collector.sent];
+
+  // The hard floor holds for every single hop. The old picker sampled uniformly
+  // from the safe set and cheerfully stepped one tile, which does not read as a
+  // teleport at all.
+  const jumps = [];
+  for (let i = 1; i < seen.length; i++) {
+    const jump = Math.hypot(seen[i].x - seen[i - 1].x, seen[i].y - seen[i - 1].y);
+    assert.ok(jump >= MIN_JUMP_TILES, `hop ${i} only travelled ${jump.toFixed(1)} tiles`);
+    jumps.push(jump);
+  }
+
+  // And the floor is the floor, not the norm: on a 40x40 grid the typical hop
+  // should be crossing a real part of the map, not scraping the minimum.
+  jumps.sort((a, b) => a - b);
+  const median = jumps[Math.floor(jumps.length / 2)];
+  assert.ok(median >= 20, `the median hop was only ${median.toFixed(1)} tiles`);
+});
+
+test('it covers the floor instead of wearing out one corner', () => {
+  const collector = fakeCollector();
+  const p = party(collector, { maxDurationMs: 60_000, random: Math.random });
+  const floor = danceFloor();
+  p.noteRoster(floor);
+
+  p.start();
+  for (let i = 0; i < 30; i++) {
+    const last = collector.sent.at(-1);
+    p.noteRoster(roster([person(ME, last.x, last.y), ...floor.rows.slice(1)]));
+    p._tick();
+  }
+  p.stop();
+
+  const distinct = new Set(collector.sent.map((t) => `${t.x},${t.y}`)).size;
+  // A 12-entry blocklist over a 35-tile pool let hop 13 land back on hop 1's tile,
+  // so 31 hops covered a fraction of the floor and hammered it. Preferring the
+  // least recently used tile makes repeats the exception rather than the rule.
+  assert.ok(distinct >= 24, `only ${distinct} distinct tiles in ${collector.sent.length} hops`);
+});
+
+test('a cramped floor still dances rather than standing still', () => {
+  const collector = fakeCollector();
+  const p = party(collector, { maxDurationMs: 60_000, random: Math.random });
+
+  // Three tiles, all close together, all safe. The minimum-distance rule must
+  // relax rather than refuse: a short hop beats a skipped one.
+  p.noteRoster(
+    roster([
+      person(ME, 0, 0),
+      person('2222', 30, 30, { connected: false }),
+      person('3333', 31, 30, { connected: false }),
+      person('4444', 30, 31, { connected: false }),
+    ]),
+  );
+
+  p.start();
+  for (let i = 0; i < 6; i++) {
+    const last = collector.sent.at(-1);
+    p.noteRoster(
+      roster([
+        person(ME, last.x, last.y),
+        person('2222', 30, 30, { connected: false }),
+        person('3333', 31, 30, { connected: false }),
+        person('4444', 30, 31, { connected: false }),
+      ]),
+    );
+    p._tick();
+  }
+  p.stop();
+
+  assert.equal(p.state().hops, 7, 'no hop was skipped for want of distance');
+  assert.ok(new Set(collector.sent.map((t) => `${t.x},${t.y}`)).size >= 2);
+});
+
+test('the clearance still wins when it conflicts with wanting a long jump', () => {
+  const collector = fakeCollector();
+  const p = party(collector, { maxDurationMs: 60_000, random: Math.random });
+
+  // The far side of the floor is where somebody is standing. Wanting distance must
+  // not become a reason to jump onto a colleague.
+  p.noteRoster(
+    roster([
+      person(ME, 0, 0),
+      person('2222', 40, 40), // here now
+      person('3333', 41, 40, { connected: false }), // their neighbour's parked tile
+      person('4444', 20, 0, { connected: false }), // the only safe tile
+    ]),
+  );
+
+  p.start();
+  p.stop();
+
+  assert.deepEqual(
+    collector.sent.map((t) => `${t.x},${t.y}`),
+    ['20,0'],
+  );
 });
 
 test('the walkable pool grows as people walk around', () => {

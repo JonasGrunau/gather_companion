@@ -56,9 +56,16 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    // The OS tears the socket down while the app is suspended. Coming back to the
-    // foreground has to reconnect, which also replays everything missed.
-    if (lifecycle == AppLifecycleState.resumed) unawaited(_state.reconnect());
+    // The OS tears the socket down while the app is suspended, so coming back to
+    // the foreground has to end up on a live socket — which also replays
+    // everything missed.
+    //
+    // Asking rather than assuming, though. `resumed` fires for a pulled-down
+    // notification banner and for Control Centre too, neither of which touches
+    // the socket, and reconnecting unconditionally threw away a working
+    // connection every time — a second of "Reconnecting" for nothing, which is
+    // most of what made the link look unreliable.
+    if (lifecycle == AppLifecycleState.resumed) unawaited(_state.verifyLink());
   }
 
   @override

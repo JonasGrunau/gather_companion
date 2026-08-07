@@ -30,6 +30,16 @@
  *
  * When nowhere is safe, the hop is **skipped** rather than approximated. A party
  * that pauses is a smaller problem than a party that walks into someone.
+ *
+ * ## Where you *want* to go
+ *
+ * Picking uniformly from the safe set is random but does not look it. The set is
+ * small — 35 of 107 known tiles in the measured space — so hops land in the same
+ * corner over and over, and consecutive picks are often two tiles apart, which
+ * reads as a twitch rather than a teleport. So every hop must clear a minimum
+ * distance measured against the size of the floor itself ([JUMP_FRACTIONS]), and
+ * among the tiles that qualify the stalest win ([_leastVisited]) — the floor gets
+ * covered before anywhere is repeated.
  */
 
 import { EventEmitter } from 'node:events';
@@ -63,12 +73,65 @@ export const MAX_DURATION_MS = 15 * 60_000;
 const DIRECTIONS = ['Up', 'Down', 'Left', 'Right'];
 
 /**
- * Recently used tiles, avoided so the hopping looks random to a human.
+ * How often a running party says how it is going.
  *
- * True uniform sampling revisits tiles often enough to read as a stutter rather
- * than as movement — the birthday problem applies to dance floors too.
+ * Separate from `change`, and much cheaper. `change` means the answer to "is this
+ * on, and if not why not" moved, and it publishes a whole snapshot; the hop counter
+ * moving is not that, but a counter frozen at 4 on a screen the user is watching
+ * reads as a crash. So progress is its own event, on its own small frame — see
+ * `BridgeServer._publishParty`.
  */
-const RECENT_MEMORY = 12;
+const PROGRESS_INTERVAL_MS = 1000;
+
+/**
+ * How far a hop has to carry you, as a fraction of how big the floor is.
+ *
+ * Tried in order, first one that has anywhere to go wins. Uniform sampling from
+ * the safe set does not read as dancing — the pool is small (35 safe tiles of 107
+ * known in the measured space), so it revisits the same corner every few hops and
+ * looks like a stutter. Worse, two consecutive picks are often neighbours, and a
+ * two-tile shuffle does not look like a teleport at all.
+ *
+ * Measuring against the floor's own size rather than a fixed tile count is what
+ * makes this work in a broom cupboard and in a 50×50 office: 0.55 of the diagonal
+ * is always "most of the way across the map". The ladder down exists because the
+ * constraint must never be able to stall the party — when everyone crowds one end
+ * and the only safe tiles are close together, a short hop beats a skipped one.
+ */
+const JUMP_FRACTIONS = [0.55, 0.35, 0.2, 0.08, 0];
+
+/**
+ * How many tiles a hop wants to choose between.
+ *
+ * Distance and variety pull against each other, and the safe pool is small — 22
+ * tiles of 78 known, in the space this was measured against, because holding
+ * [SAFE_TILES] clear of 21 people eats most of a 52x49 floor. Demanding the
+ * longest jump available then leaves only two or three places to go, and the dance
+ * degenerates into bouncing between opposite corners: 120 hops used 23 tiles and
+ * landed on one of them 42 times.
+ *
+ * So the rule is not "jump as far as possible", it is **"jump as far as possible
+ * while still having somewhere to choose from"**. Taking the longest rung of
+ * [JUMP_FRACTIONS] that offers this many candidates costs a little distance and
+ * buys back the whole floor.
+ */
+const MIN_CHOICES = 6;
+
+/**
+ * The shortest thing that counts as a teleport at all.
+ *
+ * [JUMP_FRACTIONS] is relative to the floor, which is what makes it portable — but
+ * relative alone is not enough. The safe tiles are not spread evenly: this space
+ * has a dense knot of them in one corner, and "as far as possible while having six
+ * choices" was happy to shuffle five tiles inside that knot. Five tiles is not a
+ * teleport, it is a walk.
+ *
+ * Ten is past every radius that means anything here — Gather opens a video bubble
+ * around three, `ADJACENT_TILES` is three, `SAFE_TILES` is eight — so a hop that
+ * clears it has unambiguously gone somewhere else. Only a floor with nothing at all
+ * this far away relaxes it.
+ */
+export const MIN_JUMP_TILES = 10;
 
 export class PartyMode extends EventEmitter {
   /**
@@ -100,11 +163,22 @@ export class PartyMode extends EventEmitter {
     this._tiles = new Map();
     /** The most recent roster, which is what "where is everyone" is answered from. */
     this._roster = null;
-    /** @type {string[]} keys of the last few tiles visited. */
-    this._recent = [];
+    /**
+     * @type {Map<string, number>} tile key -> the hop that last used it.
+     *
+     * A blocklist of the last dozen tiles used to stand here, which kept the very
+     * next hop from repeating but did nothing about the pool as a whole: with 35
+     * safe tiles, hop 13 was free to land back where hop 1 did, so the dance
+     * covered one quarter of the floor and hammered it. Recording *when* each tile
+     * was used instead turns avoidance into coverage — the whole floor gets
+     * visited before anywhere is repeated.
+     */
+    this._visits = new Map();
 
     this._timer = null;
     this._stopAt = 0;
+    /** When the last `progress` went out, so it stays at one a second. */
+    this._progressAt = 0;
     this._active = false;
     this._hops = 0;
     this._safeCount = 0;
@@ -167,8 +241,11 @@ export class PartyMode extends EventEmitter {
 
     this._active = true;
     this._hops = 0;
-    this._recent = [];
+    this._visits.clear();
     this._stopAt = this._now() + this.maxDurationMs;
+    // Not zero: `start` already publishes the state, so the first counter update
+    // is due a second from now rather than immediately after it.
+    this._progressAt = this._now();
     this._setDetail(null, { silent: true });
     this.log(`party mode: on — hopping every ${this.intervalMs}ms`);
 
@@ -215,14 +292,14 @@ export class PartyMode extends EventEmitter {
       return;
     }
 
-    const { tiles, detail } = this.safeTilesNow();
+    const { tiles, detail, me } = this.safeTilesNow();
     this._safeCount = tiles.length;
     if (tiles.length === 0) {
       this._setDetail(detail ?? 'nowhere far enough from everyone to jump to');
       return;
     }
 
-    const tile = this._pick(tiles);
+    const tile = this._pick(tiles, me);
     const direction = DIRECTIONS[Math.floor(this._random() * DIRECTIONS.length) % DIRECTIONS.length];
     const sent = collector.teleport({ x: tile.x, y: tile.y, direction });
     if (!sent.ok) {
@@ -233,6 +310,12 @@ export class PartyMode extends EventEmitter {
     this._hops++;
     this._remember(tile);
     this._setDetail(null);
+
+    const now = this._now();
+    if (now - this._progressAt >= PROGRESS_INTERVAL_MS) {
+      this._progressAt = now;
+      this.emit('progress', this.state());
+    }
   }
 
   /**
@@ -252,7 +335,7 @@ export class PartyMode extends EventEmitter {
     const floorId = me.floorId ?? '';
     const pool = this._tiles.get(floorId);
     if (!pool || pool.size === 0) {
-      return { tiles: [], detail: 'no tiles known on this floor yet' };
+      return { tiles: [], detail: 'no tiles known on this floor yet', me };
     }
 
     // Only people who are actually here can be walked into. An offline row is an
@@ -291,22 +374,88 @@ export class PartyMode extends EventEmitter {
           others.length > 0
             ? `everywhere known is within ${clearance} tiles of someone`
             : 'no tiles known on this floor yet',
+        me,
       };
     }
-    return { tiles, detail: null };
+    return { tiles, detail: null, me };
   }
 
-  /** A tile we have not used lately, falling back to any of them. */
-  _pick(tiles) {
-    const recent = new Set(this._recent);
-    const fresh = tiles.filter((t) => !recent.has(`${t.x},${t.y}`));
-    const from = fresh.length > 0 ? fresh : tiles;
+  /**
+   * The next tile: as far from where I am as the floor allows, favouring the parts
+   * of it I have not been to yet.
+   *
+   * Two constraints, applied in that order, because they answer different
+   * complaints. Distance is what makes a single hop *look* like a teleport instead
+   * of a step. Coverage is what stops a hundred hops from being the same six
+   * tiles.
+   */
+  _pick(tiles, me) {
+    const away = (t) => Math.hypot(t.x - me.x, t.y - me.y);
+
+    // The hard floor first, and everything after it works inside the result — so
+    // relaxing for choice or for a cramped floor can never talk us back into a
+    // short hop.
+    const eligible = tiles.filter((t) => away(t) >= MIN_JUMP_TILES);
+    const pool = eligible.length > 0 ? eligible : tiles;
+
+    // Then the longest rung that still offers a real choice. Each rung down is a
+    // superset of the one above, so the search is monotonic: this lands on the most
+    // demanding distance this floor can actually satisfy.
+    const reach = this._spread(pool);
+    let candidates = pool;
+    for (const fraction of JUMP_FRACTIONS) {
+      const min = reach * fraction;
+      if (min <= 0) break; // The last rung admits everything, which `candidates` already is.
+      const far = pool.filter((t) => away(t) >= min);
+      if (far.length === 0) continue;
+      candidates = far;
+      if (far.length >= MIN_CHOICES) break;
+    }
+    return this._leastVisited(candidates);
+  }
+
+  /**
+   * How far apart the two most distant candidates could be: the diagonal of their
+   * bounding box. A cheap stand-in for the diameter of the walkable area, and the
+   * yardstick [JUMP_FRACTIONS] is a fraction of.
+   */
+  _spread(tiles) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const t of tiles) {
+      if (t.x < minX) minX = t.x;
+      if (t.x > maxX) maxX = t.x;
+      if (t.y < minY) minY = t.y;
+      if (t.y > maxY) maxY = t.y;
+    }
+    return Math.hypot(maxX - minX, maxY - minY);
+  }
+
+  /**
+   * One of the candidates that has been used least recently, chosen at random
+   * among them.
+   *
+   * Never-visited tiles win outright, so a fresh party sweeps the whole floor
+   * before repeating anything. Once everywhere has been used the field narrows to
+   * the stalest half and picks randomly inside it — deterministic enough to keep
+   * moving across the map, random enough that a human cannot see the pattern.
+   */
+  _leastVisited(candidates) {
+    const unseen = candidates.filter((t) => !this._visits.has(`${t.x},${t.y}`));
+    let from = unseen;
+    if (from.length === 0) {
+      const stalest = [...candidates].sort(
+        (a, b) => this._visits.get(`${a.x},${a.y}`) - this._visits.get(`${b.x},${b.y}`),
+      );
+      from = stalest.slice(0, Math.max(1, Math.ceil(stalest.length / 2)));
+    }
     return from[Math.floor(this._random() * from.length) % from.length];
   }
 
   _remember(tile) {
-    this._recent.push(`${tile.x},${tile.y}`);
-    if (this._recent.length > RECENT_MEMORY) this._recent.shift();
+    this._visits.set(`${tile.x},${tile.y}`, this._hops);
   }
 
   /**

@@ -107,6 +107,15 @@ class AppState extends ChangeNotifier {
 
   bool? _partyWanted;
 
+  /// Gives up on waiting for a snapshot to confirm the toggle.
+  ///
+  /// [_partyWanted] is normally cleared by the snapshot that agrees with it, which
+  /// arrives in well under a second. If the socket dies in the gap between the
+  /// command landing and that snapshot, no such snapshot is ever coming — and the
+  /// switch would sit there lit, pending for ever, asserting a state nothing has
+  /// confirmed. Falling back to the truth is better than showing a wish.
+  Timer? _partyWantedTimer;
+
   /// The classified feed, rebuilt only when something it depends on changes.
   ///
   /// This used to classify every event in the log — up to [_logLimit] of them —
@@ -202,6 +211,8 @@ class AppState extends ChangeNotifier {
     _settings = BridgeSettings.empty;
     _bridgeName = null;
     _snapshot = PresenceSnapshot.empty;
+    _partyWantedTimer?.cancel();
+    _partyWantedTimer = null;
     _partyWanted = null;
     _log.clear();
     _invalidateFeed();
@@ -219,16 +230,37 @@ class AppState extends ChangeNotifier {
     if (client == null) return 'Not connected to the bridge.';
 
     _partyWanted = on;
+    _partyWantedTimer?.cancel();
+    _partyWantedTimer = Timer(const Duration(seconds: 6), () {
+      if (_partyWanted == null) return;
+      _partyWanted = null;
+      notifyListeners();
+    });
     notifyListeners();
 
     final error = await client.setParty(on);
     if (error != null) {
       // Snap back: nothing changed on the other end, so the button must not go
       // on claiming otherwise while it waits for a snapshot that will not come.
-      _partyWanted = null;
-      notifyListeners();
+      _clearPartyWanted();
     }
     return error;
+  }
+
+  void _clearPartyWanted() {
+    _partyWantedTimer?.cancel();
+    _partyWantedTimer = null;
+    if (_partyWanted == null) return;
+    _partyWanted = null;
+    notifyListeners();
+  }
+
+  /// Confirms the link is really up, and reconnects only if it is not.
+  ///
+  /// What iOS resume calls. See [BridgeClient.verify] for why this is not just a
+  /// reconnect.
+  Future<void> verifyLink() async {
+    await _client?.verify();
   }
 
   void setShowEverything(bool value) {
@@ -274,6 +306,7 @@ class AppState extends ChangeNotifier {
     _client = client;
     _subs
       ..add(client.snapshots.listen(_onSnapshot))
+      ..add(client.parties.listen(_onParty))
       ..add(client.events.listen(_onEvent))
       ..add(client.status.listen(_onStatus));
     _primed = false;
@@ -355,15 +388,33 @@ class AppState extends ChangeNotifier {
 
   void _onSnapshot(PresenceSnapshot snapshot) {
     _snapshot = snapshot;
-    // The bridge has caught up with what we asked for, so stop overriding it.
-    // From here on the snapshot is the only thing the button reads — which is
-    // what lets it go dark on its own when party mode times out or the bridge
-    // loses Gather.
-    if (_partyWanted == snapshot.party.active) _partyWanted = null;
+    _confirmParty(snapshot.party);
     // Names live in the snapshot and are resolved during classification, so a
     // new roster can relabel events that are already in the log.
     _invalidateFeed();
     notifyListeners();
+  }
+
+  /// Party mode's own frame: the hop counter, without the roster around it.
+  void _onParty(PartyState party) {
+    _snapshot = _snapshot.withParty(party);
+    _confirmParty(party);
+    // Deliberately no `_invalidateFeed()`: nothing here can relabel an event, and
+    // reclassifying the whole log once a second is exactly the cost this frame
+    // exists to avoid.
+    notifyListeners();
+  }
+
+  /// Stops overriding the button once the bridge agrees with what we asked for.
+  ///
+  /// From here on the bridge is the only thing the button reads — which is what
+  /// lets it go dark on its own when party mode times out or the bridge loses
+  /// Gather. Does not notify: both callers do that themselves.
+  void _confirmParty(PartyState party) {
+    if (_partyWanted != party.active) return;
+    _partyWantedTimer?.cancel();
+    _partyWantedTimer = null;
+    _partyWanted = null;
   }
 
   void _onStatus(LinkStatus status) {
@@ -383,6 +434,8 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _detach();
+    _partyWantedTimer?.cancel();
+    _partyWantedTimer = null;
     // Outside _detach on purpose: token rotation is about this device, not about
     // any one socket, so it must survive a reconnect and only end with the app.
     _pushRefresh?.cancel();

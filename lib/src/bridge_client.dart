@@ -44,10 +44,18 @@ class BridgeClient {
 
   final _events = StreamController<GatherEvent>.broadcast();
   final _snapshots = StreamController<PresenceSnapshot>.broadcast();
+  final _parties = StreamController<PartyState>.broadcast();
   final _status = StreamController<LinkStatus>.broadcast();
 
   Stream<GatherEvent> get events => _events.stream;
   Stream<PresenceSnapshot> get snapshots => _snapshots.stream;
+
+  /// Party mode on its own, without the roster around it.
+  ///
+  /// A running party updates its hop counter every second, and republishing the
+  /// whole snapshot for that would put back most of the traffic this client was
+  /// drowning in. Merged onto the held snapshot by whoever keeps one.
+  Stream<PartyState> get parties => _parties.stream;
   Stream<LinkStatus> get status => _status.stream;
 
   IOWebSocketChannel? _channel;
@@ -62,6 +70,14 @@ class BridgeClient {
 
   /// Highest sequence number we have seen, so a reconnect can resume from it.
   int lastSeq = 0;
+
+  /// Commands awaiting their ack, by the id we stamped on them.
+  ///
+  /// Keyed rather than a single pending slot because the ack for a tap the user
+  /// has already changed their mind about must not be mistaken for the answer to
+  /// the current one.
+  final _acks = <int, Completer<({bool ok, String? detail})?>>{};
+  int _nextCommandId = 0;
 
   LinkStatus _current = const LinkStatus(LinkState.idle);
   LinkStatus get currentStatus => _current;
@@ -175,6 +191,60 @@ class BridgeClient {
     }
   }
 
+  /// Sends a command down the open socket and waits for the bridge to ack it.
+  ///
+  /// Returns null when there was no live socket to send on, or when no ack came
+  /// back in time — both meaning "this did not happen", so the caller can fall
+  /// back rather than guess.
+  Future<({bool ok, String? detail})?> _command(
+    String cmd, {
+    Map<String, Object?> args = const {},
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
+    final channel = _channel;
+    if (channel == null || !_current.isLive) return null;
+
+    final id = ++_nextCommandId;
+    final completer = Completer<({bool ok, String? detail})?>();
+    _acks[id] = completer;
+    try {
+      channel.sink.add(jsonEncode({'cmd': cmd, 'id': id, ...args}));
+    } catch (_) {
+      _acks.remove(id);
+      return null;
+    }
+    try {
+      return await completer.future.timeout(timeout);
+    } catch (_) {
+      return null;
+    } finally {
+      _acks.remove(id);
+    }
+  }
+
+  /// Checks that the bridge is still on the other end of the socket we hold, and
+  /// reconnects if it is not.
+  ///
+  /// This is what iOS resume should call. Coming back to the foreground used to
+  /// reconnect unconditionally, on the reasoning that the OS tears the socket down
+  /// while suspended — but `resumed` also fires for a pulled-down notification
+  /// banner, Control Centre, or a permission sheet, none of which touch the
+  /// socket. Every one of those threw away a working connection and put
+  /// "Reconnecting" on screen for a second or two, which is most of what made the
+  /// link look unreliable. A round trip on the existing socket settles the
+  /// question in a few milliseconds when it is alive, and only then do we rebuild.
+  Future<void> verify() async {
+    if (_disposed || !_settings.isComplete) return;
+    if (!_current.isLive) {
+      reconnect();
+      return;
+    }
+    // Short on purpose: this is a LAN round trip on a socket believed healthy, and
+    // the fallback is a reconnect the app used to do immediately anyway.
+    final pong = await _command('ping', timeout: const Duration(milliseconds: 1500));
+    if (pong == null && !_disposed) reconnect();
+  }
+
   /// Switches party mode on or off.
   ///
   /// Returns null on success, or a sentence explaining the refusal. The bridge
@@ -184,7 +254,19 @@ class BridgeClient {
   ///
   /// The resulting state is not read from here: it arrives on the next snapshot,
   /// which is the same path used when the bridge stops party mode by itself.
+  ///
+  /// Tried on the WebSocket first. That socket is already open, already
+  /// authenticated and — since a snapshot arrived on it — already proven to work,
+  /// whereas the HTTP route opens a fresh TCP connection for every tap and so
+  /// gives the same flaky Wi-Fi a second, independent chance to fail. The HTTP
+  /// path stays as the fallback for a socket that is down, which is exactly when a
+  /// toggle is least likely to arrive but most likely to be tried.
   Future<String?> setParty(bool on) async {
+    final acked = await _command('party', args: {'on': on});
+    if (acked != null) {
+      return acked.ok ? null : (acked.detail ?? 'The bridge would not switch it on.');
+    }
+
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
     try {
       final request = await client.postUrl(
@@ -233,6 +315,16 @@ class BridgeClient {
       case 'event':
         final body = (frame['event'] as Map?)?.cast<String, Object?>();
         if (body != null) _events.add(GatherEvent.fromJson(body));
+      case 'party':
+        final body = (frame['party'] as Map?)?.cast<String, Object?>();
+        if (body != null) _parties.add(PartyState.fromJson(body));
+      case 'ack':
+        final id = (frame['id'] as num?)?.toInt();
+        final waiter = id == null ? null : _acks.remove(id);
+        waiter?.complete((
+          ok: frame['ok'] == true,
+          detail: frame['detail'] as String?,
+        ));
     }
   }
 
@@ -264,6 +356,18 @@ class BridgeClient {
     final channel = _channel;
     _sub = null;
     _channel = null;
+
+    // Anything still waiting for an ack was waiting on this socket. Answering
+    // "did not happen" now is what lets a party toggle fall back to HTTP
+    // immediately instead of sitting out its whole timeout first.
+    if (_acks.isNotEmpty) {
+      final waiting = List.of(_acks.values);
+      _acks.clear();
+      for (final completer in waiting) {
+        if (!completer.isCompleted) completer.complete(null);
+      }
+    }
+
     if (sub != null) unawaited(sub.cancel());
     if (channel != null) unawaited(_closeQuietly(channel));
   }
@@ -282,6 +386,7 @@ class BridgeClient {
     _abandon();
     await _events.close();
     await _snapshots.close();
+    await _parties.close();
     await _status.close();
   }
 }
