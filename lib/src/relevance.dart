@@ -145,11 +145,11 @@ EventLook lookOf(GatherEvent event, String Function(String) nameFor) {
         subject: null,
       );
 
-    case BridgeStatusEvent(:final collector, :final healthy, :final detail):
+    case BridgeStatusEvent(:final headline, :final healthy, :final detail):
       return EventLook(
         relevance: Relevance.ambient,
         icon: healthy ? Icons.link_rounded : Icons.link_off_rounded,
-        title: '$collector ${healthy ? 'connected' : 'disconnected'}',
+        title: headline,
         subject: null,
         detail: detail,
       );

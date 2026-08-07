@@ -621,7 +621,7 @@ export class BridgeServer {
           at: new Date(),
           collector: 'logTail',
           healthy: present,
-          detail: present ? this.logSource : 'gather log not found (desktop app not running)',
+          detail: present ? this.logSource : 'Gather log not found (desktop app not running)',
         }),
       ]);
     });

@@ -462,10 +462,18 @@ class BridgeStatusEvent extends GatherEvent {
   @override
   String get type => 'bridge.status';
 
+  /// The collector's health as a sentence. The wire values are identifiers, not
+  /// labels: `gather` is the brand, `logTail` is the desktop client's log file.
+  /// An unknown collector falls back to its raw name so a newer bridge still
+  /// renders.
+  String get headline => switch (collector) {
+        'gather' => healthy ? 'Gather connected' : 'Gather disconnected',
+        'logTail' => healthy ? 'Connected to log' : 'Disconnected from log',
+        _ => '$collector ${healthy ? 'connected' : 'disconnected'}',
+      };
+
   @override
-  String get summary =>
-      '$collector ${healthy ? 'connected' : 'disconnected'}'
-      '${detail == null ? '' : ' — $detail'}';
+  String get summary => '$headline${detail == null ? '' : ' — $detail'}';
 
   @override
   Map<String, Object?> payload() => {

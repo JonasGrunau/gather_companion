@@ -122,6 +122,22 @@ void main() {
       }
     });
 
+    test('collector health reads as prose, not as the bridge\'s identifiers', () {
+      String titleOf(String collector, {required bool healthy}) => look(BridgeStatusEvent(
+            at: at,
+            source: EventSource.bridge,
+            collector: collector,
+            healthy: healthy,
+          )).title;
+
+      expect(titleOf('gather', healthy: true), 'Gather connected');
+      expect(titleOf('gather', healthy: false), 'Gather disconnected');
+      expect(titleOf('logTail', healthy: true), 'Connected to log');
+      expect(titleOf('logTail', healthy: false), 'Disconnected from log');
+      // A collector this build has never heard of still renders.
+      expect(titleOf('somethingNew', healthy: true), 'somethingNew connected');
+    });
+
     test('an unmodelled event still renders rather than crashing the feed', () {
       final result = look(RawEvent(
         at: at,
