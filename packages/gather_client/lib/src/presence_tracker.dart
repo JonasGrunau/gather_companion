@@ -124,39 +124,98 @@ class PresenceTracker {
     );
   }
 
-  /// One event off Gather's own event bus.
+  /// One interaction: a bus event, or a meeting row the reader judged to be news.
   ///
-  /// Only `WaveEvent` becomes something a person sees so far. The rest — chat,
-  /// today — is dropped here rather than guessed at: an unrecognised `eventName`
-  /// has no wording, and inventing one for a lock screen is worse than silence.
+  /// Everything here is something a *person* did, aimed at *you*. An unrecognised
+  /// `eventName` is dropped rather than guessed at — it has no wording, and
+  /// inventing one for a lock screen is worse than silence.
   FoldResult applyInteraction(BusEvent event) {
-    if (event.name != 'WaveEvent') return const FoldResult();
-
     // Without knowing which SpaceUser is ours, "aimed at me" is unanswerable — the
     // same stance this class takes on being followed. Reporting every wave in the
     // space would be worse than reporting none.
-    if (!event.isFor(_selfId)) return const FoldResult();
+    if (event.name != 'ChatBroadcastNewMessage' && !event.isFor(_selfId)) {
+      return const FoldResult();
+    }
 
     final now = DateTime.now();
-    final key = event.senderId ?? 'unknown';
-    final last = _wavedAt[key];
-    if (last != null && now.difference(last) < waveCooldown) return const FoldResult();
-    _wavedAt[key] = now;
-
-    // The bus carries the sender's own clock, which is a better `at` than ours.
-    final sent = DateTime.tryParse(event.sentTime ?? '');
+    // The sender's own clock beats ours when it is offered.
+    final at = DateTime.tryParse(event.sentTime ?? '') ?? now;
     final who = nameFor(event.senderId);
-    return FoldResult(
-      emit: [
-        NotificationShownEvent(
-          at: sent ?? now,
-          source: EventSource.gather,
-          notificationType: 'wave',
-          body: '$who waved at you',
-          senderId: event.senderId,
-        ),
-      ],
-    );
+
+    switch (event.name) {
+      case 'WaveEvent':
+        // The wave *button* is not a decision the way a wave is: one person produced
+        // 41 in eight seconds. One per person per window is a record of something.
+        final key = event.senderId ?? 'unknown';
+        final last = _wavedAt[key];
+        if (last != null && now.difference(last) < waveCooldown) {
+          return const FoldResult();
+        }
+        _wavedAt[key] = now;
+        return FoldResult(emit: [
+          NotificationShownEvent(
+            at: at,
+            source: EventSource.gather,
+            notificationType: 'wave',
+            body: '$who waved at you',
+            senderId: event.senderId,
+          ),
+        ]);
+
+      case 'MeetingInvite':
+        // `MeetingParticipant` with our id and somebody else's `inviterId`. Read from
+        // state rather than scraped from the desktop client's log, which is where
+        // this used to come from — so it arrives without that client running, and it
+        // knows who invited us.
+        return FoldResult(emit: [
+          NotificationShownEvent(
+            at: at,
+            source: EventSource.gather,
+            notificationType: 'meeting invite',
+            title: 'Meeting invite',
+            body: '$who invited you to a meeting',
+            senderId: event.senderId,
+          ),
+        ]);
+
+      case 'MeetingJoinRequest':
+        // Somebody knocking on a meeting we are in, before anyone has answered. The
+        // one signal here with a deadline attached: on the observed sample the gap
+        // between the request and the answer was two seconds, so it is worthless
+        // late.
+        return FoldResult(emit: [
+          NotificationShownEvent(
+            at: at,
+            source: EventSource.gather,
+            notificationType: 'meeting join request',
+            title: 'Someone wants to join',
+            body: '$who is asking to join your meeting',
+            senderId: event.senderId,
+          ),
+        ]);
+
+      case 'ChatBroadcastNewMessage':
+        final message = event.payload['message'];
+        if (message is! Map<String, Object?>) return const FoldResult();
+        final text = message['message'];
+        // Gather emits empty system rows on the same channel as real messages —
+        // every meeting join writes one. They are not chat.
+        if (text is! String || text.isEmpty) return const FoldResult();
+        final sender = message['spaceUserId'];
+        if (sender is String && sender == _selfId) return const FoldResult();
+        return FoldResult(emit: [
+          ChatMessageEvent(
+            at: at,
+            source: EventSource.gather,
+            playerId: sender is String ? sender : (event.senderId ?? 'unknown'),
+            text: text,
+            channel: message['chatChannelId'] as String?,
+          ),
+        ]);
+
+      default:
+        return const FoldResult();
+    }
   }
 
   /// Replace what we know from Gather's own `SpaceUser` records.

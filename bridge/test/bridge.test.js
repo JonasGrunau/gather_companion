@@ -6,7 +6,14 @@ import { after, before, test } from 'node:test';
 
 import { BridgeServer } from '../lib/server.js';
 import { PushNotifier, PushRegistry } from '../lib/push.js';
-import { defaultPatches, fakeGameServer, fakeJwt, waveEvent } from './fake-gather.js';
+import {
+  defaultPatches,
+  fakeGameServer,
+  fakeJwt,
+  joinRequest,
+  participant,
+  waveEvent,
+} from './fake-gather.js';
 
 const TOKEN = 'test-token';
 const ME = 'me-1';
@@ -347,6 +354,103 @@ test('the collectors endpoint names what is actually connected', async () => {
 
 
 // ---- push -------------------------------------------------------------------
+
+// ---- meetings ---------------------------------------------------------------
+
+test('being invited to a meeting is reported, and names who invited you', async () => {
+  // Read out of `MeetingParticipant` state, not scraped from the desktop client's
+  // log — so it arrives without that client running, and it knows who sent it.
+  const pending = collect({
+    done: (f) =>
+      eventsOf(f).some(
+        (e) => e.type === 'notification.shown' && e.notificationType === 'meeting invite',
+      ),
+  });
+  await wait(200);
+  gather.latest.delta([participant({ spaceUserId: ME, inviterId: NEIGHBOUR })]);
+
+  const [shown] = eventsOf(await pending).filter((e) => e.notificationType === 'meeting invite');
+  assert.equal(shown.senderId, NEIGHBOUR);
+  assert.equal(shown.source, 'gather');
+});
+
+test('the meetings already in the state dump are history, not news', async () => {
+  // The trap: 56 `MeetingParticipant` rows arrived in the measured space, four of
+  // them naming the user. Reporting those would announce every meeting they have
+  // ever been invited to — on every reconnect, and this collector reconnects
+  // whenever the phone wakes the socket.
+  //
+  // Its own server and its own fake Gather, because the point is what a *dump*
+  // containing invites does, and the shared fixture's dump has none.
+  const withInvites = fakeGameServer({
+    patches: () => [
+      ...defaultPatches(),
+      participant({ id: 'old-1', spaceUserId: ME, inviterId: NEIGHBOUR }),
+      participant({ id: 'old-2', spaceUserId: ME, inviterId: NEIGHBOUR, meetingId: 'm2' }),
+    ],
+  });
+  const socketUrl = await withInvites.listen();
+  const bridge = new BridgeServer({
+    token: 'dump-token',
+    port: 0,
+    push: new PushNotifier({
+      sender: null,
+      registry: new PushRegistry({ read: () => ({}), write: () => {} }),
+    }),
+    socketUrl,
+    getToken: async () => fakeJwt(),
+    gatherSession: () => null,
+    spaceId: 'space-1',
+    logSource: logPath,
+    log: () => {},
+  });
+  await bridge.start();
+  const p = bridge._http.address().port;
+
+  try {
+    // Long enough for the dump to be consumed and any event to have been published.
+    for (let i = 0; i < 40; i++) {
+      const snapshot = await (await fetch(`http://127.0.0.1:${p}/state?token=dump-token`)).json();
+      if (snapshot.players?.length) break;
+      await wait(100);
+    }
+    await wait(500);
+
+    const published = (
+      await (await fetch(`http://127.0.0.1:${p}/events?token=dump-token`)).json()
+    ).events;
+    const invites = published.filter(
+      (e) => e.event?.notificationType === 'meeting invite',
+    );
+    assert.equal(invites.length, 0, 'a dump is how the world already was');
+  } finally {
+    await bridge.stop();
+    await withInvites.close();
+  }
+});
+
+test('somebody knocking on your meeting is reported; an answered one is not', async () => {
+  // First be in the meeting, the way the dump would tell us.
+  gather.latest.delta([participant({ id: 'mine', spaceUserId: ME })]);
+  await wait(300);
+
+  const pending = collect({
+    done: (f) =>
+      eventsOf(f).some((e) => e.notificationType === 'meeting join request'),
+  });
+  await wait(200);
+  gather.latest.delta([
+    // Already answered: worthless, and not reported.
+    joinRequest({ id: 'answered', respondedAt: '2026-08-07T09:45:23.710Z' }),
+    joinRequest({ id: 'waiting', spaceUserId: NEIGHBOUR }),
+  ]);
+
+  const knocks = eventsOf(await pending).filter(
+    (e) => e.notificationType === 'meeting join request',
+  );
+  assert.equal(knocks.length, 1, 'only the one still waiting');
+  assert.equal(knocks[0].senderId, NEIGHBOUR);
+});
 
 test('a phone can register for pushes, and then gets woken by a wave', async () => {
   // The point of push: this has to work when the app is not running, so it

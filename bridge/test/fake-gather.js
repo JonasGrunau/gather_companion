@@ -152,6 +152,47 @@ export function fakeGameServer({ requireAuth = true, patches = defaultPatches } 
   };
 }
 
+/** A `MeetingParticipant` row: an invite when `inviterId` is set. */
+export function participant({
+  id = 'part-1',
+  spaceUserId = 'me-1',
+  inviterId = null,
+  meetingId = 'meeting-1',
+} = {}) {
+  return {
+    op: 'addmodel',
+    model: 'MeetingParticipant',
+    data: {
+      id,
+      spaceUserId,
+      meetingId,
+      ...(inviterId ? { inviterId } : {}),
+      inviteStatus: inviterId ? 'InvitedRequired' : 'NotInvited',
+      createdAt: '2026-08-07T08:01:42.405Z',
+    },
+  };
+}
+
+/** A `MeetingJoinRequest`: somebody knocking, unanswered unless `respondedAt`. */
+export function joinRequest({
+  id = 'join-1',
+  spaceUserId = 'them-1',
+  meetingId = 'meeting-1',
+  respondedAt = null,
+} = {}) {
+  return {
+    op: 'addmodel',
+    model: 'MeetingJoinRequest',
+    data: {
+      id,
+      spaceUserId,
+      meetingId,
+      ...(respondedAt ? { respondedAt } : {}),
+      createdAt: '2026-08-07T09:45:21.834Z',
+    },
+  };
+}
+
 /**
  * One `WaveEvent`, shaped exactly as captured from a live space on 2026-08-07.
  *

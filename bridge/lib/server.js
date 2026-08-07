@@ -566,6 +566,22 @@ export class BridgeServer {
    * at rather than having silently dropped.
    */
   _onInteraction(event) {
+    // Meetings, read out of state rather than off the bus but delivered the same
+    // way. A join request is the one signal here with a deadline attached: on the
+    // observed sample the gap between somebody knocking and being let in was two
+    // seconds, so it is worthless late — which is exactly what push is for.
+    if (event.name === 'MeetingInvite' || event.name === 'MeetingJoinRequest') {
+      const isInvite = event.name === 'MeetingInvite';
+      return this._ingest([
+        notificationShown({
+          at: this._sentAt(event),
+          source: 'gather',
+          notificationType: isInvite ? 'meeting invite' : 'meeting join request',
+          senderId: event.senderId,
+        }),
+      ]);
+    }
+
     if (event.name !== 'WaveEvent') {
       this._publishRaw([
         {
@@ -593,16 +609,20 @@ export class BridgeServer {
     if (now - last < WAVE_COOLDOWN_MS) return;
     this._wavedAt.set(key, now);
 
-    // The bus carries the sender's own clock, which is a better `at` than ours.
-    const sent = event.sentTime ? new Date(event.sentTime) : null;
     this._ingest([
       notificationShown({
-        at: sent && !Number.isNaN(sent.getTime()) ? sent : new Date(),
+        at: this._sentAt(event),
         source: 'gather',
         notificationType: 'wave',
         senderId: event.senderId,
       }),
     ]);
+  }
+
+  /** The sender's own clock when it is offered, which beats ours. */
+  _sentAt(event) {
+    const sent = event.sentTime ? new Date(event.sentTime) : null;
+    return sent && !Number.isNaN(sent.getTime()) ? sent : new Date();
   }
 
   /**

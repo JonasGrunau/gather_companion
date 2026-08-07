@@ -48,7 +48,16 @@
 library;
 
 /// Only these models matter; a full state dump is mostly calendars and catalogs.
-const _models = {'SpaceUser', 'Connection', 'UserAccount', 'Space'};
+const _models = {
+  'SpaceUser',
+  'Connection',
+  'UserAccount',
+  'Space',
+  // Meetings, for the two things somebody can do *at* you that are recorded as
+  // state rather than sent over the event bus. See [_MeetingWatch].
+  'MeetingParticipant',
+  'MeetingJoinRequest',
+};
 
 /// SpaceUser fields worth tracking, for field-level `replace` patches.
 ///
@@ -186,6 +195,9 @@ class GameProtocolReader {
   /// UserAccount id belonging to me, the slower route to [selfId].
   String? _myUserAccountId;
 
+  /// Meetings, for the two things somebody can do at you that are state, not bus.
+  final _MeetingWatch _meetings = _MeetingWatch();
+
   /// Interaction events waiting to be drained.
   ///
   /// Queued rather than delivered inline, so [ingest]'s "did the roster change"
@@ -248,7 +260,14 @@ class GameProtocolReader {
       _busEvents++;
     }
 
-    final patches = _collectPatches(frame);
+    // The dump and the deltas are read separately, because for anything
+    // event-shaped the difference is the whole signal. `MeetingParticipant` rows
+    // arrive in both: 56 of them in the measured space, four naming us. Treating a
+    // dump row as news would announce every meeting we have ever been invited to,
+    // on every reconnect — and this collector reconnects whenever the phone wakes.
+    final dump = _patchesIn(frame['fullStatePatches']);
+    final deltas = _patchesIn(frame['patches']);
+    final patches = [...dump, ...deltas];
     if (patches.isEmpty) {
       // Frames that legitimately carry no model state (Authenticate, Subscribe,
       // SpaceStatus, …) — but a frame we *did* understand as an interaction is not
@@ -258,17 +277,33 @@ class GameProtocolReader {
     }
 
     var changed = false;
-    for (final patch in patches) {
-      if (_applyPatch(patch)) changed = true;
+    for (final patch in dump) {
+      if (_applyPatch(patch, isNews: false)) changed = true;
+    }
+    for (final patch in deltas) {
+      if (_applyPatch(patch, isNews: true)) changed = true;
     }
     if (changed || selfId == null) _identifySelf();
+
+    // Identity can arrive after the rows that depend on it — the `Connection` row
+    // is one patch among ~1500 — so anything we could not judge at the time is
+    // reconsidered once we know who we are.
+    if (selfId != null) _meetings.resolvePending(selfId!, _pending);
     return changed;
   }
 
-  bool _applyPatch(Map<String, Object?> patch) {
+  bool _applyPatch(Map<String, Object?> patch, {required bool isNews}) {
     final model = patch['model'];
     if (model is! String || !_models.contains(model)) return false;
     _patchCount++;
+
+    if (model == 'MeetingParticipant' || model == 'MeetingJoinRequest') {
+      _meetings.apply(model, patch, isNews: isNews, selfId: selfId, out: _pending);
+      // Never "the roster changed": meetings are not people standing in a room, and
+      // republishing a 79-row snapshot because a calendar row moved is exactly the
+      // traffic the coalescing window exists to prevent.
+      return false;
+    }
 
     switch (patch['op']) {
       case 'addmodel':
@@ -464,20 +499,140 @@ class GameProtocolReader {
   }
 }
 
-/// Pulls the patch arrays out of a frame.
+/// One patch array out of a frame.
 ///
-/// `FullStateChunk` uses `fullStatePatches`, `DeltaState` uses `patches`. Both are
-/// read explicitly; anything else is left alone rather than guessed at.
-List<Map<String, Object?>> _collectPatches(Map<String, Object?> frame) {
+/// `FullStateChunk` uses `fullStatePatches`, `DeltaState` uses `patches`. They are
+/// read separately rather than merged, because for anything event-shaped the
+/// difference between "this is how the world already was" and "this just happened"
+/// is the entire signal.
+List<Map<String, Object?>> _patchesIn(Object? list) {
+  if (list is! List) return const [];
   final out = <Map<String, Object?>>[];
-  for (final key in const ['fullStatePatches', 'patches']) {
-    final list = frame[key];
-    if (list is! List) continue;
-    for (final patch in list) {
-      if (patch is Map<String, Object?> && patch['op'] is String) out.add(patch);
-    }
+  for (final patch in list) {
+    if (patch is Map<String, Object?> && patch['op'] is String) out.add(patch);
   }
   return out;
+}
+
+/// Watches the meeting models for the two things somebody can do *at* you that
+/// Gather records as state rather than sending over the event bus.
+///
+///  - **An invite.** `MeetingParticipant{spaceUserId: <you>, inviterId: <them>}`,
+///    with `inviteStatus: 'InvitedRequired'`. Observed on a live space.
+///  - **A knock.** `MeetingJoinRequest{spaceUserId: <them>, meetingId}` with no
+///    `respondedAt` — somebody asking to be let in and waiting on an answer. This
+///    model is not even in the documented table; it turned up in the census.
+///
+/// Both are surfaced as [BusEvent]s so they travel the same path as a wave, and
+/// neither is emitted for a row that arrived in the state dump — see [apply].
+class _MeetingWatch {
+  /// Meetings we are a participant of, so a knock on somebody else's meeting in the
+  /// same space is not mistaken for one aimed at us.
+  final Set<String> _myMeetings = {};
+
+  /// Participant rows seen in the dump, so the same row arriving again as a delta
+  /// (an `updatedAt` touch, a response recorded) is not read as a fresh invite.
+  final Set<String> _known = {};
+
+  /// Rows that arrived before we knew which SpaceUser we are.
+  ///
+  /// Identity comes from one `Connection` patch among ~1500, and there is no
+  /// guarantee it lands first. Without this, an invite delivered in the same frame
+  /// as the dump would be judged against a null `selfId` and silently dropped.
+  final List<Map<String, Object?>> _undecided = [];
+
+  void apply(
+    String model,
+    Map<String, Object?> patch, {
+    required bool isNews,
+    required String? selfId,
+    required List<BusEvent> out,
+  }) {
+    final data = patch['data'];
+    if (patch['op'] != 'addmodel' || data is! Map<String, Object?>) {
+      // Updates and deletions carry nothing we report. A response being recorded on
+      // an invite is the *answer*, not a new question.
+      return;
+    }
+    final id = data['id'];
+    if (id is! String) return;
+
+    final firstSighting = _known.add(id);
+
+    if (model == 'MeetingParticipant') {
+      // Learn which meetings are ours regardless of where the row came from: the
+      // dump is exactly how we know which meetings we were already in.
+      if (selfId != null && data['spaceUserId'] == selfId) {
+        final meetingId = data['meetingId'];
+        if (meetingId is String) _myMeetings.add(meetingId);
+      }
+    }
+
+    if (!isNews || !firstSighting) return;
+
+    if (selfId == null) {
+      _undecided.add({'model': model, 'data': data});
+      return;
+    }
+    final event = _judge(model, data, selfId);
+    if (event != null) out.add(event);
+  }
+
+  /// Re-reads what arrived before we knew who we were.
+  void resolvePending(String selfId, List<BusEvent> out) {
+    if (_undecided.isEmpty) return;
+    final pending = List<Map<String, Object?>>.of(_undecided);
+    _undecided.clear();
+    for (final row in pending) {
+      final data = row['data'] as Map<String, Object?>;
+      if (data['spaceUserId'] == selfId) {
+        final meetingId = data['meetingId'];
+        if (meetingId is String) _myMeetings.add(meetingId);
+      }
+      final event = _judge(row['model'] as String, data, selfId);
+      if (event != null) out.add(event);
+    }
+  }
+
+  BusEvent? _judge(String model, Map<String, Object?> data, String selfId) {
+    if (model == 'MeetingParticipant') {
+      // Ours, and somebody put us there — a row we created by walking into a room
+      // has no `inviterId`, and is not an invitation.
+      if (data['spaceUserId'] != selfId) return null;
+      final inviter = data['inviterId'];
+      if (inviter is! String || inviter.isEmpty) return null;
+      return BusEvent(
+        name: 'MeetingInvite',
+        senderId: inviter,
+        sentTime: _isoOf(data['createdAt']),
+        targetUserIds: [selfId],
+        payload: data,
+      );
+    }
+
+    // A knock: somebody asking to join, before anyone has answered.
+    final asker = data['spaceUserId'];
+    if (asker is! String || asker == selfId) return null;
+    // Asked positively, because "absent" on this protocol is msgpack `undefined`
+    // rather than null — a `!= null` test would read every unanswered knock as
+    // already answered and report nothing at all.
+    if (_isoOf(data['respondedAt']) != null) return null;
+    final meetingId = data['meetingId'];
+    if (meetingId is! String || !_myMeetings.contains(meetingId)) return null;
+    return BusEvent(
+      name: 'MeetingJoinRequest',
+      senderId: asker,
+      sentTime: _isoOf(data['createdAt']),
+      targetUserIds: [selfId],
+      payload: data,
+    );
+  }
+}
+
+String? _isoOf(Object? value) {
+  if (value is DateTime) return value.toIso8601String();
+  if (value is String && value.isNotEmpty) return value;
+  return null;
 }
 
 /// Pulls interaction events out of `DeltaState.events[]`.

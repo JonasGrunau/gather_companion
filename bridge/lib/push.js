@@ -11,11 +11,14 @@
  *  - **wave** — rare, always deliberate, always means somebody wants you. The
  *    strongest case there is.
  *  - **meeting invite**, **event reminder** — scheduled, few, and time-bound.
+ *  - **meeting join request** — somebody knocking on a meeting and waiting. The
+ *    only one with a deadline: on the observed sample the gap between the request
+ *    and the answer was two seconds, so it is worthless late.
  *  - **follow.started** — rare and unambiguous, and the reason this app exists.
  *
- * All four are deliberate acts by a person. That is the bar, and it is why there
- * is no rate limiting here: proximity used to need a per-person cooldown because
- * walking past a desk is not a decision, and it is gone.
+ * All of them are deliberate acts by a person. That is the bar, and it is why there
+ * is no rate limiting here — with one exception, the wave *button*, which is
+ * debounced in `server.js` because one person produced 41 waves in eight seconds.
  *
  * ## Foreground double-ups
  *
@@ -141,6 +144,15 @@ export class PushNotifier {
   }
 }
 
+/** The kinds that carry a sender, and how to word them with a name. */
+function namedWording(type, who) {
+  return {
+    wave: `${who} waved at you`,
+    'meeting invite': `${who} invited you to a meeting`,
+    'meeting join request': `${who} is asking to join your meeting`,
+  }[type];
+}
+
 /**
  * The sentence a person reads on their lock screen, or null for "not worth it".
  *
@@ -168,21 +180,22 @@ export function describe(event, nameFor = (id) => id) {
       const wording = {
         wave: ['Someone waved at you', 'Someone is trying to get your attention in Gather'],
         'meeting invite': ['Meeting invite', 'You have been invited to a meeting'],
+        'meeting join request': ['Someone wants to join', 'Somebody is asking to join your meeting'],
         'event reminder': ['Event reminder', 'An event on your calendar is starting'],
       }[type];
       if (!wording) return null;
 
-      // A wave off the game socket carries `senderId`, so it can say who. The
-      // log-scraped version never could — the IPC line has only a type — which is
-      // why the fallback wording is as vague as it is.
-      const who = type === 'wave' && event.senderId ? nameFor(event.senderId) : null;
+      // Anything off the game socket carries `senderId`, so it can say who. The
+      // log-scraped kinds never could — the IPC line has only a type — which is why
+      // the fallback wording is as vague as it is.
+      const who = event.senderId ? nameFor(event.senderId) : null;
       return {
         kind: type,
         title: event.title ?? wording[0],
-        body: event.body ?? (who ? `${who} waved at you` : wording[1]),
+        body: event.body ?? (who ? namedWording(type, who) ?? wording[1] : wording[1]),
         // Collapsed per sender when we know them, so two different people waving
         // do not overwrite each other on the lock screen.
-        collapseId: event.senderId ? `gather-wave-${event.senderId}` : `gather-${type}`,
+        collapseId: event.senderId ? `gather-${type}-${event.senderId}` : `gather-${type}`,
       };
     }
 

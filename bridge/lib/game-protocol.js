@@ -50,8 +50,8 @@
  * us, and 45 `ChatBroadcastNewMessage`es, all on an **observer** connection — so
  * `enterSpace` is not required to hear them.
  *
- * This corrects a long-standing and expensive mistake. `collectPatches` reads only
- * `fullStatePatches` and `patches`, so a frame carrying nothing but `events[]`
+ * This corrects a long-standing and expensive mistake. The patch reader looked only
+ * at `fullStatePatches` and `patches`, so a frame carrying nothing but `events[]`
  * fell straight through to `_unknownFrames++`. Every wave had been arriving on
  * this socket from the beginning and being tallied as an unrecognised envelope —
  * while `desktop-notifications.js` was built to scrape the same waves back out of
@@ -70,7 +70,16 @@
  */
 
 /** Only these models matter; a full state dump is mostly calendars and catalogs. */
-const MODELS = new Set(['SpaceUser', 'Connection', 'UserAccount', 'Space']);
+const MODELS = new Set([
+  'SpaceUser',
+  'Connection',
+  'UserAccount',
+  'Space',
+  // Meetings, for the two things somebody can do *at* you that Gather records as
+  // state rather than sending over the event bus. See `MeetingWatch`.
+  'MeetingParticipant',
+  'MeetingJoinRequest',
+]);
 
 /**
  * SpaceUser fields worth tracking, for field-level `replace` patches.
@@ -105,6 +114,9 @@ export class GameProtocolReader {
 
     /** UserAccount id belonging to me, the slower route to `selfId`. */
     this._myUserAccountId = null;
+
+    /** Meetings, for the two things somebody can do at you that are state, not bus. */
+    this.meetings = new MeetingWatch();
 
     /** The space's display name, from the single `Space` row in the dump. */
     this.spaceName = null;
@@ -180,8 +192,14 @@ export class GameProtocolReader {
       this._busEvents++;
     }
 
-    const patches = collectPatches(frame);
-    if (patches.length === 0) {
+    // The dump and the deltas are read separately, because for anything
+    // event-shaped the difference is the whole signal. `MeetingParticipant` rows
+    // arrive in both: 56 of them in the measured space, four naming us. Treating a
+    // dump row as news would announce every meeting the user has ever been invited
+    // to, on every reconnect.
+    const dump = patchesIn(frame.fullStatePatches);
+    const deltas = patchesIn(frame.patches);
+    if (dump.length === 0 && deltas.length === 0) {
       // Frames that legitimately carry no model state (Authenticate, Subscribe,
       // SpaceStatus, …). Counted so a genuinely unrecognised envelope is visible
       // in stats() rather than silently ignored — but a frame we *did* understand
@@ -191,17 +209,33 @@ export class GameProtocolReader {
     }
 
     let changed = false;
-    for (const patch of patches) {
-      if (this._applyPatch(patch)) changed = true;
+    for (const patch of dump) {
+      if (this._applyPatch(patch, false)) changed = true;
+    }
+    for (const patch of deltas) {
+      if (this._applyPatch(patch, true)) changed = true;
     }
     if (changed || this.selfId == null) this._identifySelf();
+
+    // Identity can arrive after the rows that depend on it — `Connection` is one
+    // patch among ~1500 — so anything we could not judge at the time is reconsidered
+    // once we know who we are.
+    if (this.selfId) this.meetings.resolvePending(this.selfId, this.pending);
     return changed;
   }
 
-  _applyPatch(patch) {
+  _applyPatch(patch, isNews) {
     const model = patch.model;
     if (!MODELS.has(model)) return false;
     this._patchCount++;
+
+    if (model === 'MeetingParticipant' || model === 'MeetingJoinRequest') {
+      this.meetings.apply(model, patch, isNews, this.selfId, this.pending);
+      // Never "the roster changed": meetings are not people standing in a room, and
+      // republishing a 79-row snapshot because a calendar row moved is exactly the
+      // traffic the coalescing window exists to prevent.
+      return false;
+    }
 
     switch (patch.op) {
       case 'addmodel':
@@ -374,22 +408,108 @@ export class GameProtocolReader {
 }
 
 /**
- * Pulls the patch arrays out of a frame.
+ * One patch array out of a frame.
  *
- * `FullStateChunk` uses `fullStatePatches`, `DeltaState` uses `patches`. Both are
- * read explicitly; anything else is left alone rather than guessed at, so a new
- * envelope shows up as an unrecognised frame in `stats()`.
+ * `FullStateChunk` uses `fullStatePatches`, `DeltaState` uses `patches`. They are
+ * read separately rather than merged, because for anything event-shaped the
+ * difference between "this is how the world already was" and "this just happened"
+ * is the entire signal.
  */
-function collectPatches(frame) {
-  const out = [];
-  for (const key of ['fullStatePatches', 'patches']) {
-    const list = frame[key];
-    if (!Array.isArray(list)) continue;
-    for (const patch of list) {
-      if (patch && typeof patch === 'object' && typeof patch.op === 'string') out.push(patch);
+function patchesIn(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter((p) => p && typeof p === 'object' && typeof p.op === 'string');
+}
+
+/**
+ * Watches the meeting models for the two things somebody can do *at* you that
+ * Gather records as state rather than sending over the event bus.
+ *
+ *  - **An invite.** `MeetingParticipant{spaceUserId: <you>, inviterId: <them>}`.
+ *  - **A knock.** `MeetingJoinRequest{spaceUserId: <them>, meetingId}` with no
+ *    `respondedAt` — somebody asking to be let in and waiting on an answer. On the
+ *    observed sample the gap between request and answer was two seconds, so this is
+ *    the one signal here that is worthless late.
+ *
+ * Both are surfaced as bus events so they travel the same path as a wave.
+ */
+export class MeetingWatch {
+  constructor() {
+    /** Meetings we are a participant of, so somebody else's knock is not ours. */
+    this.mine = new Set();
+    /** Row ids already seen, so a re-sent row is not a second invitation. */
+    this.known = new Set();
+    /** Rows that arrived before we knew which SpaceUser we are. */
+    this.undecided = [];
+  }
+
+  apply(model, patch, isNews, selfId, out) {
+    // Updates and deletions carry nothing we report: a response being recorded on
+    // an invite is the *answer*, not a new question.
+    if (patch.op !== 'addmodel') return;
+    const data = patch.data;
+    if (!data || typeof data !== 'object' || typeof data.id !== 'string') return;
+
+    const firstSighting = !this.known.has(data.id);
+    this.known.add(data.id);
+
+    // Learn which meetings are ours wherever the row came from: the dump is exactly
+    // how we know which meetings we were already in.
+    if (model === 'MeetingParticipant' && selfId && data.spaceUserId === selfId) {
+      if (typeof data.meetingId === 'string') this.mine.add(data.meetingId);
+    }
+
+    if (!isNews || !firstSighting) return;
+    if (!selfId) {
+      this.undecided.push({ model, data });
+      return;
+    }
+    const event = this._judge(model, data, selfId);
+    if (event) out.push(event);
+  }
+
+  /** Re-reads what arrived before we knew who we were. */
+  resolvePending(selfId, out) {
+    if (this.undecided.length === 0) return;
+    const pending = this.undecided;
+    this.undecided = [];
+    for (const { model, data } of pending) {
+      if (data.spaceUserId === selfId && typeof data.meetingId === 'string') {
+        this.mine.add(data.meetingId);
+      }
+      const event = this._judge(model, data, selfId);
+      if (event) out.push(event);
     }
   }
-  return out;
+
+  _judge(model, data, selfId) {
+    if (model === 'MeetingParticipant') {
+      // Ours, and somebody put us there — a row we created by walking into a room
+      // has no `inviterId`, and is not an invitation.
+      if (data.spaceUserId !== selfId) return null;
+      if (typeof data.inviterId !== 'string' || !data.inviterId) return null;
+      return {
+        name: 'MeetingInvite',
+        senderId: data.inviterId,
+        sentTime: asIsoString(data.createdAt),
+        targetUserIds: [selfId],
+        payload: data,
+      };
+    }
+
+    const asker = data.spaceUserId;
+    if (typeof asker !== 'string' || asker === selfId) return null;
+    // Asked positively, because "absent" here is msgpack `undefined` rather than
+    // null — a `!= null` test would read every unanswered knock as already answered.
+    if (asIsoString(data.respondedAt)) return null;
+    if (typeof data.meetingId !== 'string' || !this.mine.has(data.meetingId)) return null;
+    return {
+      name: 'MeetingJoinRequest',
+      senderId: asker,
+      sentTime: asIsoString(data.createdAt),
+      targetUserIds: [selfId],
+      payload: data,
+    };
+  }
 }
 
 /**
