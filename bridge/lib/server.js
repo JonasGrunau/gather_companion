@@ -6,6 +6,7 @@ import { DirectCollector } from './direct.js';
 import { bridgeStatus } from './events.js';
 import { FcmSender } from './fcm.js';
 import { LogTail } from './log-tail.js';
+import { PartyMode } from './party.js';
 import { PresenceTracker } from './presence.js';
 import { PairingCodes } from './pairing.js';
 import { fcmKeyFile, gatherLogFile, lanAddresses, readGatherSpace } from './paths.js';
@@ -77,6 +78,14 @@ export class BridgeServer {
     this.push =
       push ?? new PushNotifier({ sender: loadPushSender(log), registry: new PushRegistry({ log }), log });
 
+    // The collector is looked up lazily rather than passed: it does not exist
+    // until `start()`, and it is replaced outright whenever the bridge
+    // reconnects to Gather.
+    this.party = new PartyMode({ collector: () => this._collector, log });
+    // Only switching on and off is worth a push. The hop count rides along on
+    // whatever snapshot goes out next — see `_snapshot()`.
+    this.party.on('change', () => this._publishSnapshot());
+
     /** @type {Set<import('./ws.js').WsConnection>} */
     this._clients = new Set();
     /** Clients that asked for the unfiltered firehose via `?raw=1`. */
@@ -102,6 +111,7 @@ export class BridgeServer {
   }
 
   async stop() {
+    this.party.stop('the bridge stopped');
     this._collector?.stop();
     this._tail?.stop();
     for (const client of this._clients) client.close(1001);
@@ -200,9 +210,23 @@ export class BridgeServer {
       return undefined;
     }
 
+    // Party mode: the one thing the phone can switch on rather than only watch.
+    // Reachable by GET as well as POST — it is a toggle, the state it produces is
+    // published on the snapshot anyway, and `curl` is how you turn it off when
+    // your phone is the thing that went flat.
+    if (url.pathname === '/party') {
+      const wanted = url.searchParams.get('on');
+      if (wanted == null) return json(200, this.party.state());
+      const on = wanted !== '0' && wanted !== 'false';
+      const result = on ? this.party.start() : this.party.stop('switched off');
+      // `ok:false` means it refused to start and said why, which is a 409 rather
+      // than a failure of the request itself.
+      return json(result.ok === false ? 409 : 200, result);
+    }
+
     switch (url.pathname) {
       case '/state':
-        return json(200, { seq: this._seq, ...this.tracker.snapshot() });
+        return json(200, { seq: this._seq, ...this._snapshot() });
       case '/events': {
         const since = Number(url.searchParams.get('since') ?? 0);
         const events = this._history.filter((h) => h.seq > since);
@@ -246,6 +270,12 @@ export class BridgeServer {
             sending: this.push.enabled,
             devices: this.push.registry.list().length,
             kinds: this.push.registry.kinds(),
+          },
+          party: {
+            ...this.party.state(),
+            // How big the walkable-tile pool has grown. A small number here is
+            // why party mode would be skipping hops.
+            knownTiles: this.party.knownTiles,
           },
           // Live protocol-reader stats. This is the thing to look at when the
           // collector is connected but the roster stays empty: unknown frame types
@@ -308,12 +338,26 @@ export class BridgeServer {
     }
   }
 
+  /**
+   * The snapshot, with party mode folded in at the last moment.
+   *
+   * Pulled rather than pushed. Party mode changes four times a second while it
+   * runs, and mirroring each hop into the tracker would mean either a stale
+   * counter or a snapshot per hop to every connected phone. Reading it here
+   * costs nothing and means whatever snapshot goes out next — for any reason —
+   * carries a current number.
+   */
+  _snapshot() {
+    this.tracker.setParty(this.party.state());
+    return this.tracker.snapshot();
+  }
+
   _publishSnapshot() {
     if (this._clients.size === 0) return;
     const frame = JSON.stringify({
       kind: 'snapshot',
       seq: this._seq,
-      snapshot: this.tracker.snapshot(),
+      snapshot: this._snapshot(),
     });
     for (const client of this._clients) client.send(frame);
   }
@@ -365,6 +409,9 @@ export class BridgeServer {
     this.log('connecting to Gather as an observer');
 
     collector.on('roster', (roster) => {
+      // Before the tracker, so that a hop fired from this same roster is judged
+      // against the freshest positions we hold rather than the previous ones.
+      this.party.noteRoster(roster);
       const out = this.tracker.applyRoster(roster);
       this._publish(out.emit);
       if (out.stateChanged) this._publishSnapshot();

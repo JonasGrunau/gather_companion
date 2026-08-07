@@ -89,6 +89,24 @@ class AppState extends ChangeNotifier {
   /// in the UI, because it changes what a quiet screen means.
   bool get hasRichData => _snapshot.health.hasRichData;
 
+  /// Party mode as the bridge last reported it.
+  PartyState get party => _snapshot.party;
+
+  /// What the button should show: what we asked for while that is still in
+  /// flight, and the truth the rest of the time.
+  ///
+  /// A round trip to the computer takes long enough that a button waiting for it
+  /// feels broken, and party mode is a toy — it has to answer the tap instantly.
+  /// [_partyWanted] is cleared by the snapshot that agrees with it rather than by
+  /// the HTTP response, because the two race and the snapshot is the one that is
+  /// actually true.
+  bool get partyMode => _partyWanted ?? _snapshot.party.active;
+
+  /// Whether a toggle is still on its way to the bridge.
+  bool get partyPending => _partyWanted != null;
+
+  bool? _partyWanted;
+
   /// The classified feed, rebuilt only when something it depends on changes.
   ///
   /// This used to classify every event in the log — up to [_logLimit] of them —
@@ -184,10 +202,33 @@ class AppState extends ChangeNotifier {
     _settings = BridgeSettings.empty;
     _bridgeName = null;
     _snapshot = PresenceSnapshot.empty;
+    _partyWanted = null;
     _log.clear();
     _invalidateFeed();
     _detach();
     notifyListeners();
+  }
+
+  /// Asks the bridge to start or stop teleporting me around the map.
+  ///
+  /// Returns null when it took, or a sentence to put in front of the user. The
+  /// bridge refuses rather than pretending when it has no Gather connection, so
+  /// the failure is worth showing rather than swallowing.
+  Future<String?> setPartyMode(bool on) async {
+    final client = _client;
+    if (client == null) return 'Not connected to the bridge.';
+
+    _partyWanted = on;
+    notifyListeners();
+
+    final error = await client.setParty(on);
+    if (error != null) {
+      // Snap back: nothing changed on the other end, so the button must not go
+      // on claiming otherwise while it waits for a snapshot that will not come.
+      _partyWanted = null;
+      notifyListeners();
+    }
+    return error;
   }
 
   void setShowEverything(bool value) {
@@ -314,6 +355,11 @@ class AppState extends ChangeNotifier {
 
   void _onSnapshot(PresenceSnapshot snapshot) {
     _snapshot = snapshot;
+    // The bridge has caught up with what we asked for, so stop overriding it.
+    // From here on the snapshot is the only thing the button reads — which is
+    // what lets it go dark on its own when party mode times out or the bridge
+    // loses Gather.
+    if (_partyWanted == snapshot.party.active) _partyWanted = null;
     // Names live in the snapshot and are resolved during classification, so a
     // new roster can relabel events that are already in the log.
     _invalidateFeed();

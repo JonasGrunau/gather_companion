@@ -13,7 +13,7 @@ needed to be shared twice yet.
 
 | File | Description |
 |------|-------------|
-| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_FollowerCard`, `_PersonChip`, `_Avatar`, `_SectionLabel`, `_EventRow`, `_BackgroundToggle`, `_EmptyFeed`. Answers "who is here now" at the top from the snapshot, history underneath. |
+| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`, `_SectionLabel`, `_EventRow`, `_BackgroundToggle`, `_EmptyFeed`. Answers "who is here now" at the top from the snapshot, history underneath. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 
@@ -28,6 +28,17 @@ needed to be shared twice yet.
   "Show N background events".
 - `CustomScrollView` needs `AlwaysScrollableScrollPhysics` or a short feed cannot
   be over-scrolled and pull-to-refresh silently does nothing on a quiet screen.
+- **`_PartyCard` renders the snapshot, never its own memory.** The bridge stops
+  party mode by itself — on its 15-minute timer, when it loses Gather, when the
+  daemon exits — so a button holding local state would keep glowing through all
+  three. `AppState.partyMode` overrides the snapshot only while a tap is in
+  flight, and that override is cleared by the snapshot that agrees with it rather
+  than by the HTTP response, because the two race.
+- **The gradient animates only while it is actually hopping.** This is the one
+  moving thing in an interface that otherwise deliberately sits still, which is
+  what makes it read as a status light rather than as decoration; the controller
+  is stopped when the card is off, and `MediaQuery.disableAnimationsOf` is
+  honoured.
 - **An empty feed has two different meanings** and must say which: "nothing has
   happened" versus "not connected". `_EmptyFeed` reads `AppState.link` and
   `isPriming` to tell them apart, and there is a test for each.

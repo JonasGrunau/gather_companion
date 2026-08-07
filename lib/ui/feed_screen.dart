@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:gather_events/gather_events.dart';
@@ -45,6 +46,7 @@ class FeedScreen extends StatelessWidget {
                   physics: const AlwaysScrollableScrollPhysics(),
                   slivers: [
                     SliverToBoxAdapter(child: _AroundYou(state: state)),
+                    SliverToBoxAdapter(child: _PartyCard(state: state)),
                     // Nothing at all while the backlog is in flight: showing
                     // "No activity yet" and replacing it a moment later is the
                     // kind of flicker that makes an app look broken on open.
@@ -382,6 +384,291 @@ class _AroundYou extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The one control on the screen, and the only thing here that writes to Gather.
+///
+/// Everything else in this app watches. This teleports your avatar to a random
+/// tile four times a second, which is silly on purpose — so it is allowed the one
+/// piece of motion in an interface that otherwise deliberately sits still. The
+/// gradient turns only while it is actually hopping: an animation that runs when
+/// nothing is happening is decoration, and this one is a status light.
+///
+/// It reads [AppState.partyMode] rather than any local flag, so it goes dark by
+/// itself when the bridge stops — on its own timer, or because it lost Gather.
+class _PartyCard extends StatefulWidget {
+  const _PartyCard({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_PartyCard> createState() => _PartyCardState();
+}
+
+class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMixin {
+  /// Slow enough to read as a drift rather than a strobe. This sits on a screen
+  /// someone may leave open.
+  late final AnimationController _spin = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 5),
+  );
+
+  bool _reduceMotion = false;
+
+  /// The palette opens and closes on Gather's own accent so the sweep meets
+  /// itself: a gradient whose ends differ shows a seam every time it comes round.
+  static const _palette = [
+    Color(0xFF4257DA),
+    Color(0xFF7B3FE4),
+    Color(0xFFD33EF7),
+    Color(0xFFE0A22F),
+    Color(0xFF3FBF87),
+    Color(0xFF2C86C4),
+    Color(0xFF4257DA),
+  ];
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _reduceMotion = MediaQuery.maybeDisableAnimationsOf(context) ?? false;
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(_PartyCard old) {
+    super.didUpdateWidget(old);
+    _sync();
+  }
+
+  /// Ties the controller to the bridge's answer, and stops it otherwise — a
+  /// ticker left running behind a switched-off card costs a rebuild every frame
+  /// for something nobody can see.
+  void _sync() {
+    final on = widget.state.partyMode && !_reduceMotion;
+    if (on && !_spin.isAnimating) {
+      _spin.repeat();
+    } else if (!on && _spin.isAnimating) {
+      _spin.stop();
+      _spin.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  Future<void> _toggle() async {
+    if (widget.state.partyPending) return;
+    final on = !widget.state.partyMode;
+    final error = await widget.state.setPartyMode(on);
+    if (error == null || !mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final on = widget.state.partyMode;
+    final party = widget.state.party;
+
+    // While it is hopping, a reason means it is *not* hopping this moment — a
+    // corner it has been backed into rather than a fault. Standing still is the
+    // correct behaviour there, so it is reported plainly instead of as an error.
+    final subtitle = switch ((on, party.detail)) {
+      (true, final String why) => why,
+      (true, _) => 'Hopping four times a second, nowhere near anyone',
+      (false, final String why) => why,
+      _ => 'Teleport around the map, never next to anyone',
+    };
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(kGutter, 6, kGutter, 2),
+      child: AnimatedBuilder(
+        animation: _spin,
+        builder: (context, child) {
+          final phase = _spin.value;
+          return DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(t.radius),
+              color: on ? null : t.card,
+              border: on ? null : Border.all(color: t.border),
+              gradient: on
+                  ? LinearGradient(
+                      colors: _palette,
+                      transform: GradientRotation(phase * 2 * math.pi),
+                    )
+                  : null,
+              boxShadow: on
+                  ? [
+                      BoxShadow(
+                        color: _palette[1].withValues(alpha: 0.34),
+                        blurRadius: 24,
+                        spreadRadius: -6,
+                        offset: const Offset(0, 8),
+                      ),
+                    ]
+                  : null,
+            ),
+            child: child,
+          );
+        },
+        // Built once and handed to the builder: only the decoration depends on
+        // the animation, so the row underneath has no business rebuilding sixty
+        // times a second.
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: _toggle,
+            borderRadius: BorderRadius.circular(t.radius),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(13, 13, 14, 13),
+              child: Row(
+                children: [
+                  _PartyGlyph(spin: _spin, on: on),
+                  const SizedBox(width: 13),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              'Party mode',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.2,
+                                color: on ? Colors.white : t.foreground,
+                              ),
+                            ),
+                            if (on && party.hops > 0) ...[
+                              const SizedBox(width: 8),
+                              Text(
+                                '${party.hops}',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white.withValues(alpha: 0.75),
+                                  fontFeatures: const [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            height: 1.35,
+                            color: on ? Colors.white.withValues(alpha: 0.86) : t.faint,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _PartySwitch(on: on, pending: widget.state.partyPending),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The disco ball. Wobbles rather than spins — a full rotation on a round icon
+/// is invisible, and a tilt back and forth reads as bouncing.
+class _PartyGlyph extends StatelessWidget {
+  const _PartyGlyph({required this.spin, required this.on});
+
+  final Animation<double> spin;
+  final bool on;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return AnimatedBuilder(
+      animation: spin,
+      builder: (context, child) {
+        final wobble = on ? math.sin(spin.value * 2 * math.pi) : 0.0;
+        return Transform.rotate(
+          angle: wobble * 0.22,
+          child: Transform.scale(scale: 1 + wobble.abs() * 0.08, child: child),
+        );
+      },
+      child: Container(
+        width: 38,
+        height: 38,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: on ? Colors.white.withValues(alpha: 0.2) : t.secondary,
+          shape: BoxShape.circle,
+          border: on ? null : Border.all(color: t.border),
+        ),
+        child: Icon(
+          Icons.celebration_rounded,
+          size: 20,
+          color: on ? Colors.white : t.mutedForeground,
+        ),
+      ),
+    );
+  }
+}
+
+/// A switch drawn by hand rather than a `Switch`, because Material's fills its
+/// own track colour and would fight the gradient behind it.
+class _PartySwitch extends StatelessWidget {
+  const _PartySwitch({required this.on, required this.pending});
+
+  final bool on;
+
+  /// A tap that has not reached the computer yet. Shown as a dimmed knob so the
+  /// button reads as "heard you" rather than as finished.
+  final bool pending;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      width: 44,
+      height: 26,
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: on ? Colors.white.withValues(alpha: 0.28) : t.secondary,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: on ? Colors.white.withValues(alpha: 0.4) : t.border,
+        ),
+      ),
+      child: AnimatedAlign(
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutBack,
+        alignment: on ? Alignment.centerRight : Alignment.centerLeft,
+        child: Opacity(
+          opacity: pending ? 0.55 : 1,
+          child: Container(
+            width: 20,
+            height: 20,
+            decoration: BoxDecoration(
+              color: on ? Colors.white : t.faint,
+              shape: BoxShape.circle,
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -21,6 +21,7 @@ platform plumbing — launchd installation, paths, pairing codes.
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
 | `fcm.js` | `FcmSender` — Firebase Cloud Messaging HTTP v1, hand-rolled: RS256 service-account JWT → OAuth2 access token → `messages:send`. Also `readServiceAccount()`. |
 | `push.js` | `PushNotifier` (which events deserve waking a locked phone) and `PushRegistry` (the registered devices, persisted in the config file). `describe()` holds the policy and is pure. |
+| `party.js` | `PartyMode` — the only thing here that *writes* to Gather. Picks a random tile that is both proven walkable and at least `SAFE_TILES` from everyone connected, four times a second. `safeTilesNow()` is the whole interesting part. |
 | `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster, reads the space name off the `Space` row, and resolves which row is *me*. |
 | `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
 | `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper. One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. |
@@ -45,6 +46,17 @@ platform plumbing — launchd installation, paths, pairing codes.
   it from colliding with the user's own desktop session. A duplicate connection was
   measured harmless in observer mode only — two *entered* connections were never
   tested. `bridge/test/direct.test.js` guards this.
+- **Entering is not a prerequisite for writing.** `teleport` was measured working
+  from an observer connection (2026-08-07), because `SpaceUser` is
+  per-person-per-space while `Connection.entered` is per-socket. So the rule above
+  costs nothing: `party.js` moves the user's avatar without ever incrementing
+  `numTimesEnteredSpace`. `teleport` is the *only* write this bridge makes, and a
+  second one should have to argue for itself — the gateway would accept anything.
+- **Party mode must never publish per hop.** It runs at 4Hz and every `change`
+  event sends a snapshot to every connected phone; the hop counter is therefore
+  pulled in at `BridgeServer._snapshot()` rather than pushed. This is the same
+  failure the collector's health detail once had, where a frame counter in the
+  detail string filled the 500-event replay history within minutes.
 - **A wrong handshake fails silently.** Gather does not reject a frame it cannot
   parse: it keeps heartbeating and says nothing. So `msgpack.js`'s encoder refuses
   values it cannot represent faithfully rather than emitting something plausible,

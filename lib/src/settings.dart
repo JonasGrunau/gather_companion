@@ -31,12 +31,12 @@ class BridgeSettings {
         },
       );
 
-  Uri httpUri(String path) => Uri(
+  Uri httpUri(String path, [Map<String, String> query = const {}]) => Uri(
         scheme: 'http',
         host: host.trim(),
         port: port,
         path: path,
-        queryParameters: {'token': token.trim()},
+        queryParameters: {'token': token.trim(), ...query},
       );
 
   static const empty = BridgeSettings(host: '', port: defaultPort, token: '');

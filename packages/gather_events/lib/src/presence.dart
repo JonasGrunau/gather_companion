@@ -252,6 +252,47 @@ class CollectorHealth {
       );
 }
 
+/// Party mode: whether the bridge is currently teleporting me around the map.
+///
+/// Comes back on the snapshot rather than being tracked in the app, because the
+/// app is not the only thing that can change it — the bridge stops on its own
+/// after fifteen minutes, when it loses Gather, and when the daemon shuts down.
+/// A toggle that only remembers what it was last told would keep glowing through
+/// all three.
+class PartyState {
+  const PartyState({
+    this.active = false,
+    this.hops = 0,
+    this.safeTiles = 0,
+    this.detail,
+  });
+
+  final bool active;
+
+  /// Teleports made this session.
+  final int hops;
+
+  /// How many tiles were far enough from everyone at the last hop.
+  final int safeTiles;
+
+  /// Why it is not hopping, when it is not. Also carries the reason it stopped.
+  final String? detail;
+
+  Map<String, Object?> toJson() => {
+        'active': active,
+        'hops': hops,
+        'safeTiles': safeTiles,
+        'detail': detail,
+      };
+
+  static PartyState fromJson(Map<String, Object?> json) => PartyState(
+        active: json['active'] as bool? ?? false,
+        hops: (json['hops'] as num?)?.toInt() ?? 0,
+        safeTiles: (json['safeTiles'] as num?)?.toInt() ?? 0,
+        detail: json['detail'] as String?,
+      );
+}
+
 /// Full snapshot pushed on connect and whenever state changes materially.
 class PresenceSnapshot {
   const PresenceSnapshot({
@@ -259,12 +300,17 @@ class PresenceSnapshot {
     required this.players,
     required this.health,
     required this.at,
+    this.party = const PartyState(),
   });
 
   final SelfState self;
   final List<PlayerRef> players;
   final CollectorHealth health;
   final DateTime at;
+
+  /// Defaulted rather than required: a bridge older than this app build sends no
+  /// `party` key at all, and "off" is the right reading of its silence.
+  final PartyState party;
 
   List<PlayerRef> get nearby => players.where((p) => p.isNear).toList();
   List<PlayerRef> get followers =>
@@ -276,6 +322,7 @@ class PresenceSnapshot {
         'self': self.toJson(),
         'players': players.map((p) => p.toJson()).toList(),
         'health': health.toJson(),
+        'party': party.toJson(),
       };
 
   static PresenceSnapshot fromJson(Map<String, Object?> json) =>
@@ -288,6 +335,8 @@ class PresenceSnapshot {
             .toList(),
         health: CollectorHealth.fromJson(
             (json['health'] as Map?)?.cast<String, Object?>() ?? const {}),
+        party: PartyState.fromJson(
+            (json['party'] as Map?)?.cast<String, Object?>() ?? const {}),
       );
 
   /// A blank snapshot for first paint, before the bridge has answered.

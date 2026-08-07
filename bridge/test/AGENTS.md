@@ -20,6 +20,7 @@ rather than evidence that the code matches its own assumptions.
 | `game-protocol.test.js` | The largest suite. Model patches (`addmodel` / `deletemodel` / `replace`), both envelope keys, identity resolution via `Connection` and via `UserAccount`, component-wise position updates, teleports, follow detection, bot filtering — feeding `GameProtocolReader` into `PresenceTracker`. |
 | `desktop-notifications.test.js` | The last scraper, against verbatim log lines. Includes the suppressed-notification case, which is the one that decides which line to key off. |
 | `fake-gather.js` | **Not a suite.** A fake Gather game server shared by `bridge.test.js` and `direct.test.js`: real op names and envelope keys, synthetic ids. |
+| `party.test.js` | Tile selection for party mode: clearance from everyone connected, offline rows donating tiles without defending them, floor separation, skipping rather than approximating, the self-imposed time limit, and the no-emit-per-hop rule. |
 | `msgpack.test.js` | Decoder coverage. Ships a **test-only encoder** so fixtures are built in code rather than pasted as hex — the library itself is decode-only on purpose. |
 | `pairing.test.js` | Code lifecycle (single use, expiry, attempt limit), the unambiguous alphabet, and the QR encoder. |
 

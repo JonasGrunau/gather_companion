@@ -14,7 +14,7 @@ socket, distinguished by the frame's `kind`.
 | File | Description |
 |------|-------------|
 | `events.dart` | `sealed class GatherEvent` plus thirteen subclasses, and the `EventSource` / `Confidence` / `MediaTrack` enums. |
-| `presence.dart` | `PlayerRef`, `SelfState`, `CollectorHealth`, `PresenceSnapshot` — the `kind: 'snapshot'` frame. |
+| `presence.dart` | `PlayerRef`, `SelfState`, `CollectorHealth`, `PartyState`, `PresenceSnapshot` — the `kind: 'snapshot'` frame. |
 
 ## The event hierarchy
 

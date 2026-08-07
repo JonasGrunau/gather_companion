@@ -175,6 +175,37 @@ class BridgeClient {
     }
   }
 
+  /// Switches party mode on or off.
+  ///
+  /// Returns null on success, or a sentence explaining the refusal. The bridge
+  /// declines rather than pretending when it cannot hop — no Gather connection,
+  /// or it does not yet know which avatar is yours — and that reason is worth
+  /// putting in front of whoever pressed the button.
+  ///
+  /// The resulting state is not read from here: it arrives on the next snapshot,
+  /// which is the same path used when the bridge stops party mode by itself.
+  Future<String?> setParty(bool on) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final request = await client.postUrl(
+        _settings.httpUri('/party', {'on': on ? '1' : '0'}),
+      );
+      final response = await request.close().timeout(const Duration(seconds: 6));
+      final text = await response.transform(utf8.decoder).join();
+      if (response.statusCode == 200) return null;
+
+      final body = jsonDecode(text);
+      final detail = body is Map ? body['detail'] as String? : null;
+      return detail ?? 'The bridge said no (${response.statusCode}).';
+    } on TimeoutException {
+      return 'The bridge did not answer.';
+    } catch (_) {
+      return 'Could not reach the bridge.';
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   void _onFrame(dynamic raw) {
     if (raw is! String) return;
     Map<String, Object?> frame;

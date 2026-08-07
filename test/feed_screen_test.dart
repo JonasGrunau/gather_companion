@@ -173,6 +173,47 @@ void main() {
     expect(find.textContaining('Log-only mode'), findsNothing);
   });
 
+  testWidgets('the party button reads the bridge, not its own memory', (tester) async {
+    // The bridge stops party mode by itself — on its timer, when it loses
+    // Gather, when the daemon exits. A button holding local state would keep
+    // glowing through all three, so it renders the snapshot and nothing else.
+    final state = connected(snapshotWith(const []));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('Party mode'), findsOneWidget);
+    expect(find.text('Teleport around the map, never next to anyone'), findsOneWidget);
+
+    state.debugApplySnapshot(PresenceSnapshot(
+      self: const SelfState(spaceId: 'space-1'),
+      players: const [],
+      health: const CollectorHealth(logTail: true, cdp: true),
+      at: at,
+      party: const PartyState(active: true, hops: 12, safeTiles: 40),
+    ));
+    await tester.pump();
+
+    expect(find.text('Hopping four times a second, nowhere near anyone'), findsOneWidget);
+    expect(find.text('12'), findsOneWidget);
+
+    // Standing still because there is nowhere safe is not a fault, and saying so
+    // beats a card that claims to be hopping while nothing moves.
+    state.debugApplySnapshot(PresenceSnapshot(
+      self: const SelfState(spaceId: 'space-1'),
+      players: const [],
+      health: const CollectorHealth(logTail: true, cdp: true),
+      at: at,
+      party: const PartyState(active: true, detail: 'everywhere known is within 8 tiles of someone'),
+    ));
+    await tester.pump();
+
+    expect(find.text('everywhere known is within 8 tiles of someone'), findsOneWidget);
+
+    // Let the controller stop before the test tears the tree down.
+    state.debugApplySnapshot(snapshotWith(const []));
+    await tester.pump();
+  });
+
   test('a refresh lasts long enough to be seen', () async {
     // Regression: `reconnect()` used to return void, so the pull-to-refresh
     // future completed on the next microtask and the indicator snapped shut

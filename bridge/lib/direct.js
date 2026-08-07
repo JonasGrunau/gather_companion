@@ -139,6 +139,58 @@ export class DirectCollector extends EventEmitter {
     return this.reader.users.size > 0;
   }
 
+  /** Our own `SpaceUser` id, once the dump has told us which row is us. */
+  get selfId() {
+    return this.reader.selfId;
+  }
+
+  /**
+   * Moves our avatar to a tile. The one thing this collector writes.
+   *
+   * `SpaceUser` is per-person-per-space rather than per-connection, so this moves
+   * the *same* avatar the desktop client is driving — there is no second body to
+   * fight with. Verified 2026-08-07 that it works from an observer connection:
+   * `teleport` returns `{type:'Success'}` without `enterSpace` having been sent,
+   * which was previously an open question (docs/gather-api.md, Unverified #3).
+   * That matters because entering is the one action with a permanent cost, so
+   * being able to skip it keeps writes as free as reads.
+   *
+   * Fire-and-forget by design. Replies come back asynchronously in
+   * `DeltaState.actionReturns[]` keyed by `txnId`, and the only failure a caller
+   * could act on — not connected, or not knowing which avatar is ours — is
+   * already answerable here. The authoritative confirmation is the position
+   * patch that follows, which arrives through the normal roster path.
+   *
+   * The server does **not** validate walkability: every tile on the grid is
+   * accepted, including walls and void. Picking somewhere sensible is the
+   * caller's job — see `PartyMode`.
+   */
+  teleport({ x, y, direction = 'Down' }) {
+    const ws = this._ws;
+    if (!ws || ws.readyState !== 1) return { ok: false, detail: 'not connected to Gather' };
+    const selfId = this.reader.selfId;
+    if (!selfId) return { ok: false, detail: 'do not know which avatar is ours yet' };
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return { ok: false, detail: 'teleport needs finite coordinates' };
+    }
+
+    try {
+      ws.send(
+        encode({
+          type: 'Action',
+          txnId: randomUUID(),
+          action: 'teleport',
+          // Flat x/y — `{position:{x,y}}` is rejected — and `direction` is
+          // required even though teleporting does not pass through any tiles.
+          args: ['SpaceUser', selfId, { x, y, direction }],
+        }),
+      );
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, detail: error.message };
+    }
+  }
+
   stats() {
     return {
       ...this.reader.stats(),

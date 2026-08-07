@@ -712,6 +712,32 @@ Probed and confirmed **not** to exist on `SpaceUser`: `moveTo`, `setPosition`,
 `{position:{x,y}}` — the coordinates must be flat, and `direction` is required even
 when teleporting.
 
+### An observer can move. Entering is not a prerequisite for writing
+
+Measured 2026-08-07, settling what used to be Unverified #3. Every earlier
+movement test had called `enterSpace` first, so the requirement was assumed
+rather than shown. It is not required: a connection that sent only
+`Authenticate` / `ConnectToSpace` / `Subscribe` / `loadSpaceUser` issued
+`teleport` and got `{type:'Success'}` back, and the position patch followed.
+
+This is the structural consequence of `SpaceUser` being per-person-per-space
+rather than per-connection. `enterSpace` flips `Connection.entered`, which is
+about *that socket*; `teleport` addresses the person's row, which every one of
+their connections shares. So the observer is not a spectator with a read-only
+handle — it drives the same avatar the desktop client draws.
+
+Two things follow, and both matter:
+
+- **Writing costs nothing.** `numTimesEnteredSpace` is only touched by
+  `enterSpace`, so a collector that moves the user around still never increments
+  the one counter that cannot be undone.
+- **Read-only is a choice, not a property.** `DirectCollector` sends exactly one
+  kind of write (`teleport`, for party mode) and nothing else, because the
+  gateway would let it send anything.
+
+`bridge/lib/party.js` is the consumer, and the reason the walkability finding
+below is load-bearing rather than trivia.
+
 ### The server does not validate walkability
 
 Eight teleports to uniformly random tiles across the full 124×82 grid were **all
@@ -1100,18 +1126,16 @@ positions, and `Authenticate` frames contain a live JWT.
    platform-ish enum in the bundle is `WebApp | OutlookApp | MobileApp | Unknown`,
    which does **not** contain `'Desktop'`, so that is a different enum and the real
    vocabulary is unconfirmed.
-3. **Whether an observer can `move`/`teleport` without entering.** Every movement test
-   called `enterSpace` first, so the requirement was assumed, not measured.
-4. **Whether other clients render anything** when a second connection enters, and
+3. **Whether other clients render anything** when a second connection enters, and
    whether the desktop client's mic/camera are disturbed by it. The socket was
    untouched, but AV state was never instrumented.
-5. **The SFU signalling socket's authentication.** Mapped for the game socket only.
-6. **Token lifetime in practice.** Refresh works (~60 min ID tokens), but nothing has
+4. **The SFU signalling socket's authentication.** Mapped for the game socket only.
+5. **Token lifetime in practice.** Refresh works (~60 min ID tokens), but nothing has
    run long enough to see whether a refresh token survives the desktop client
    signing out.
-7. **The rest of the action vocabulary.** Six names are known; status, chat, follow,
+6. **The rest of the action vocabulary.** Six names are known; status, chat, follow,
    desks and hand-raising are all presumably actions too, and all discoverable by
    probing. Nobody has swept it.
-8. `unknownFrames` occasionally counts 1–2 server frames the interpreter does not
+7. `unknownFrames` occasionally counts 1–2 server frames the interpreter does not
    recognise. Harmless for presence, unidentified.
-9. Delta envelope names were matched structurally, not against a labelled frame.
+8. Delta envelope names were matched structurally, not against a labelled frame.

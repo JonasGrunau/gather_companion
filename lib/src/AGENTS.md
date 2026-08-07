@@ -14,7 +14,7 @@ rules that decide which events are worth a person's attention.
 | File | Description |
 |------|-------------|
 | `app_state.dart` | `AppState extends ChangeNotifier` — the one object the UI reads. Owns the event log (1000 max, newest first), the presence snapshot, the link status, the classified-feed cache, and the client lifecycle (`boot`, `pair`, `unpair`, `reconnect`, `_attach`/`_detach`). |
-| `bridge_client.dart` | `BridgeClient` — one WebSocket with sequence-based catch-up and ping-driven liveness. Also `LinkState` / `LinkStatus`, `recentHistory()` for a first connection, and `whenLive()` for pull-to-refresh. |
+| `bridge_client.dart` | `BridgeClient` — one WebSocket with sequence-based catch-up and ping-driven liveness. Also `LinkState` / `LinkStatus`, `recentHistory()` for a first connection, `whenLive()` for pull-to-refresh, and `setParty()` — the only call that asks the bridge to *do* something. |
 | `relevance.dart` | `Relevance` (alert / notable / ambient), `EventLook`, and `lookOf()` — classifies *and* phrases every event in one exhaustive switch. The feed's editorial policy. |
 | `pairing.dart` | `PairPayload` parsing (`HOST:PORT:CODE`), `normaliseCode()`, `parseAddress()`, and `claimPairing()` — the one unauthenticated call in the API. |
 | `settings.dart` | `BridgeSettings` — host, port, token in `SharedPreferences`, plus `wsUri()` / `httpUri()` construction and the bridge's friendly name. |

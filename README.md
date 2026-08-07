@@ -234,6 +234,59 @@ npx gather-app-bridge push test
 
 ---
 
+## 🪩 Party mode
+
+The one control in the app, and the only thing in this project that *writes* to
+Gather. Switch it on and the bridge teleports your avatar to a random tile four
+times a second until you switch it off.
+
+Two things make that less trivial than picking coordinates.
+
+**Gather's server does not check walkability.** Every tile on the grid is
+accepted — walls, scenery, the void outside the map. Collision is enforced
+client-side only, so uniform random coordinates put you inside furniture about as
+often as not. Rather than rebuild the collision map out of `MapObject` and
+`CatalogItemVariant.collision`, the bridge takes the empirical route: **a tile
+somebody has stood on is a tile you can stand on.** The state dump carries every
+member of the space with their last position — 111 of them in the space this was
+built against, most parked at a desk — and the pool grows as people walk around.
+
+**Landing next to someone opens the video bubble on their screen.** Doing that
+four times a second, to a different colleague each time, would be a genuinely
+antisocial thing to inflict on an office. So every candidate tile is held at
+least **8 tiles** from everyone currently connected — more than double the
+3 tiles at which Gather connects media, with the margin covering the fact that
+the roster is always a beat behind. Offline rows donate their tile without
+defending it: a parked avatar is proof a body fits there and proof nobody is on
+it.
+
+When nothing clears, the hop is **skipped** rather than approximated, and the
+card says why. A party that pauses is a smaller problem than a party that walks
+into someone.
+
+Measured live against a 111-person space: 16 hops in 4 seconds, closest approach
+8.1 tiles.
+
+It ends on its own after **15 minutes**. The toggle is on a phone and the hopping
+happens on a computer that will happily keep going for days; between a flat
+battery and a phone left in a drawer, "on until told otherwise" eventually means
+"on all week". The app reads party state from the snapshot rather than
+remembering what it asked for, so the button goes dark by itself when that timer
+fires, when the bridge loses Gather, or when the daemon stops.
+
+```sh
+curl -X POST "localhost:7799/party?on=1&token=$TOKEN"   # if the phone is flat
+curl -X POST "localhost:7799/party?on=0&token=$TOKEN"
+```
+
+Entering the space is **not** required to move — `SpaceUser` is
+per-person-per-space, so an observer connection drives the same avatar the
+desktop client draws. That is what keeps this free: `numTimesEnteredSpace`, the
+one counter that cannot be undone, is never touched. See
+[`docs/gather-api.md`](docs/gather-api.md).
+
+---
+
 ## 🔬 How it reads the protocol
 
 The bridge holds one binary WebSocket to
@@ -392,6 +445,7 @@ Everything except `/health` needs `?token=<token>`.
 | `WS /ws?raw=1` | additionally the unfiltered firehose, as `kind: "raw"` frames |
 | `GET /resync` | force a full state resync (reconnects the game socket) |
 | `POST /push/register` | phone hands over its FCM token (idempotent) |
+| `POST /party?on=1\|0` | party mode on/off; `GET /party` reads it |
 | `GET /pair/offer` | mint a pairing code (used by `pair`) |
 | `GET /pair/claim?code=` | **no token** — trade a code for the token, once |
 

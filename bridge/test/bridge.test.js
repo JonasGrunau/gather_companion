@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { BridgeServer } from '../lib/server.js';
+import { SAFE_TILES } from '../lib/party.js';
 import { PushNotifier, PushRegistry } from '../lib/push.js';
 import { defaultPatches, fakeGameServer, fakeJwt } from './fake-gather.js';
 
@@ -319,6 +320,60 @@ test('the collectors endpoint names what is actually connected', async () => {
   assert.equal(body.health.logTail, true, 'the notification tail is separate and optional');
   assert.equal(body.stats.entered, false, 'we observe the space, we never enter it');
   assert.equal(body.stats.users, defaultPatches().filter((p) => p.model === 'SpaceUser').length);
+});
+
+// ---- party mode -------------------------------------------------------------
+
+test('party mode teleports on the wire, and only to a tile nobody is near', async () => {
+  await ready();
+  // Park the neighbour at the far end. This is what makes anywhere safe: with
+  // them one tile away, every tile the bridge knows about is inside the
+  // clearance and party mode is right to sit still.
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 90 },
+  ]);
+  await wait(400);
+
+  const on = await (
+    await fetch(`http://127.0.0.1:${port}/party?on=1&token=${TOKEN}`, { method: 'POST' })
+  ).json();
+  assert.equal(on.active, true);
+  assert.equal(on.ok, true);
+
+  await wait(400);
+
+  const teleports = gather.latest.received.filter((f) => f.action === 'teleport');
+  assert.ok(teleports.length > 0, 'the Action must actually reach Gather');
+
+  const [model, id, payload] = teleports[0].args;
+  assert.equal(model, 'SpaceUser');
+  assert.equal(id, ME, 'we move our own avatar and nobody else');
+  assert.equal(typeof payload.x, 'number', 'flat x/y — {position:{x,y}} is rejected');
+  assert.ok(payload.direction, 'required even when teleporting');
+
+  // The promise the feature rests on: never within the clearance of someone who
+  // is actually here.
+  for (const frame of teleports) {
+    const { x, y } = frame.args[2];
+    assert.ok(Math.hypot(x - 90, y - 10) >= SAFE_TILES, `hopped to ${x},${y} — too close`);
+  }
+
+  const snapshot = await state();
+  assert.equal(snapshot.party.active, true, 'the phone learns about it from the snapshot');
+  assert.ok(snapshot.party.hops > 0);
+
+  const off = await (
+    await fetch(`http://127.0.0.1:${port}/party?on=0&token=${TOKEN}`, { method: 'POST' })
+  ).json();
+  assert.equal(off.active, false);
+
+  const settled = gather.latest.received.filter((f) => f.action === 'teleport').length;
+  await wait(300);
+  assert.equal(
+    gather.latest.received.filter((f) => f.action === 'teleport').length,
+    settled,
+    'switching it off stops the hopping',
+  );
 });
 
 // ---- push -------------------------------------------------------------------
