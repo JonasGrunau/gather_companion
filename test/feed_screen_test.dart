@@ -39,7 +39,7 @@ void main() {
     await tester.pumpWidget(wrap(connected(snapshotWith(const []))));
     await tester.pump();
 
-    expect(find.text('Nobody next to you'), findsOneWidget);
+    expect(find.text('Nobody is following you'), findsOneWidget);
     expect(find.text('All quiet'), findsOneWidget);
   });
 
@@ -67,41 +67,26 @@ void main() {
     expect(find.text('All quiet'), findsNothing);
   });
 
-  testWidgets('people standing next to you are listed with a count', (tester) async {
-    final state = connected(snapshotWith([
-        PlayerRef(id: 'a', name: 'Ada', isNear: true, nearSince: at),
-        PlayerRef(id: 'b', name: 'Bram', isNear: true, nearSince: at),
-        // Present in the space but not near: must not appear here.
-        const PlayerRef(id: 'c', name: 'Cleo'),
-      ]));
-    await tester.pumpWidget(wrap(state));
-    await tester.pump();
-
-    expect(find.text('Next to you'), findsOneWidget);
-    expect(find.text('2'), findsOneWidget);
-    expect(find.text('Ada'), findsOneWidget);
-    expect(find.text('Bram'), findsOneWidget);
-    expect(find.text('Cleo'), findsNothing);
-  });
-
   testWidgets('being followed shows the alert card by name', (tester) async {
     final state = connected(snapshotWith([
         PlayerRef(
           id: 'a',
           name: 'Ada',
-          isNear: true,
           isFollowingMe: true,
           followingMeSince: DateTime.now().subtract(const Duration(minutes: 3)),
         ),
+        // In the space but not following: must not appear here.
+        const PlayerRef(id: 'c', name: 'Cleo'),
       ]));
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
     expect(find.text('Ada is following you'), findsOneWidget);
     expect(find.text('for 3 min'), findsOneWidget);
+    expect(find.text('Cleo'), findsNothing);
   });
 
-  testWidgets('several followers collapse into one line', (tester) async {
+  testWidgets('several followers are named on chips', (tester) async {
     final state = connected(snapshotWith([
         const PlayerRef(id: 'a', name: 'Ada', isFollowingMe: true),
         const PlayerRef(id: 'b', name: 'Bram', isFollowingMe: true),
@@ -110,19 +95,44 @@ void main() {
     await tester.pump();
 
     expect(find.text('2 people are following you'), findsOneWidget);
-    expect(find.text('Ada, Bram'), findsOneWidget);
+    expect(find.text('Ada'), findsOneWidget);
+    expect(find.text('Bram'), findsOneWidget);
+  });
+
+  testWidgets('a follower who is talking is marked as talking', (tester) async {
+    // Somebody following you *and* speaking is the case this app exists for, so
+    // `speaking` has to reach the screen — it is drawn nowhere else.
+    final state = connected(snapshotWith([
+        const PlayerRef(id: 'a', name: 'Ada', isFollowingMe: true, speaking: true),
+      ]));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('Ada is following you'), findsOneWidget);
+    expect(find.byIcon(Icons.graphic_eq_rounded), findsOneWidget);
+  });
+
+  testWidgets('a lone quiet follower gets no redundant chip', (tester) async {
+    // The title already says the name; repeating it underneath is noise.
+    final state = connected(snapshotWith([
+        const PlayerRef(id: 'a', name: 'Ada', isFollowingMe: true),
+      ]));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    expect(find.text('Ada is following you'), findsOneWidget);
+    expect(find.text('Ada'), findsNothing);
+    expect(find.byIcon(Icons.graphic_eq_rounded), findsNothing);
   });
 
   testWidgets('the background tier is hidden until asked for', (tester) async {
     final state = connected(snapshotWith(const []));
     // One notable, two ambient.
     state
-      ..debugApplyEvent(ProximityEvent(
+      ..debugApplyEvent(NotificationShownEvent(
         at: at,
-        source: EventSource.cdp,
-        playerId: 'a',
-        near: true,
-        distance: 2,
+        source: EventSource.log,
+        notificationType: 'wave',
       ))
       ..debugApplyEvent(PlayerSpaceEvent(
         at: at,
@@ -141,7 +151,7 @@ void main() {
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    expect(find.textContaining('is next to you'), findsOneWidget);
+    expect(find.text('Wave'), findsOneWidget);
     expect(find.textContaining('joined the space'), findsNothing);
     expect(find.text('Show 2 background events'), findsOneWidget);
 

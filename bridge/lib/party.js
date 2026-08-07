@@ -24,9 +24,8 @@
  * Landing next to a colleague opens the video bubble on their screen. Doing that
  * four times a second, to a different person each time, would be a genuinely
  * antisocial thing to inflict on an office. So every candidate is held at least
- * [SAFE_TILES] away from everyone currently connected — comfortably outside
- * Gather's proximity radius, and outside the `ADJACENT_TILES` this bridge itself
- * uses to decide somebody is standing next to you.
+ * [SAFE_TILES] away from everyone currently connected — comfortably outside the
+ * radius at which Gather connects media.
  *
  * When nowhere is safe, the hop is **skipped** rather than approximated. A party
  * that pauses is a smaller problem than a party that walks into someone.
@@ -50,11 +49,10 @@ export const HOP_INTERVAL_MS = 250;
 /**
  * Tiles of clearance from every connected person.
  *
- * Gather connects media at around 3 tiles, which is also `ADJACENT_TILES` in
- * `presence.js`. This is deliberately more than double that: positions arrive
- * coalesced over a 250ms window, so the roster is always slightly behind, and
- * somebody walking towards a tile we picked a moment ago should still not end up
- * next to us.
+ * Gather connects media at around 3 tiles. This is deliberately more than double
+ * that: positions arrive coalesced over a 250ms window, so the roster is always
+ * slightly behind, and somebody walking towards a tile we picked a moment ago
+ * should still not end up next to us.
  */
 export const SAFE_TILES = 8;
 
@@ -127,9 +125,8 @@ const MIN_CHOICES = 6;
  * teleport, it is a walk.
  *
  * Ten is past every radius that means anything here — Gather opens a video bubble
- * around three, `ADJACENT_TILES` is three, `SAFE_TILES` is eight — so a hop that
- * clears it has unambiguously gone somewhere else. Only a floor with nothing at all
- * this far away relaxes it.
+ * around three, `SAFE_TILES` is eight — so a hop that clears it has unambiguously
+ * gone somewhere else. Only a floor with nothing at all this far away relaxes it.
  */
 export const MIN_JUMP_TILES = 10;
 

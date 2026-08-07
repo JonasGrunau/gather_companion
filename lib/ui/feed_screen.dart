@@ -9,11 +9,11 @@ import '../src/bridge_client.dart';
 import '../src/relevance.dart';
 import '../theme/gather_theme.dart';
 
-/// The main screen: who is around you now, and what has happened.
+/// The main screen: who is following you now, and what has happened.
 ///
-/// The split is deliberate. The top of the screen answers a question you have
-/// *right now* — is anyone next to me, is anyone following me — from the bridge's
-/// snapshot, which is authoritative and does not depend on having been running.
+/// The split is deliberate. The top of the screen answers the question you have
+/// *right now* — is anyone following me — from the bridge's snapshot, which is
+/// authoritative and does not depend on having been running.
 /// The list underneath is history, and only carries what is worth reading; the
 /// background tier is a tap away rather than mixed in.
 class FeedScreen extends StatelessWidget {
@@ -303,7 +303,12 @@ class _LinkStripBody extends StatelessWidget {
   }
 }
 
-/// The answer to "who is around me", from the snapshot rather than from history.
+/// The answer to "is anyone following me", from the snapshot rather than from
+/// history.
+///
+/// This used to be two cards — one for who was standing next to you, one for who
+/// was following. Being near somebody says nothing about whether they want you,
+/// so only the second question survived, and it now holds the slot on its own.
 class _AroundYou extends StatelessWidget {
   const _AroundYou({required this.state});
 
@@ -311,79 +316,11 @@ class _AroundYou extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final t = context.tokens;
-    final followers = state.followers;
-    final nearby = state.nearby;
-
     return Padding(
       padding: const EdgeInsets.fromLTRB(kGutter, 4, kGutter, 4),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          if (followers.isNotEmpty) ...[
-            _FollowerCard(followers: followers),
-            const SizedBox(height: 10),
-          ],
-          Container(
-            padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
-            decoration: BoxDecoration(
-              color: t.card,
-              borderRadius: BorderRadius.circular(t.radius),
-              border: Border.all(color: t.border),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      Icons.person_pin_circle_rounded,
-                      size: 16,
-                      color: nearby.isEmpty ? t.faint : t.brandSoft,
-                    ),
-                    const SizedBox(width: 7),
-                    Text(
-                      nearby.isEmpty ? 'Nobody next to you' : 'Next to you',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.2,
-                        color: nearby.isEmpty ? t.faint : t.mutedForeground,
-                      ),
-                    ),
-                    const Spacer(),
-                    if (nearby.isNotEmpty)
-                      Text(
-                        '${nearby.length}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                          color: t.mutedForeground,
-                        ),
-                      ),
-                  ],
-                ),
-                if (nearby.isNotEmpty) ...[
-                  const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [for (final person in nearby) _PersonChip(person: person)],
-                  ),
-                ],
-                if (!state.hasRichData) ...[
-                  const SizedBox(height: 12),
-                  Text(
-                    'Log-only mode: no names, and being followed can only be '
-                    'guessed. Run gather-app-bridge doctor on your computer to turn the '
-                    'rest on.',
-                    style: TextStyle(fontSize: 11.5, height: 1.45, color: t.faint),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
+      child: _FollowerCard(
+        followers: state.followers,
+        hasRichData: state.hasRichData,
       ),
     );
   }
@@ -675,69 +612,117 @@ class _PartySwitch extends StatelessWidget {
 }
 
 /// Being followed is the one thing this app exists to tell you, so it gets the
-/// only saturated surface on the screen.
+/// only saturated surface on the screen — and, when nobody is, the quietest.
+///
+/// It is always on screen either way. An empty slot reads as the app being
+/// broken; "nobody is following you" is an answer, and the difference between
+/// the two is the whole reason anyone opens this.
 class _FollowerCard extends StatelessWidget {
-  const _FollowerCard({required this.followers});
+  const _FollowerCard({required this.followers, required this.hasRichData});
 
   final List<PlayerRef> followers;
+  final bool hasRichData;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
+    final empty = followers.isEmpty;
     final single = followers.length == 1;
+
+    // Chips repeat the name for a lone silent follower, whose name the title
+    // already carries. They earn their place when there is more than one, or
+    // when somebody is talking — which the title cannot say.
+    final showChips = followers.length > 1 || followers.any((f) => f.speaking);
 
     return Container(
       padding: const EdgeInsets.fromLTRB(14, 14, 14, 15),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [t.brand, t.brand.withValues(alpha: 0.72)],
-        ),
+        color: empty ? t.card : null,
+        gradient: empty
+            ? null
+            : LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [t.brand, t.brand.withValues(alpha: 0.72)],
+              ),
         borderRadius: BorderRadius.circular(t.radius),
+        border: empty ? Border.all(color: t.border) : null,
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.18),
-              shape: BoxShape.circle,
-            ),
-            child: const Icon(Icons.directions_walk_rounded, color: Colors.white, size: 21),
+          Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: empty ? t.secondary : Colors.white.withValues(alpha: 0.18),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.directions_walk_rounded,
+                  color: empty ? t.faint : Colors.white,
+                  size: 21,
+                ),
+              ),
+              const SizedBox(width: 13),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      switch (followers.length) {
+                        0 => 'Nobody is following you',
+                        1 => '${followers.first.label} is following you',
+                        final n => '$n people are following you',
+                      },
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: -0.2,
+                        color: empty ? t.mutedForeground : Colors.white,
+                      ),
+                    ),
+                    if (single) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        _since(followers.first.followingMeSince),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.white.withValues(alpha: 0.85),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 13),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          if (showChips) ...[
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
               children: [
-                Text(
-                  single
-                      ? '${followers.first.label} is following you'
-                      : '${followers.length} people are following you',
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: -0.2,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  single
-                      ? _since(followers.first.followingMeSince)
-                      : followers.map((f) => f.label).join(', '),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.white.withValues(alpha: 0.85),
-                  ),
-                ),
+                for (final person in followers) _PersonChip(person: person, onBrand: true),
               ],
             ),
-          ),
+          ],
+          if (!hasRichData) ...[
+            const SizedBox(height: 12),
+            Text(
+              'Log-only mode: no names, and being followed can only be guessed. '
+              'Run gather-app-bridge doctor on your computer to turn the rest on.',
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.45,
+                color: empty ? t.faint : Colors.white.withValues(alpha: 0.8),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -753,9 +738,13 @@ class _FollowerCard extends StatelessWidget {
 }
 
 class _PersonChip extends StatelessWidget {
-  const _PersonChip({required this.person});
+  const _PersonChip({required this.person, this.onBrand = false});
 
   final PlayerRef person;
+
+  /// Drawn on the follower card's saturated gradient rather than a plain
+  /// surface, so it borrows white translucency instead of the theme's greys.
+  final bool onBrand;
 
   @override
   Widget build(BuildContext context) {
@@ -763,9 +752,11 @@ class _PersonChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.fromLTRB(4, 4, 11, 4),
       decoration: BoxDecoration(
-        color: t.secondary,
+        color: onBrand ? Colors.white.withValues(alpha: 0.16) : t.secondary,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: t.border),
+        border: Border.all(
+          color: onBrand ? Colors.white.withValues(alpha: 0.22) : t.border,
+        ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -774,15 +765,24 @@ class _PersonChip extends StatelessWidget {
           const SizedBox(width: 8),
           Text(
             person.label,
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.foreground),
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              color: onBrand ? Colors.white : t.foreground,
+            ),
           ),
           // Talking, from Gather's own `speaking` field. This used to be a
           // mic-off icon driven by the desktop client's log, which could only
           // ever be turned *off* and so almost never showed. Voice activity is
-          // both readable and the thing you actually want to know.
+          // both readable and the thing you actually want to know — somebody
+          // following you *and* talking is this app's whole reason to exist.
           if (person.speaking) ...[
             const SizedBox(width: 6),
-            Icon(Icons.graphic_eq_rounded, size: 13, color: t.brandSoft),
+            Icon(
+              Icons.graphic_eq_rounded,
+              size: 13,
+              color: onBrand ? Colors.white : t.brandSoft,
+            ),
           ],
         ],
       ),
@@ -996,8 +996,8 @@ class _EmptyFeed extends StatelessWidget {
           const SizedBox(height: 6),
           Text(
             connected
-                ? 'Nothing worth interrupting you for. Anyone walking up to you, or '
-                    'following you, shows up here.'
+                ? 'Nothing worth interrupting you for. Anyone who starts '
+                    'following you shows up here.'
                 : 'Waiting for the bridge on your computer.',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12.5, height: 1.5, color: t.faint),

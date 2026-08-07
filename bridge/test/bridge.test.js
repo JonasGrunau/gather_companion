@@ -111,6 +111,9 @@ function collect({ done, timeoutMs = 6000, since = 0 }) {
 const eventsOf = (frames) => frames.filter((f) => f.kind === 'event').map((f) => f.event);
 const state = async () =>
   (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
+/** Everything in the server's replay buffer, for asserting that nothing was added. */
+const eventsSoFar = async () =>
+  (await (await fetch(`http://127.0.0.1:${port}/events?token=${TOKEN}`)).json()).events;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Waits until the state dump has been consumed, so tests start from a roster. */
@@ -149,49 +152,34 @@ test('a connecting client is given a snapshot first', async () => {
   assert.ok(Array.isArray(frames[0].snapshot.players));
 });
 
-test('the state dump becomes a roster with names, positions and the space name', async () => {
+test('the state dump becomes a roster with names and the space name', async () => {
   const snapshot = await ready();
   const neighbour = snapshot.players.find((p) => p.id === NEIGHBOUR);
 
   assert.equal(neighbour.name, 'Neighbour', 'names come straight off SpaceUser');
-  assert.equal(neighbour.x, 11);
-  assert.equal(neighbour.isNear, true, 'one tile away is standing next to you');
+  assert.equal(neighbour.isFollowingMe, false, 'nobody is following yet');
   assert.equal(snapshot.self.spaceName, 'Test Space', 'read from the Space model');
   assert.ok(
     !snapshot.players.some((p) => p.id === ME),
-    'my own row is self, not a player standing next to me',
+    'my own row is self, not one of the people around me',
   );
 });
 
-test('walking away is delivered live as proximity.left', async () => {
+test('walking about the space is not news', async () => {
+  // Positions are still decoded — party mode needs them — but they reach nobody.
+  // This is the whole removal in one assertion.
   await ready();
-  const pending = collect({
-    done: (f) => eventsOf(f).some((e) => e.type === 'proximity.left'),
-  });
-  await wait(100);
+  const before = (await eventsSoFar()).length;
   gather.latest.delta([
     { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 40 },
   ]);
-
-  const left = eventsOf(await pending).find((e) => e.type === 'proximity.left');
-  assert.equal(left.playerId, NEIGHBOUR);
-  assert.equal((await state()).players.find((p) => p.id === NEIGHBOUR).isNear, false);
-});
-
-test('a component-wise walk back is delivered as proximity.entered', async () => {
-  // `/position/x` rather than `/position`: position mutates in place, so reading
-  // only the last path segment would silently drop every walking patch.
-  const pending = collect({
-    done: (f) => eventsOf(f).some((e) => e.type === 'proximity.entered'),
-  });
-  await wait(100);
+  await wait(400);
   gather.latest.delta([
     { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 11 },
   ]);
+  await wait(400);
 
-  const arrived = eventsOf(await pending).find((e) => e.type === 'proximity.entered');
-  assert.equal(arrived.playerId, NEIGHBOUR);
-  assert.equal(arrived.source, 'gather');
+  assert.equal((await eventsSoFar()).length, before, 'walking produces no events at all');
 });
 
 test('someone pointing followTargetId at me is reported as following me', async () => {
@@ -276,10 +264,9 @@ test('a reconnecting client can replay what it missed', async () => {
 });
 
 test('the raw channel shows what the filtered stream suppresses', async () => {
-  // Someone shuffling about next to you is state, not news, so `player.moved`
-  // is published but the tracker keeps plenty else to itself. A raw subscriber
-  // should still see the firehose, because "what can this thing actually see"
-  // has to be answerable.
+  // The tracker keeps most of what it sees to itself — roster churn, voice
+  // activity, everyone walking around. A raw subscriber should still see the
+  // firehose, because "what can this thing actually see" has to be answerable.
   const raw = [];
   const filtered = [];
 
@@ -560,9 +547,9 @@ test('push registration needs the pairing token like everything else', async () 
   assert.equal(res.status, 401);
 });
 
-test('a busy room does not push, because proximity is opt-in', async () => {
-  // Moving people around generates proximity events constantly; none of them
-  // should reach a lock screen unless the reason is explicitly enabled.
+test('a busy room does not push, because walking about is not a reason', async () => {
+  // People move constantly. Nothing about that is a deliberate act, so nothing
+  // about it may reach a lock screen.
   pushes.length = 0;
   gather.latest.delta([
     { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 60 },

@@ -114,29 +114,6 @@ sealed class GatherEvent {
           playerId: pid(),
           joined: false,
         ),
-      'proximity.entered' => ProximityEvent(
-          at: at,
-          source: source,
-          confidence: confidence,
-          playerId: pid(),
-          near: true,
-          distance: (json['distance'] as num?)?.toDouble(),
-        ),
-      'proximity.left' => ProximityEvent(
-          at: at,
-          source: source,
-          confidence: confidence,
-          playerId: pid(),
-          near: false,
-          distance: (json['distance'] as num?)?.toDouble(),
-        ),
-      'audio.range' => AudioRangeEvent(
-          at: at,
-          source: source,
-          playerId: pid(),
-          inRange: json['inRange'] as bool? ?? false,
-          volume: (json['volume'] as num?)?.toDouble(),
-        ),
       'media.changed' => MediaChangedEvent(
           at: at,
           source: source,
@@ -167,14 +144,6 @@ sealed class GatherEvent {
           targetId: json['targetId'] as String? ?? '',
           started: false,
           targetIsSelf: json['targetIsSelf'] as bool? ?? false,
-        ),
-      'player.moved' => PlayerMovedEvent(
-          at: at,
-          source: source,
-          playerId: pid(),
-          x: (json['x'] as num?)?.toDouble() ?? 0,
-          y: (json['y'] as num?)?.toDouble() ?? 0,
-          distance: (json['distance'] as num?)?.toDouble(),
         ),
       'chat.message' => ChatMessageEvent(
           at: at,
@@ -298,77 +267,6 @@ class PlayerSpaceEvent extends GatherEvent {
   Map<String, Object?> payload() => {'playerId': playerId};
 }
 
-/// Someone came into — or dropped out of — my immediate surroundings.
-///
-/// This is the "standing next to me" signal. From the log collector it is
-/// [Confidence.inferred] (derived from Gather's own proximity-gated media
-/// connections); from the CDP collector it is [Confidence.observed] and
-/// carries a real tile [distance].
-class ProximityEvent extends GatherEvent {
-  ProximityEvent({
-    required super.at,
-    required super.source,
-    required this.playerId,
-    required this.near,
-    super.confidence,
-    this.distance,
-  });
-
-  @override
-  final String playerId;
-
-  /// True when entering proximity, false when leaving.
-  final bool near;
-
-  /// Distance in tiles, when known.
-  final double? distance;
-
-  @override
-  String get type => near ? 'proximity.entered' : 'proximity.left';
-
-  @override
-  String get summary {
-    final d = distance == null ? '' : ' (${distance!.toStringAsFixed(1)} tiles)';
-    return near ? 'Is next to you$d' : 'Moved away$d';
-  }
-
-  @override
-  Map<String, Object?> payload() => {
-        'playerId': playerId,
-        'distance': distance,
-      };
-}
-
-/// A remote player's audio came in or out of range.
-class AudioRangeEvent extends GatherEvent {
-  AudioRangeEvent({
-    required super.at,
-    required super.source,
-    required this.playerId,
-    required this.inRange,
-    this.volume,
-  });
-
-  @override
-  final String playerId;
-  final bool inRange;
-  final double? volume;
-
-  @override
-  String get type => 'audio.range';
-
-  @override
-  String get summary =>
-      inRange ? 'Came into audio range' : 'Left audio range';
-
-  @override
-  Map<String, Object?> payload() => {
-        'playerId': playerId,
-        'inRange': inRange,
-        'volume': volume,
-      };
-}
-
 enum MediaTrack {
   audio,
   video,
@@ -484,41 +382,6 @@ class FollowEvent extends GatherEvent {
         'followerId': followerId,
         'targetId': targetId,
         'targetIsSelf': targetIsSelf,
-      };
-}
-
-/// A player moved. Only available from the CDP collector.
-class PlayerMovedEvent extends GatherEvent {
-  PlayerMovedEvent({
-    required super.at,
-    required super.source,
-    required this.playerId,
-    required this.x,
-    required this.y,
-    this.distance,
-  });
-
-  @override
-  final String playerId;
-  final double x;
-  final double y;
-
-  /// Distance to me in tiles at the time of the move.
-  final double? distance;
-
-  @override
-  String get type => 'player.moved';
-
-  @override
-  String get summary =>
-      'Moved to (${x.toStringAsFixed(0)}, ${y.toStringAsFixed(0)})';
-
-  @override
-  Map<String, Object?> payload() => {
-        'playerId': playerId,
-        'x': x,
-        'y': y,
-        'distance': distance,
       };
 }
 

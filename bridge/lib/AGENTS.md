@@ -15,7 +15,7 @@ platform plumbing — launchd installation, paths, pairing codes.
 | File | Description |
 |------|-------------|
 | `server.js` | `BridgeServer` — owns the collector, the notification tail, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
-| `presence.js` | `PresenceTracker` — folds the roster into current state, suppresses duplicates, decides what a human should see. Exports `ADJACENT_TILES` / `LEAVE_TILES`. |
+| `presence.js` | `PresenceTracker` — folds the roster into current state, suppresses duplicates, decides what a human should see. Answers one question about other people: who is following me. |
 | `events.js` | Every event constructor, and therefore the wire format. `{type, at, source, confidence, ...payload}`. Also `newPlayer()` / `emptySelf()` snapshot shapes. |
 | `direct.js` | `DirectCollector` — **the only collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
@@ -69,10 +69,11 @@ platform plumbing — launchd installation, paths, pairing codes.
   "log-only mode: no names" banner while the bridge held the full roster. Newer
   builds read `gather`. Do not remove the mirror until those builds are gone.
 - **Push is the path that survives the app being killed**, so it obeys different
-  rules from the local notifications in the app. Only five reasons exist and four
-  are on by default; `proximity` is deliberately off, because a colleague pacing
-  near a desk can cross the threshold repeatedly. `PROXIMITY_COOLDOWN_MS` exists
-  for the moment somebody turns it on.
+  rules from the local notifications in the app. Four reasons exist and all four
+  are on: wave, meeting invite, event reminder, follow. Every one is a deliberate
+  act by a person, which is why there is no rate limiting — the cooldown that
+  used to exist was there for proximity, and proximity is gone. A new reason that
+  needs a cooldown is a reason that does not belong here.
 - **`BridgeServer` must be given a `push` in tests.** Left to build its own it
   reads `~/.gather-app-bridge-fcm.json` and the real device list, so a suite on a
   machine where push is set up would fire real notifications at a real phone.
@@ -91,17 +92,21 @@ platform plumbing — launchd installation, paths, pairing codes.
   phone is a different device and should still be told. Keying off the IPC line
   also stops each notification being reported twice.
 - **Do not grow `desktop-notifications.js` back into a general log parser.**
-  Everything the old one produced — proximity, roster churn, media — now comes
-  from the protocol, observed rather than inferred. The scrape survives only for
-  what genuinely exists nowhere else.
+  Everything the old one produced — roster churn, media — now comes from the
+  protocol, observed rather than inferred. The scrape survives only for what
+  genuinely exists nowhere else.
 - **`game-protocol.js` patch paths are addressed to the row**, so the field is
   the *first* segment (`/position/x` → `position`). Reading the last segment
-  would silently drop every walking patch. `followTargetId` and `clusterId` are
-  optional columns — absent, not null — so only touch them when the key is
-  actually present.
-- **`presence.js` hysteresis is deliberate.** `ADJACENT_TILES` (3) for arriving,
-  `LEAVE_TILES` (4.5) for leaving. Collapsing them to one threshold makes anyone
-  loitering at the boundary flap forever, and every flap is a phone notification.
+  would silently drop every walking patch. `followTargetId` is an optional
+  column — absent, not null — so only touch it when the key is actually present;
+  `presence.js` tells the two apart to decide whether following is answerable.
+- **Proximity was removed deliberately, and is not a missing feature.** Being
+  near somebody says nothing about whether they want you: people park at desks,
+  walk past, and loiter at thresholds. It produced most of the events and least
+  of the meaning, and the thresholds and hysteresis it needed existed only to
+  make its own noise bearable. `position` and `floorId` are still decoded, but
+  only so party mode knows which tiles a body fits on. Do not reintroduce
+  `isNear`, tile distances or adjacency thresholds.
 - **`direct.js` distinguishes "connected" from "holding state".** `hasState`
   gates health, because an empty roster reported confidently lets the app render
   "nobody is following you" out of nothing.
@@ -146,7 +151,7 @@ pins them.
 
 - **`setStreamPausedState <id> <track> false` does not mean that person is
   sending.** It is logged when the client *subscribes* to a remote track, which
-  happens on proximity. Gather never logs the matching `true`: across `main.log`
+  happens when somebody comes close. Gather never logs the matching `true`: across `main.log`
   and `main.old.log`, 249 such lines, 74 `screen false`, 175 `video false`, zero
   `true` in either direction. The video and screen track sets were the same 17
   people — the client unpauses a participant's whole track set at once. Reading
@@ -157,10 +162,11 @@ pins them.
 - **A `SpaceUser` row with `connected: false` is furniture.** The full state dump
   carries every member of the space, not just the ones online — 80 rows, 25
   connected, 54 of the rest still holding the coordinates where their owner
-  logged off, which is usually their desk. Name, position, floor, all present and
-  indistinguishable from someone standing next to you. `applyRoster` must gate
-  proximity on `connected !== false`, or walking past an empty desk announces its
-  owner. `null` still counts as judgeable: unknown is not absent.
+  logged off, which is usually their desk. Party mode leans on exactly this: an
+  offline row's position is a tile somebody really stood on and nobody is
+  standing on now, which makes the parked half of a space the best source of safe
+  tiles rather than dead weight. Anything that reasons about *people* must still
+  gate on `connected !== false`.
 
 ## Dependencies
 

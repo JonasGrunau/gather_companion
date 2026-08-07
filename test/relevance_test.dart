@@ -66,30 +66,6 @@ void main() {
       expect(result.relevance, Relevance.ambient);
     });
 
-    test('arriving next to me is notable and carries the distance', () {
-      final result = look(ProximityEvent(
-        at: at,
-        source: EventSource.cdp,
-        playerId: 'them',
-        near: true,
-        distance: 2.4,
-      ));
-      expect(result.relevance, Relevance.notable);
-      expect(result.title, 'Alex is next to you');
-      expect(result.detail, contains('2 tiles'));
-    });
-
-    test('proximity inferred from the log admits where it came from', () {
-      final result = look(ProximityEvent(
-        at: at,
-        source: EventSource.log,
-        confidence: Confidence.inferred,
-        playerId: 'them',
-        near: true,
-      ));
-      expect(result.detail, contains('close enough to talk'));
-    });
-
     test('screen sharing is notable; mics and cameras are not', () {
       expect(
         look(MediaChangedEvent(
@@ -137,7 +113,6 @@ void main() {
           playerId: 'them',
           state: 'Connected',
         ),
-        AudioRangeEvent(at: at, source: EventSource.log, playerId: 'them', inRange: true),
         SelfChangedEvent(at: at, source: EventSource.log, audioEnabled: false),
         BridgeStatusEvent(at: at, source: EventSource.bridge, collector: 'cdp', healthy: true),
         RawEvent(at: at, source: EventSource.log, rawType: 'app.badge', text: '3'),

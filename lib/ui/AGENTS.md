@@ -13,7 +13,7 @@ needed to be shared twice yet.
 
 | File | Description |
 |------|-------------|
-| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`, `_SectionLabel`, `_EventRow`, `_BackgroundToggle`, `_EmptyFeed`. Answers "who is here now" at the top from the snapshot, history underneath. |
+| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`, `_SectionLabel`, `_EventRow`, `_BackgroundToggle`, `_EmptyFeed`. Answers "is anyone following me" at the top from the snapshot, history underneath. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 

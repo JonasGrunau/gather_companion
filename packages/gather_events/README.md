@@ -51,8 +51,7 @@ points at every place that needs updating when a type is added:
 final line = switch (event) {
   FollowEvent(targetIsSelf: true, started: true, :final followerId) =>
     '$followerId started following you',
-  ProximityEvent(near: true, :final playerId, :final distance) =>
-    '$playerId is next to you${distance == null ? '' : ' ($distance tiles)'}',
+  NotificationShownEvent(:final notificationType) => 'Gather: $notificationType',
   _ => event.summary,
 };
 ```
@@ -64,17 +63,14 @@ getters and a `payload()` / `toJson()` pair that round-trips it back to the wire
 
 | Class | Wire `type` | Notes |
 |---|---|---|
-| `ProximityEvent` | `proximity.entered` · `proximity.left` | Someone came into, or dropped out of, your immediate surroundings. `distance` is CDP-only. |
-| `FollowEvent` | `follow.started` · `follow.stopped` | `targetIsSelf: true` is the one that matters — you are being followed. |
-| `PlayerSpaceEvent` | `player.joinedSpace` · `player.leftSpace` | Roster churn, not proximity. |
-| `AudioRangeEvent` | `audio.range` | A weaker proximity signal than `ProximityEvent`. |
+| `FollowEvent` | `follow.started` · `follow.stopped` | `targetIsSelf: true` is the one that matters — you are being followed. The only people-signal the bridge still emits. |
+| `NotificationShownEvent` | `notification.shown` | A notification Gather itself raised: a wave, a meeting invite, an event reminder. |
+| `PlayerSpaceEvent` | `player.joinedSpace` · `player.leftSpace` | Roster churn. |
 | `MediaChangedEvent` | `media.changed` | `MediaTrack.audio` / `video` / `screen`, plus `paused`. |
 | `MediaConnectionEvent` | `media.connection` | Transport state. Mostly noise. |
-| `PlayerMovedEvent` | `player.moved` | CDP only. |
 | `ChatMessageEvent` | `chat.message` | |
 | `SelfChangedEvent` | `self.changed` | Your own mic, camera, screenshare and in-office state. |
 | `SpaceChangedEvent` | `space.changed` | |
-| `NotificationShownEvent` | `notification.shown` | A notification Gather itself raised. |
 | `BridgeStatusEvent` | `bridge.status` | A collector came up or went quiet. |
 | `RawEvent` | *anything else* | The forward-compatibility escape hatch. |
 
@@ -85,8 +81,8 @@ materially, so the app can paint a correct first frame without replaying history
 
 | Type | What it holds |
 |---|---|
-| `PresenceSnapshot` | `self`, `players`, `health`, `at` — plus `nearby` and `followers` convenience filters |
-| `PlayerRef` | One other person: `isNear`, `isFollowingMe`, `distance`, `name`, mic and camera state, `nearSince` / `followingMeSince` |
+| `PresenceSnapshot` | `self`, `players`, `health`, `at` — plus a `followers` convenience filter |
+| `PlayerRef` | One other person: `isFollowingMe`, `followingMeSince`, `name`, `speaking` |
 | `SelfState` | Your own id, space, device state and `followingPlayerId` |
 | `CollectorHealth` | Which collectors are live, and `hasRichData` |
 
@@ -111,12 +107,12 @@ a guess as a fact.
 | | |
 |---|---|
 | `observed` | Read directly from authoritative state or an explicit protocol signal. |
-| `inferred` | Derived from a proxy signal — audio range standing in for adjacency, or movement standing in for following. |
+| `inferred` | Derived from a proxy signal — historically, movement standing in for following. |
 
 The app surfaces that difference in words: an inferred follow says *"guessed from
-movement"*, and log-derived proximity says *"close enough to talk"* rather than
-inventing a distance. In log-only mode `name`, `distance`, `x` and `y` are all
-null, so treat them as optional everywhere.
+movement"*. Nothing emits `inferred` any more — following is read from
+`SpaceUser.followTargetId`, which means exactly what it says — but the enum stays
+because older bridges on people's machines still send it.
 
 ## Forward compatibility
 

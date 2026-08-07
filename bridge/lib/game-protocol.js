@@ -23,16 +23,17 @@
  *   - `{op:'deletemodel', model, id}`              row removed
  *   - `{op:'replace',     model, id, path, data}`  one field, e.g. `/position/x`
  *
- * ## The two signals
+ * ## The signal
  *
- *  - **Someone is following me** — `SpaceUser.followTargetId` pointing at my own
- *    row. It is an optional column, so it is *absent* rather than null when
- *    nobody is following, and shows up as a `replace` on `/followTargetId`. The
- *    official client derives followers the same way, filtering `usersInOffice` by
- *    `followTargetId === this.id`.
- *  - **Someone is standing next to me** — `position` (integer tiles) compared
- *    with mine, requiring the same `floorId`. `clusterId` is likewise optional and
- *    only present while a cluster exists.
+ * **Someone is following me** — `SpaceUser.followTargetId` pointing at my own
+ * row. It is an optional column, so it is *absent* rather than null when nobody
+ * is following, and shows up as a `replace` on `/followTargetId`. The official
+ * client derives followers the same way, filtering `usersInOffice` by
+ * `followTargetId === this.id`.
+ *
+ * `position` and `floorId` are still tracked, but no longer to judge who is near
+ * whom — party mode reads them to learn which tiles a body fits on, and which
+ * floor it is standing on.
  *
  * ## Identity
  *
@@ -56,7 +57,6 @@ const MODELS = new Set(['SpaceUser', 'Connection', 'UserAccount', 'Space']);
  */
 const TRACKED_FIELDS = new Set([
   'followTargetId',
-  'clusterId',
   'position',
   'floorId',
   'name',
@@ -268,9 +268,9 @@ export class GameProtocolReader {
     if ('isBot' in data) set('isBot', asBool(data.isBot));
     if ('type' in data) set('kind', nullableString(data.type));
 
-    // Both of these are optional columns: absent means "not set", so only touch
-    // them when the key is actually present.
-    if ('clusterId' in data) set('clusterId', nullableString(data.clusterId));
+    // An optional column: absent means "not set", so only touch it when the key
+    // is actually present. `presence.js` tells absent from null to decide whether
+    // following is answerable at all.
     if ('followTargetId' in data) set('followTargetId', nullableString(data.followTargetId));
 
     // Position arrives as a value object: { $type: 'Position', x, y }.
@@ -301,14 +301,14 @@ export class GameProtocolReader {
   roster() {
     const rows = [];
     for (const row of this.users.values()) {
-      // Recording clients and bots are not people standing next to you.
+      // Recording clients and bots are not people who can follow you.
       if (row.isBot === true || row.kind === 'RecordingClient') continue;
       rows.push({
         id: row.id,
         name: row.name ?? null,
+        // Kept for party mode's walkable-tile pool, not for judging adjacency.
         x: row.x ?? null,
         y: row.y ?? null,
-        clusterId: row.clusterId ?? null,
         floorId: row.floorId ?? null,
         connected: row.gone ? false : (row.connected ?? null),
         speaking: row.speaking ?? null,

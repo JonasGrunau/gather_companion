@@ -932,7 +932,7 @@ deleted mic/camera flags; the other three are still unused.
 | `profilePictureId` | no |
 | `followTargetId` | **yes** |
 | `userAccountId` | **yes** |
-| `clusterId` | **yes** |
+| `clusterId` | no — was Gather's own "standing together" signal; dropped with proximity |
 | `deskId` | no |
 | `shouldBeInClusterWithFollowTarget` | no |
 | `connected` | **yes** |
@@ -963,7 +963,7 @@ deleted mic/camera flags; the other three are still unused.
 | `speed__modifier` | no |
 | `userSetAvailability__value` | no |
 
-The bridge consumes 9 of 37, plus `Space.name`. Unused fields that look
+The bridge consumes 8 of 37, plus `Space.name`. Unused fields that look
 immediately useful: `deskId`
 (which desk someone is at), `handRaisedAt`, `activeApp`, `activeCustomStatusId` /
 `activeUserGeneratedStatusId` (custom status), `profilePictureId`, `aiSummary`,
@@ -1043,7 +1043,7 @@ space it was the single most frequent patch of any kind: **13 of 46 deltas**.
 
 The old parser could not really produce them anyway. Gather logs
 `setStreamPausedState <id> <track> false` when the client *subscribes* to a
-remote track — which happens on proximity, not when the person starts sending —
+remote track — which happens when somebody comes close, not when they start sending —
 and never logs the matching `true`. Across 249 samples in two real logs: 74
 `screen false`, 175 `video false`, zero `true`, ever. So the flags could only be
 turned off, never on.

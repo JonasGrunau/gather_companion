@@ -17,8 +17,8 @@ Future<void> main() async {
   // file to drift.
   //
   // Wrapped because push is an enhancement, not a requirement. A missing or
-  // malformed plist must degrade to "no push" — the feed, proximity and follow
-  // detection all work without Firebase — rather than crash on launch.
+  // malformed plist must degrade to "no push" — the feed and follow detection
+  // both work without Firebase — rather than crash on launch.
   try {
     await Firebase.initializeApp();
   } catch (error) {

@@ -76,14 +76,16 @@ class AppState extends ChangeNotifier {
   bool get isPriming => !_primed && _log.isEmpty;
   String? get bridgeName => _bridgeName;
 
-  List<PlayerRef> get nearby {
-    final list = _snapshot.players.where((p) => p.isNear).toList()
+  /// Who is following me — the only thing this app claims to know about anyone.
+  ///
+  /// Sorted by name so the chips keep their places between snapshots. Roster
+  /// order is Gather's own map iteration and shuffles for reasons that have
+  /// nothing to do with people, which reads as flicker.
+  List<PlayerRef> get followers {
+    final list = _snapshot.players.where((p) => p.isFollowingMe).toList()
       ..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return list;
   }
-
-  List<PlayerRef> get followers =>
-      _snapshot.players.where((p) => p.isFollowingMe).toList(growable: false);
 
   /// Whether the bridge currently has the high-fidelity collector attached. Shown
   /// in the UI, because it changes what a quiet screen means.

@@ -9,17 +9,11 @@ class PlayerRef {
     required this.id,
     this.name,
     this.inSpace = true,
-    this.isNear = false,
-    this.inAudioRange = false,
     this.isFollowingMe = false,
     this.speaking = false,
     this.micOn,
     this.cameraOn,
     this.screensharing = false,
-    this.distance,
-    this.x,
-    this.y,
-    this.nearSince,
     this.followingMeSince,
   });
 
@@ -31,15 +25,14 @@ class PlayerRef {
 
   final bool inSpace;
 
-  /// Standing next to me — Gather considers us close enough to connect media.
-  final bool isNear;
-  final bool inAudioRange;
-
-  /// This person is following me around.
+  /// This person is following me around — the one thing worth knowing about
+  /// somebody else in the space, and the reason this app exists.
   final bool isFollowingMe;
 
   /// Talking right now — Gather's own `SpaceUser.speaking`, and the most
-  /// frequently updated field on the whole game socket.
+  /// frequently updated field on the whole game socket. The bridge only reports
+  /// changes for people who are following you, because they are the only ones
+  /// the app draws.
   final bool speaking;
 
   /// Always null. Mic, camera and screenshare were only ever readable by
@@ -49,12 +42,6 @@ class PlayerRef {
   final bool? cameraOn;
   final bool screensharing;
 
-  /// Distance in tiles.
-  final double? distance;
-  final double? x;
-  final double? y;
-
-  final DateTime? nearSince;
   final DateTime? followingMeSince;
 
   /// What to show in a list: the name if we have it, else a short id.
@@ -63,36 +50,23 @@ class PlayerRef {
   PlayerRef copyWith({
     String? name,
     bool? inSpace,
-    bool? isNear,
-    bool? inAudioRange,
     bool? isFollowingMe,
     bool? speaking,
     bool? micOn,
     bool? cameraOn,
     bool? screensharing,
-    double? distance,
-    double? x,
-    double? y,
-    DateTime? nearSince,
     DateTime? followingMeSince,
-    bool clearNearSince = false,
     bool clearFollowingMeSince = false,
   }) {
     return PlayerRef(
       id: id,
       name: name ?? this.name,
       inSpace: inSpace ?? this.inSpace,
-      isNear: isNear ?? this.isNear,
-      inAudioRange: inAudioRange ?? this.inAudioRange,
       isFollowingMe: isFollowingMe ?? this.isFollowingMe,
       speaking: speaking ?? this.speaking,
       micOn: micOn ?? this.micOn,
       cameraOn: cameraOn ?? this.cameraOn,
       screensharing: screensharing ?? this.screensharing,
-      distance: distance ?? this.distance,
-      x: x ?? this.x,
-      y: y ?? this.y,
-      nearSince: clearNearSince ? null : (nearSince ?? this.nearSince),
       followingMeSince: clearFollowingMeSince
           ? null
           : (followingMeSince ?? this.followingMeSince),
@@ -103,17 +77,11 @@ class PlayerRef {
         'id': id,
         'name': name,
         'inSpace': inSpace,
-        'isNear': isNear,
-        'inAudioRange': inAudioRange,
         'isFollowingMe': isFollowingMe,
         'speaking': speaking,
         'micOn': micOn,
         'cameraOn': cameraOn,
         'screensharing': screensharing,
-        'distance': distance,
-        'x': x,
-        'y': y,
-        'nearSince': nearSince?.toIso8601String(),
         'followingMeSince': followingMeSince?.toIso8601String(),
       };
 
@@ -121,17 +89,11 @@ class PlayerRef {
         id: json['id'] as String? ?? '',
         name: json['name'] as String?,
         inSpace: json['inSpace'] as bool? ?? true,
-        isNear: json['isNear'] as bool? ?? false,
-        inAudioRange: json['inAudioRange'] as bool? ?? false,
         isFollowingMe: json['isFollowingMe'] as bool? ?? false,
         speaking: json['speaking'] as bool? ?? false,
         micOn: json['micOn'] as bool?,
         cameraOn: json['cameraOn'] as bool?,
         screensharing: json['screensharing'] as bool? ?? false,
-        distance: (json['distance'] as num?)?.toDouble(),
-        x: (json['x'] as num?)?.toDouble(),
-        y: (json['y'] as num?)?.toDouble(),
-        nearSince: DateTime.tryParse(json['nearSince'] as String? ?? ''),
         followingMeSince:
             DateTime.tryParse(json['followingMeSince'] as String? ?? ''),
       );
@@ -219,7 +181,7 @@ class CollectorHealth {
   });
 
   /// The connection to Gather's own game socket. Everything about people —
-  /// names, positions, proximity, following, voice activity — comes from here.
+  /// names, following, voice activity — comes from here.
   final bool gather;
 
   /// The tail of the desktop client's log, which now carries exactly one thing:
@@ -312,7 +274,6 @@ class PresenceSnapshot {
   /// `party` key at all, and "off" is the right reading of its silence.
   final PartyState party;
 
-  List<PlayerRef> get nearby => players.where((p) => p.isNear).toList();
   List<PlayerRef> get followers =>
       players.where((p) => p.isFollowingMe).toList();
 

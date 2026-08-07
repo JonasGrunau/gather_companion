@@ -9,10 +9,10 @@ import 'package:gather_events/gather_events.dart';
 /// a toggle rather than dropping it: "who joined the space" is real information,
 /// it is simply not what anyone opened this app for.
 enum Relevance {
-  /// Interrupts: someone is following you.
+  /// Interrupts: someone is following you. The only thing in this tier.
   alert,
 
-  /// Worth reading: somebody arrived next to you, started sharing, said
+  /// Worth reading: somebody stopped following you, started sharing, said
   /// something, or Gather itself raised a notification.
   notable,
 
@@ -40,7 +40,7 @@ class EventLook {
   /// Who it is about — drives the avatar. Null for events about nobody.
   final String? subject;
 
-  /// Dim supporting text: distance, confidence, message body.
+  /// Dim supporting text: confidence, message body.
   final String? detail;
 
   bool get isAlert => relevance == Relevance.alert;
@@ -67,20 +67,6 @@ EventLook lookOf(GatherEvent event, String Function(String) nameFor) {
         icon: Icons.follow_the_signs_rounded,
         title: started ? 'You are following ${nameFor(targetId)}' : 'You stopped following',
         subject: started ? targetId : null,
-      );
-
-    case ProximityEvent(:final near, :final playerId, :final distance):
-      return EventLook(
-        relevance: Relevance.notable,
-        icon: near ? Icons.person_pin_circle_rounded : Icons.arrow_outward_rounded,
-        title: near ? '${nameFor(playerId)} is next to you' : '${nameFor(playerId)} moved away',
-        subject: playerId,
-        detail: [
-          if (distance != null) '${distance.toStringAsFixed(0)} tiles',
-          // Log-derived proximity comes from Gather opening media with people
-          // close enough to hear you — not from a measured distance.
-          if (event.confidence == Confidence.inferred) 'close enough to talk',
-        ].join(' · ').orNull,
       );
 
     case MediaChangedEvent(:final track, :final paused, :final playerId)
@@ -127,14 +113,6 @@ EventLook lookOf(GatherEvent event, String Function(String) nameFor) {
         subject: playerId,
       );
 
-    case AudioRangeEvent(:final inRange, :final playerId):
-      return EventLook(
-        relevance: Relevance.ambient,
-        icon: inRange ? Icons.hearing_rounded : Icons.hearing_disabled_rounded,
-        title: '${nameFor(playerId)} ${inRange ? 'came into' : 'left'} earshot',
-        subject: playerId,
-      );
-
     case PlayerSpaceEvent(:final joined, :final playerId):
       return EventLook(
         relevance: Relevance.ambient,
@@ -149,15 +127,6 @@ EventLook lookOf(GatherEvent event, String Function(String) nameFor) {
         icon: Icons.cable_rounded,
         title: '${nameFor(playerId)} — $state',
         subject: playerId,
-      );
-
-    case PlayerMovedEvent(:final playerId, :final distance):
-      return EventLook(
-        relevance: Relevance.ambient,
-        icon: Icons.my_location_rounded,
-        title: '${nameFor(playerId)} moved',
-        subject: playerId,
-        detail: distance == null ? null : '${distance.toStringAsFixed(0)} tiles away',
       );
 
     case SelfChangedEvent():

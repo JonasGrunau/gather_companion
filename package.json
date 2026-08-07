@@ -1,7 +1,7 @@
 {
   "name": "gather-app-bridge",
-  "version": "0.2.0",
-  "description": "Connects to Gather V2 with your own session and streams presence events \u2014 who is standing next to you, who is following you, who is talking \u2014 to the Gather Companion phone app over your LAN.",
+  "version": "0.3.0",
+  "description": "Connects to Gather V2 with your own session and tells the Gather Companion phone app, over your LAN, when somebody starts following you.",
   "license": "MIT",
   "author": "Jonas Grunau",
   "repository": {
@@ -32,7 +32,6 @@
     "gather",
     "gather-town",
     "presence",
-    "proximity",
     "follow",
     "bridge",
     "websocket"

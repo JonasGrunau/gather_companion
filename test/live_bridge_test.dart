@@ -48,27 +48,28 @@ void main() {
     expect(snapshots.first.players, isA<List<PlayerRef>>());
 
     // ---- feed it a real log line and watch it come back --------------------
-    const player = '1652d4a7-7874-4c66-b571-d55d00205705';
+    // A wave is the one thing still read from the desktop client's log; it
+    // exists in no part of Gather's game state, so this is the only signal a
+    // written log line can still produce.
     File(logPath!).writeAsStringSync(
-      '[2026-08-04 12:00:02.200] [verbose] (webapp)                       '
-      'GameMediaController.remoteParticipantJoinedHandler $player '
-      '[object Object] [object Object]\n',
+      "[2026-08-04 12:00:02.200] [info]  (main)                        "
+      "IPC Event: SHOW_NOTIFICATION { type: 'wave' }\n"
+      '[2026-08-04 12:00:02.201] [info]  (main)                        '
+      'Showing notification 62c41002-9661-4429-b66e-ae369f83e916: wave\n',
       mode: FileMode.append,
     );
 
     await _until(
-      () => events.any((e) => e is ProximityEvent && e.near),
-      'a proximity event derived from the log line',
+      () => events.any((e) => e is NotificationShownEvent),
+      'a notification event derived from the log line',
     );
 
-    final arrival = events.whereType<ProximityEvent>().firstWhere((e) => e.near);
-    expect(arrival.playerId, player);
-    expect(arrival.confidence, Confidence.inferred);
+    final wave = events.whereType<NotificationShownEvent>().first;
+    expect(wave.notificationType, 'wave');
 
     // ---- and that the feed would actually show it ---------------------------
-    final look = lookOf(arrival, (id) => id.substring(0, 8));
+    final look = lookOf(wave, (id) => id.substring(0, 8));
     expect(look.relevance, Relevance.notable);
-    expect(look.title, contains('is next to you'));
 
     await client.dispose();
   },

@@ -21,7 +21,7 @@ terminal rendering for all of them, and nothing else — all logic lives in
 |---|---|
 | *(default)* `install` | Copies the package to `~/.gather-app-bridge/bridge`, installs the LaunchAgent, waits for the daemon, prints pairing details |
 | `run` | Foreground daemon. What launchd actually executes |
-| `status` | launchd state, liveness, collector health, who is near and who is following |
+| `status` | launchd state, liveness, collector health, who is following you |
 | `doctor` | What the bridge can see right now, and the exact command to enable full mode |
 | `pair` | Mints a code, draws the QR square, then blocks until it is claimed or expires |
 | `token` | Reprints the pairing details |

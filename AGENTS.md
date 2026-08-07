@@ -8,8 +8,7 @@ Two halves of one product, in one repository. **`gather-app-bridge`** (`bridge/`
 is a zero-dependency Node daemon that runs on the computer where the Gather V2
 desktop client is open, watches that client, and serves presence events over the
 LAN. **Gather Companion** (`lib/`, `ios/`) is the Flutter phone app that consumes
-that stream and tells you who just walked up to you and who is following you
-around the space.
+that stream and tells you when somebody starts following you around the space.
 
 Everything here is a *passive reader* of a client the user already runs. Nothing
 authenticates to Gather, opens a second session, writes to the space, or patches

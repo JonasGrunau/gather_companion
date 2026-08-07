@@ -122,8 +122,8 @@ test('the clearance it keeps is wider than the range that opens a video bubble',
   const collector = fakeCollector();
   const p = party(collector);
 
-  // Someone standing exactly one tile outside our own "next to me" radius. A
-  // naive implementation reusing ADJACENT_TILES (3) would happily jump here.
+  // Someone standing one tile outside the ~3-tile radius at which Gather
+  // connects media. An implementation that only cleared that would jump here.
   p.noteRoster(roster([person(ME, 0, 0), person('2222', 4, 0)]));
 
   assert.equal(p.safeTilesNow().tiles.length, 0);

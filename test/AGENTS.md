@@ -14,7 +14,7 @@ a real running bridge.
 | File | Description |
 |------|-------------|
 | `relevance_test.dart` | The feed's editorial policy — which events are alerts, which are notable, which are background — plus the pairing-code and address parsers. The most specified file in the app. |
-| `feed_screen_test.dart` | Widget tests for the two things the screen exists to say: who is next to you, and who is following you. Also empty states, the background-tier toggle, the log-only fidelity notice, and the refresh duration. |
+| `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also empty states, the background-tier toggle, the log-only fidelity notice, and the refresh duration. |
 | `live_bridge_test.dart` | End-to-end against a real bridge, exercising the app's own pairing and client code rather than mocks. **Skipped unless configured**, so `flutter test` stays green on a machine with no Gather on it. |
 
 ## For AI Agents

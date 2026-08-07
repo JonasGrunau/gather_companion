@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="docs/icon.png" width="104" alt="Gather Companion — a proximity ping on a pixel grid">
+<img src="docs/icon.png" width="104" alt="Gather Companion — a ping on a pixel grid">
 
 # Gather Companion
 
-**Know when someone walks up to you — or starts following you — in your live Gather V2 session.**
+**Know when someone starts following you in your live Gather V2 session.**
 
 [![npm](https://img.shields.io/npm/v/gather-app-bridge?label=gather-app-bridge)](https://www.npmjs.com/package/gather-app-bridge)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -41,8 +41,8 @@ client makes and hands to macOS, so those are still read from its log.
           │  (the whole space)  │          │ (waves, invites,    │
           │                     │          │  event reminders)   │
           └──────────┬──────────┘          └──────────┬──────────┘
-                     │ names, tiles, clusters,        │
-                     │ real follows, voice activity   │
+                     │ names, real follows,           │
+                     │ voice activity                 │
                      └───────────────┬────────────────┘
                                      ▼
                         ┌─────────────────────────┐
@@ -115,8 +115,9 @@ It then opens its own game socket in **observer mode**. The distinction that mak
 this safe is that Gather splits joining a space into two actions: `loadSpaceUser`
 starts the state dump, and `enterSpace` puts an avatar in the room. The bridge
 sends the first and never the second, so it receives the entire roster — names,
-tile coordinates, clusters, `followTargetId`, live voice activity — while
-remaining invisible to everyone in the space, with `Connection.entered: false`.
+`followTargetId`, live voice activity, and tile coordinates for party mode —
+while remaining invisible to everyone in the space, with
+`Connection.entered: false`.
 
 It also does **not** disturb your own session. That was the long-standing fear:
 Gather's gateway was believed to evict a duplicate `spaceId` + `authUserId` with
@@ -136,12 +137,17 @@ Protocol details, the REST surface, and what is still unverified:
 
 - 🎯 **who is following you**, read from the field that actually means it, not
   guessed from movement. Reported as `confidence: "observed"`.
-- 🧩 **who is standing next to you**, via Gather's own cluster model, falling back
-  to tile distance on the same floor.
-- 🏷️ display names, tile coordinates, real distances
-- 🔊 **who is talking** — `SpaceUser.speaking`, which on a live 111-person space
-  was the most frequent update of any kind
+- 🏷️ display names
+- 🔊 **which of your followers is talking** — `SpaceUser.speaking`, which on a
+  live 111-person space was the most frequent update of any kind
 - ✋ waves, meeting invites and event reminders, from the desktop client's log
+
+**What this deliberately does not do:** ❌ tell you who is standing next to you.
+It used to. Being near somebody says nothing about whether they want you — people
+park at desks, walk past on the way somewhere else, and loiter at the edge of the
+radius — and it produced most of the events and the least of the meaning.
+Somebody *following* you is a decision they made about you, which is the only
+thing worth a notification.
 
 **What nothing can give you:** ❌ mic, camera and screenshare state. Those were
 IPC state inside the desktop client and appear in no Gather model, no REST route
@@ -155,8 +161,8 @@ they exist nowhere else:
 
 | | source | needs the desktop app? |
 |---|---|---|
-| Someone next to you, following you, talking | game socket | no |
-| Names, coordinates, clusters, space name | game socket | no |
+| Someone following you, and whether they are talking | game socket | no |
+| Names, space name | game socket | no |
 | Wave, meeting invite, event reminder | `main.log` | **yes** |
 | Mic / camera / screenshare | — | not available at all |
 
@@ -183,7 +189,10 @@ Messaging, so a wave reaches a locked or killed phone. Four reasons wake it:
 | meeting invite | ✅ | scheduled and time-bound |
 | event reminder | ✅ | scheduled and time-bound |
 | someone follows you | ✅ | rare and unambiguous |
-| someone next to you | ❌ | the noisiest by far — a colleague pacing near your desk crosses the threshold repeatedly. Enable with `push.kinds.proximity` in `~/.gather-app-bridge.json`; a ten-minute per-person cooldown applies |
+
+All four are deliberate acts by a person, which is the whole bar — and why there
+is no rate limiting. Any reason can be switched off per install with
+`push.kinds.<reason>: false` in `~/.gather-app-bridge.json`.
 
 No double-ups: iOS does not display a push while the app is frontmost unless the
 app asks it to, and this one does not. So the local notification is what you see
@@ -320,12 +329,14 @@ are exactly three ops:
 - 🎯 **following** — a `replace` on *their* row's `/followTargetId` set to *my*
   id. There is no "follow started" server event; the official client derives it
   the same way (`SpaceUser.followers` filters by `followTargetId === this.id`).
-  `followTargetId` and `clusterId` are optional columns, so they are *absent*
-  rather than null when unset.
-- 📐 **adjacency** — `position` compared with my own, requiring the same
-  `floorId`. Position mutates component-wise, so walking arrives as `/position/x`
-  and `/position/y`; a teleport replaces `/position` wholesale with an ext-0
-  `Position` value object. Both shapes are handled.
+  `followTargetId` is an optional column, so it is *absent* rather than null when
+  unset — and the bridge tells the two apart, because absent means "this space
+  never said" while null means "nobody".
+- 📐 **position** — still decoded, but no longer to judge who is near whom. It
+  feeds party mode's pool of tiles a body is known to fit on. Position mutates
+  component-wise, so walking arrives as `/position/x` and `/position/y`; a
+  teleport replaces `/position` wholesale with an ext-0 `Position` value object.
+  Both shapes are handled.
 
 Identity — which row is mine — comes from the `Connection` model, which carries
 both halves:
@@ -338,7 +349,7 @@ The Firebase uid comes out of our own ID token, so no lookup is needed.
 `UserAccount.firebaseAuthId` plus `SpaceUser.userAccountId` is a second route.
 
 Bots and recording clients (`isBot`, `type: 'RecordingClient'`) are filtered out —
-every real space has them and they are not people standing next to you.
+every real space has them and none of them is going to follow you.
 
 ### ❄️ Cold start, and `resync`
 
@@ -384,7 +395,7 @@ You do not need the phone to see what the bridge is doing:
 ```sh
 npx gather-app-bridge watch                        # attach to the live feed
 npx gather-app-bridge watch --history 20           # last 20 events, then follow
-npx gather-app-bridge watch --filter follow,proximity
+npx gather-app-bridge watch --filter follow,notification
 npx gather-app-bridge watch --json | jq .          # one event per line, pipeable
 npx gather-app-bridge watch --raw                  # everything, unfiltered
 npx gather-app-bridge watch --host 192.168.1.20    # a bridge on another machine
@@ -399,7 +410,7 @@ Three layers sit between interception and publication:
 
 | dropped where | what gets dropped |
 |---|---|
-| `PresenceTracker` | anything that is not a *state change*: repeated proximity reports, and voice activity, which is recorded in state but never announced — `speaking` toggles every few seconds while somebody talks |
+| `PresenceTracker` | anything that is not a *state change*, and everything that is not about following: the whole space walking around, plus voice activity, which is recorded in state but never announced — `speaking` toggles every few seconds while somebody talks |
 | `GameProtocolReader` | 43 of ~47 models — calendar events, chat metadata, catalog items, map areas, GitHub PRs. Only `SpaceUser`, `Connection`, `UserAccount` and `Space` are kept |
 | the collector | heartbeats, bots, recording clients |
 
@@ -455,10 +466,9 @@ Every event carries `type`, `at`, `source` (`gather` \| `log` \| `bridge`) and
 replays exactly what was missed, which is what keeps the phone's log complete
 across screen locks.
 
-**Event types:** `proximity.entered/left`, `follow.started/stopped`,
-`player.moved`, `self.changed`, `space.changed`, `notification.shown`,
-`bridge.status`. The Dart package still decodes several types the bridge no
-longer emits (`media.changed`, `audio.range`, `player.joinedSpace/leftSpace`,
+**Event types:** `follow.started/stopped`, `self.changed`, `space.changed`,
+`notification.shown`, `bridge.status`. The Dart package still decodes several
+types the bridge no longer emits (`media.changed`, `player.joinedSpace/leftSpace`,
 `chat.message`), so a phone can read an older bridge.
 
 The Dart definitions in `packages/gather_events` are the same contract, so the
@@ -532,12 +542,12 @@ Only what is worth reading. Events are classified into three tiers:
 | tier | what | shown |
 |---|---|---|
 | 🔵 **alert** | someone started following you | yes, on a Gather-blue card |
-| ⚪ **notable** | someone arrived next to you or moved away, Gather's own notifications | yes |
+| ⚪ **notable** | someone stopped following you, Gather's own notifications | yes |
 | ▫️ **ambient** | mic and camera toggles, transport state, roster churn, your own device state | behind "Show N background events" |
 
-The top of the screen answers *now* — who is next to you, who is following you —
-straight from the bridge's snapshot, so it is right even if the app was closed
-when it happened. The list underneath is history.
+The top of the screen answers *now* — who is following you, and which of them is
+talking — straight from the bridge's snapshot, so it is right even if the app was
+closed when it happened. The list underneath is history.
 
 ### 🎨 Palette and icon
 
@@ -545,9 +555,9 @@ The palette is Gather's own: `#4257DA`, read out of `app.v2.gather.town`'s
 stylesheet (`--theme-color-accent`) rather than picked by eye, with the tint ramp
 around it and Inter to match.
 
-**The icon** is a proximity ping on a 32×32 pixel grid: you are the white block
-in the middle, the ring is the radius the bridge watches, and the green marker on
-it is somebody who just walked into range. Pixel geometry nods at the medium — a
+**The icon** is a ping on a 32×32 pixel grid: you are the white block in the
+middle, and the green marker on the ring is somebody who has attached themselves
+to you. Pixel geometry nods at the medium — a
 tile-grid virtual office — while borrowing nothing from Gather's own mark; the
 dark indigo tile is the app's own `background`, not Gather's blue square. It is
 drawn by `tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
@@ -657,15 +667,15 @@ re-run gets a fresh build number, so neither half objects to going twice.
   authenticated session: the handshake order, the three patch ops, both envelope
   keys (`fullStatePatches`, `patches`), the `Connection` identity row and the
   `SpaceUser` field set. Replaying that capture resolves the right own-row id and
-  yields the correct set of nearby people, by name. What has *not* been observed
-  on the wire is a follow actually starting — `followTargetId` is an optional
-  column and nobody was following during capture — so that one path rests on the
-  SDK's own model definition rather than an observation.
+  the correct roster, by name. What has *not* been observed on the wire is a
+  follow actually starting — `followTargetId` is an optional column and nobody
+  was following during capture — so the one path this app is built on rests on
+  the SDK's own model definition rather than an observation.
 - 📊 `GameProtocolReader.stats()` reports frame types and unrecognised-frame
   counts, so a future format change shows up as a number rather than as silence.
   Check it via `GET /collectors` (`stats`).
 - 🌊 **Wire-format drift.** The web app redeploys constantly. The *field* names
-  (`followTargetId`, `position`, `clusterId`, `floorId`) are Prisma columns and
+  (`followTargetId`, `position`, `floorId`) are Prisma columns and
   change rarely; the msgpack framing and patch envelope are internal and could
   change with any deploy. `bridge.status` events tell the app when a collector goes
   quiet, so drift shows up as a visibly degraded state rather than silence.
@@ -702,6 +712,6 @@ re-run gets a fresh build number, so neither half objects to going twice.
 
 <div align="center">
 
-MIT · not affiliated with Gather · built for the people who keep walking up behind you
+MIT · not affiliated with Gather · built for the people who keep following you around
 
 </div>

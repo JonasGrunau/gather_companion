@@ -233,10 +233,8 @@ async function cmdStatus() {
     }
     const snapshot = await getJson(port, '/state', config.token);
     if (snapshot) {
-      const near = (snapshot.players ?? []).filter((p) => p.isNear);
       const followers = (snapshot.players ?? []).filter((p) => p.isFollowingMe);
       line('space', snapshot.self?.spaceName ?? snapshot.self?.spaceId ?? dim('unknown'));
-      line('next to you', near.length ? near.map(labelOf).join(', ') : dim('nobody'));
       line('following you', followers.length ? followers.map(labelOf).join(', ') : dim('nobody'));
     }
   }
@@ -341,8 +339,8 @@ async function cmdDoctor() {
     console.log('  the desktop client itself and appear in no part of Gather\'s game');
     console.log('  state, so they are the one thing that still needs it running.');
     console.log('');
-    console.log(dim('  Everything else — who is next to you, who is following you — keeps'));
-    console.log(dim('  working with the app closed.'));
+    console.log(dim('  Everything else — who is following you — keeps working with the'));
+    console.log(dim('  app closed.'));
   }
   console.log('');
   console.log(dim('  Not available at all: mic, camera and screenshare state. They were'));
@@ -575,22 +573,6 @@ function describe(event, nameFor) {
       return event.targetIsSelf
         ? { mark: dim('▽'), text: `${who} stopped following you`, meta }
         : { mark: dim('▽'), text: 'you stopped following', meta };
-    case 'proximity.entered':
-      return {
-        mark: green('●'),
-        text: bold(`${who} is next to you`),
-        meta: [event.distance != null ? `${event.distance.toFixed(1)} tiles` : '', meta]
-          .filter(Boolean)
-          .join(' · '),
-      };
-    case 'proximity.left':
-      return { mark: dim('○'), text: `${who} moved away`, meta };
-    case 'player.moved':
-      return {
-        mark: dim('→'),
-        text: `${who} moved`,
-        meta: event.distance != null ? `${event.distance.toFixed(1)} tiles` : '',
-      };
     case 'notification.shown':
       // A wave is the loudest thing Gather itself will tell you about, and the
       // one most worth seeing here.
@@ -886,7 +868,7 @@ function usage() {
   ${bold('Watching the event feed')}
     ${INVOKE} watch                       attach to the live stream
     ${INVOKE} watch --history 20          show the last 20 events first
-    ${INVOKE} watch --filter follow,proximity
+    ${INVOKE} watch --filter follow,notification
     ${INVOKE} watch --json | jq .         machine-readable, one event per line
     ${INVOKE} watch --raw                 everything intercepted, unfiltered
 

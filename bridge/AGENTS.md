@@ -33,8 +33,8 @@ Two collectors were deleted in favour of this, and should not come back:
 `CdpCollector` (attached to the desktop renderer's devtools port — required a
 debug port open on a live authenticated session, and could not get a state dump
 without reloading the renderer) and the broad `GatherLogParser` (regexes over
-`main.log` for proximity, media and roster churn — all of it now read from the
-protocol, and better).
+`main.log` for adjacency, media and roster churn — none of which is read that way
+any more: following comes from the protocol, and proximity was dropped outright).
 
 **Mic, camera and screenshare are gone and are not recoverable.** They were IPC
 state inside the desktop client and appear in no Gather model. `SpaceUser.speaking`

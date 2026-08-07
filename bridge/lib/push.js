@@ -11,11 +11,11 @@
  *  - **wave** — rare, always deliberate, always means somebody wants you. The
  *    strongest case there is.
  *  - **meeting invite**, **event reminder** — scheduled, few, and time-bound.
- *  - **follow.started** — rare and unambiguous.
- *  - **proximity** — built, and **off by default**. In a busy space it is by far
- *    the noisiest of the five: a colleague pacing near your desk can cross the
- *    threshold repeatedly. The cooldown below exists for it. Turn it on with
- *    `push.kinds.proximity` in `~/.gather-app-bridge.json`.
+ *  - **follow.started** — rare and unambiguous, and the reason this app exists.
+ *
+ * All four are deliberate acts by a person. That is the bar, and it is why there
+ * is no rate limiting here: proximity used to need a per-person cooldown because
+ * walking past a desk is not a decision, and it is gone.
  *
  * ## Foreground double-ups
  *
@@ -34,16 +34,7 @@ export const PUSH_DEFAULTS = Object.freeze({
   'meeting invite': true,
   'event reminder': true,
   follow: true,
-  proximity: false,
 });
-
-/**
- * How long the same person must wait before they can buzz you again.
- *
- * Only proximity needs this. Waves are deliberate acts and rate-limited by the
- * human sending them; walking past a desk is not.
- */
-export const PROXIMITY_COOLDOWN_MS = 10 * 60_000;
 
 /**
  * The phones that have asked to be told.
@@ -102,13 +93,10 @@ export class PushNotifier {
    * @param {{ sender: import('./fcm.js').FcmSender|null, registry?: PushRegistry,
    *           log?: Function, now?: () => number }} options
    */
-  constructor({ sender, registry = null, log = () => {}, now = Date.now }) {
+  constructor({ sender, registry = null, log = () => {} }) {
     this.sender = sender;
     this.registry = registry ?? new PushRegistry({ log });
     this.log = log;
-    this._now = now;
-    /** collapse key -> when we last sent it, for the cooldown. */
-    this._lastSent = new Map();
   }
 
   get enabled() {
@@ -131,12 +119,6 @@ export class PushNotifier {
 
     const devices = this.registry.list();
     if (devices.length === 0) return null;
-
-    if (note.cooldownMs) {
-      const last = this._lastSent.get(note.collapseId) ?? 0;
-      if (this._now() - last < note.cooldownMs) return null;
-    }
-    this._lastSent.set(note.collapseId, this._now());
 
     for (const device of devices) {
       try {
@@ -174,17 +156,6 @@ export function describe(event, nameFor = (id) => id) {
         title: 'Someone is following you',
         body: `${who} started following you`,
         collapseId: `follow-${event.followerId}`,
-      };
-    }
-
-    case 'proximity.entered': {
-      const who = nameFor(event.playerId);
-      return {
-        kind: 'proximity',
-        title: 'Someone is next to you',
-        body: `${who} is standing next to you`,
-        collapseId: `near-${event.playerId}`,
-        cooldownMs: PROXIMITY_COOLDOWN_MS,
       };
     }
 

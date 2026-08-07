@@ -54,26 +54,6 @@ export function selfChanged({ at, source = 'gather', userId = null, inOffice = n
   };
 }
 
-/**
- * Someone came into, or dropped out of, your immediate surroundings.
- * This is the "standing next to me" signal.
- */
-export function proximity({
-  at,
-  source = 'gather',
-  confidence = 'observed',
-  playerId,
-  near,
-  distance = null,
-}) {
-  return {
-    type: near ? 'proximity.entered' : 'proximity.left',
-    ...base(at, source, confidence),
-    playerId,
-    distance,
-  };
-}
-
 /** `targetIsSelf: true` is the one that matters: you are being followed. */
 export function follow({
   at,
@@ -91,10 +71,6 @@ export function follow({
     targetId,
     targetIsSelf,
   };
-}
-
-export function playerMoved({ at, source = 'gather', playerId, x, y, distance = null }) {
-  return { type: 'player.moved', ...base(at, source), playerId, x, y, distance };
 }
 
 /**
@@ -129,8 +105,6 @@ export function newPlayer(id) {
     id,
     name: null,
     inSpace: true,
-    isNear: false,
-    inAudioRange: false,
     isFollowingMe: false,
     /** Live voice activity, straight from `SpaceUser.speaking`. */
     speaking: false,
@@ -138,10 +112,6 @@ export function newPlayer(id) {
     micOn: null,
     cameraOn: null,
     screensharing: false,
-    distance: null,
-    x: null,
-    y: null,
-    nearSince: null,
     followingMeSince: null,
   };
 }

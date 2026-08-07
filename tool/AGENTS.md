@@ -22,10 +22,10 @@ build to TestFlight. Neither is part of the app or the npm package.
 
 **`make_icons.mjs`**
 
-- The mark is a proximity ping on a 32×32 pixel grid: you are the white block in
-  the centre, the ring is the radius the bridge watches, the green marker is
-  somebody who just walked into range. Pixel geometry nods at the tile-grid
-  medium while borrowing nothing from Gather's own mark.
+- The mark is a ping on a 32×32 pixel grid: you are the white block in the
+  centre, and the green marker is somebody who has attached themselves to you.
+  Pixel geometry nods at the tile-grid medium while borrowing nothing from
+  Gather's own mark.
 - The palette constants are copied by hand from `lib/theme/gather_theme.dart`.
   Changing a token there means updating them here and re-running.
 - **Catalogue sizes stay full-bleed squares.** iOS applies the squircle itself; a

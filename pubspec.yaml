@@ -1,5 +1,5 @@
 name: gather_companion
-description: "Gather Companion — live event log for your Gather V2 session: who is next to you, who is following you."
+description: "Gather Companion — know when somebody starts following you in your live Gather V2 session."
 publish_to: 'none'
 version: 0.1.0+4
 

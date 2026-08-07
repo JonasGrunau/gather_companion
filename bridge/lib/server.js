@@ -535,7 +535,7 @@ export class BridgeServer {
   _ingest(events) {
     // Raw subscribers see everything the collectors produced, before the tracker
     // decides what is worth telling a human. Most of what is dropped here is
-    // genuine noise — repeated proximity reports, mic toggles, transport chatter —
+    // genuine noise — roster churn, voice activity, transport chatter —
     // but "what can this thing actually see" is a fair question to be able to
     // answer, so it is one query parameter away rather than unavailable.
     this._publishRaw(events);

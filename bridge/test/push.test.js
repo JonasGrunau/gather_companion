@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { FcmSender, buildAssertion, readServiceAccount } from '../lib/fcm.js';
-import { PROXIMITY_COOLDOWN_MS, PushNotifier, PushRegistry, describe } from '../lib/push.js';
+import { PushNotifier, PushRegistry, describe } from '../lib/push.js';
 
 /**
  * A throwaway RSA key, generated per run. Never a real service account — the
@@ -203,8 +203,8 @@ test('the four chosen reasons produce a sentence, and nothing else does', () => 
 
   // Me following somebody else is not news to me.
   assert.equal(describe({ type: 'follow.started', targetIsSelf: false, targetId: 'p1' }), null);
-  assert.equal(describe({ type: 'proximity.left', playerId: 'p1' }), null);
-  assert.equal(describe({ type: 'player.moved', playerId: 'p1' }), null);
+  // Somebody giving up on following you is not worth a lock screen.
+  assert.equal(describe({ type: 'follow.stopped', targetIsSelf: true, followerId: 'p1' }), null);
   assert.equal(describe({ type: 'bridge.status', collector: 'gather' }), null);
 });
 
@@ -225,52 +225,42 @@ test("Gather's own title and body win when it sends them", () => {
   assert.equal(note.body, 'Come to the kitchen');
 });
 
-test('proximity is off by default and on when asked for', async () => {
+test('a reason can be switched off per install', async () => {
   const sent = [];
   const sender = { send: async (n) => (sent.push(n), { ok: true }) };
-  const event = { type: 'proximity.entered', playerId: 'p1' };
+  const event = { type: 'follow.started', targetIsSelf: true, followerId: 'p1' };
 
   const off = new PushNotifier({
     sender,
-    registry: memoryRegistry({ push: { devices: [{ token: TOKEN, platform: 'ios' }] } }),
+    registry: memoryRegistry({
+      push: { devices: [{ token: TOKEN, platform: 'ios' }], kinds: { follow: false } },
+    }),
   });
   assert.equal(await off.consider(event, nameFor), null);
-  assert.equal(sent.length, 0, 'the noisiest reason must stay opt-in');
+  assert.equal(sent.length, 0, 'config has to be able to say no');
 
   const on = new PushNotifier({
     sender,
-    registry: memoryRegistry({
-      push: { devices: [{ token: TOKEN, platform: 'ios' }], kinds: { proximity: true } },
-    }),
+    registry: memoryRegistry({ push: { devices: [{ token: TOKEN, platform: 'ios' }] } }),
   });
   assert.ok(await on.consider(event, nameFor));
-  assert.equal(sent[0].body, 'Ada is standing next to you');
+  assert.equal(sent[0].body, 'Ada started following you');
 });
 
-test('the same person cannot buzz you twice inside the cooldown', async () => {
+test('the same person following you twice buzzes twice', async () => {
+  // There is no rate limiting left. Every remaining reason is a deliberate act by
+  // a person, so the cooldown that proximity needed would only ever swallow
+  // something somebody meant to do.
   const sent = [];
-  let clock = 1_000_000;
   const notifier = new PushNotifier({
     sender: { send: async (n) => (sent.push(n), { ok: true }) },
-    registry: memoryRegistry({
-      push: { devices: [{ token: TOKEN, platform: 'ios' }], kinds: { proximity: true } },
-    }),
-    now: () => clock,
+    registry: memoryRegistry({ push: { devices: [{ token: TOKEN, platform: 'ios' }] } }),
   });
-  const event = { type: 'proximity.entered', playerId: 'p1' };
+  const event = { type: 'follow.started', targetIsSelf: true, followerId: 'p1' };
 
   await notifier.consider(event, nameFor);
-  clock += PROXIMITY_COOLDOWN_MS - 1000;
   await notifier.consider(event, nameFor);
-  assert.equal(sent.length, 1, 'pacing near a desk must not buzz repeatedly');
-
-  clock += 2000;
-  await notifier.consider(event, nameFor);
-  assert.equal(sent.length, 2, 'but it must not be silenced forever either');
-
-  // A different person is a different notification, cooldown or not.
-  await notifier.consider({ type: 'proximity.entered', playerId: 'p2' }, nameFor);
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 2);
 });
 
 test('every registered phone is sent to, and dead ones are dropped', async () => {
@@ -345,9 +335,9 @@ test('a token too short to be real is refused', () => {
 });
 
 test('config overrides the default reasons without losing the rest', () => {
-  const registry = memoryRegistry({ push: { kinds: { proximity: true, wave: false } } });
+  const registry = memoryRegistry({ push: { kinds: { follow: false, wave: false } } });
   const kinds = registry.kinds();
-  assert.equal(kinds.proximity, true);
+  assert.equal(kinds.follow, false);
   assert.equal(kinds.wave, false);
-  assert.equal(kinds.follow, true, 'unmentioned reasons keep their default');
+  assert.equal(kinds['meeting invite'], true, 'unmentioned reasons keep their default');
 });

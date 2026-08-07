@@ -16,7 +16,7 @@ rather than evidence that the code matches its own assumptions.
 
 | File | Description |
 |------|-------------|
-| `bridge.test.js` | End-to-end: boots a real `BridgeServer` against the fake Gather server, drives it with real model patches, appends real log lines to a temp log, and reads the results over a real WebSocket. Covers auth, snapshot-then-events framing, proximity, follows, waves and `?since=` catch-up. |
+| `bridge.test.js` | End-to-end: boots a real `BridgeServer` against the fake Gather server, drives it with real model patches, appends real log lines to a temp log, and reads the results over a real WebSocket. Covers auth, snapshot-then-events framing, follows, waves, that walking about produces nothing at all, and `?since=` catch-up. |
 | `game-protocol.test.js` | The largest suite. Model patches (`addmodel` / `deletemodel` / `replace`), both envelope keys, identity resolution via `Connection` and via `UserAccount`, component-wise position updates, teleports, follow detection, bot filtering — feeding `GameProtocolReader` into `PresenceTracker`. |
 | `desktop-notifications.test.js` | The last scraper, against verbatim log lines. Includes the suppressed-notification case, which is the one that decides which line to key off. |
 | `fake-gather.js` | **Not a suite.** A fake Gather game server shared by `bridge.test.js` and `direct.test.js`: real op names and envelope keys, synthetic ids. |

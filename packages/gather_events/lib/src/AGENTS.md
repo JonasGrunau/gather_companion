@@ -13,20 +13,17 @@ socket, distinguished by the frame's `kind`.
 
 | File | Description |
 |------|-------------|
-| `events.dart` | `sealed class GatherEvent` plus thirteen subclasses, and the `EventSource` / `Confidence` / `MediaTrack` enums. |
+| `events.dart` | `sealed class GatherEvent` plus ten subclasses, and the `EventSource` / `Confidence` / `MediaTrack` enums. |
 | `presence.dart` | `PlayerRef`, `SelfState`, `CollectorHealth`, `PartyState`, `PresenceSnapshot` — the `kind: 'snapshot'` frame. |
 
 ## The event hierarchy
 
 | Class | Wire `type` |
 |---|---|
-| `ProximityEvent` | `proximity.entered` / `proximity.left` |
 | `FollowEvent` | `follow.started` / `follow.stopped` |
 | `PlayerSpaceEvent` | `player.joinedSpace` / `player.leftSpace` |
-| `AudioRangeEvent` | `audio.range` |
 | `MediaChangedEvent` | `media.changed` |
 | `MediaConnectionEvent` | `media.connection` |
-| `PlayerMovedEvent` | `player.moved` |
 | `ChatMessageEvent` | `chat.message` |
 | `SelfChangedEvent` | `self.changed` |
 | `SpaceChangedEvent` | `space.changed` |
@@ -48,13 +45,16 @@ socket, distinguished by the frame's `kind`.
 - Both parse helpers use `firstWhere(..., orElse:)` and default to the safe
   option (`EventSource.bridge`, `Confidence.observed`).
 - `PlayerRef.label` is the display rule the whole app relies on: name if known,
-  otherwise the first 8 characters of the uuid. `distance`, `x`, `y` and `name`
-  are all null in log-only mode — treat them as optional everywhere.
+  otherwise the first 8 characters of the uuid. `name` is null in log-only mode —
+  treat it as optional everywhere.
+- **`PlayerRef` is deliberately not a position.** It carries who somebody is and
+  whether they are following you, and nothing about where they are standing.
+  Proximity was removed on purpose; do not reintroduce `isNear`, `distance` or
+  coordinates to make a UI easier.
 - `CollectorHealth.hasRichData` is what the UI reads to decide whether to admit
   the follow-detection limitation. It is not decoration.
-- `copyWith` on `PlayerRef` carries explicit `clearNearSince` /
-  `clearFollowingMeSince` flags, because null cannot mean both "unchanged" and
-  "cleared".
+- `copyWith` on `PlayerRef` carries an explicit `clearFollowingMeSince` flag,
+  because null cannot mean both "unchanged" and "cleared".
 
 ### Testing Requirements
 
