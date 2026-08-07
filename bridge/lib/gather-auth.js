@@ -175,6 +175,36 @@ export function hasGatherSession() {
   return typeof readConfig().gather?.refreshToken === 'string';
 }
 
+/**
+ * The session, packaged for handing to a paired phone.
+ *
+ * The phone cannot adopt a session itself — it has no access to this machine's
+ * disk — so pairing is the only moment it can be given one. What crosses is the
+ * *refresh* token, not an ID token: ID tokens last an hour, and a phone that had
+ * to re-pair hourly would be useless.
+ *
+ * ## What this widens
+ *
+ * `/pair/claim` is the one unauthenticated route, because handing over a
+ * credential is its whole purpose. Until now the credential it handed over was
+ * scoped to this bridge on this LAN. Now it is the user's Gather identity, so a
+ * stolen code is worth more. The protections are unchanged and still the right
+ * ones — no code exists until someone runs `pair`, it is single-use, it expires in
+ * fifteen minutes, and eight wrong guesses destroy it — but the stakes are higher,
+ * which is worth stating where somebody will read it.
+ *
+ * Returns null when no session has been adopted, so pairing can say so plainly
+ * rather than handing over a phone that will never connect.
+ */
+export function gatherSessionForHandover() {
+  const gather = readConfig().gather;
+  if (typeof gather?.refreshToken !== 'string' || !gather.refreshToken) return null;
+  return {
+    refreshToken: gather.refreshToken,
+    uid: gather.uid ?? uidFromIdToken(gather.idToken),
+  };
+}
+
 /** The adopted Firebase uid, if we have one. */
 export function gatherUid() {
   const gather = readConfig().gather;

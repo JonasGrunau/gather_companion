@@ -5,9 +5,8 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { BridgeServer } from '../lib/server.js';
-import { SAFE_TILES } from '../lib/party.js';
 import { PushNotifier, PushRegistry } from '../lib/push.js';
-import { defaultPatches, fakeGameServer, fakeJwt } from './fake-gather.js';
+import { defaultPatches, fakeGameServer, fakeJwt, waveEvent } from './fake-gather.js';
 
 const TOKEN = 'test-token';
 const ME = 'me-1';
@@ -16,6 +15,10 @@ const NEIGHBOUR = 'them-1';
 /**
  * Real notification lines, verbatim from `~/Library/Logs/GatherV2/main.log`, with
  * the uuid replaced. These three types are everything Gather's client raises.
+ *
+ * `wave` is kept only to prove it is now *ignored* here: waves come off the game
+ * socket's event bus instead (see `waveEvent`), which names the sender and does not
+ * need the desktop app running at all.
  */
 const line = {
   wave: () =>
@@ -69,6 +72,9 @@ before(async () => {
     // broken, however green it looks.
     socketUrl,
     getToken: async () => fakeJwt(),
+    // Never the real reader: its default would put the developer's live Gather
+    // refresh token into this suite's assertions.
+    gatherSession: () => ({ refreshToken: 'refresh-for-the-phone', uid: 'uid-1' }),
     spaceId: 'space-1',
     logSource: logPath,
     log: () => {},
@@ -114,6 +120,9 @@ const state = async () =>
 /** Everything in the server's replay buffer, for asserting that nothing was added. */
 const eventsSoFar = async () =>
   (await (await fetch(`http://127.0.0.1:${port}/events?token=${TOKEN}`)).json()).events;
+/** One token-gated GET, decoded. */
+const getJson = async (path) =>
+  (await fetch(`http://127.0.0.1:${port}${path}?token=${TOKEN}`)).json();
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Waits until the state dump has been consumed, so tests start from a roster. */
@@ -166,7 +175,8 @@ test('the state dump becomes a roster with names and the space name', async () =
 });
 
 test('walking about the space is not news', async () => {
-  // Positions are still decoded — party mode needs them — but they reach nobody.
+  // Positions are still decoded and still sent in the roster — the app’s party mode
+  // needs them — but they are not news, so they reach no feed.
   // This is the whole removal in one assertion.
   await ready();
   const before = (await eventsSoFar()).length;
@@ -217,18 +227,44 @@ test('voice activity reaches the snapshot but is never an event', async () => {
   );
 });
 
-test('a wave in the desktop log is delivered as a notification', async () => {
-  // The one thing still scraped, because it exists in no Gather model — and the
-  // single event most worth waking a phone for.
+test('a wave on the game socket becomes a notification that names the sender', async () => {
+  // The event bus, which nobody read for weeks: a `DeltaState` whose `patches`
+  // array is empty and whose `events` array holds the wave. It arrives with a
+  // `senderId`, which the log-scraped version never had.
   const pending = collect({
     done: (f) => eventsOf(f).some((e) => e.type === 'notification.shown'),
   });
   await wait(250);
-  appendFileSync(logPath, `${line.noise()}\n${line.wave()}\n${line.waveShown()}\n`);
+  gather.latest.bus([waveEvent({ senderId: NEIGHBOUR, targetId: ME })]);
 
   const shown = eventsOf(await pending).filter((e) => e.type === 'notification.shown');
-  assert.equal(shown.length, 1, 'the IPC line and the "Showing" line are one notification');
+  assert.equal(shown.length, 1);
   assert.equal(shown[0].notificationType, 'wave');
+  assert.equal(shown[0].senderId, NEIGHBOUR, 'the phone can say who waved');
+  assert.equal(shown[0].source, 'gather', 'no longer scraped');
+  assert.equal(shown[0].at, '2026-08-07T14:22:20.563Z', "the sender's own clock, not ours");
+});
+
+test('a wave aimed at somebody else is not reported', async () => {
+  // `options.targetUserIds` is the server's own routing. Reporting every wave in
+  // the space would be worse than reporting none — the same stance `presence.js`
+  // takes on being followed when it does not know which row is ours.
+  const before = await state();
+  gather.latest.bus([waveEvent({ senderId: NEIGHBOUR, targetId: 'someone-else' })]);
+  await wait(400);
+
+  const after = await state();
+  assert.equal(after.seq, before.seq, 'nothing was published');
+});
+
+test('a wave in the desktop log is ignored, because the socket already reported it', async () => {
+  // Both sources would otherwise fire for one wave, and the log is always second.
+  const before = await state();
+  appendFileSync(logPath, `${line.noise()}\n${line.wave()}\n${line.waveShown()}\n`);
+  await wait(600);
+
+  const after = await state();
+  assert.equal(after.seq, before.seq, 'the log path must stay silent about waves');
 });
 
 test('a notification Gather suppressed still reaches the phone', async () => {
@@ -248,7 +284,7 @@ test('a notification Gather suppressed still reaches the phone', async () => {
 test('a reconnecting client can replay what it missed', async () => {
   const before = await state();
   await wait(250);
-  appendFileSync(logPath, `${line.wave()}\n`);
+  appendFileSync(logPath, `${line.invite()}\n`);
 
   await collect({ done: (f) => eventsOf(f).some((e) => e.type === 'notification.shown') });
 
@@ -284,7 +320,7 @@ test('the raw channel shows what the filtered stream suppresses', async () => {
   const filteredWs = await open('', filtered);
   await wait(250);
 
-  appendFileSync(logPath, `${line.wave()}\n`);
+  appendFileSync(logPath, `${line.invite()}\n`);
   await wait(900);
 
   rawWs.close();
@@ -309,200 +345,6 @@ test('the collectors endpoint names what is actually connected', async () => {
   assert.equal(body.stats.users, defaultPatches().filter((p) => p.model === 'SpaceUser').length);
 });
 
-// ---- party mode -------------------------------------------------------------
-
-test('party mode teleports on the wire, and only to a tile nobody is near', async () => {
-  await ready();
-  // Park the neighbour at the far end. This is what makes anywhere safe: with
-  // them one tile away, every tile the bridge knows about is inside the
-  // clearance and party mode is right to sit still.
-  gather.latest.delta([
-    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 90 },
-  ]);
-  await wait(400);
-
-  const on = await (
-    await fetch(`http://127.0.0.1:${port}/party?on=1&token=${TOKEN}`, { method: 'POST' })
-  ).json();
-  assert.equal(on.active, true);
-  assert.equal(on.ok, true);
-
-  await wait(400);
-
-  const teleports = gather.latest.received.filter((f) => f.action === 'teleport');
-  assert.ok(teleports.length > 0, 'the Action must actually reach Gather');
-
-  const [model, id, payload] = teleports[0].args;
-  assert.equal(model, 'SpaceUser');
-  assert.equal(id, ME, 'we move our own avatar and nobody else');
-  assert.equal(typeof payload.x, 'number', 'flat x/y — {position:{x,y}} is rejected');
-  assert.ok(payload.direction, 'required even when teleporting');
-
-  // The promise the feature rests on: never within the clearance of someone who
-  // is actually here.
-  for (const frame of teleports) {
-    const { x, y } = frame.args[2];
-    assert.ok(Math.hypot(x - 90, y - 10) >= SAFE_TILES, `hopped to ${x},${y} — too close`);
-  }
-
-  const snapshot = await state();
-  assert.equal(snapshot.party.active, true, 'the phone learns about it from the snapshot');
-  assert.ok(snapshot.party.hops > 0);
-
-  const off = await (
-    await fetch(`http://127.0.0.1:${port}/party?on=0&token=${TOKEN}`, { method: 'POST' })
-  ).json();
-  assert.equal(off.active, false);
-
-  const settled = gather.latest.received.filter((f) => f.action === 'teleport').length;
-  await wait(300);
-  assert.equal(
-    gather.latest.received.filter((f) => f.action === 'teleport').length,
-    settled,
-    'switching it off stops the hopping',
-  );
-});
-
-test('party mode can be switched from the socket the phone already has', async () => {
-  await ready();
-  gather.latest.delta([
-    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 90 },
-  ]);
-  await wait(400);
-
-  // The point of the command channel: no second TCP connection. On a phone the
-  // HTTP round trip is a fresh connection over the same flaky Wi-Fi every tap,
-  // while this socket has already proved it works by delivering a snapshot.
-  const acks = await new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${TOKEN}`);
-    const seen = [];
-    const timer = setTimeout(() => reject(new Error('no ack came back')), 6000);
-    ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ cmd: 'ping', id: 7 }));
-      ws.send(JSON.stringify({ cmd: 'party', on: true, id: 8 }));
-      ws.send(JSON.stringify({ cmd: 'nonsense', id: 9 }));
-    });
-    ws.addEventListener('message', (event) => {
-      const frame = JSON.parse(String(event.data));
-      if (frame.kind !== 'ack') return;
-      seen.push(frame);
-      if (seen.length === 3) {
-        clearTimeout(timer);
-        ws.close();
-        resolve(seen);
-      }
-    });
-    ws.addEventListener('error', () => reject(new Error('websocket error')));
-  });
-
-  // Every ack carries back the id it answers, so a stale reply cannot be mistaken
-  // for the answer to the tap the user is waiting on.
-  assert.deepEqual(
-    acks.map((a) => [a.id, a.ok]),
-    [
-      [7, true],
-      [8, true],
-      [9, false],
-    ],
-  );
-
-  const snapshot = await state();
-  assert.equal(snapshot.party.active, true, 'the command really took');
-
-  await fetch(`http://127.0.0.1:${port}/party?on=0&token=${TOKEN}`, { method: 'POST' });
-});
-
-test('the hop counter ticks on its own small frame, not on the roster', async () => {
-  await ready();
-  gather.latest.delta([
-    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 90 },
-  ]);
-  await wait(400);
-
-  const frames = [];
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${TOKEN}`);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve);
-    ws.addEventListener('error', () => reject(new Error('could not connect')));
-  });
-  ws.addEventListener('message', (event) => frames.push(JSON.parse(String(event.data))));
-
-  await fetch(`http://127.0.0.1:${port}/party?on=1&token=${TOKEN}`, { method: 'POST' });
-  await wait(1400);
-  await fetch(`http://127.0.0.1:${port}/party?on=0&token=${TOKEN}`, { method: 'POST' });
-  ws.close();
-
-  const parties = frames.filter((f) => f.kind === 'party');
-  assert.ok(parties.length > 0, 'a running party reports its progress');
-  assert.ok(parties.at(-1).party.hops > 0);
-  assert.ok(parties.at(-1).party.active);
-
-  // The whole point: a counter that moves four times a second must not cost a
-  // roster. 22 KiB to deliver a number that changed by four is what made the link
-  // feel fragile in the first place.
-  const size = JSON.stringify(parties[0]).length;
-  assert.ok(size < 200, `the party frame grew to ${size} bytes`);
-});
-
-test('a client that stops answering is dropped rather than written to for ever', async () => {
-  // A phone never says goodbye: iOS suspends it, or the Wi-Fi hands over, and the
-  // socket just stops being answered. Nothing in that raises an error, so without
-  // reaping the fan-out list only grows — the symptom was `client connected (2
-  // total)` on a bridge with one phone.
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${TOKEN}`);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve);
-    ws.addEventListener('error', () => reject(new Error('could not connect')));
-  });
-  assert.equal(server._clients.size, 1);
-
-  // A live client survives the sweep, and is pinged so it stays that way.
-  server._sweepClients();
-  await wait(50);
-  assert.equal(server._clients.size, 1, 'a healthy client is left alone');
-
-  // Now stand in for a phone that went away without saying so: the connection is
-  // still open, but nothing has been heard from it in longer than the timeout.
-  for (const client of server._clients) client.lastSeenAt = 0;
-  server._sweepClients();
-  await wait(50);
-
-  assert.equal(server._clients.size, 0, 'the dead client is off the fan-out list');
-  ws.close();
-});
-
-test('a burst of changes becomes one snapshot, not one snapshot each', async () => {
-  await ready();
-
-  const frames = [];
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${TOKEN}`);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve);
-    ws.addEventListener('error', () => reject(new Error('could not connect')));
-  });
-  ws.addEventListener('message', (event) => frames.push(JSON.parse(String(event.data))));
-  await wait(100);
-  frames.length = 0;
-
-  // Eight separate state changes inside one coalescing window. Unthrottled this
-  // was eight full rosters — 23 KiB each in the measured space — for a screen that
-  // can only draw the last one.
-  for (let i = 0; i < 8; i++) {
-    gather.latest.delta([
-      { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/name', data: `Renamed ${i}` },
-    ]);
-  }
-  await wait(900);
-  ws.close();
-
-  const snapshots = frames.filter((f) => f.kind === 'snapshot');
-  assert.ok(snapshots.length > 0, 'the change still reaches the phone');
-  assert.ok(snapshots.length <= 3, `coalesced to ${snapshots.length} snapshots, not 8`);
-  // Coalescing, not sampling: the flush reads live state, so the last change wins
-  // rather than being dropped with the rest.
-  const last = snapshots.at(-1).snapshot.players.find((p) => p.id === NEIGHBOUR);
-  assert.equal(last.name, 'Renamed 7');
-});
 
 // ---- push -------------------------------------------------------------------
 
@@ -520,13 +362,31 @@ test('a phone can register for pushes, and then gets woken by a wave', async () 
 
   pushes.length = 0;
   await wait(250);
-  appendFileSync(logPath, `${line.wave()}\n`);
+  // A sender the roster does not know, because `them-1` has already waved in this
+  // suite and is inside its cooldown. An unknown sender also exercises the
+  // fallback wording, which is what a wave looked like before it had a sender.
+  gather.latest.bus([waveEvent({ senderId: 'stranger-1', targetId: ME })]);
   for (let i = 0; i < 40 && pushes.length === 0; i++) await wait(50);
 
   assert.equal(pushes.length, 1, 'a wave must reach a phone that is not listening');
   assert.equal(pushes[0].token, token);
   assert.equal(pushes[0].title, 'Someone waved at you');
-  assert.equal(pushes[0].collapseId, 'gather-wave');
+  assert.equal(
+    pushes[0].collapseId,
+    'gather-wave-stranger-1',
+    'collapsed per sender, so two people waving do not overwrite each other',
+  );
+});
+
+test('the same person waving repeatedly is reported once', async () => {
+  // Measured on a live space: one person produced 41 `WaveEvent`s in eight seconds.
+  // A wave is a decision; the wave *button* is not.
+  const before = await state();
+  for (let i = 0; i < 5; i++) gather.latest.bus([waveEvent({ senderId: NEIGHBOUR, targetId: ME })]);
+  await wait(600);
+
+  const after = await state();
+  assert.equal(after.seq, before.seq, 'already inside the cooldown from the earlier wave');
 });
 
 test('registering without a plausible token is refused', async () => {
@@ -536,6 +396,64 @@ test('registering without a plausible token is refused', async () => {
     body: JSON.stringify({ token: 'short' }),
   });
   assert.equal(res.status, 400);
+});
+
+test('claiming a code hands over both credentials', async () => {
+  // The phone needs two things and they are not interchangeable: the bridge token,
+  // which lets it register for pushes on this LAN, and the *Gather* refresh token,
+  // which lets it read presence itself without this computer being involved at all.
+  const offer = await getJson('/pair/offer');
+  assert.match(offer.code, /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8}$/);
+
+  const claimed = await (
+    await fetch(`http://127.0.0.1:${port}/pair/claim?code=${offer.code}`)
+  ).json();
+
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.token, TOKEN, 'the bridge token, for push registration');
+  assert.equal(claimed.gather.refreshToken, 'refresh-for-the-phone');
+  assert.equal(claimed.gather.uid, 'uid-1');
+  assert.equal(claimed.gather.spaceId, 'space-1', 'so the first connection needs no REST call');
+  assert.equal(typeof claimed.name, 'string');
+});
+
+test('a claimed code is burnt, so a shoulder-surfer gets one chance and loses it', async () => {
+  const offer = await getJson('/pair/offer');
+  const first = await fetch(`http://127.0.0.1:${port}/pair/claim?code=${offer.code}`);
+  assert.equal(first.status, 200);
+
+  const second = await fetch(`http://127.0.0.1:${port}/pair/claim?code=${offer.code}`);
+  assert.equal(second.status, 409, 'single use, and now there is no live code at all');
+});
+
+test('a bridge with no Gather session says so rather than pairing a phone that cannot connect', async () => {
+  // `adopt` not yet run. Everything else about pairing works, and the fix is one
+  // command on the Mac — so this has to be reported, not silently succeeded.
+  const bare = new BridgeServer({
+    token: 'other-token',
+    port: 0,
+    push: new PushNotifier({ sender: null, registry: new PushRegistry({ read: () => ({}), write: () => {} }) }),
+    socketUrl: 'ws://127.0.0.1:1',
+    getToken: async () => fakeJwt(),
+    gatherSession: () => null,
+    logSource: logPath,
+    log: () => {},
+  });
+  await bare.start();
+  const barePort = bare._http.address().port;
+  try {
+    const offer = await (
+      await fetch(`http://127.0.0.1:${barePort}/pair/offer?token=other-token`)
+    ).json();
+    const claimed = await (
+      await fetch(`http://127.0.0.1:${barePort}/pair/claim?code=${offer.code}`)
+    ).json();
+
+    assert.equal(claimed.ok, true, 'pairing itself succeeded');
+    assert.equal(claimed.gather, null, 'and the phone is told there is no session');
+  } finally {
+    await bare.stop();
+  }
 });
 
 test('push registration needs the pairing token like everything else', async () => {

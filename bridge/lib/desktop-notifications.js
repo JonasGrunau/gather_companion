@@ -1,17 +1,27 @@
 /**
  * Gather's own desktop notifications, read out of the client's log.
  *
- * This is the last thing the bridge scrapes, and it is deliberate. Everything
- * else — who is in the space, where they are standing, who is following you, who
- * is talking — now comes from Gather's game socket, which is authoritative and
- * needs no desktop client at all. These do not, because they cannot: a wave, a
- * meeting invite and an event reminder are decisions Gather's *client* makes and
- * hands to the OS. They appear in no model, no REST route and no delta patch.
+ * This is the last thing the bridge scrapes, and it is now down to two signals.
  *
- * Three minutes of live deltas on a 111-person space returned 46 patches across
- * four models — `SpaceUser`, `SpaceUserStatus`, `ExternalCalendarConnection`,
- * `SpaceUserCluster` — and nothing resembling an event. The game socket is a
- * state channel, not a notification bus.
+ * ## Waves are no longer read here
+ *
+ * They used to be, on the reasoning that a wave is a decision Gather's *client*
+ * makes and hands to the OS, appearing in no model, no REST route and no delta
+ * patch. That reasoning rested on three minutes of live deltas in which **nobody
+ * waved**, and on a reader that dropped the frame before anyone could look.
+ *
+ * Measured 2026-08-07: waves arrive on the game socket in `DeltaState.events[]`,
+ * an event bus nobody had read, complete with `senderId` and `targetUserIds`, on
+ * an observer connection. See `game-protocol.js`. The socket path is strictly
+ * better — it names who waved, it does not depend on the desktop app running, and
+ * it arrives first — so `type: 'wave'` is ignored here to avoid reporting every
+ * wave twice.
+ *
+ * What is left is `meeting invite` and `event reminder`. Both are *also* readable
+ * from state — `MeetingParticipant.inviterId` carries an invite, and
+ * `BaseCombinedCalendarEvent.startDateTime` is what the client itself raises
+ * reminders from — so this file is on its way out entirely. It survives only
+ * because neither is implemented from state yet.
  *
  * ## What it reads
  *
@@ -107,7 +117,8 @@ export class DesktopNotificationReader {
       this._openBody = message;
       return flushed;
     }
-    return [...flushed, event(at, match[1])];
+    const parsed = event(at, match[1]);
+    return parsed ? [...flushed, parsed] : flushed;
   }
 
   _closeOpenEntry() {
@@ -119,15 +130,28 @@ export class DesktopNotificationReader {
     // Flattened first: the pattern is anchored with `$`, and a body that wrapped
     // across lines would never match it otherwise.
     const match = SHOW_NOTIFICATION.exec(body.replace(/\s*\n\s*/g, ' ').trim());
-    return match ? [event(entry.at, match[1])] : [];
+    if (!match) return [];
+    const parsed = event(entry.at, match[1]);
+    return parsed ? [parsed] : [];
   }
 }
 
+/**
+ * Types the game socket now reports better than this file can.
+ *
+ * Dropped here rather than deduplicated downstream: two sources for one wave means
+ * whichever arrives second is a duplicate, and the log always arrives second.
+ */
+const FROM_THE_SOCKET_INSTEAD = new Set(['wave']);
+
+/** One parsed IPC line, or nothing when the socket already covers it. */
 function event(at, args) {
   const fields = parseInspect(args);
+  const type = fields.type ?? 'unknown';
+  if (FROM_THE_SOCKET_INSTEAD.has(type)) return null;
   return notificationShown({
     at,
-    notificationType: fields.type ?? 'unknown',
+    notificationType: type,
     title: fields.title ?? null,
     body: fields.body ?? null,
   });

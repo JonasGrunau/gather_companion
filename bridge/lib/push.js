@@ -171,11 +171,18 @@ export function describe(event, nameFor = (id) => id) {
         'event reminder': ['Event reminder', 'An event on your calendar is starting'],
       }[type];
       if (!wording) return null;
+
+      // A wave off the game socket carries `senderId`, so it can say who. The
+      // log-scraped version never could — the IPC line has only a type — which is
+      // why the fallback wording is as vague as it is.
+      const who = type === 'wave' && event.senderId ? nameFor(event.senderId) : null;
       return {
         kind: type,
         title: event.title ?? wording[0],
-        body: event.body ?? wording[1],
-        collapseId: `gather-${type}`,
+        body: event.body ?? (who ? `${who} waved at you` : wording[1]),
+        // Collapsed per sender when we know them, so two different people waving
+        // do not overwrite each other on the lock screen.
+        collapseId: event.senderId ? `gather-wave-${event.senderId}` : `gather-${type}`,
       };
     }
 

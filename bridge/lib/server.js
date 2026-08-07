@@ -3,10 +3,10 @@ import { hostname } from 'node:os';
 
 import { DesktopNotificationReader } from './desktop-notifications.js';
 import { DirectCollector } from './direct.js';
-import { bridgeStatus } from './events.js';
+import { bridgeStatus, notificationShown } from './events.js';
+import { gatherSessionForHandover } from './gather-auth.js';
 import { FcmSender } from './fcm.js';
 import { LogTail } from './log-tail.js';
-import { PartyMode } from './party.js';
 import { PresenceTracker } from './presence.js';
 import { PairingCodes } from './pairing.js';
 import { fcmKeyFile, gatherLogFile, lanAddresses, readGatherSpace } from './paths.js';
@@ -35,6 +35,17 @@ const SNAPSHOT_MIN_INTERVAL_MS = 500;
 
 /** How often to ask each phone to prove it is still on the other end. */
 const PING_INTERVAL_MS = 15_000;
+
+/**
+ * Ignore a repeat wave from the same person inside this window.
+ *
+ * A wave is a deliberate act, which is why nothing else here is rate limited. But
+ * the wave *button* is not: one person produced **41 `WaveEvent`s in eight
+ * seconds** while this was being measured. iOS collapses the pushes by
+ * `collapseId`, so the lock screen survives that — the feed does not, and 41
+ * identical rows is not a record of anything. One wave per person per window is.
+ */
+const WAVE_COOLDOWN_MS = 30_000;
 
 /**
  * Drop a client we have not heard a single byte from in this long.
@@ -88,6 +99,14 @@ export class BridgeServer {
      * notifications at the developer's phone.
      */
     push = null,
+    /**
+     * Reads the adopted Gather session for handing to a paired phone.
+     *
+     * A seam for the same reason `push` is one: the default reads the developer's
+     * real `~/.gather-app-bridge.json`, so a suite that left it alone would put a
+     * live Gather refresh token into test assertions and log output.
+     */
+    gatherSession = gatherSessionForHandover,
     log = () => {},
   }) {
     this.token = token;
@@ -96,6 +115,7 @@ export class BridgeServer {
     this.logSource = logSource;
     this.socketUrl = socketUrl;
     this.getToken = getToken;
+    this.gatherSession = gatherSession;
     this.log = log;
 
     this.tracker = new PresenceTracker();
@@ -104,14 +124,6 @@ export class BridgeServer {
     this.push =
       push ?? new PushNotifier({ sender: loadPushSender(log), registry: new PushRegistry({ log }), log });
 
-    // The collector is looked up lazily rather than passed: it does not exist
-    // until `start()`, and it is replaced outright whenever the bridge
-    // reconnects to Gather.
-    this.party = new PartyMode({ collector: () => this._collector, log });
-    // Switching on and off changes what the whole card says, so it goes out as a
-    // snapshot. The hop counter ticking does not, and gets a frame of its own.
-    this.party.on('change', () => this._publishSnapshot());
-    this.party.on('progress', (state) => this._publishParty(state));
 
     /** @type {Set<import('./ws.js').WsConnection>} */
     this._clients = new Set();
@@ -130,6 +142,8 @@ export class BridgeServer {
     /** Pending coalesced snapshot publish, and when the last one went out. */
     this._snapshotTimer = null;
     this._snapshotAt = 0;
+    /** senderId -> when we last reported a wave from them. See [WAVE_COOLDOWN_MS]. */
+    this._wavedAt = new Map();
     /** Pings the phones and drops the ones that stopped answering. */
     this._keepalive = null;
 
@@ -145,7 +159,6 @@ export class BridgeServer {
   }
 
   async stop() {
-    this.party.stop('the bridge stopped');
     this._collector?.stop();
     this._tail?.stop();
     if (this._snapshotTimer) clearTimeout(this._snapshotTimer);
@@ -243,6 +256,10 @@ export class BridgeServer {
     if (url.pathname === '/pair/claim') {
       const outcome = this.pairing.claim(url.searchParams.get('code') ?? '');
       if (outcome === 'ok') {
+        // The Gather session goes with it, which is what lets the phone read
+        // presence itself instead of holding a socket open to this machine. See
+        // `gatherSessionForHandover` for what that widens.
+        const gather = this.gatherSession();
         return json(200, {
           ok: true,
           token: this.token,
@@ -250,6 +267,16 @@ export class BridgeServer {
           // First label only: hostnames arrive as "studio.local" on some networks and
           // "studio.fritz.box" on others, and neither domain belongs on a phone screen.
           name: hostname().split('.')[0],
+          // Null rather than absent when there is no session: the phone can then say
+          // "run `gather-bridge adopt` first" instead of pairing successfully and
+          // then failing to connect for reasons it cannot explain.
+          gather: gather && {
+            ...gather,
+            // Which space to watch, so the first connection needs no REST round trip.
+            // The phone re-reads `/users/me/recent-spaces` itself afterwards, which is
+            // how it follows the user between spaces.
+            spaceId: this.spaceId ?? this._collector?.spaceId ?? readGatherSpace().spaceId,
+          },
         });
       }
       const detail = {
@@ -277,19 +304,6 @@ export class BridgeServer {
       return undefined;
     }
 
-    // Party mode: the one thing the phone can switch on rather than only watch.
-    // Reachable by GET as well as POST — it is a toggle, the state it produces is
-    // published on the snapshot anyway, and `curl` is how you turn it off when
-    // your phone is the thing that went flat.
-    if (url.pathname === '/party') {
-      const wanted = url.searchParams.get('on');
-      if (wanted == null) return json(200, this.party.state());
-      const on = wanted !== '0' && wanted !== 'false';
-      const result = on ? this.party.start() : this.party.stop('switched off');
-      // `ok:false` means it refused to start and said why, which is a 409 rather
-      // than a failure of the request itself.
-      return json(result.ok === false ? 409 : 200, result);
-    }
 
     switch (url.pathname) {
       case '/state':
@@ -338,12 +352,6 @@ export class BridgeServer {
             devices: this.push.registry.list().length,
             kinds: this.push.registry.kinds(),
           },
-          party: {
-            ...this.party.state(),
-            // How big the walkable-tile pool has grown. A small number here is
-            // why party mode would be skipping hops.
-            knownTiles: this.party.knownTiles,
-          },
           // Live protocol-reader stats. This is the thing to look at when the
           // collector is connected but the roster stays empty: unknown frame types
           // here mean the wire format moved.
@@ -373,10 +381,8 @@ export class BridgeServer {
     });
     client.on('message', (text) => this._onCommand(client, text));
 
-    // First frame is always a full snapshot, so the app can paint without
-    // replaying history. Through `_snapshot()` rather than the tracker directly,
-    // so a phone connecting while party mode is already running sees that instead
-    // of waiting for the next change to find out.
+    // First frame is always a full snapshot, so a client can paint without replaying
+    // history.
     client.send(JSON.stringify({ kind: 'snapshot', seq: this._seq, snapshot: this._snapshot() }));
 
     // A reconnecting phone asks for what it missed.
@@ -391,17 +397,12 @@ export class BridgeServer {
   }
 
   /**
-   * A command from a phone, over the socket it already has.
+   * A command from a client on the operator socket.
    *
-   * Party mode used to be reachable only over HTTP, which meant the one thing the
-   * app can *do* rode a brand new TCP connection every time — a second chance for
-   * the same flaky Wi-Fi to fail, on a link whose WebSocket was demonstrably up.
-   * On a phone that is not a theoretical difference: a connection that has been
-   * open and passing traffic for a minute is far likelier to work than one being
-   * opened from cold.
-   *
-   * `/party` stays, because `curl` is how you switch it off when your phone is the
-   * thing that went flat.
+   * Down to one: `ping`. Party mode used to be here, and moved into the app when the
+   * app got its own Gather connection — routing a teleport through this machine to
+   * reach a socket the phone already holds would be pure detour, and two independent
+   * parties driving one avatar at 4Hz would be worse than that.
    *
    * No token check: the socket proved the token at upgrade, and nothing can reach
    * this without one.
@@ -429,10 +430,6 @@ export class BridgeServer {
       case 'ping':
         return reply(true);
 
-      case 'party': {
-        const result = msg.on === true ? this.party.start() : this.party.stop('switched off');
-        return reply(result.ok !== false, result.detail);
-      }
 
       default:
         return reply(false, `unknown command ${String(msg.cmd).slice(0, 40)}`);
@@ -457,17 +454,8 @@ export class BridgeServer {
     }
   }
 
-  /**
-   * The snapshot, with party mode folded in at the last moment.
-   *
-   * Pulled rather than pushed. Party mode changes four times a second while it
-   * runs, and mirroring each hop into the tracker would mean either a stale
-   * counter or a snapshot per hop to every connected phone. Reading it here
-   * costs nothing and means whatever snapshot goes out next — for any reason —
-   * carries a current number.
-   */
+  /** The snapshot the operator endpoints answer with. */
   _snapshot() {
-    this.tracker.setParty(this.party.state());
     return this.tracker.snapshot();
   }
 
@@ -495,24 +483,6 @@ export class BridgeServer {
     this._snapshotTimer.unref?.();
   }
 
-  /**
-   * Party mode's own state, and nothing else.
-   *
-   * The hop counter is on screen while somebody watches it, and a snapshot is the
-   * wrong envelope for it: 22 KiB of roster to deliver a number that changed by
-   * four. This is about 80 bytes, which is what makes a live counter affordable at
-   * all — the alternatives were a frozen one or reintroducing the flood the rest of
-   * this work removed.
-   *
-   * The tracker is updated too, so the next snapshot for any other reason agrees
-   * with what the phone was just told.
-   */
-  _publishParty(state) {
-    if (this._clients.size === 0) return;
-    this.tracker.setParty(state);
-    const frame = JSON.stringify({ kind: 'party', seq: this._seq, party: state });
-    for (const client of this._clients) client.send(frame);
-  }
 
   _flushSnapshot() {
     if (this._clients.size === 0) return;
@@ -572,19 +542,67 @@ export class BridgeServer {
     this.log('connecting to Gather as an observer');
 
     collector.on('roster', (roster) => {
-      // Before the tracker, so that a hop fired from this same roster is judged
-      // against the freshest positions we hold rather than the previous ones.
-      this.party.noteRoster(roster);
       const out = this.tracker.applyRoster(roster);
       this._publish(out.emit);
       if (out.stateChanged) this._publishSnapshot();
     });
+
+    collector.on('interaction', (event) => this._onInteraction(event));
 
     collector.on('status', ({ healthy, detail }) => {
       this._ingest([bridgeStatus({ at: new Date(), collector: 'gather', healthy, detail })]);
     });
 
     collector.start();
+  }
+
+  /**
+   * One event off Gather's own event bus.
+   *
+   * Only `WaveEvent` is translated into our vocabulary so far. The rest — chat,
+   * today — reaches raw subscribers verbatim, because "what can this thing
+   * actually see" should stay answerable without a code change, and because the
+   * bus is new enough that an unrecognised `eventName` is worth being able to look
+   * at rather than having silently dropped.
+   */
+  _onInteraction(event) {
+    if (event.name !== 'WaveEvent') {
+      this._publishRaw([
+        {
+          type: 'gather.interaction',
+          at: event.sentTime ?? new Date().toISOString(),
+          source: 'gather',
+          confidence: 'observed',
+          name: event.name,
+          senderId: event.senderId,
+          targetUserIds: event.targetUserIds,
+        },
+      ]);
+      return;
+    }
+
+    // Without knowing which SpaceUser is ours, "aimed at me" is unanswerable — the
+    // same stance `presence.js` takes on being followed. Reporting every wave in
+    // the space would be worse than reporting none.
+    const selfId = this._collector?.selfId ?? null;
+    if (!selfId || !event.targetUserIds.includes(selfId)) return;
+
+    const now = Date.now();
+    const key = event.senderId ?? 'unknown';
+    const last = this._wavedAt.get(key) ?? 0;
+    if (now - last < WAVE_COOLDOWN_MS) return;
+    this._wavedAt.set(key, now);
+
+    // The bus carries the sender's own clock, which is a better `at` than ours.
+    const sent = event.sentTime ? new Date(event.sentTime) : null;
+    this._ingest([
+      notificationShown({
+        at: sent && !Number.isNaN(sent.getTime()) ? sent : new Date(),
+        source: 'gather',
+        notificationType: 'wave',
+        senderId: event.senderId,
+      }),
+    ]);
   }
 
   /**

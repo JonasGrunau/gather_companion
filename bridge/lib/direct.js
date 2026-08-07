@@ -434,6 +434,12 @@ export class DirectCollector extends EventEmitter {
     if (frame == null || typeof frame !== 'object') return;
     this._frames++;
     if (this.reader.ingest(frame)) this._dirty = true;
+
+    // Interactions go out at once rather than waiting for [PUBLISH_INTERVAL_MS].
+    // Coalescing exists because nobody needs every intermediate position; a wave
+    // is a single deliberate act by a person and there is nothing to coalesce it
+    // with. Emitted after `ingest` so the roster it is judged against is current.
+    for (const event of this.reader.takePending()) this.emit('interaction', event);
   }
 
   _flush() {

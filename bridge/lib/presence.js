@@ -34,13 +34,6 @@ export class PresenceTracker {
     this._players = new Map();
     this._self = emptySelf();
     this._health = { gather: false, cdp: false, logTail: false, detail: null };
-    /**
-     * Party mode, mirrored here so it rides along on the snapshot the phone
-     * already receives. It is the one piece of state the app can *change* rather
-     * than only observe, which makes reporting it back the difference between a
-     * button that knows what it did and one that only hopes.
-     */
-    this._party = { active: false, hops: 0, safeTiles: 0, detail: null };
     /** My own SpaceUser id, learned from the roster. Follow is judged against it. */
     this._selfId = null;
   }
@@ -57,10 +50,6 @@ export class PresenceTracker {
     return [...this._players.values()];
   }
 
-  get party() {
-    return this._party;
-  }
-
   snapshot() {
     return {
       type: 'presence.snapshot',
@@ -68,16 +57,11 @@ export class PresenceTracker {
       self: this._self,
       players: this.players,
       health: this._health,
-      party: this._party,
     };
   }
 
   setHealth(patch) {
     this._health = { ...this._health, ...patch };
-  }
-
-  setParty(state) {
-    this._party = { ...this._party, ...state };
   }
 
   _player(id) {

@@ -35,6 +35,31 @@
  * whom — party mode reads them to learn which tiles a body fits on, and which
  * floor it is standing on.
  *
+ * ## The event bus, which was here all along
+ *
+ * `DeltaState` carries a **third** array beside `patches`: `events[]`. It is a
+ * genuine event bus — news rather than state — and it looks like this:
+ *
+ *   {type:'DeltaState', patches:[], actionReturns:[], sequenceNumber:17059,
+ *    events:[{payload:{eventName:'WaveEvent',
+ *                      senderId:'<their SpaceUser id>',
+ *                      sentTime:'2026-08-07T14:22:20.563Z'},
+ *             options:{targetUserIds:['<my SpaceUser id>']}}]}
+ *
+ * Measured 2026-08-07: 41 `WaveEvent`s, every one carrying `targetUserIds` naming
+ * us, and 45 `ChatBroadcastNewMessage`es, all on an **observer** connection — so
+ * `enterSpace` is not required to hear them.
+ *
+ * This corrects a long-standing and expensive mistake. `collectPatches` reads only
+ * `fullStatePatches` and `patches`, so a frame carrying nothing but `events[]`
+ * fell straight through to `_unknownFrames++`. Every wave had been arriving on
+ * this socket from the beginning and being tallied as an unrecognised envelope —
+ * while `desktop-notifications.js` was built to scrape the same waves back out of
+ * the desktop client's log file, where they arrive later and without a sender.
+ *
+ * The lesson worth keeping: `unknownFrames` in `stats()` is not noise. It was
+ * pointing at this for weeks.
+ *
  * ## Identity
  *
  * Which row is *me* is answered by the `Connection` model, which carries both
@@ -84,9 +109,28 @@ export class GameProtocolReader {
     /** The space's display name, from the single `Space` row in the dump. */
     this.spaceName = null;
 
+    /**
+     * Interaction events read off `DeltaState.events[]`, waiting to be drained.
+     *
+     * Queued rather than emitted, so `ingest`'s "did the roster change" boolean
+     * keeps its meaning — a wave changes no state at all. `DirectCollector` takes
+     * them after every frame and publishes them immediately: they are news, and
+     * the roster's 250ms coalescing window is the wrong place for news.
+     */
+    this.pending = [];
+
     this._frameTypes = new Map();
     this._unknownFrames = 0;
     this._patchCount = 0;
+    this._busEvents = 0;
+  }
+
+  /** Hands over the queued interaction events and forgets them. */
+  takePending() {
+    if (this.pending.length === 0) return [];
+    const out = this.pending;
+    this.pending = [];
+    return out;
   }
 
   /** Learns identity hints from the WebSocket URL the client opened. */
@@ -106,6 +150,7 @@ export class GameProtocolReader {
       selfId: this.selfId,
       spaceId: this.spaceId,
       patches: this._patchCount,
+      busEvents: this._busEvents,
       unknownFrames: this._unknownFrames,
       frameTypes: [...this._frameTypes.entries()]
         .sort((a, b) => b[1] - a[1])
@@ -127,12 +172,21 @@ export class GameProtocolReader {
     // Heartbeats are the bulk of the traffic and carry nothing.
     if (type === 'Heartbeat') return false;
 
+    // Before the patches, because a wave arrives in a frame whose `patches` array
+    // is empty — which is exactly how it went unnoticed for so long.
+    const bus = collectBusEvents(frame);
+    for (const event of bus) {
+      this.pending.push(event);
+      this._busEvents++;
+    }
+
     const patches = collectPatches(frame);
     if (patches.length === 0) {
       // Frames that legitimately carry no model state (Authenticate, Subscribe,
       // SpaceStatus, …). Counted so a genuinely unrecognised envelope is visible
-      // in stats() rather than silently ignored.
-      this._unknownFrames++;
+      // in stats() rather than silently ignored — but a frame we *did* understand
+      // as an interaction is not unrecognised.
+      if (bus.length === 0) this._unknownFrames++;
       return false;
     }
 
@@ -336,6 +390,48 @@ function collectPatches(frame) {
     }
   }
   return out;
+}
+
+/**
+ * Pulls interaction events out of `DeltaState.events[]`.
+ *
+ * Normalised rather than passed through raw, because the two things a caller
+ * always needs — who did it, and was it aimed at me — sit in different halves of
+ * the envelope: `payload.senderId` and `options.targetUserIds`. The untouched
+ * payload rides along under `payload` so a new `eventName` needs no change here
+ * to be readable.
+ *
+ * `sentTime` is normalised to an ISO string. Gather sends it as a plain string
+ * today, but `createdAt`-style fields on this protocol are msgpack ext-1 Dates,
+ * and a caller that has to test which one it got would get it wrong eventually.
+ */
+function collectBusEvents(frame) {
+  const list = frame.events;
+  if (!Array.isArray(list)) return [];
+
+  const out = [];
+  for (const entry of list) {
+    const payload = entry?.payload;
+    if (!payload || typeof payload !== 'object') continue;
+    if (typeof payload.eventName !== 'string') continue;
+
+    const targets = entry.options?.targetUserIds;
+    out.push({
+      name: payload.eventName,
+      senderId: nullableString(payload.senderId),
+      sentTime: asIsoString(payload.sentTime),
+      targetUserIds: Array.isArray(targets) ? targets.filter((id) => typeof id === 'string') : [],
+      payload,
+    });
+  }
+  return out;
+}
+
+function asIsoString(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string' && value) return value;
+  if (typeof value === 'number') return new Date(value).toISOString();
+  return null;
 }
 
 function nullableString(value) {

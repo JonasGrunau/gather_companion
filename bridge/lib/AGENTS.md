@@ -21,10 +21,9 @@ platform plumbing — launchd installation, paths, pairing codes.
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
 | `fcm.js` | `FcmSender` — Firebase Cloud Messaging HTTP v1, hand-rolled: RS256 service-account JWT → OAuth2 access token → `messages:send`. Also `readServiceAccount()`. |
 | `push.js` | `PushNotifier` (which events deserve waking a locked phone) and `PushRegistry` (the registered devices, persisted in the config file). `describe()` holds the policy and is pure. |
-| `party.js` | `PartyMode` — the only thing here that *writes* to Gather. Picks a random tile that is both proven walkable and at least `SAFE_TILES` from everyone connected, four times a second. `safeTilesNow()` is the whole interesting part. |
 | `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster, reads the space name off the `Space` row, and resolves which row is *me*. |
 | `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
-| `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper. One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. |
+| `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper, and down to two signals (`meeting invite`, `event reminder`). One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. **`wave` is deliberately ignored**: waves come off the game socket's `DeltaState.events[]` bus, with a sender, whether or not the desktop app is running. |
 | `log-tail.js` | `LogTail` — follows a growing file across rotation, truncation and machine sleep. |
 | `ws.js` | Minimal RFC 6455 **server** (handshake, framing, backpressure limits). |
 | `pairing.js` | `PairingCodes` — short-lived single-use codes, the unambiguous 31-character alphabet, `pairPayload()` and `normalise()`. |
@@ -49,7 +48,7 @@ platform plumbing — launchd installation, paths, pairing codes.
 - **Entering is not a prerequisite for writing.** `teleport` was measured working
   from an observer connection (2026-08-07), because `SpaceUser` is
   per-person-per-space while `Connection.entered` is per-socket. So the rule above
-  costs nothing: `party.js` moves the user's avatar without ever incrementing
+  costs nothing: the app's own party mode moves the avatar without ever incrementing
   `numTimesEnteredSpace`. `teleport` is the *only* write this bridge makes, and a
   second one should have to argue for itself — the gateway would accept anything.
 - **Party mode must never publish per hop.** It runs at 4Hz and every `change`
@@ -105,7 +104,7 @@ platform plumbing — launchd installation, paths, pairing codes.
   walk past, and loiter at thresholds. It produced most of the events and least
   of the meaning, and the thresholds and hysteresis it needed existed only to
   make its own noise bearable. `position` and `floorId` are still decoded, but
-  only so party mode knows which tiles a body fits on. Do not reintroduce
+  only so the app's party mode knows which tiles a body fits on. Do not reintroduce
   `isNear`, tile distances or adjacency thresholds.
 - **`direct.js` distinguishes "connected" from "holding state".** `hasState`
   gates health, because an empty roster reported confidently lets the app render

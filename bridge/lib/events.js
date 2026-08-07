@@ -74,11 +74,18 @@ export function follow({
 }
 
 /**
- * Gather's own desktop client raised a notification: a wave, a meeting invite, an
- * event reminder.
+ * Somebody did something at you: a wave, a meeting invite, an event reminder.
  *
- * The one thing still read from the client's log rather than from Gather's API,
- * because it exists nowhere else. See `desktop-notifications.js`.
+ * Waves now come from Gather's own event bus (`DeltaState.events[]`, see
+ * `game-protocol.js`) with `source: 'gather'` and a `senderId`. Meeting invites
+ * and event reminders are still scraped from the desktop client's log, so they
+ * still arrive with `source: 'log'` and no sender — both are readable from state
+ * too (`MeetingParticipant.inviterId`, `BaseCombinedCalendarEvent.startDateTime`)
+ * but neither is implemented from it yet.
+ *
+ * The type is deliberately unchanged. Phones in the wild switch on
+ * `notification.shown` and read `notificationType`; `senderId` is additive, so an
+ * older build ignores it and still shows the wave.
  */
 export function notificationShown({
   at,
@@ -86,6 +93,7 @@ export function notificationShown({
   notificationType,
   title = null,
   body = null,
+  senderId = null,
 }) {
   return {
     type: 'notification.shown',
@@ -93,6 +101,7 @@ export function notificationShown({
     notificationType,
     title,
     body,
+    senderId,
   };
 }
 

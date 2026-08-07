@@ -85,6 +85,16 @@ export function fakeGameServer({ requireAuth = true, patches = defaultPatches } 
     /** Push a delta after the dump, the way the real server does. */
     conn.delta = (list) => send({ type: 'DeltaState', sequenceNumber: 2, patches: list });
 
+    /**
+     * Push interaction events onto Gather's event bus.
+     *
+     * A real wave arrives in a `DeltaState` whose `patches` array is **empty** —
+     * which is precisely why the bus went unread for so long, and so exactly what
+     * a test needs to reproduce.
+     */
+    conn.bus = (events) =>
+      send({ type: 'DeltaState', sequenceNumber: 3, patches: [], actionReturns: [], events });
+
     // The real server heartbeats before the first state chunk, which is what
     // makes a premature "handshake rejected" verdict so tempting.
     send({ type: 'Heartbeat', timestamp: 1, origin: 'Server' });
@@ -139,6 +149,24 @@ export function fakeGameServer({ requireAuth = true, patches = defaultPatches } 
       }
       return new Promise((resolve) => server.close(resolve));
     },
+  };
+}
+
+/**
+ * One `WaveEvent`, shaped exactly as captured from a live space on 2026-08-07.
+ *
+ * The two halves live in different places on purpose, because they do in the real
+ * envelope: who waved is `payload.senderId`, and who they waved *at* is
+ * `options.targetUserIds`.
+ */
+export function waveEvent({
+  senderId = 'them-1',
+  targetId = 'me-1',
+  sentTime = '2026-08-07T14:22:20.563Z',
+} = {}) {
+  return {
+    payload: { eventName: 'WaveEvent', senderId, sentTime },
+    options: { targetUserIds: [targetId] },
   };
 }
 
