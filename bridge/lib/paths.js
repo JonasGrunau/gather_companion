@@ -19,6 +19,15 @@ export const plistFile = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.pl
 export const configFile = join(homedir(), '.gather-app-bridge.json');
 
 /**
+ * The Firebase service account that lets the bridge send push notifications.
+ *
+ * Kept out of the repo and out of `stateDir` for the same reason as the config:
+ * it is a credential, it survives `uninstall`, and it is the user's to place.
+ * `gather-app-bridge push setup <file>` copies one here at 0600.
+ */
+export const fcmKeyFile = join(homedir(), '.gather-app-bridge-fcm.json');
+
+/**
  * Where the Gather V2 desktop client writes its log.
  *
  * Read for exactly one thing now — Gather's own notifications, see

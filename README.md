@@ -166,6 +166,74 @@ Mac is no reason to withhold a wave from the screen in your pocket.
 
 ---
 
+## 🔔 Notifications, and reaching a phone that is asleep
+
+There are two delivery paths and they cover different moments.
+
+**Local notifications** fire from the app itself, and only while it is running —
+in the foreground, or during the short window iOS grants a backgrounded app
+before it suspends the WebSocket. After that the socket is gone.
+
+**Push** is what survives that. The bridge sends through Firebase Cloud
+Messaging, so a wave reaches a locked or killed phone. Four reasons wake it:
+
+| reason | on by default | why |
+|---|---|---|
+| wave | ✅ | rare, deliberate, always means somebody wants you |
+| meeting invite | ✅ | scheduled and time-bound |
+| event reminder | ✅ | scheduled and time-bound |
+| someone follows you | ✅ | rare and unambiguous |
+| someone next to you | ❌ | the noisiest by far — a colleague pacing near your desk crosses the threshold repeatedly. Enable with `push.kinds.proximity` in `~/.gather-app-bridge.json`; a ten-minute per-person cooldown applies |
+
+No double-ups: iOS does not display a push while the app is frontmost unless the
+app asks it to, and this one does not. So the local notification is what you see
+when the app is open, and the push is the only one when it is not.
+
+### Setting it up
+
+Push is optional. Everything else works without it; you simply do not get woken
+when the app is closed.
+
+**1. An APNs key from Apple.** Developer portal → Certificates, Identifiers &
+Profiles → **Keys** → new key → tick *Apple Push Notifications service (APNs)*.
+Download the `.p8` — Apple lets you do that exactly once — and note the Key ID.
+This is **not** the App Store Connect API key used to upload builds; different
+section, different key.
+
+**2. Enable the capability on the App ID**, then **regenerate the
+`Gather Companion App Store` provisioning profile**. This is the step that bites:
+signing here is manual (see `ios/ExportOptions.plist`), so an existing profile
+without the push entitlement fails the build rather than quietly updating itself.
+
+**3. Give the key to Firebase.** Console → Project settings → **Cloud Messaging**
+→ APNs Authentication Key → upload the `.p8` with its Key ID and team `JQ4STVWTQ3`.
+
+**4. Give the bridge a service account.** Console → Project settings → **Service
+accounts** → *Generate new private key* → a JSON download. Then:
+
+```sh
+npx gather-app-bridge push setup ~/Downloads/gather-companion-....json
+npx gather-app-bridge restart
+```
+
+That validates the file, copies it to `~/.gather-app-bridge-fcm.json` and chmods
+it `0600`. Open the app once so the phone registers, then:
+
+```sh
+npx gather-app-bridge push test
+```
+
+> [!WARNING]
+> **`aps-environment` is the classic silent failure.** A build signed for
+> development gets a *sandbox* device token, and the production APNs gateway does
+> not know it — the phone registers, the bridge sends, FCM answers `200`, and
+> nothing arrives, with no error anywhere. That is why there are two entitlements
+> files (`Runner.entitlements`, `RunnerRelease.entitlements`) wired per build
+> configuration rather than one file Xcode rewrites, which it only does under
+> automatic signing.
+
+---
+
 ## 🔬 How it reads the protocol
 
 The bridge holds one binary WebSocket to
@@ -248,6 +316,9 @@ npx gather-app-bridge logs -f        follow the daemon log
 npx gather-app-bridge token          show the pairing details again
 npx gather-app-bridge restart|stop|start|uninstall
 npx gather-app-bridge replay [file]  re-check the notification regex on a log
+npx gather-app-bridge push           is push set up, and who is registered
+npx gather-app-bridge push setup <f> install the Firebase service account JSON
+npx gather-app-bridge push test      send a test notification to every phone
 ```
 
 **Options:** `--port <n>` (default `7799`), `--token <s>`, `--log-file <path>`,
@@ -320,6 +391,7 @@ Everything except `/health` needs `?token=<token>`.
 | `WS /ws?since=<seq>` | snapshot frame, then live events |
 | `WS /ws?raw=1` | additionally the unfiltered firehose, as `kind: "raw"` frames |
 | `GET /resync` | force a full state resync (reconnects the game socket) |
+| `POST /push/register` | phone hands over its FCM token (idempotent) |
 | `GET /pair/offer` | mint a pairing code (used by `pair`) |
 | `GET /pair/claim?code=` | **no token** — trade a code for the token, once |
 

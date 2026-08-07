@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, createReadStream, existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import { flagValue, parseCommand, parsePort } from '../lib/cli-args.js';
 import { DesktopNotificationReader } from '../lib/desktop-notifications.js';
+import { FcmSender, readServiceAccount } from '../lib/fcm.js';
 import { adoptDesktopSession, gatherUid, hasGatherSession } from '../lib/gather-auth.js';
 import * as launchd from '../lib/launchd.js';
 import { pairPayload } from '../lib/pairing.js';
+import { PushRegistry } from '../lib/push.js';
 import { render as renderQr } from '../lib/qr.js';
 import {
   ensureStateDir,
   ensureToken,
+  fcmKeyFile,
   gatherLogFile,
   lanAddresses,
   logFile,
@@ -82,6 +85,8 @@ async function main() {
       return cmdPair();
     case 'replay':
       return cmdReplay();
+    case 'push':
+      return cmdPush();
     case 'help':
       return usage();
     default:
@@ -653,6 +658,113 @@ async function cmdReplay() {
   console.log('');
 }
 
+/**
+ * Push: install the Firebase service account, inspect it, or send a test.
+ *
+ * `setup` exists because the alternative is telling somebody to `cp` a file to a
+ * dotfile path and `chmod 600` it, and the whole point of the credential is that
+ * it is not left world-readable in ~/Downloads.
+ */
+async function cmdPush() {
+  const sub = argv[argv.indexOf('push') + 1];
+
+  if (sub === 'setup') {
+    const source = argv[argv.indexOf('setup') + 1];
+    if (!source) {
+      throw new Error(
+        `Which file?\n  ${INVOKE} push setup ~/Downloads/gather-companion-firebase-adminsdk-....json`,
+      );
+    }
+    // Validated before it is copied: a wrong file put in place and only rejected
+    // at the next daemon start is a much worse error to debug.
+    const account = readServiceAccount(source);
+    copyFileSync(source, fcmKeyFile);
+    chmodSync(fcmKeyFile, 0o600);
+    console.log('');
+    console.log(`  ${green('Push credentials installed.')}`);
+    line('project', account.projectId);
+    line('account', account.clientEmail);
+    line('stored at', `${fcmKeyFile} (0600)`);
+    console.log('');
+    console.log(`  Restart to pick it up:  ${bold(`${INVOKE} restart`)}`);
+    console.log(dim('  Then open the app once so the phone can register for pushes.'));
+    console.log('');
+    return;
+  }
+
+  if (sub === 'test') {
+    const registry = new PushRegistry();
+    const devices = registry.list();
+    if (devices.length === 0) {
+      throw new Error(
+        'No phone has registered for pushes yet.\n' +
+          '  Open the app while it is paired — it registers on connect.',
+      );
+    }
+    const sender = new FcmSender({ keyFile: fcmKeyFile, log: () => {} });
+    sender.account(); // throws with a fixable message if it is not set up
+    console.log('');
+    for (const device of devices) {
+      const result = await sender.send({
+        token: device.token,
+        title: 'Gather Companion',
+        body: 'Push is working. This is a test from your Mac.',
+        data: { type: 'test' },
+        collapseId: 'test',
+      });
+      const id = `${device.platform} ${device.token.slice(0, 12)}…`;
+      if (result.ok) console.log(`  ${green('sent')}     ${id}`);
+      else if (result.drop) {
+        registry.forget(device.token);
+        console.log(`  ${yellow('dropped')}  ${id} — ${result.detail}`);
+      } else console.log(`  ${red('failed')}   ${id} — ${result.detail}`);
+    }
+    console.log('');
+    return;
+  }
+
+  // Default: status.
+  const registry = new PushRegistry();
+  let account = null;
+  let problem = null;
+  try {
+    account = readServiceAccount(fcmKeyFile);
+  } catch (error) {
+    problem = error.message;
+  }
+
+  console.log('');
+  console.log(`  ${bold('Push notifications')}`);
+  console.log(`  ${'─'.repeat(56)}`);
+  line('credentials', account ? green(account.projectId) : red('not installed'));
+  const devices = registry.list();
+  line('devices', devices.length ? green(`${devices.length} registered`) : yellow('none yet'));
+  const kinds = registry.kinds();
+  line('wakes on', Object.keys(kinds).filter((k) => kinds[k]).join(', ') || dim('nothing'));
+  console.log('');
+
+  if (problem) {
+    console.log(`  ${problem}`);
+    console.log('');
+    console.log(`  Install it with:  ${bold(`${INVOKE} push setup <file.json>`)}`);
+    console.log('');
+    console.log(dim('  The file comes from the Firebase console:'));
+    console.log(dim('  Project settings → Service accounts → Generate new private key.'));
+    console.log('');
+    process.exitCode = 1;
+    return;
+  }
+
+  if (devices.length === 0) {
+    console.log(dim('  Nothing to send to yet. Open the app while it is paired — it'));
+    console.log(dim('  registers its push token as soon as it connects.'));
+    console.log('');
+    return;
+  }
+  console.log(`  Send a test:  ${bold(`${INVOKE} push test`)}`);
+  console.log('');
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 function line(label, value) {
@@ -764,7 +876,12 @@ function usage() {
     ${INVOKE} token              show pairing details again
     ${INVOKE} start|stop|restart
     ${INVOKE} uninstall
-    ${INVOKE} replay [file]      parse a log file and summarise it
+    ${INVOKE} replay [file]      re-check the notification regex on a log
+
+  ${bold('Push notifications')}
+    ${INVOKE} push                 is push set up, and who is registered
+    ${INVOKE} push setup <file>    install the Firebase service account JSON
+    ${INVOKE} push test            send a test notification to every phone
 
   ${bold('Watching the event feed')}
     ${INVOKE} watch                       attach to the live stream
@@ -775,9 +892,7 @@ function usage() {
 
   ${bold('Options')}
     --port <n>        LAN port to serve on (default ${DEFAULT_PORT})
-    --cdp-port <n>    Gather's devtools port (default ${DEFAULT_CDP_PORT})
     --space <uuid>    watch a specific space (run; default: last one you opened)
-    --no-direct       force the CDP collector instead of connecting directly (run)
     --token <s>       use a specific pairing token
     --log-file <p>    tail a different Gather log (run)
     --host <h>        bridge to attach to (watch, default 127.0.0.1)

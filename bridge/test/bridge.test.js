@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { BridgeServer } from '../lib/server.js';
+import { PushNotifier, PushRegistry } from '../lib/push.js';
 import { defaultPatches, fakeGameServer, fakeJwt } from './fake-gather.js';
 
 const TOKEN = 'test-token';
@@ -33,6 +34,15 @@ let gather;
 let logPath;
 let port;
 
+/**
+ * Every push the server tried to send. The sender is a fake and the registry is
+ * in memory, so this suite can never reach Google or read the developer's real
+ * device list — which, on a machine where push is set up, would mean firing real
+ * notifications at a real phone during `npm test`.
+ */
+const pushes = [];
+let pushConfig = {};
+
 before(async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gather-bridge-test-'));
   logPath = join(dir, 'main.log');
@@ -41,9 +51,18 @@ before(async () => {
   gather = fakeGameServer();
   const socketUrl = await gather.listen();
 
+  const registry = new PushRegistry({
+    read: () => pushConfig,
+    write: (next) => (pushConfig = next),
+  });
+
   server = new BridgeServer({
     token: TOKEN,
     port: 0, // ask the OS for a free port
+    push: new PushNotifier({
+      sender: { send: async (note) => (pushes.push(note), { ok: true }) },
+      registry,
+    }),
     // Both seams point at the local fake. Tests must never leave the machine: a
     // suite whose result depends on whether the developer has run `adopt` is
     // broken, however green it looks.
@@ -300,4 +319,63 @@ test('the collectors endpoint names what is actually connected', async () => {
   assert.equal(body.health.logTail, true, 'the notification tail is separate and optional');
   assert.equal(body.stats.entered, false, 'we observe the space, we never enter it');
   assert.equal(body.stats.users, defaultPatches().filter((p) => p.model === 'SpaceUser').length);
+});
+
+// ---- push -------------------------------------------------------------------
+
+test('a phone can register for pushes, and then gets woken by a wave', async () => {
+  // The point of push: this has to work when the app is not running, so it
+  // cannot depend on the WebSocket that carries everything else.
+  const token = 'f'.repeat(64);
+  const res = await fetch(`http://127.0.0.1:${port}/push/register?token=${TOKEN}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token, platform: 'ios' }),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, devices: 1, sending: true });
+
+  pushes.length = 0;
+  await wait(250);
+  appendFileSync(logPath, `${line.wave()}\n`);
+  for (let i = 0; i < 40 && pushes.length === 0; i++) await wait(50);
+
+  assert.equal(pushes.length, 1, 'a wave must reach a phone that is not listening');
+  assert.equal(pushes[0].token, token);
+  assert.equal(pushes[0].title, 'Someone waved at you');
+  assert.equal(pushes[0].collapseId, 'gather-wave');
+});
+
+test('registering without a plausible token is refused', async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/push/register?token=${TOKEN}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'short' }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('push registration needs the pairing token like everything else', async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/push/register?token=wrong`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'g'.repeat(64) }),
+  });
+  assert.equal(res.status, 401);
+});
+
+test('a busy room does not push, because proximity is opt-in', async () => {
+  // Moving people around generates proximity events constantly; none of them
+  // should reach a lock screen unless the reason is explicitly enabled.
+  pushes.length = 0;
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 60 },
+  ]);
+  await wait(400);
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 11 },
+  ]);
+  await wait(400);
+
+  assert.deepEqual(pushes, []);
 });

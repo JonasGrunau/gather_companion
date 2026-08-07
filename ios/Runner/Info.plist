@@ -76,6 +76,10 @@
 		     an alert can still be delivered. iOS suspends it soon after; the log is
 		     backfilled by sequence number on the next resume. -->
 		<string>fetch</string>
+		<!-- Once suspended, the socket is gone and only a push can reach us. This
+		     lets a delivered notification hand the app a moment to run before the
+		     user taps it; the alert itself is shown either way. -->
+		<string>remote-notification</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

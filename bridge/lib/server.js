@@ -4,10 +4,12 @@ import { hostname } from 'node:os';
 import { DesktopNotificationReader } from './desktop-notifications.js';
 import { DirectCollector } from './direct.js';
 import { bridgeStatus } from './events.js';
+import { FcmSender } from './fcm.js';
 import { LogTail } from './log-tail.js';
 import { PresenceTracker } from './presence.js';
 import { PairingCodes } from './pairing.js';
-import { gatherLogFile, lanAddresses, readGatherSpace } from './paths.js';
+import { fcmKeyFile, gatherLogFile, lanAddresses, readGatherSpace } from './paths.js';
+import { PushNotifier, PushRegistry } from './push.js';
 import { acceptWebSocket, isWebSocketUpgrade } from './ws.js';
 
 export const DEFAULT_PORT = 7799;
@@ -50,6 +52,15 @@ export class BridgeServer {
     // neither: it reads the adopted session and talks to Gather.
     socketUrl = undefined,
     getToken = undefined,
+    /**
+     * The push subsystem. Null builds the real one, which reads the service
+     * account from disk and the device list from the user's config.
+     *
+     * **Tests must always pass one.** Left to build its own, a suite on a machine
+     * where push is set up would load real credentials and fire real
+     * notifications at the developer's phone.
+     */
+    push = null,
     log = () => {},
   }) {
     this.token = token;
@@ -63,6 +74,8 @@ export class BridgeServer {
     this.tracker = new PresenceTracker();
     this.notifications = new DesktopNotificationReader();
     this.pairing = new PairingCodes({ log });
+    this.push =
+      push ?? new PushNotifier({ sender: loadPushSender(log), registry: new PushRegistry({ log }), log });
 
     /** @type {Set<import('./ws.js').WsConnection>} */
     this._clients = new Set();
@@ -172,6 +185,21 @@ export class BridgeServer {
 
     if (!this._authorised(url)) return json(401, { error: 'bad or missing token' });
 
+    // The phone hands over its FCM token after pairing, and again whenever
+    // Firebase rotates it. Idempotent by token, so re-registering is free.
+    if (url.pathname === '/push/register') {
+      readJsonBody(req)
+        .then((body) => {
+          const count = this.push.registry.register({
+            token: body?.token,
+            platform: body?.platform ?? 'ios',
+          });
+          json(200, { ok: true, devices: count, sending: this.push.enabled });
+        })
+        .catch((error) => json(400, { ok: false, detail: error.message }));
+      return undefined;
+    }
+
     switch (url.pathname) {
       case '/state':
         return json(200, { seq: this._seq, ...this.tracker.snapshot() });
@@ -211,6 +239,14 @@ export class BridgeServer {
           detail: this._collector?.detail ?? null,
           logFile: this.logSource,
           logTailHealthy: this._tail?.healthy ?? false,
+          push: {
+            // Whether a service account is loaded, versus how many phones asked
+            // for pushes: "configured but nobody registered" and "phones waiting
+            // but no credentials" are different problems with different fixes.
+            sending: this.push.enabled,
+            devices: this.push.registry.list().length,
+            kinds: this.push.registry.kinds(),
+          },
           // Live protocol-reader stats. This is the thing to look at when the
           // collector is connected but the roster stays empty: unknown frame types
           // here mean the wire format moved.
@@ -263,6 +299,9 @@ export class BridgeServer {
       this._history.push({ seq, event });
       const frame = JSON.stringify({ kind: 'event', seq, event });
       for (const client of this._clients) client.send(frame);
+      // Fire-and-forget: a phone with a live socket already has this event, and
+      // a slow round trip to Google must never hold up the ones that do.
+      this.push.consider(event, (id) => this._nameFor(id)).catch(() => {});
     }
     if (this._history.length > HISTORY) {
       this._history.splice(0, this._history.length - HISTORY);
@@ -277,6 +316,12 @@ export class BridgeServer {
       snapshot: this.tracker.snapshot(),
     });
     for (const client of this._clients) client.send(frame);
+  }
+
+  /** A display name for a push, falling back to something a person can read. */
+  _nameFor(id) {
+    const player = this.tracker.players.find((p) => p.id === id);
+    return player?.name ?? 'Someone';
   }
 
   /** Route one collector event through the tracker and out to the clients. */
@@ -374,4 +419,48 @@ export class BridgeServer {
     tail.on('error', (err) => this.log(`log tail error: ${err.message}`));
     tail.start();
   }
+}
+
+/**
+ * Builds the FCM sender, or returns null when push is not set up.
+ *
+ * Absent credentials are a normal state, not a fault: everything else works and
+ * the phone still gets its notifications whenever the app is running. So this
+ * says so once and moves on, rather than throwing at start-up.
+ */
+function loadPushSender(log) {
+  const sender = new FcmSender({ keyFile: fcmKeyFile, log });
+  try {
+    sender.account();
+  } catch (error) {
+    log(`push: disabled — ${error.message}`);
+    return null;
+  }
+  log(`push: sending as ${sender.projectId}`);
+  return sender;
+}
+
+/** Reads a JSON request body, with a cap so a bad client cannot exhaust memory. */
+function readJsonBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+      } catch {
+        reject(new Error('body is not valid JSON'));
+      }
+    });
+    req.on('error', () => reject(new Error('the request ended early')));
+  });
 }

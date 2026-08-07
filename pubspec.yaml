@@ -16,6 +16,8 @@ dependencies:
   mobile_scanner: ^7.4.0
   shared_preferences: ^2.3.3
   web_socket_channel: ^3.0.1
+  firebase_core: ^4.13.0
+  firebase_messaging: ^16.5.0
 
 dev_dependencies:
   flutter_test:

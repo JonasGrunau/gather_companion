@@ -19,6 +19,8 @@ platform plumbing — launchd installation, paths, pairing codes.
 | `events.js` | Every event constructor, and therefore the wire format. `{type, at, source, confidence, ...payload}`. Also `newPlayer()` / `emptySelf()` snapshot shapes. |
 | `direct.js` | `DirectCollector` — **the only collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
+| `fcm.js` | `FcmSender` — Firebase Cloud Messaging HTTP v1, hand-rolled: RS256 service-account JWT → OAuth2 access token → `messages:send`. Also `readServiceAccount()`. |
+| `push.js` | `PushNotifier` (which events deserve waking a locked phone) and `PushRegistry` (the registered devices, persisted in the config file). `describe()` holds the policy and is pure. |
 | `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster, reads the space name off the `Space` row, and resolves which row is *me*. |
 | `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
 | `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper. One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. |
@@ -54,6 +56,20 @@ platform plumbing — launchd installation, paths, pairing codes.
   `CollectorHealth.cdp`. Publishing only the honest name would make them show the
   "log-only mode: no names" banner while the bridge held the full roster. Newer
   builds read `gather`. Do not remove the mirror until those builds are gone.
+- **Push is the path that survives the app being killed**, so it obeys different
+  rules from the local notifications in the app. Only five reasons exist and four
+  are on by default; `proximity` is deliberately off, because a colleague pacing
+  near a desk can cross the threshold repeatedly. `PROXIMITY_COOLDOWN_MS` exists
+  for the moment somebody turns it on.
+- **`BridgeServer` must be given a `push` in tests.** Left to build its own it
+  reads `~/.gather-app-bridge-fcm.json` and the real device list, so a suite on a
+  machine where push is set up would fire real notifications at a real phone.
+  `PushRegistry` takes `read`/`write` seams for the same reason — registering a
+  device for real would rewrite the developer's own config.
+- **A push failure must never break the event pipeline.** The phone with a live
+  socket already has the event; a Google outage must not take the socket with it.
+  `PushNotifier.consider` swallows everything, and `server.js` calls it
+  fire-and-forget.
 - **`events.js` is a published contract.** Field names are mirrored in
   `packages/gather_events/lib/src/events.dart` and documented in the root
   `README.md`. Renaming one breaks the app with no compile error.

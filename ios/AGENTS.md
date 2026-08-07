@@ -18,6 +18,9 @@ Bundle id `com.jonasgrunau.gatherCompanion`, team `JQ4STVWTQ3`, minimum iOS 15.5
 | File | Description |
 |------|-------------|
 | `ExportOptions.plist` | How the archive becomes an uploadable IPA. **Manual signing**, explicit certificate and profile. Used by both `.github/workflows/publish.yml` and `tool/upload-testflight.sh`. |
+| `Runner/Runner.entitlements` | Debug + Profile. `aps-environment: development`. |
+| `Runner/RunnerRelease.entitlements` | Release. `aps-environment: production`. |
+| `Runner/GoogleService-Info.plist` | Firebase config for project `gather-companion`. Read by `Firebase.initializeApp()` at runtime, so it must stay in the target's Resources build phase. |
 
 ## Subdirectories
 
@@ -45,6 +48,25 @@ Bundle id `com.jonasgrunau.gatherCompanion`, team `JQ4STVWTQ3`, minimum iOS 15.5
   Identifiers/Profiles access, warm and cold profile caches). It works on a
   developer Mac only because Xcode holds an Apple ID session, which a runner has
   no equivalent of.
+- **There are two entitlements files, and that is deliberate.** `aps-environment`
+  decides which APNs host mints the device token, and sandbox and production are
+  separate token namespaces. Get it wrong and *nothing reports an error*: the
+  phone registers, the bridge sends, FCM answers 200, and the notification is
+  never delivered. Xcode normally rewrites this value at export time — but only
+  under automatic signing, and this project signs manually. Hence one file per
+  build configuration, wired through `CODE_SIGN_ENTITLEMENTS` in
+  `project.pbxproj`. RunnerTests deliberately has neither.
+- **Adding push meant the App ID and the provisioning profile changed.** The
+  `Gather Companion App Store` profile must include the push entitlement, which
+  means regenerating it after enabling the capability. A stale profile fails the
+  export rather than silently building without push — which is the good outcome,
+  but the error names the profile, not the capability.
+- **`GoogleService-Info.plist` is committed on purpose.** It holds identifiers,
+  not secrets: it ships inside every copy of the app and is extractable from any
+  IPA, and CI cannot build without it. What *is* secret is the FCM service
+  account, which lives only on the user's Mac at `~/.gather-app-bridge-fcm.json`
+  and is never in this repo. Worth restricting the API key to this bundle id in
+  the Google Cloud console regardless.
 - **`manageAppVersionAndBuildNumber` must stay `false`,** or Xcode rewrites the
   build number during export and the workflow's run number stops being the build
   number.

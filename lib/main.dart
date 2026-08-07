@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,7 +9,21 @@ import 'theme/gather_theme.dart';
 import 'ui/feed_screen.dart';
 import 'ui/pair_screen.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // No generated `firebase_options.dart`: on Apple platforms the SDK reads
+  // ios/Runner/GoogleService-Info.plist, which is the file the Firebase console
+  // hands out and the only place the config should live. One fewer generated
+  // file to drift.
+  //
+  // Wrapped because push is an enhancement, not a requirement. A missing or
+  // malformed plist must degrade to "no push" — the feed, proximity and follow
+  // detection all work without Firebase — rather than crash on launch.
+  try {
+    await Firebase.initializeApp();
+  } catch (error) {
+    debugPrint('firebase: not initialised, push disabled — $error');
+  }
   runApp(const GatherCompanionApp());
 }
 

@@ -6,16 +6,37 @@ import 'package:gather_events/gather_events.dart';
 import 'bridge_client.dart';
 import 'notifications.dart';
 import 'pairing.dart';
+import 'push.dart';
 import 'relevance.dart';
 import 'settings.dart';
 
 /// Everything the UI reads. One object, so the whole app is a single
 /// `ListenableBuilder` away from being correct.
 class AppState extends ChangeNotifier {
-  AppState({Notifier? notifier}) : _notifier = notifier ?? Notifier();
+  // A named parameter cannot be a private initializing formal, so the field is
+  // assigned the long way round — same as `BridgeClient`.
+  AppState({Notifier? notifier, PushRegistrar? push})
+      : _notifier = notifier ?? Notifier(),
+        // ignore: prefer_initializing_formals
+        _push = push;
 
   final Notifier _notifier;
   Notifier get notifier => _notifier;
+
+  /// Built lazily and never eagerly: `FirebaseMessaging.instance` throws when
+  /// Firebase was not initialised, which is the normal state in widget tests and
+  /// on a build without a `GoogleService-Info.plist`. Push is an enhancement, so
+  /// its absence has to be survivable rather than fatal.
+  PushRegistrar? _push;
+  StreamSubscription<String>? _pushRefresh;
+
+  PushRegistrar? _pushRegistrar() {
+    try {
+      return _push ??= PushRegistrar();
+    } catch (_) {
+      return null;
+    }
+  }
 
   BridgeClient? _client;
   final _subs = <StreamSubscription<dynamic>>[];
@@ -217,6 +238,21 @@ class AppState extends ChangeNotifier {
     _primed = false;
     client.connect();
     _primeHistory(client);
+    unawaited(_registerForPush());
+  }
+
+  /// Hands this phone's push token to the bridge, and keeps it current.
+  ///
+  /// Done on every attach rather than once at pairing: registration is
+  /// idempotent, tokens rotate, and the bridge forgets a device it was told is
+  /// dead — so the only way to be reliably reachable is to say so regularly.
+  Future<void> _registerForPush() async {
+    final registrar = _pushRegistrar();
+    if (registrar == null) return;
+    await registrar.register(_settings);
+    _pushRefresh ??= registrar.tokenRefreshes.listen((_) {
+      unawaited(registrar.register(_settings));
+    });
   }
 
   /// Fills the feed with recent history on a first connection, so the app does
@@ -301,6 +337,10 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _detach();
+    // Outside _detach on purpose: token rotation is about this device, not about
+    // any one socket, so it must survive a reconnect and only end with the app.
+    _pushRefresh?.cancel();
+    _pushRefresh = null;
     super.dispose();
   }
 }

@@ -47,3 +47,10 @@ app.*.map.json
 
 # Anything a run leaves behind
 *.log
+
+# Firebase service accounts. The real one lives at ~/.gather-app-bridge-fcm.json
+# and never belongs in the repo — it can send push as this project. This is a
+# guard against a downloaded key being dropped in here by accident; the download
+# is named `<project>-firebase-adminsdk-<hash>-<id>.json`.
+*-firebase-adminsdk-*.json
+service-account*.json

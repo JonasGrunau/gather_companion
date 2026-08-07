@@ -2,8 +2,8 @@
 export const VALUE_FLAGS = new Set([
   '--port',
   '--token',
-  '--cdp-port',
   '--log-file',
+  '--space',
   '--host',
   '--since',
   '--history',
