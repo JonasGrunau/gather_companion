@@ -1063,21 +1063,74 @@ normally follows, because Gather **suppresses its own notification when its
 window has focus** — and then the second line never appears. The phone is a
 different device and should still be told.
 
-### The game socket is a state channel, not an event bus
+### The game socket is a state channel **and** an event bus
 
-Worth recording, because it is what closes off any hope of getting the
-notifications from the protocol. Three minutes of deltas on a live 111-person
-space produced **46 patches across four models**:
+This section used to say the opposite, and the correction is the most expensive
+mistake recorded in this document — so the wrong reasoning is kept below rather
+than deleted.
 
-| Model | Patches |
-|---|---|
-| `SpaceUser` | 28 (13 `/speaking`, 5 `/updatedAt`, 2 `/position`, 2 `/clusterId`, 2 `/connected`, 2 `/lastOnlineAt`, 1 `/direction`, 1 `/activeApp`) |
-| `SpaceUserStatus` | 12 |
-| `ExternalCalendarConnection` | 5 |
-| `SpaceUserCluster` | 1 |
+`DeltaState` carries a **third** array beside `patches` and `actionReturns`:
+`events[]`. Measured 2026-08-07 on an **observer** connection (no `enterSpace`),
+over five minutes: **41 `WaveEvent`s and 45 `ChatBroadcastNewMessage`es.**
 
-No `ActivityEvent`, no `Meeting`, no `MeetingParticipant`, no `ChatMessage`.
-Nothing event-shaped at all. The socket reports what *is*, not what *happened*.
+```jsonc
+{ "type": "DeltaState", "patches": [], "actionReturns": [], "sequenceNumber": 17059,
+  "events": [
+    { "payload": { "eventName": "WaveEvent",
+                   "senderId":  "<their SpaceUser id>",
+                   "sentTime":  "2026-08-07T14:22:20.563Z" },
+      "options": { "targetUserIds": ["<my SpaceUser id>"] } }]}
+```
+
+Known `eventName`s so far: `WaveEvent`, `ChatBroadcastNewMessage`. The envelope
+splits "who did it" (`payload.senderId`) from "who they did it at"
+(`options.targetUserIds`), and the payload is otherwise event-specific.
+
+**Why this went unnoticed for weeks.** `collectPatches` read only
+`fullStatePatches` and `patches`. A frame carrying nothing but `events[]` has an
+*empty* `patches` array, so it fell straight through to `_unknownFrames++` — and
+`desktop-notifications.js` was then built to scrape the same waves back out of the
+desktop client's log file, where they arrive later, without a sender, and only
+when that client happens to be running. The counter in `stats()` had been pointing
+at this the whole time.
+
+**The reasoning that was wrong, and why.** Three minutes of deltas on a live
+111-person space produced 46 patches across four models — `SpaceUser` (28),
+`SpaceUserStatus` (12), `ExternalCalendarConnection` (5), `SpaceUserCluster` (1) —
+with no `ActivityEvent`, `Meeting`, `MeetingParticipant` or `ChatMessage`, from
+which this document concluded "nothing event-shaped at all". Two flaws:
+
+1. **Nobody waved during those three minutes.** Absence of evidence.
+2. **The reader filtered to four models before anyone could look,** so a wave
+   could not have been seen even if it had arrived.
+
+The lesson generalises: a negative result from an instrument that discards the
+thing you are looking for is not a negative result.
+
+### Two of the three "log-only" notifications are also in state
+
+Beyond the bus, and also contrary to what this document used to claim:
+
+- **Meeting invites.** `MeetingParticipant{spaceUserId, inviterId, inviteStatus}`
+  — an `addmodel` where `spaceUserId` is yours and `inviterId` is set *is* the
+  invite. Observed values: `inviteStatus` ∈ `InvitedRequired` | `NotInvited`,
+  `responseStatus` ∈ `Accepted` | …
+- **Event reminders.** 1,771 `BaseCombinedCalendarEvent` rows carry
+  `startDateTime`. The client raises reminders from that state; anything holding
+  the state can do the same.
+- **`MeetingJoinRequest`** — not in the model table below, and event-shaped:
+  `{spaceUserId, meetingId, responderId, responseStatus, respondedAt}`. A row
+  arriving with no `respondedAt` is "somebody is asking to join and waiting on
+  you". Neither the bridge nor the app reads it yet.
+
+Neither invites nor reminders are implemented from state, so
+`desktop-notifications.js` still scrapes those two. Waves it no longer touches.
+
+The census also drifts wider than the table below: **49 models** observed
+2026-08-07, adding `MeetingJoinRequest`, `GoogleCalendarEvent` and
+`SpaceUserCluster`. Reproduce with `node tool/probe-events.mjs`, which prints the
+full census, dumps the interaction-shaped models, and then watches every delta
+patch and every bus event unfiltered.
 
 Two further caveats carried forward. The `sequenceNumber` on
 `FullStateChunk`/`DeltaState` is Gather's, unrelated to the bridge's own `seq`
