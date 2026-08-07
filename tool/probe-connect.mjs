@@ -826,7 +826,7 @@ async function walkable(args) {
   const authUserId = readCache().uid ?? uidFromIdToken(token);
   const seconds = Number(args.seconds ?? 25);
 
-  const KEEP = new Set(['MapArea', 'MapObject', 'CatalogItemVariant', 'FloorMap', 'SpaceUser']);
+  const KEEP = new Set(['MapArea', 'MapObject', 'CatalogItemVariant', 'CatalogItem', 'FloorMap', 'SpaceUser']);
   const rows = new Map([...KEEP].map((m) => [m, new Map()]));
 
   const url = `${GAME_SOCKET}?spaceId=${encodeURIComponent(spaceId)}&authUserId=${encodeURIComponent(authUserId)}`;

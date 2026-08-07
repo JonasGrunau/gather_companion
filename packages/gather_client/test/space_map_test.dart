@@ -1,10 +1,11 @@
 /// [SpaceMapBuilder] turns the map models into tiles you can stand on.
 ///
-/// The rules being pinned here were not reasoned out — they were recovered by
-/// sweeping every plausible decoding against a live space and keeping the one that
-/// put nobody inside a wall (`tool/probe-connect.mjs walkable`). That makes them
-/// exactly the kind of thing that looks arbitrary later and gets "tidied up", so
-/// each one is stated as a named guarantee with the evidence in the reason.
+/// Every rule here is transcribed from Gather's own client bundle, and the tests
+/// name the getter they came from. That provenance is the point: the first version
+/// of this file inferred the rules statistically instead, scored a perfect zero
+/// against the live roster, and was still wrong in 425 of about 500 tiles. Eleven
+/// connected people cannot distinguish four contradictory decodings. The bundle
+/// can.
 library;
 
 import 'package:gather_client/gather_client.dart';
@@ -36,12 +37,34 @@ SpaceMapBuilder _base({int width = 20, int height = 10}) {
 }
 
 /// A variant that blocks the tiles at [points], expressed as `[x, y]` pairs.
-void _variant(SpaceMapBuilder b, String id, List<List<num>> points) {
+///
+/// `originX`/`originY` are in pixels and default to zero so most tests can ignore
+/// them; the one that cares sets them explicitly.
+void _variant(
+  SpaceMapBuilder b,
+  String id,
+  List<List<num>> points, {
+  num originX = 0,
+  num originY = 0,
+  String? family,
+  List<List<num>> sittable = const [],
+}) {
+  if (family != null) {
+    b.apply('CatalogItem', _add({'id': 'item-$id', 'family': family}));
+  }
   b.apply('CatalogItemVariant', _add({
     'id': id,
+    'catalogItemId': 'item-$id',
+    'originX': originX,
+    'originY': originY,
     'collision': {
       'points': [
         for (final p in points) {'x': p[0], 'y': p[1]},
+      ],
+    },
+    'sittable': {
+      'points': [
+        for (final p in sittable) {'x': p[0], 'y': p[1]},
       ],
     },
   }));
@@ -106,16 +129,22 @@ void main() {
       expect(b.forFloor('floor-1')!.blockedCount, 0);
     });
 
-    test('the origin floors and the offset rounds', () {
-      // The rule that survived the sweep. An object at 5.65 with an offset of
-      // -0.0625 blocks tile 5: floor(5.65) + round(-0.0625) = 5 + 0. Rounding the
-      // sum instead gives 6, which is how people ended up inside walls.
+    test("the sprite's pixel origin is backed out before rounding", () {
+      // MapObject#topLeftAbsolutePosition:
+      //   topLeft = absolutePosition - (originX, originY)/TILE_SIZE
+      // then absoluteCollisionPositionHashes rounds topLeft + point.
+      //
+      // x: 5.6484375 - 46/32 = 4.2109; + (-0.0625, 0.9375, 1.9375) -> 4, 5, 6.
+      // y: 3.4296875 - 28/32 = 2.5547; + 0                          -> 3.
+      // Skipping the origin subtraction puts x at 6, 7, 8 — two tiles out. No
+      // amount of staring at coordinates produces this rule; it came from the
+      // bundle.
       final b = _base();
       _variant(b, 'desk', [
         [-0.0625, 0],
         [0.9375, 0],
         [1.9375, 0],
-      ]);
+      ], originX: 46, originY: 28);
       b.apply('MapObject', _add({
         'id': 'o1',
         'mapId': 'map-1',
@@ -126,16 +155,18 @@ void main() {
       }));
 
       final map = b.forFloor('floor-1')!;
+      expect(map.isWalkable(4, 3), isFalse);
       expect(map.isWalkable(5, 3), isFalse);
       expect(map.isWalkable(6, 3), isFalse);
-      expect(map.isWalkable(7, 3), isFalse);
-      expect(map.isWalkable(8, 3), isTrue, reason: 'a three-tile desk, not four');
-      expect(map.isWalkable(5, 4), isTrue, reason: 'y floored to 3, not rounded to 4');
+      expect(map.blockedCount, 3, reason: 'a three-tile desk, not four');
+      expect(map.isWalkable(7, 3), isTrue);
+      expect(map.isWalkable(4, 2), isTrue, reason: '2.55 rounds up, not down');
     });
 
-    test('an object parented to another object is placed against it', () {
-      // 1140 of 1140 objects in the measured space carry a fractional offset, and
-      // they nest — a monitor sits on a desk, not on the floor.
+    test('an object standing on another object does not collide', () {
+      // isSpecialEffectActive = !parentObjectId && !isSnappedToWall. A monitor on a
+      // desk is the desk's problem, not the floor's — 28 objects on the measured
+      // space, and counting them was part of why the old grid was wrong.
       final b = _base();
       _variant(b, 'v1', [
         [0, 0],
@@ -157,7 +188,64 @@ void main() {
         'catalogItemVariantId': 'v1',
       }));
 
-      expect(b.forFloor('floor-1')!.isWalkable(6, 5), isFalse);
+      expect(b.forFloor('floor-1')!.blockedCount, 0);
+    });
+
+    test('an object flush against a room wall does not collide', () {
+      // isSnappedToWall: canSnapToWalls && parentAreaId && floor(relativeY) === 0.
+      // 50 objects on the measured space.
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'room',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(6, 6),
+        'mapAreaType': 'MeetingRoom',
+        'wallsTexture': 'PlainWhite',
+      }));
+      _variant(b, 'poster', [
+        [0, 0],
+        [1, 0],
+      ], family: 'Wall Decor');
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'room',
+        'relativeX': 2,
+        'relativeY': 0.4,
+        'catalogItemVariantId': 'poster',
+      }));
+
+      expect(b.forFloor('floor-1')!.blockedCount, 0);
+    });
+
+    test('a chair against a wall still collides, because chairs never snap', () {
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'room',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(6, 6),
+        'mapAreaType': 'MeetingRoom',
+        'wallsTexture': 'PlainWhite',
+      }));
+      _variant(b, 'chair', [
+        [0, 0],
+      ], family: 'Chair');
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'room',
+        'relativeX': 2,
+        'relativeY': 0.4,
+        'catalogItemVariantId': 'chair',
+      }));
+
+      expect(b.forFloor('floor-1')!.blockedCount, 1);
     });
 
     test('an unresolvable parent is dropped rather than placed at the origin', () {
@@ -183,7 +271,7 @@ void main() {
   });
 
   group('rooms', () {
-    test('a walled area blocks its perimeter but not its inside', () {
+    test('a walled area blocks nothing — walls are directions, not tiles', () {
       final b = _base();
       b.apply('MapArea', _add({
         'id': 'room',
@@ -197,13 +285,20 @@ void main() {
         'wallsTexture': 'PlainWhite',
       }));
 
+      // Collisions.addArea records blocked *directions* between the wall tile and
+      // the tile outside it; blockedAtPosition consults only the object map. So
+      // every one of these is standable, and teleporting ignores walls entirely.
       final map = b.forFloor('floor-1')!;
-      expect(map.isWalkable(2, 2), isFalse, reason: 'corner');
-      expect(map.isWalkable(3, 2), isFalse, reason: 'top wall');
-      expect(map.isWalkable(2, 3), isFalse, reason: 'left wall');
+      expect(map.blockedCount, 0);
+      expect(map.isWalkable(2, 2), isTrue, reason: 'corner');
+      expect(map.isWalkable(3, 2), isTrue, reason: 'top wall');
       expect(map.isWalkable(3, 3), isTrue, reason: 'inside the room');
-      expect(map.isWalkable(4, 4), isTrue);
-      expect(map.isWalkable(5, 5), isFalse, reason: 'far corner');
+
+      // Standable, but not somewhere to throw a party. That is manners, not physics,
+      // and it is a separate list.
+      expect(map.isPrivate(3, 3), isTrue);
+      expect(map.open, isNot(contains(3 * 20 + 3)));
+      expect(map.walkable, contains(3 * 20 + 3));
     });
 
     test('an area with no walls is a label, not an obstacle', () {
@@ -224,6 +319,7 @@ void main() {
 
       final map = b.forFloor('floor-1')!;
       expect(map.blockedCount, 0);
+      expect(map.isPrivate(3, 3), isFalse, reason: 'no walls, so not private');
       expect(map.roomAt(3, 3)?.name, 'Backend & DevOps');
     });
 
@@ -248,11 +344,13 @@ void main() {
         },
       }));
 
+      // doorwayPositionHashes expands {origin, orientation} into two tiles — the
+      // origin plus one down for Vertical, one right for Horizontal. Nothing here
+      // blocks a tile either way, so the assertion is that the room still parses
+      // and stays private.
       final map = b.forFloor('floor-1')!;
-      expect(map.isWalkable(5, 4), isTrue, reason: 'the doorway itself');
-      expect(map.isWalkable(5, 5), isTrue, reason: 'doors are two tiles tall');
-      expect(map.isWalkable(5, 6), isFalse, reason: 'wall resumes below the door');
-      expect(map.isWalkable(5, 3), isFalse, reason: 'and above it');
+      expect(map.blockedCount, 0);
+      expect(map.rooms.any((r) => r.walled), isTrue);
     });
 
     test('the smallest named room wins when they overlap', () {

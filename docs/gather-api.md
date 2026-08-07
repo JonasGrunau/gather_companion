@@ -775,44 +775,107 @@ blocks, *not* a bitmask. 341 of the 477 variants block nothing at all (rugs,
 posters, things standing on desks); the rest block one to six tiles. `sittable` has
 the same shape.
 
-**Positions compose through a parent chain.** `MapArea` and `MapObject` both carry
-`relativeX`/`relativeY` against a `parentAreaId` *or* a `parentObjectId` — objects
-nest inside other objects, so a monitor is positioned against its desk. Absolute
-position is the sum up the chain to the base area.
+#### The decoding, transcribed from the client
 
-**Area origins are whole tiles; object origins never are.** All 93 areas resolve to
-integers. All 1140 objects carry a fractional offset, because `relativeX` places a
-sprite that has its own pixel origin (`originX`/`originY`, `dimensionsInPixels`).
-Collision offsets are near-integers with the same kind of nudge (`-0.0625`,
-`0.9375`).
+The first attempt at this inferred the rules by sweeping every plausible rounding
+against the live roster and keeping whichever put nobody inside a wall. It produced
+a self-consistent answer that was **wrong in 425 of about 500 tiles**, and the check
+could not tell: only eleven people were connected, and four mutually contradictory
+rules all scored zero. Eleven positions is not enough to derive anything from.
 
-**The rounding rule was measured, not reasoned.** Every combination of floor / round
-/ ceil over origin and offset was swept against the live roster, scoring each by how
-many *connected, non-bot* members it placed inside a wall — everybody is standing
-somewhere, so live positions are a free test of the decoding:
+The rules below are therefore read out of the client instead. The desktop app is an
+Electron shell with no game code in it (`app.asar` has no `dimensionsInTiles`, no
+`catalogItemVariant`); it loads `app.v2.gather.town`, whose entry `main.js` names 79
+lazy chunks. The collision engine is in `bundle.fcbc27cfb33c44ea.js` — class
+`Collisions`, plus getters on `MapObject` and `MapArea`. Constants live in `main.js`:
+`TILE_SIZE = 32`, `MAX_HIERARCHY_DEPTH = 20`.
 
-| rule | blocked tiles | people in walls (of 11 connected) |
-|---|---|---|
-| `round(origin + offset)` | 516 | 7 |
-| `floor(origin + offset)` | 522 | 2 |
-| **`floor(origin) + round(offset)`** | **524** | **0** |
-| `round(origin) + floor(offset)` | 524 | 7 |
+**Absolute position** — `MapEntity#absolutePosition`. The plain sum of
+`relativeX`/`relativeY` up the parent chain, no rounding anywhere, depth-capped at 20:
 
-Filtering to connected non-bots matters: of 112 rows with a position, only 11 were
-live people. The rest are offline members whose coordinates are wherever they logged
-off — furniture may have been placed there since — and `RecordingClient` bots, which
-are not avatars.
+```js
+get absolutePosition(){
+  const A = new Position({x:this.relativeX, y:this.relativeY});
+  let e = this.parent, g = 0;
+  while (e && g < MAX_HIERARCHY_DEPTH) { A.x += e.relativeX; A.y += e.relativeY; e = e.parent; g++ }
+  return A;
+}
+```
 
-**Walls are not objects.** They are a property of an area: `wallsTexture` is
-`NewStyleNoWall` for the 74 areas that are only logical groupings (a desk cluster, a
-team's zone) and a real texture for the 17 that are rooms. A room blocks its own
-perimeter, minus the gaps in `doorways.locations` — each `{origin:{x,y},
-orientation}` is a **two-tile** gap, extending down for `Vertical` and right for
-`Horizontal`.
+**An object's collision tiles** — the pixel origin is backed out *before* rounding,
+which is the step no amount of coordinate-staring would produce:
 
-Together: **1012 blocked of 10168 tiles, 9156 walkable**, and zero connected members
-standing anywhere this calls blocked. `packages/gather_client/lib/src/space_map.dart`
-is the implementation.
+```js
+get topLeftAbsolutePosition(){           // MapObject; on MapArea it is absolutePosition
+  const A = this.absolutePosition;
+  return {x: A.x - variant.originX/TILE_SIZE, y: A.y - variant.originY/TILE_SIZE};
+}
+get absoluteCollisionPositionHashes(){
+  const A = this.topLeftAbsolutePosition;
+  return variant.collisionPositions.map(e =>
+    hashOf({x: Math.round(A.x + e.x), y: Math.round(A.y + e.y)}));
+}
+```
+
+**Not every object collides.** `activeAbsoluteCollisionPositionHashes` returns `[]`
+unless `isSpecialEffectActive`:
+
+```js
+get isSpecialEffectActive(){ return !this.parentObjectId && !this.isSnappedToWall }
+get isSnappedToWall(){
+  if (!this.canSnapToWalls) return false;
+  if (!this.parentAreaId) return false;
+  return Math.floor(this.relativeY) === 0;
+}
+get canSnapToWalls(){                    // abridged
+  if (!this.parentMapArea?.isWalled) return false;
+  if (family === "Chair" || family === "Desk") return false;
+  return collisionTiles.every(sameY) || sittableTiles.every(sameY);
+}
+```
+
+So anything sitting on top of something else, and anything flush against a wall,
+contributes nothing — 28 and 50 objects respectively on the measured space. Counting
+them was most of the original error. The `family` test is why `CatalogItem` has to be
+retained alongside `CatalogItemVariant`.
+
+**Walls do not block tiles.** The easiest thing here to get backwards.
+`Collisions.addArea` records *blocked directions* — pairs of adjacent tiles you may
+not move between — not impassable tiles:
+
+```js
+addArea(A){
+  if (!A.isWalled) return;
+  // for each perimeter tile, excluding doorways:
+  //   addBlockedDirection(A.id, hashOf(tileOutside), hashOf(wallTile))
+}
+blockedAtPosition(A){ return this.mapEntitiesAtPosition(A).size > 0 }   // objects only
+canPassThrough(A,e){ return !blockedDirections.has(A.hashPair(e)) && !...has(e.hashPair(A)) }
+```
+
+`blockedAtPosition` consults only the object map, so **a wall tile is standable** —
+488 perimeter tiles the first version excluded are perfectly good floor. Since a
+teleport is not a move, blocked directions never apply to it at all.
+
+**`isWalled`** is `wallsTexture !== "NewStyleNoWall"` — 19 of 93 areas here. Gather
+also defines `get isPrivate(){ return this.isWalled }`.
+
+**Doorways** are two tiles, expanded from each `{origin, orientation}` in coordinates
+relative to the area:
+
+```js
+get doorwayPositionHashes(){
+  return this.doorways.locations.flatMap(({origin:A, orientation:e}) => [
+    hashOf(A),
+    e === "Horizontal" ? hashOf({x:A.x+1, y:A.y}) : hashOf({x:A.x, y:A.y+1}),
+  ]);
+}
+```
+
+Result on the measured space: **463 blocked of 10168 tiles, 9705 walkable.**
+`packages/gather_client/lib/src/space_map.dart` is the transcription; live positions
+are kept as a regression check (nobody may stand on a blocked tile) rather than as
+the source of truth.
 
 ### Entering costs something
 

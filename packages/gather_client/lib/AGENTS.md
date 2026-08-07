@@ -16,7 +16,7 @@ you change something here, look at the JS twin named in the table.
 | `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — observer handshake, heartbeat, 250ms roster coalescing, `teleport`, backoff. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
 | `party.dart` | *(deleted from the bridge)* | `PartyMode`. Lives only here now — the app holds the socket, and two parties driving one avatar would fight. Draws its tiles from `space_map.dart`. |
-| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan, decoded from `MapArea` + `MapObject` + `CatalogItemVariant.collision`. Answers "which tiles can I stand on" and "what is this room called". |
+| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas) and "what is this room called". |
 
 ## Things that will bite you
 

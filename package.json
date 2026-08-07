@@ -1,6 +1,6 @@
 {
   "name": "gather-app-bridge",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Connects to Gather V2 with your own session and tells the Gather Companion phone app, over your LAN, when somebody starts following you.",
   "license": "MIT",
   "author": "Jonas Grunau",

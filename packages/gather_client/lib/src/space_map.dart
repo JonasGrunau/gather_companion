@@ -1,47 +1,93 @@
-/// The floor plan, read off the game socket.
+/// The floor plan, decoded the way Gather's own client decodes it.
 ///
 /// Gather never serves the map over REST — `/spaces/<id>/maps`, `/floors` and
-/// `/map` all 404. It does not need to: **the whole map is already in the state
-/// dump**, and until now this client threw it away. Three models carry it, and the
-/// counts are from the 124×82 space this was built against:
+/// `/map` all 404. It does not need to: the whole map is in the state dump, in four
+/// models, with counts from the 124×82 space this was built against.
 ///
-///  - **`FloorMap`** names the base `MapArea` (`baseAreaId`) and the floor the map
-///    belongs to. One per floor.
-///  - **`MapArea`** ×93 — rectangles. The base area is the grid itself
-///    (`dimensionsInTiles` 124×82); the rest are rooms, desks and team zones, each
-///    positioned by `relativeX`/`relativeY` against a parent area. Area origins are
-///    always whole tiles.
-///  - **`MapObject`** ×1140 — furniture, positioned the same way but against an
-///    area *or* another object, and at sub-tile precision. Each names a
-///    `CatalogItemVariant`.
-///  - **`CatalogItemVariant`** ×477 — the shapes. `collision.points` is a list of
-///    tile offsets the object blocks. 341 of the 477 block nothing at all (rugs,
-///    posters, things on top of desks); the rest block one to six tiles.
+///  - **`FloorMap`** ×1 — names the base `MapArea` and the floor.
+///  - **`MapArea`** ×93 — rectangles. The base area is the grid; the rest are rooms,
+///    desks and team zones, positioned against a parent.
+///  - **`MapObject`** ×1140 — furniture, positioned against an area *or* another
+///    object, each naming a variant.
+///  - **`CatalogItemVariant`** ×477 / **`CatalogItem`** ×558 — the shapes.
 ///
-/// ## Two kinds of obstacle
+/// ## This is transcribed, not inferred
 ///
-/// **Furniture** is the object collision above. **Walls** are not objects at all —
-/// they are a property of an area: `wallsTexture` is `NewStyleNoWall` for the 74
-/// areas that are only logical groupings (a desk cluster, a team's zone), and a
-/// real texture for the 17 that are rooms. A room's walls are its perimeter, minus
-/// the gaps named in `doorways`, which are two tiles wide.
+/// The first version of this file reverse-engineered the rules by sweeping every
+/// plausible rounding against the live roster and keeping whichever put nobody
+/// inside a wall. That gave a self-consistent answer that was **wrong in 425 of
+/// about 500 tiles**, and the test could not tell: only eleven people were connected
+/// at the time, so four mutually contradictory rules all scored a perfect zero.
 ///
-/// Together those give 1012 blocked tiles of 10168 on the measured space — and,
-/// checked against the eleven people connected at the time, **not one of them was
-/// standing on a tile this calls blocked**. That check is worth keeping: everybody
-/// in a space is standing somewhere, so live positions are a free, continuous test
-/// of whether the decoding is right.
+/// So the rules below are transcribed from the client bundle instead
+/// (`app.v2.gather.town`, chunk `bundle.fcbc27cfb33c44ea.js`, class `Collisions` and
+/// the `MapObject` getters). Where a comment cites a name like
+/// `activeAbsoluteCollisionPositionHashes`, that is the real identifier and the
+/// behaviour is copied, not guessed. Positions of live people remain a good
+/// *regression* check — everybody is standing somewhere — but they are far too
+/// sparse to derive anything from.
 ///
-/// ## Why the rounding is what it is
+/// ## The rules
 ///
-/// Area origins are whole tiles. Object origins never are — all 1140 carry a
-/// fractional offset, because `relativeX`/`relativeY` place a *sprite*, which has
-/// its own pixel origin. Collision points are near-integers with the same kind of
-/// nudge (`-0.0625`, `0.9375`). Rounding the sum of the two puts people inside
-/// walls; flooring the object origin and rounding the offset does not. That was
-/// settled by sweeping every combination against the live roster, not by reasoning
-/// about it — see `tool/probe-connect.mjs walkable`.
+/// **Absolute position** is the plain sum of `relativeX`/`relativeY` up the parent
+/// chain (`parentObjectId` first, then `parentAreaId`), with no rounding anywhere,
+/// capped at `MAX_HIERARCHY_DEPTH` = 20.
+///
+/// **An object's collision tiles** are, per `MapObject`:
+///
+/// ```js
+/// get topLeftAbsolutePosition() {
+///   const A = this.absolutePosition;
+///   return {x: A.x - variant.originX/TILE_SIZE, y: A.y - variant.originY/TILE_SIZE};
+/// }
+/// get absoluteCollisionPositionHashes() {
+///   const A = this.topLeftAbsolutePosition;
+///   return variant.collisionPositions.map(e =>
+///     hashOf({x: Math.round(A.x + e.x), y: Math.round(A.y + e.y)}));
+/// }
+/// ```
+///
+/// `TILE_SIZE` is 32. The origin subtraction is the part no amount of staring at
+/// coordinates would have produced: `relativeX` positions a *sprite*, and the sprite
+/// has its own anchor in pixels.
+///
+/// **Not every object collides.** `activeAbsoluteCollisionPositionHashes` returns
+/// nothing unless `isSpecialEffectActive`, which is
+/// `!parentObjectId && !isSnappedToWall` — so anything sitting on top of something
+/// else contributes no collision at all, and neither does anything flush against a
+/// wall. On the measured space that is 28 nested and 50 wall-snapped objects, and
+/// leaving them in was most of the error.
+///
+/// **Walls do not block tiles.** This is the part that matters most and is easiest
+/// to get backwards. `Collisions.addArea` does not mark a room's perimeter
+/// impassable; it records *blocked directions* — pairs of adjacent tiles you may not
+/// move between — via `addBlockedDirection(outsideTile, wallTile)`. `blockedAtPosition`
+/// consults only the object map. So **a wall tile is a tile you can stand on**, and
+/// 488 perimeter tiles this used to exclude are perfectly good floor. Since party
+/// mode teleports rather than walks, blocked directions never apply to it at all.
+///
+/// **Doorways** are two tiles. `doorwayPositionHashes` expands each
+/// `{origin, orientation}` into the origin plus one more — right for `Horizontal`,
+/// down for `Vertical` — in coordinates relative to the area.
+///
+/// ## Standing somewhere you should not
+///
+/// Walkability is a physical question and this answers it physically. Whether party
+/// mode *ought* to land inside a closed meeting room is a different question, and
+/// the answer is no — so [SpaceMap.open] also holds back the insides of walled
+/// areas. That is a manners rule, not a collision rule, and it is kept separate from
+/// [SpaceMap.walkable] so the two never get confused. Gather agrees about which
+/// areas those are: its own `get isPrivate() { return this.isWalled }`.
 library;
+
+/// Pixels per tile. `const l=32` in the bundle, exported as `TILE_SIZE`.
+const _tileSize = 32;
+
+/// The client's own cap on how far a parent chain may be followed.
+const _maxHierarchyDepth = 20;
+
+/// `wallsTexture` meaning "this area is a grouping, not a room".
+const _noWall = 'NewStyleNoWall';
 
 /// One rectangle on the floor: a room, a desk, a team's corner.
 ///
@@ -72,14 +118,15 @@ class SpaceRoom {
   final int width;
   final int height;
 
-  /// Whether this area draws walls, and therefore blocks its own perimeter.
+  /// Whether this area draws walls. Gather treats this as the definition of a
+  /// private area, and so does party mode.
   final bool walled;
 
   bool contains(int tx, int ty) =>
       tx >= x && tx < x + width && ty >= y && ty < y + height;
 }
 
-/// One floor, as a grid of tiles you can and cannot stand on.
+/// One floor, as a grid of tiles.
 class SpaceMap {
   SpaceMap({
     required this.floorId,
@@ -87,30 +134,45 @@ class SpaceMap {
     required this.height,
     required Set<int> blocked,
     required this.rooms,
+    Set<int>? private,
   })  : _blocked = blocked,
+        _private = private ?? const {},
         walkable = List.unmodifiable([
           for (var y = 0; y < height; y++)
             for (var x = 0; x < width; x++)
               if (!blocked.contains(y * width + x)) y * width + x,
+        ]),
+        open = List.unmodifiable([
+          for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+              if (!blocked.contains(y * width + x) &&
+                  !(private ?? const {}).contains(y * width + x))
+                y * width + x,
         ]);
 
   final String floorId;
   final int width;
   final int height;
   final Set<int> _blocked;
+  final Set<int> _private;
   final List<SpaceRoom> rooms;
 
-  /// Every walkable tile, as `y * width + x`.
-  ///
-  /// Materialised once per rebuild rather than recomputed: party mode reads it
-  /// four times a second and the map changes only when somebody edits it.
+  /// Every tile a body physically fits on, as `y * width + x`. Furniture removed;
+  /// walls are not furniture and do not appear here.
   final List<int> walkable;
+
+  /// [walkable] minus the insides of walled areas — where party mode is willing to
+  /// go. Materialised once per rebuild because it is read four times a second.
+  final List<int> open;
 
   int get tiles => width * height;
   int get blockedCount => _blocked.length;
 
   bool isWalkable(int x, int y) =>
       x >= 0 && y >= 0 && x < width && y < height && !_blocked.contains(y * width + x);
+
+  /// Inside a walled area: standable, but not somewhere to teleport for fun.
+  bool isPrivate(int x, int y) => _private.contains(y * width + x);
 
   int xOf(int tile) => tile % width;
   int yOf(int tile) => tile ~/ width;
@@ -130,18 +192,14 @@ class SpaceMap {
 
 /// Accumulates the map models as patches arrive, and rebuilds when they change.
 ///
-/// Kept separate from `GameProtocolReader` because the lifecycles differ: the
-/// roster changes several times a second and the map changes when somebody drags a
-/// plant, which in most spaces is never. Rebuilding is therefore lazy — a full
-/// state dump applies ~1700 map patches, and rebuilding on each would be 1700
-/// sweeps of a 10168-tile grid to produce the same answer as one.
+/// Rebuilding is lazy: a full state dump applies ~2200 map patches, and rebuilding
+/// on each would be 2200 sweeps of a 10168-tile grid to reach the same answer as
+/// one.
 class SpaceMapBuilder {
-  /// Wall texture meaning "this area is a grouping, not a room".
-  static const _noWall = 'NewStyleNoWall';
-
   final Map<String, Map<String, Object?>> _areas = {};
   final Map<String, Map<String, Object?>> _objects = {};
   final Map<String, Map<String, Object?>> _variants = {};
+  final Map<String, Map<String, Object?>> _items = {};
   final Map<String, Map<String, Object?>> _floors = {};
 
   bool _dirty = true;
@@ -175,6 +233,7 @@ class SpaceMapBuilder {
         'MapArea' => _areas,
         'MapObject' => _objects,
         'CatalogItemVariant' => _variants,
+        'CatalogItem' => _items,
         'FloorMap' => _floors,
         _ => null,
       };
@@ -220,42 +279,98 @@ class SpaceMapBuilder {
     return true;
   }
 
-  // ---- building --------------------------------------------------------------
+  // ---- the client's getters, transcribed ---------------------------------------
 
   static num? _num(Object? value) => value is num ? value : null;
 
-  /// Absolute tile position, following `parentObjectId` then `parentAreaId` up to
-  /// the base area.
-  ///
-  /// Returns null when the chain cannot be resolved. That matters: a missing
-  /// parent means an unknown offset, and an object placed at the wrong offset is a
-  /// wall in the wrong place. Dropping it leaves a tile walkable that is not,
-  /// which a person walks around; inventing one leaves a tile blocked that is fine,
-  /// which party mode would simply never use. Neither is good, but only one of them
-  /// is silent.
-  ({double x, double y})? _originOf(Map<String, Object?> row, [int depth = 0]) {
-    if (depth > 32) return null; // a cycle in the parent chain
-    final x = (_num(row['relativeX']) ?? 0).toDouble();
-    final y = (_num(row['relativeY']) ?? 0).toDouble();
-
-    final parentObject = row['parentObjectId'];
-    final parentArea = row['parentAreaId'];
-    final parentId = parentObject is String
-        ? parentObject
-        : parentArea is String
-            ? parentArea
-            : null;
-    if (parentId == null) return (x: x, y: y);
-
-    final parent = _objects[parentId] ?? _areas[parentId];
-    if (parent == null) return null;
-    final up = _originOf(parent, depth + 1);
-    return up == null ? null : (x: up.x + x, y: up.y + y);
-  }
+  static String? _str(Object? value) => value is String ? value : null;
 
   /// A row is live unless it carries a deletion timestamp. Absent fields decode to
   /// msgpack's undefined, which is not a String, so this is a positive test.
   static bool _live(Map<String, Object?> row) => row['deletedAt'] is! String;
+
+  /// `MapEntity#absolutePosition` — the parent chain summed, nothing rounded.
+  ({double x, double y})? _absolute(Map<String, Object?> row, [int depth = 0]) {
+    if (depth > _maxHierarchyDepth) return null;
+    final x = (_num(row['relativeX']) ?? 0).toDouble();
+    final y = (_num(row['relativeY']) ?? 0).toDouble();
+
+    final parentId = _str(row['parentObjectId']) ?? _str(row['parentAreaId']);
+    if (parentId == null) return (x: x, y: y);
+
+    final parent = _objects[parentId] ?? _areas[parentId];
+    if (parent == null) return null;
+    final up = _absolute(parent, depth + 1);
+    return up == null ? null : (x: up.x + x, y: up.y + y);
+  }
+
+  /// `MapObject#topLeftAbsolutePosition` — the sprite's anchor backed out.
+  ({double x, double y})? _topLeft(
+    Map<String, Object?> object,
+    Map<String, Object?> variant,
+  ) {
+    final at = _absolute(object);
+    if (at == null) return null;
+    return (
+      x: at.x - (_num(variant['originX']) ?? 0) / _tileSize,
+      y: at.y - (_num(variant['originY']) ?? 0) / _tileSize,
+    );
+  }
+
+  /// `MapObject#absoluteCollisionPositionHashes`, or the `sittable` equivalent.
+  List<({int x, int y})> _pointsOf(
+    Map<String, Object?> object,
+    Map<String, Object?> variant,
+    String field,
+  ) {
+    final shape = variant[field];
+    final points = shape is Map<String, Object?> ? shape['points'] : null;
+    if (points is! List || points.isEmpty) return const [];
+    final tl = _topLeft(object, variant);
+    if (tl == null) return const [];
+    return [
+      for (final point in points)
+        if (point is Map<String, Object?>)
+          (
+            x: (tl.x + (_num(point['x']) ?? 0)).round(),
+            y: (tl.y + (_num(point['y']) ?? 0)).round(),
+          ),
+    ];
+  }
+
+  static bool _sameRow(List<({int x, int y})> tiles) =>
+      tiles.isNotEmpty && tiles.every((t) => t.y == tiles.first.y);
+
+  /// `MapObject#canSnapToWalls`.
+  bool _canSnapToWalls(Map<String, Object?> object, Map<String, Object?> variant) {
+    final areaId = _str(object['parentAreaId']);
+    final area = areaId == null ? null : _areas[areaId];
+    if (area == null || area['wallsTexture'] == _noWall) return false;
+
+    final itemId = _str(variant['catalogItemId']);
+    final family = itemId == null ? null : _str(_items[itemId]?['family']);
+    if (family == 'Chair' || family == 'Desk') return false;
+
+    final collision = _pointsOf(object, variant, 'collision');
+    if (collision.isNotEmpty) return _sameRow(collision);
+    final sittable = _pointsOf(object, variant, 'sittable');
+    if (sittable.isNotEmpty) return _sameRow(sittable);
+    return false;
+  }
+
+  /// `MapObject#isSpecialEffectActive` — `!parentObjectId && !isSnappedToWall`.
+  ///
+  /// Anything standing on something else, or flush against a wall, contributes no
+  /// collision at all. 78 of the 352 colliding objects on the measured space.
+  bool _collides(Map<String, Object?> object, Map<String, Object?> variant) {
+    if (_str(object['parentObjectId']) != null) return false;
+    final snapped = _canSnapToWalls(object, variant) &&
+        _str(object['parentAreaId']) != null &&
+        (_num(object['relativeY']) ?? 0).floor() == 0;
+    return !snapped;
+  }
+
+  // ---- building ----------------------------------------------------------------
 
   Map<String, SpaceMap> _build() {
     final out = <String, SpaceMap>{};
@@ -275,42 +390,28 @@ class SpaceMapBuilder {
       if (width <= 0 || height <= 0) continue;
 
       final blocked = <int>{};
+      final private = <int>{};
       final rooms = <SpaceRoom>[];
-      void block(int x, int y) {
-        if (x < 0 || y < 0 || x >= width || y >= height) return;
-        blocked.add(y * width + x);
-      }
 
-      // 1. Furniture.
+      // Furniture, and only furniture. Walls are directions, not tiles — see the
+      // library doc — so nothing here paints a perimeter.
       for (final object in _objects.values) {
         if (object['mapId'] != mapId || !_live(object)) continue;
-        final variantId = object['catalogItemVariantId'];
-        final variant = variantId is String ? _variants[variantId] : null;
-        final collision = variant?['collision'];
-        final points = collision is Map<String, Object?> ? collision['points'] : null;
-        if (points is! List || points.isEmpty) continue;
-
-        final at = _originOf(object);
-        if (at == null) continue;
-        // Floor the origin, round the offset — see the library doc.
-        final ox = at.x.floor();
-        final oy = at.y.floor();
-        for (final point in points) {
-          if (point is! Map<String, Object?>) continue;
-          block(
-            ox + (_num(point['x']) ?? 0).round(),
-            oy + (_num(point['y']) ?? 0).round(),
-          );
+        final variantId = _str(object['catalogItemVariantId']);
+        final variant = variantId == null ? null : _variants[variantId];
+        if (variant == null || !_collides(object, variant)) continue;
+        for (final tile in _pointsOf(object, variant, 'collision')) {
+          if (tile.x < 0 || tile.y < 0 || tile.x >= width || tile.y >= height) continue;
+          blocked.add(tile.y * width + tile.x);
         }
       }
 
-      // 2. Rooms, and the walls of the ones that have them.
       for (final area in _areas.values) {
         if (area['mapId'] != mapId || !_live(area)) continue;
-        final id = area['id'];
+        final id = _str(area['id']);
         final dims = area['dimensionsInTiles'];
-        if (id is! String || dims is! Map<String, Object?>) continue;
-        final at = _originOf(area);
+        if (id == null || dims is! Map<String, Object?>) continue;
+        final at = _absolute(area);
         if (at == null) continue;
 
         final w = _num(dims['width'])?.toInt() ?? 0;
@@ -320,11 +421,10 @@ class SpaceMapBuilder {
         final y0 = at.y.round();
         final walled = id != baseId && area['wallsTexture'] != _noWall;
 
-        final name = area['name'];
         rooms.add(SpaceRoom(
           id: id,
-          name: name is String ? name : null,
-          type: area['mapAreaType'] is String ? area['mapAreaType']! as String : 'Public',
+          name: _str(area['name']),
+          type: _str(area['mapAreaType']) ?? 'Public',
           x: x0,
           y: y0,
           width: w,
@@ -332,41 +432,16 @@ class SpaceMapBuilder {
           walled: walled,
         ));
 
+        // Not collision: a manners rule. Gather calls a walled area private, and a
+        // party hopping through somebody's closed meeting room is the thing this
+        // whole feature is trying not to be.
         if (!walled) continue;
-
-        // The perimeter, minus the doorways. A doorway is two tiles: its own, and
-        // the next one along the wall it sits in.
-        final gaps = <int>{};
-        final doorways = area['doorways'];
-        final locations =
-            doorways is Map<String, Object?> ? doorways['locations'] : null;
-        if (locations is List) {
-          for (final door in locations) {
-            if (door is! Map<String, Object?>) continue;
-            final at = door['origin'];
-            if (at is! Map<String, Object?>) continue;
-            final dx = x0 + (_num(at['x']) ?? 0).round();
-            final dy = y0 + (_num(at['y']) ?? 0).round();
-            gaps.add(dy * width + dx);
-            gaps.add(door['orientation'] == 'Vertical'
-                ? (dy + 1) * width + dx
-                : dy * width + dx + 1);
-          }
-        }
-
-        void wall(int x, int y) {
-          if (x < 0 || y < 0 || x >= width || y >= height) return;
-          if (gaps.contains(y * width + x)) return;
-          blocked.add(y * width + x);
-        }
-
-        for (var x = x0; x < x0 + w; x++) {
-          wall(x, y0);
-          wall(x, y0 + h - 1);
-        }
         for (var y = y0; y < y0 + h; y++) {
-          wall(x0, y);
-          wall(x0 + w - 1, y);
+          if (y < 0 || y >= height) continue;
+          for (var x = x0; x < x0 + w; x++) {
+            if (x < 0 || x >= width) continue;
+            private.add(y * width + x);
+          }
         }
       }
 
@@ -375,6 +450,7 @@ class SpaceMapBuilder {
         width: width,
         height: height,
         blocked: blocked,
+        private: private,
         rooms: rooms,
       );
     }

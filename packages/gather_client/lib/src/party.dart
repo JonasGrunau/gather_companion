@@ -404,7 +404,7 @@ class PartyMode {
 
     final here = me.y!.round() * map.width + me.x!.round();
     final tiles = <PartyTile>[];
-    for (final tile in map.walkable) {
+    for (final tile in map.open) {
       if (tile == here) continue; // standing still is not a hop
       if (excluded.contains(tile)) continue;
       tiles.add(PartyTile(map.xOf(tile), map.yOf(tile)));

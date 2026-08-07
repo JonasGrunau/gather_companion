@@ -61,6 +61,9 @@ const _models = {
   'MapArea',
   'MapObject',
   'CatalogItemVariant',
+  // `family`, which decides whether an object can be wall-snapped and so whether
+  // it collides at all.
+  'CatalogItem',
   // Meetings, for the two things somebody can do *at* you that are recorded as
   // state rather than sent over the event bus. See [_MeetingWatch].
   'MeetingParticipant',
@@ -68,7 +71,13 @@ const _models = {
 };
 
 /// The map models, routed to [SpaceMapBuilder] rather than to the roster.
-const _mapModels = {'FloorMap', 'MapArea', 'MapObject', 'CatalogItemVariant'};
+const _mapModels = {
+  'FloorMap',
+  'MapArea',
+  'MapObject',
+  'CatalogItemVariant',
+  'CatalogItem',
+};
 
 /// SpaceUser fields worth tracking, for field-level `replace` patches.
 ///

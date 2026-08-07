@@ -150,7 +150,7 @@ class _Plan extends StatelessWidget {
               _Key(color: t.brand, label: 'You'),
               _Key(color: t.ok, label: 'Following you'),
               _Key(color: t.mutedForeground, label: 'Someone else'),
-              _Key(color: t.border, label: 'Wall or furniture'),
+              _Key(color: t.border, label: 'Furniture'),
             ],
           ),
         ),
@@ -219,9 +219,9 @@ class _PlanPainter extends CustomPainter {
       );
     }
 
-    // 3. Walls and furniture. One rect per blocked tile is up to a thousand draw
-    // calls; batching them into a single path keeps this cheap enough to repaint on
-    // every roster.
+    // 3. Furniture. One rect per blocked tile is several hundred draw calls;
+    // batching them into a single path keeps this cheap enough to repaint on every
+    // roster.
     final blocked = Path();
     for (var y = 0; y < map.height; y++) {
       for (var x = 0; x < map.width; x++) {
@@ -231,7 +231,28 @@ class _PlanPainter extends CustomPainter {
     }
     canvas.drawPath(blocked, Paint()..color = tokens.border);
 
-    // 4. People. Never smaller than a finger-visible dot, however far out we are.
+    // 4. Walls, as outlines rather than filled tiles — which is what they actually
+    // are. Gather blocks *movement between* a room's edge and the tile outside it,
+    // not the edge tile itself, so a wall is a line on a boundary and you can stand
+    // on it.
+    final walls = Path();
+    for (final room in map.rooms) {
+      // Not `rooms`: that list is filtered to the named ones, and a private desk is
+      // walled without being named.
+      if (!room.walled) continue;
+      walls.addRect(
+        Rect.fromLTWH(room.x * tile, room.y * tile, room.width * tile, room.height * tile),
+      );
+    }
+    canvas.drawPath(
+      walls,
+      Paint()
+        ..color = tokens.mutedForeground
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = (tile * 0.5).clamp(1.0, 3.0),
+    );
+
+    // 5. People. Never smaller than a finger-visible dot, however far out we are.
     final r = (tile * 1.6).clamp(2.5, 9.0);
     for (final person in people) {
       canvas.drawCircle(
@@ -251,7 +272,7 @@ class _PlanPainter extends CustomPainter {
       }
     }
 
-    // 5. Me, last and largest, with a ring while the party is on — which is the one
+    // 6. Me, last and largest, with a ring while the party is on — which is the one
     // time this screen is worth watching rather than glancing at.
     final here = me;
     if (here != null) {

@@ -287,11 +287,20 @@ often as not.
 
 So party mode reads the actual floor plan. **Gather sends the whole map in every
 state dump** — `MapArea` rectangles, 1140 `MapObject`s and the
-`CatalogItemVariant.collision` shapes behind them — and this client used to throw
-all of it away. Decoding it gives **9156 walkable tiles of 10168**, walls and
-furniture removed, updated live as people rearrange things. There is no REST route
-for any of this; `/spaces/<id>/maps`, `/floors` and `/map` all 404. It was only ever
-on the socket.
+`CatalogItemVariant.collision` shapes behind them — and this client used to throw all
+of it away. There is no REST route for any of it; `/spaces/<id>/maps`, `/floors` and
+`/map` all 404. It was only ever on the socket.
+
+The decoding is **transcribed from Gather's own client**, not inferred. The first
+attempt did infer it — sweeping every plausible rounding against the live roster and
+keeping whichever put nobody inside a wall — and produced a confident answer that was
+wrong in 425 of about 500 tiles. Eleven people were connected at the time, and four
+contradictory rules all scored zero. So the rules now come from the web bundle
+(`bundle.fcbc27cfb33c44ea.js`, class `Collisions`), down to backing the sprite's pixel
+origin out before rounding, skipping objects that sit on other objects, and knowing
+that **walls block movement between tiles rather than the tiles themselves** — so a
+wall is standable, and 488 tiles the first version excluded are fine. Result:
+**9705 walkable tiles of 10168**, updated live as people rearrange the furniture.
 
 It used to guess instead, and that was the whole of the "party mode keeps revisiting
 the same tiles" bug. The old rule was *a tile somebody has been seen on is a tile you
@@ -309,6 +318,11 @@ which Gather connects media, with the margin covering the fact that the roster i
 always a beat behind. It was 8, which bought margin nobody can perceive at the
 price of a third of the usable floor. Offline rows cost nothing: somebody who logged
 off at a desk is not standing there.
+
+It also stays out of walled areas. Gather calls those private (`isPrivate` is
+literally `isWalled`), and hopping through somebody's closed meeting room is exactly
+the thing this feature is trying not to be. That is a manners rule rather than a
+collision one, and the two are kept as separate lists so they never get confused.
 
 When nothing clears, the hop is **skipped** rather than approximated, and the
 card says why. A party that pauses is a smaller problem than a party that walks
