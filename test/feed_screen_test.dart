@@ -138,7 +138,7 @@ void main() {
     ));
     await tester.pump();
 
-    expect(find.text('Hopping four times a second, nowhere near anyone'), findsOneWidget);
+    expect(find.text('Hopping four times a second'), findsOneWidget);
     expect(find.text('12'), findsOneWidget);
 
     // Standing still because there is nowhere safe is not a fault, and saying so

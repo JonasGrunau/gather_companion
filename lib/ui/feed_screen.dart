@@ -114,7 +114,10 @@ class _TopBar extends StatelessWidget {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => ListenableBuilder(
-                  listenable: state,
+                  // Both: `state` for the connection and the party, `positions` for
+                  // people walking — which the presence tracker deliberately does
+                  // not treat as a change, because no other screen draws it.
+                  listenable: Listenable.merge([state, state.positions]),
                   builder: (context, _) => MapScreen(state: state),
                 ),
               ),
@@ -410,7 +413,7 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
     // correct behaviour there, so it is reported plainly instead of as an error.
     final subtitle = switch ((on, party.detail)) {
       (true, final String why) => why,
-      (true, _) => 'Hopping four times a second, nowhere near anyone',
+      (true, _) => 'Hopping four times a second',
       (false, final String why) => why,
       _ => 'Teleport around the map, never next to anyone',
     };

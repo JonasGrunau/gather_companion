@@ -17,9 +17,17 @@
 /// The answer is to read the actual floor plan, which Gather sends us and this
 /// client used to throw away. [SpaceMap] decodes it out of the state dump —
 /// `MapArea` rectangles, `MapObject` furniture and the `collision` shapes behind
-/// it — and hands back every tile on the floor with the walls and the furniture
-/// taken out. On the space this was built against that is **9156 walkable tiles of
-/// 10168**.
+/// it — and hands back every tile on the floor with the furniture taken out. On the
+/// space this was built against that is **9705 walkable tiles of 10168**.
+///
+/// Walkable is not the same as *somewhere to hold a party*, and the difference is
+/// most of the grid. Walls block directions rather than tiles, so a walking avatar
+/// is kept indoors by rules a teleport steps straight over: the emptiness outside
+/// the building is unfurnished, nothing marks it blocked, and the jump ladder below
+/// prefers exactly the far edges it lives on. [SpaceMap.open] is the pool this uses
+/// — walkable, inside the office footprint, and out of the rooms people close
+/// behind them. **1447 tiles of the 9705**, all of them somewhere a colleague might
+/// plausibly be standing.
 ///
 /// It is worth being clear about how much that changed, because the old approach
 /// was the whole bug. Party mode used to infer walkability: *a tile somebody has

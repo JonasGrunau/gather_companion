@@ -131,6 +131,21 @@ class AppState extends ChangeNotifier {
   /// directly instead of widening `PlayerRef` for everybody.
   Roster? _roster;
 
+  /// Ticks whenever a roster lands, which is up to four times a second.
+  ///
+  /// Separate from [notifyListeners] on purpose. Movement is not a presence event:
+  /// [PresenceTracker] does not look at coordinates at all, so a roster where
+  /// everybody walked leaves `stateChanged` false and never reaches the UI — which
+  /// is right for every screen except the one that draws positions, where it meant
+  /// the map froze until somebody happened to follow you or disconnect.
+  ///
+  /// Waking the whole tree at 4Hz to fix that would be the other mistake: the feed
+  /// would rebuild on a stranger's footstep. So this is its own [Listenable] and
+  /// only the map listens. With the map closed it has no listeners and a tick costs
+  /// nothing.
+  Listenable get positions => _positions;
+  final _positions = _Ticker();
+
   /// The floor plan, or null until enough of it has arrived.
   SpaceMap? get map => debugMap ?? _collector?.mapFor(_myRow()?.floorId);
 
@@ -188,6 +203,10 @@ class AppState extends ChangeNotifier {
         speaking: speaking.contains(row.id),
       ));
     }
+    // Roster order is Gather's own map iteration and shuffles between snapshots.
+    // The painter decides whether to repaint by comparing this list position by
+    // position, so a stable order is what makes that comparison mean anything.
+    out.sort((a, b) => a.id.compareTo(b.id));
     return out;
   }
 
@@ -354,6 +373,9 @@ class AppState extends ChangeNotifier {
         // freshest positions we hold rather than the previous ones.
         party.noteRoster(roster);
         _roster = roster;
+        // The collector already coalesces and only publishes when something in the
+        // state actually moved, so this is "the map changed", not a clock.
+        _positions.tick();
         final out = _tracker.applyRoster(roster);
         _onFold(out);
       }))
@@ -461,10 +483,17 @@ class AppState extends ChangeNotifier {
 
   /// Feeds a roster in as though Gather had sent it, for the screens that draw
   /// positions rather than the presence digest.
+  ///
+  /// Deliberately the same path as the live subscription, including *not* calling
+  /// [notifyListeners] for a roster the tracker finds nothing in. A seam that woke
+  /// the whole tree unconditionally would make a screen wired to the wrong
+  /// [Listenable] look live in tests and freeze in the office, which is exactly the
+  /// bug this shape exists to prevent.
   @visibleForTesting
   void debugApplyRoster(Roster roster) {
     _roster = roster;
-    notifyListeners();
+    _positions.tick();
+    _onFold(_tracker.applyRoster(roster));
   }
 
   /// Feeds a snapshot in as though Gather had sent it, so the screens can be
@@ -491,11 +520,33 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    _positions.dispose();
     unawaited(_detach());
     // Outside `_detach` on purpose: token rotation is about this device, not about any
     // one connection, so it must survive a reconnect and only end with the app.
     _pushRefresh?.cancel();
     _pushRefresh = null;
+    super.dispose();
+  }
+}
+
+/// A [Listenable] with nothing in it, for changes whose value is read from
+/// somewhere else.
+///
+/// The disposed guard is not defensive programming: `_detach` cancels the roster
+/// subscription asynchronously, so a roster already in flight can land after
+/// `dispose`, and a [ChangeNotifier] used after disposal throws.
+class _Ticker extends ChangeNotifier {
+  bool _disposed = false;
+
+  void tick() {
+    if (_disposed) return;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
     super.dispose();
   }
 }

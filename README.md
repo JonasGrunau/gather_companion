@@ -319,10 +319,27 @@ always a beat behind. It was 8, which bought margin nobody can perceive at the
 price of a third of the usable floor. Offline rows cost nothing: somebody who logged
 off at a desk is not standing there.
 
-It also stays out of walled areas. Gather calls those private (`isPrivate` is
-literally `isWalled`), and hopping through somebody's closed meeting room is exactly
-the thing this feature is trying not to be. That is a manners rule rather than a
-collision one, and the two are kept as separate lists so they never get confused.
+**Walkable is not the same as somewhere to hold a party**, and the difference was
+most of the map. Two manners rules narrow it, kept as separate lists from the
+collision one so the physics and the etiquette never get confused.
+
+The first is that a party stays *inside the office*. Walls block directions rather
+than tiles, which is what keeps a walking avatar indoors — and a teleport has no
+direction to block. Nobody furnishes the emptiness outside the building, so no
+collision rule can object to it, and since hops are chosen for distance it is
+exactly where they went: **5133 of 7315 candidate tiles were outside the building
+altogether**. The base area is the whole grid and proves nothing; the other 92 areas
+are the office, and a tile has to be in one of them.
+
+The second is that it stays out of rooms with doors. This used to follow Gather's own
+`get isPrivate(){ return this.isWalled }`, which is right about audio and wrong about
+buildings: the main floor is itself a walled 44×34 `Public` area and the Lobby is
+walled too, so "walled means private" deleted the entire office — **all 112 people in
+the captured dump were standing on tiles it excluded**. Walls only close a room when
+the area is a `MeetingRoom` or a private desk booth.
+
+Together: **1447 tiles**, all indoors, and 94 of those 112 people were standing in
+them.
 
 When nothing clears, the hop is **skipped** rather than approximated, and the
 card says why. A party that pauses is a smaller problem than a party that walks

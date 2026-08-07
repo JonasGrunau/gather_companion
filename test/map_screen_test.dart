@@ -28,10 +28,13 @@ RosterRow _row(String id, num x, num y, {bool connected = true, String? name}) =
     RosterRow(id: id, name: name, x: x, y: y, floorId: 'f1', connected: connected);
 
 void main() {
+  // The same pair of listenables the app opens this screen with. `state` alone is
+  // not enough: walking is not a presence event, so a roster where everybody moved
+  // and nothing else changed never reaches a listener of `state`.
   Widget wrap(AppState state) => MaterialApp(
         theme: buildGatherTheme(),
         home: ListenableBuilder(
-          listenable: state,
+          listenable: Listenable.merge([state, state.positions]),
           builder: (context, _) => MapScreen(state: state),
         ),
       );
@@ -92,6 +95,45 @@ void main() {
     await tester.pump();
 
     expect(find.text('Green Park'), findsOneWidget);
+  });
+
+  testWidgets('walking redraws the map, though nothing else counts it as a change', (tester) async {
+    // The bug: PresenceTracker never looks at coordinates — being near somebody says
+    // nothing about whether they want you, which is this app's whole argument — so a
+    // roster carrying only movement leaves `stateChanged` false. The map was the one
+    // screen that needed it, and it sat frozen until somebody happened to follow you
+    // or drop off.
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugMap = _map(rooms: const [
+        SpaceRoom(
+          id: 'r1',
+          name: 'Green Park',
+          type: 'Common',
+          x: 4,
+          y: 4,
+          width: 4,
+          height: 4,
+          walled: false,
+        ),
+      ]);
+
+    await tester.pumpWidget(wrap(state));
+    state.debugApplyRoster(Roster(selfId: 'me', rows: [
+      _row('me', 1, 1),
+      _row('ada', 8, 4, name: 'Ada'),
+    ]));
+    await tester.pump();
+    expect(find.text('20×10 tiles'), findsOneWidget, reason: 'standing in no room');
+
+    // Only a position moves. Same people, same names, same connections.
+    state.debugApplyRoster(Roster(selfId: 'me', rows: [
+      _row('me', 5, 5),
+      _row('ada', 8, 4, name: 'Ada'),
+    ]));
+    await tester.pump();
+
+    expect(find.text('Green Park'), findsOneWidget, reason: 'I walked into the park');
   });
 
   testWidgets('outside every room it falls back to the size of the floor', (tester) async {

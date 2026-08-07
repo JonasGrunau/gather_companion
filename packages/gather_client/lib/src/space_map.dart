@@ -72,12 +72,32 @@
 ///
 /// ## Standing somewhere you should not
 ///
-/// Walkability is a physical question and this answers it physically. Whether party
-/// mode *ought* to land inside a closed meeting room is a different question, and
-/// the answer is no — so [SpaceMap.open] also holds back the insides of walled
-/// areas. That is a manners rule, not a collision rule, and it is kept separate from
-/// [SpaceMap.walkable] so the two never get confused. Gather agrees about which
-/// areas those are: its own `get isPrivate() { return this.isWalled }`.
+/// Walkability is a physical question and this answers it physically. Where a party
+/// *ought* to go is a different question, and [SpaceMap.open] answers it with two
+/// rules that are deliberately kept out of [SpaceMap.walkable] so the physics and
+/// the manners never get confused.
+///
+/// **Inside the building.** Walls block directions, not tiles — which is exactly
+/// what keeps a walking avatar indoors, and exactly what a teleport ignores. So
+/// everything outside the office is "walkable" too: nobody furnishes the void, so
+/// no collision rule can ever object to it. On the measured space the grid is
+/// 124×82 and the office occupies 96×52 of it, which left **5133 of 7315 party
+/// tiles outside the building altogether** — and since the jump ladder in
+/// `party.dart` favours distance, those were the tiles it kept choosing. The base
+/// area is the grid and proves nothing; the other 92 areas are the office. A tile
+/// has to be inside one of them.
+///
+/// **Not in a closed room.** This used to be "not in a walled area", following
+/// Gather's own `get isPrivate() { return this.isWalled }`. That is right about
+/// audio and wrong about buildings: the office's main floor is itself a walled
+/// 44×34 `Public` area, and the Lobby is walled too. Between them they held **all
+/// 112 people in the captured dump** — so the rule that was meant to keep a party
+/// out of somebody's meeting was deleting the entire office, and the tiles it left
+/// were the ones nobody can be. Walls only make an area private when it is a room
+/// with a door: [_privateTypes].
+///
+/// Together those two turn 7315 party tiles into 1447, every one of them indoors,
+/// and 94 of the 112 people were standing in that set.
 library;
 
 /// Pixels per tile. `const l=32` in the bundle, exported as `TILE_SIZE`.
@@ -88,6 +108,15 @@ const _maxHierarchyDepth = 20;
 
 /// `wallsTexture` meaning "this area is a grouping, not a room".
 const _noWall = 'NewStyleNoWall';
+
+/// The `mapAreaType`s where walls mean "a room you can close yourself into".
+///
+/// Every other type — `Public`, `Lobby`, `Common`, `Team` — is a zone, and its
+/// walls are the building's, not a door. On the measured space this is 14 meeting
+/// rooms and 2 private desk booths; the walled areas it deliberately lets through
+/// are the 44×34 main floor, the Lobby and one more `Public` zone, which is where
+/// everybody actually is.
+const _privateTypes = {'MeetingRoom', 'Desk'};
 
 /// One rectangle on the floor: a room, a desk, a team's corner.
 ///
@@ -135,34 +164,45 @@ class SpaceMap {
     required Set<int> blocked,
     required this.rooms,
     Set<int>? private,
+    Set<int>? inside,
   })  : _blocked = blocked,
         _private = private ?? const {},
-        walkable = List.unmodifiable([
-          for (var y = 0; y < height; y++)
-            for (var x = 0; x < width; x++)
-              if (!blocked.contains(y * width + x)) y * width + x,
-        ]),
-        open = List.unmodifiable([
-          for (var y = 0; y < height; y++)
-            for (var x = 0; x < width; x++)
-              if (!blocked.contains(y * width + x) &&
-                  !(private ?? const {}).contains(y * width + x))
-                y * width + x,
-        ]);
+        _inside = inside ?? const {},
+        walkable = _select(width * height, (t) => !blocked.contains(t)),
+        open = _select(width * height, (t) {
+          if (blocked.contains(t)) return false;
+          if ((private ?? const {}).contains(t)) return false;
+          final building = inside ?? const <int>{};
+          // A space that names no areas beyond the base one is all office — there is
+          // no footprint to be outside of, and demanding one would leave a party with
+          // nowhere at all to go.
+          return building.isEmpty || building.contains(t);
+        });
+
+  static List<int> _select(int tiles, bool Function(int) keep) =>
+      List.unmodifiable([for (var t = 0; t < tiles; t++) if (keep(t)) t]);
 
   final String floorId;
   final int width;
   final int height;
   final Set<int> _blocked;
   final Set<int> _private;
+
+  /// Every tile covered by an area other than the base one: the office's footprint.
+  ///
+  /// The base area is the whole grid, so it says nothing about where the building
+  /// is. Empty for a space that defines no other areas — see the constructor.
+  final Set<int> _inside;
+
   final List<SpaceRoom> rooms;
 
   /// Every tile a body physically fits on, as `y * width + x`. Furniture removed;
   /// walls are not furniture and do not appear here.
   final List<int> walkable;
 
-  /// [walkable] minus the insides of walled areas — where party mode is willing to
-  /// go. Materialised once per rebuild because it is read four times a second.
+  /// Where party mode is willing to go: [walkable], inside the building, and out of
+  /// the rooms people close behind them. Materialised once per rebuild because it is
+  /// read four times a second.
   final List<int> open;
 
   int get tiles => width * height;
@@ -171,8 +211,16 @@ class SpaceMap {
   bool isWalkable(int x, int y) =>
       x >= 0 && y >= 0 && x < width && y < height && !_blocked.contains(y * width + x);
 
-  /// Inside a walled area: standable, but not somewhere to teleport for fun.
+  /// Inside a closed room: standable, but not somewhere to teleport for fun.
   bool isPrivate(int x, int y) => _private.contains(y * width + x);
+
+  /// Inside the office rather than the emptiness around it.
+  bool isInside(int x, int y) =>
+      _inside.isEmpty || _inside.contains(y * width + x);
+
+  /// How many tiles the building covers. Diagnostics, and the thing to look at when
+  /// a party says it has nowhere to go.
+  int get insideCount => _inside.isEmpty ? walkable.length : _inside.length;
 
   int xOf(int tile) => tile % width;
   int yOf(int tile) => tile ~/ width;
@@ -391,6 +439,7 @@ class SpaceMapBuilder {
 
       final blocked = <int>{};
       final private = <int>{};
+      final inside = <int>{};
       final rooms = <SpaceRoom>[];
 
       // Furniture, and only furniture. Walls are directions, not tiles — see the
@@ -419,12 +468,13 @@ class SpaceMapBuilder {
         if (w <= 0 || h <= 0) continue;
         final x0 = at.x.round();
         final y0 = at.y.round();
+        final type = _str(area['mapAreaType']) ?? 'Public';
         final walled = id != baseId && area['wallsTexture'] != _noWall;
 
         rooms.add(SpaceRoom(
           id: id,
           name: _str(area['name']),
-          type: _str(area['mapAreaType']) ?? 'Public',
+          type: type,
           x: x0,
           y: y0,
           width: w,
@@ -432,15 +482,19 @@ class SpaceMapBuilder {
           walled: walled,
         ));
 
-        // Not collision: a manners rule. Gather calls a walled area private, and a
-        // party hopping through somebody's closed meeting room is the thing this
-        // whole feature is trying not to be.
-        if (!walled) continue;
+        // The base area is the grid itself. Counting it as building would make the
+        // whole map "inside", which is the thing the footprint exists to disprove.
+        if (id == baseId) continue;
+
+        // Neither of these is collision — both are manners. Being inside the office
+        // at all, and staying out of the rooms people shut behind them.
+        final closed = walled && _privateTypes.contains(type);
         for (var y = y0; y < y0 + h; y++) {
           if (y < 0 || y >= height) continue;
           for (var x = x0; x < x0 + w; x++) {
             if (x < 0 || x >= width) continue;
-            private.add(y * width + x);
+            inside.add(y * width + x);
+            if (closed) private.add(y * width + x);
           }
         }
       }
@@ -451,6 +505,7 @@ class SpaceMapBuilder {
         height: height,
         blocked: blocked,
         private: private,
+        inside: inside,
         rooms: rooms,
       );
     }

@@ -334,6 +334,46 @@ void main() {
       }
     });
 
+    test('the office is the pool, not the emptiness around it', () {
+      // The failure this covers: everything outside the building is walkable, since
+      // walls block directions and a teleport has no direction to block. On the real
+      // map that was 5133 of 7315 candidate tiles, all of it further from the office
+      // than anywhere in it — so the jump ladder picked it every time and party mode
+      // spent fifteen minutes in a field.
+      const width = 40, height = 40;
+      final office = <int>{
+        for (var y = 10; y < 20; y++)
+          for (var x = 10; x < 20; x++) y * width + x,
+      };
+      collector.map = SpaceMap(
+        floorId: 'f1',
+        width: width,
+        height: height,
+        blocked: const {},
+        inside: office,
+        rooms: const [],
+      );
+      var roll = 0.0;
+      final p = party = PartyMode(
+        collector: () => collector,
+        random: () => (roll = (roll + 0.37) % 1.0),
+      )..noteRoster(_floor(present: [_row('me-1', 10, 10)]));
+
+      p.start();
+      for (var i = 0; i < 60; i++) {
+        p.tick();
+      }
+
+      expect(collector.hops, isNotEmpty);
+      for (final hop in collector.hops) {
+        expect(
+          office,
+          contains(hop.y.round() * width + hop.x.round()),
+          reason: 'hopped outside the office to (${hop.x},${hop.y})',
+        );
+      }
+    });
+
     test('the whole floor is available, not just where people have been', () {
       // The bug this fixes: the pool used to be tiles somebody had been seen on,
       // which on a real map is under one percent of it.

@@ -858,7 +858,23 @@ canPassThrough(A,e){ return !blockedDirections.has(A.hashPair(e)) && !...has(e.h
 teleport is not a move, blocked directions never apply to it at all.
 
 **`isWalled`** is `wallsTexture !== "NewStyleNoWall"` — 19 of 93 areas here. Gather
-also defines `get isPrivate(){ return this.isWalled }`.
+also defines `get isPrivate(){ return this.isWalled }`, which is a statement about
+audio and not one about buildings: the walled areas here include the 44×34 `Public`
+main floor and the Lobby, which between them hold every connected person. Reading it
+as "do not teleport here" excluded the whole office. `space_map.dart` narrows it to
+`MeetingRoom` and `Desk` — walls plus a door — and separately requires a party tile
+to be inside some non-base area at all, since walls block directions rather than
+tiles and the void outside the building is therefore "walkable" to a teleport.
+
+|                                    | tiles |
+| ---------------------------------- | ----: |
+| grid (the base area)                | 10168 |
+| walkable — furniture removed        |  9705 |
+| inside the office (92 other areas)  |  2774 |
+| minus closed rooms → party pool     |  1447 |
+
+Of 112 captured people: 94 stood in the party pool, 7 in closed rooms, 11 on tiles
+this decoding calls furniture, and **none outside the office footprint**.
 
 **Doorways** are two tiles, expanded from each `{origin, orientation}` in coordinates
 relative to the area:

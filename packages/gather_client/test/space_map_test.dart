@@ -301,6 +301,88 @@ void main() {
       expect(map.walkable, contains(3 * 20 + 3));
     });
 
+    test('walls around a zone are the building, not a closed door', () {
+      // The bug this fixes. "Walled means private" is Gather's own rule for audio
+      // and the wrong rule for a floor plan: the measured office's main room is a
+      // walled 44x34 Public area holding 42 of the 112 people, and the Lobby is
+      // walled too. Treating those as private deleted the entire office from the
+      // party pool and left only the void outside it.
+      final b = _base();
+      for (final (id, type, x) in [
+        ('floor', 'Public', 2),
+        ('lobby', 'Lobby', 10),
+      ]) {
+        b.apply('MapArea', _add({
+          'id': id,
+          'mapId': 'map-1',
+          'parentAreaId': 'base',
+          'relativeX': x,
+          'relativeY': 2,
+          'dimensionsInTiles': _dims(6, 6),
+          'mapAreaType': type,
+          'wallsTexture': 'PlainWhite',
+        }));
+      }
+
+      final map = b.forFloor('floor-1')!;
+      expect(map.rooms.where((r) => r.walled), hasLength(2), reason: 'both have walls');
+      expect(map.isPrivate(3, 3), isFalse, reason: 'a walled Public zone is the office');
+      expect(map.isPrivate(11, 3), isFalse, reason: 'so is a walled Lobby');
+      expect(map.open, contains(3 * 20 + 3));
+      expect(map.open, contains(3 * 20 + 11));
+    });
+
+    test('a walled desk booth is somewhere to leave alone', () {
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'booth',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(4, 4),
+        'mapAreaType': 'Desk',
+        'wallsTexture': 'PlainWhite',
+      }));
+
+      expect(b.forFloor('floor-1')!.isPrivate(3, 3), isTrue);
+    });
+
+    test('the emptiness outside the building is not party floor', () {
+      // Walls block *directions*, so nothing marks the void impassable and a
+      // teleport ignores directions entirely. On the measured space that left 5133
+      // of 7315 party tiles outside the office, which is where every hop went.
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'floor',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 4,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(6, 6),
+        'mapAreaType': 'Public',
+        'wallsTexture': 'PlainWhite',
+      }));
+
+      final map = b.forFloor('floor-1')!;
+      expect(map.isWalkable(0, 0), isTrue, reason: 'physically standable — nothing is there');
+      expect(map.isInside(0, 0), isFalse, reason: 'but it is not the office');
+      expect(map.walkable, contains(0));
+      expect(map.open, isNot(contains(0)));
+      expect(map.open, hasLength(36), reason: 'the 6x6 area and nothing else');
+      expect(map.insideCount, 36);
+    });
+
+    test('a space that names no areas is all office', () {
+      // The base area is the grid, so a footprint built from it would be the whole
+      // map and prove nothing. With no other areas there is nothing to be outside
+      // of, and a party still has to have somewhere to go.
+      final map = _base().forFloor('floor-1')!;
+      expect(map.open, hasLength(200));
+      expect(map.isInside(0, 0), isTrue);
+      expect(map.insideCount, 200);
+    });
+
     test('an area with no walls is a label, not an obstacle', () {
       // 74 of 93 areas are like this: desk clusters and team zones, which group
       // people without enclosing them.
