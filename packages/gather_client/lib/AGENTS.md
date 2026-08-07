@@ -11,7 +11,7 @@ you change something here, look at the JS twin named in the table.
 | File | Twin | What it is |
 |---|---|---|
 | `msgpack.dart` | `bridge/lib/msgpack.js` | Decoder for everything Gather sends, incl. 5 ext types. Shallow encoder for the 5 frames we send. |
-| `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 4 of ~49 models, **plus `DeltaState.events[]`**. |
+| `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, plus `MeetingWatch` for invites and knocks. |
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
 | `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — observer handshake, heartbeat, 250ms roster coalescing, `teleport`, backoff. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
@@ -40,6 +40,15 @@ you change something here, look at the JS twin named in the table.
 - **A wave's frame has an empty `patches` array.** That is exactly how the event bus
   went unread in the bridge for weeks. `ingest` checks `events[]` *before* patches, and
   a frame understood as an interaction must not land in `unknownFrames`.
+- **A dump row is history; only a delta is news.** `MeetingParticipant` rows arrive
+  in the state dump as well — 56 in the measured space, four naming us — so
+  `ingest` reads `fullStatePatches` and `patches` separately and only the latter can
+  produce an invite. Merge them again and every reconnect announces every meeting
+  the user has ever been invited to; the collector reconnects whenever the phone
+  wakes.
+- **Identity can arrive after the rows that need it.** `Connection` is one patch
+  among ~1500, so `MeetingWatch` parks anything it cannot judge and
+  `resolvePending` re-reads it once `selfId` is known.
 - **`PartyMode.tick()` is public** so tests can drive a hundred hops without a
   hundred real quarter-seconds. The timer does nothing but call it.
 

@@ -126,6 +126,18 @@ jobs:
       - name: Bridge tests
         run: npm test
 
+      # Path dependencies do not get their dev_dependencies resolved by the root
+      # `flutter pub get`, and `flutter analyze` analyses the whole tree — so
+      # without this, every `package:test` import under packages/*/test is an
+      # unresolved URI and analysis fails before a line of app code is read. It also
+      # means these tests were not running at all: they are the only coverage the
+      # Gather protocol has, and the protocol is what the app now depends on.
+      - name: Gather client tests
+        working-directory: packages/gather_client
+        run: |
+          dart pub get
+          dart test
+
       - name: App analysis and tests
         run: |
           flutter analyze

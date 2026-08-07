@@ -735,7 +735,9 @@ Two things follow, and both matter:
   kind of write (`teleport`, for party mode) and nothing else, because the
   gateway would let it send anything.
 
-`bridge/lib/party.js` is the consumer, and the reason the walkability finding
+`packages/gather_client/lib/src/party.dart` is the consumer — party mode moved
+into the app when the app got its own socket — and it is the reason the
+walkability finding
 below is load-bearing rather than trivia.
 
 ### The server does not validate walkability

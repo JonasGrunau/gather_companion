@@ -22,39 +22,43 @@ with your own session, from your own computer, and tells your phone what it sees
 
 | | what it is | where it runs |
 |---|---|---|
-| 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency background daemon that connects to Gather as you and serves events over your LAN | your **computer** |
-| 📱 `lib/`, `ios/` | **Gather Companion** — a Flutter app showing a live event log and who is around you right now | your **phone** |
+| 📱 `lib/`, `ios/` | **Gather Companion** — a Flutter app that connects to Gather itself and shows who is following you, who waved, and what happened | your **phone** |
+| 📦 `packages/gather_client/` | Gather V2's protocol in pure Dart: msgpack, the game socket, the presence fold | inside the **app** |
+| 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency daemon that pairs your phone and wakes it while the app is closed | your **computer** |
 
-The bridge talks to Gather's own servers, as you. Everything about people comes
-from there. One narrow thing does not, and cannot: Gather's *own* desktop
-notifications — a wave, a meeting invite, an event reminder — are decisions its
-client makes and hands to macOS, so those are still read from its log.
+**The phone talks to Gather directly.** Pairing hands it your Gather session, and
+from then on it holds its own authenticated socket to the game server — so
+presence works on cellular, with your computer asleep or shut.
+
+The bridge is left with the two jobs a phone cannot do for itself: handing over
+that session once, and noticing things while the app is not running so it can
+push them.
 
 ```
-        ┌─────────────────────────┐      ┌─────────────────────────┐
-        │   Gather's own servers  │      │  Gather V2 desktop app  │
-        └────────────┬────────────┘      └────────────┬────────────┘
-                     │ authenticated                  │
-                     ▼ observer socket                ▼
-          ┌─────────────────────┐          ┌─────────────────────┐
-          │   game socket       │          │      main.log       │
-          │  (the whole space)  │          │ (waves, invites,    │
-          │                     │          │  event reminders)   │
-          └──────────┬──────────┘          └──────────┬──────────┘
-                     │ names, real follows,           │
-                     │ voice activity                 │
-                     └───────────────┬────────────────┘
-                                     ▼
-                        ┌─────────────────────────┐
-                        │    gather-app-bridge    │  ← your computer
-                        │          :7799          │
-                        └────────────┬────────────┘
-                                     │ WebSocket over your LAN
-                                     ▼
-                        ┌─────────────────────────┐
-                        │    Gather Companion     │  ← your phone
-                        └─────────────────────────┘
+                    ┌─────────────────────────┐
+                    │   Gather's own servers  │
+                    └────┬───────────────┬────┘
+      authenticated      │               │      authenticated
+      observer socket    ▼               ▼    observer socket
+       ┌─────────────────────────┐   ┌─────────────────────────┐
+       │    Gather Companion     │   │    gather-app-bridge    │
+       │       ← your phone      │   │      ← your computer    │
+       │                         │   │          :7799          │
+       │  follows · waves · chat │   │  watches while the app  │
+       │  meetings · party mode  │   │  is closed, and pushes  │
+       └─────────────────────────┘   └────────────┬────────────┘
+                    ▲                             │
+                    │                             │
+                    │  ① pairing, once:           │
+                    │     your Gather session ────┘
+                    │
+                    └──── ② push, via FCM, when the app is asleep
 ```
+
+The two connections do not fight: `Connection` is per-connection but `SpaceUser`
+is per-person-per-space, so your phone, the bridge and the desktop client all
+observe the same avatar without disturbing each other. Neither observer ever
+sends `enterSpace`, so neither appears in the room.
 
 ---
 
@@ -69,17 +73,9 @@ npx gather-app-bridge
 That installs it as a background service — starts at login, restarts if it dies,
 survives sleep.
 
-**2.** Pair your phone:
-
-```sh
-npx gather-app-bridge pair
-```
-
-It draws a QR square in the terminal. Scan it in the app and you are done; the
-code and address are printed underneath for a phone whose camera is refused.
-
-**3.** Let it into Gather. This is not optional — without it the bridge can see
-nothing:
+**2.** Let it into Gather. **Do this before pairing** — pairing is what hands the
+session to your phone, so a phone paired first gets nothing to connect with and
+has to be paired again:
 
 ```sh
 npx gather-app-bridge adopt
@@ -89,6 +85,21 @@ npx gather-app-bridge restart
 This reuses the Gather session your desktop app is already signed in with. No
 login, no second account, nothing visible to your colleagues. See
 [How it connects](#-how-it-connects).
+
+**3.** Pair your phone:
+
+```sh
+npx gather-app-bridge pair
+```
+
+It draws a QR square in the terminal. Scan it in the app and you are done; the
+code and address are printed underneath for a phone whose camera is refused.
+
+Two things cross at this moment: a token scoped to this bridge on this LAN, which
+is only used to tell it where to send pushes, and **your Gather session**, which
+is what lets the phone read presence on its own afterwards. The app puts the
+second in the iOS keychain. If the bridge has no session yet, the app says so
+rather than pairing into a feed that can never fill.
 
 **4.** Check what it can actually see:
 
@@ -111,21 +122,23 @@ is no login to perform and no second account to create. Refresh tokens are
 long-lived, so this is a one-time read: afterwards the bridge mints its own ID
 tokens and never touches the desktop client again.
 
-It then opens its own game socket in **observer mode**. The distinction that makes
+It then opens its own game socket in **observer mode**, and hands the same session
+to your phone at pairing so the app can open one too. The distinction that makes
 this safe is that Gather splits joining a space into two actions: `loadSpaceUser`
-starts the state dump, and `enterSpace` puts an avatar in the room. The bridge
-sends the first and never the second, so it receives the entire roster — names,
+starts the state dump, and `enterSpace` puts an avatar in the room. Both observers
+send the first and never the second, so each receives the entire roster — names,
 `followTargetId`, live voice activity, and tile coordinates for party mode —
 while remaining invisible to everyone in the space, with
 `Connection.entered: false`.
 
-It also does **not** disturb your own session. That was the long-standing fear:
+None of these connections disturbs the others, which was the long-standing fear:
 Gather's gateway was believed to evict a duplicate `spaceId` + `authUserId` with
 close code 4031. Measured on 2026-08-06 against a live 111-person space, with the
 desktop client joined and watched throughout: the client's socket was never closed
 and never dropped a frame. The structural reason is that `Connection` is
-per-connection while `SpaceUser` is per-person-per-space — both connections drive
-the same avatar, so there is no second you to collide with.
+per-connection while `SpaceUser` is per-person-per-space — so the phone, the
+bridge and the desktop client are all looking at, and for party mode moving, the
+same single avatar. There is no second you to collide with.
 
 And because the full state dump is sent once per *connection*, and the connection
 is ours, `resync` is just a reconnect.
@@ -140,7 +153,9 @@ Protocol details, the REST surface, and what is still unverified:
 - 🏷️ display names
 - 🔊 **which of your followers is talking** — `SpaceUser.speaking`, which on a
   live 111-person space was the most frequent update of any kind
-- ✋ waves, meeting invites and event reminders, from the desktop client's log
+- ✋ **waves, with the name of whoever sent one** — off Gather's own event bus
+- 📅 **meeting invites**, and **somebody knocking on a meeting** you are in
+- 💬 chat messages
 
 **What this deliberately does not do:** ❌ tell you who is standing next to you.
 It used to. Being near somebody says nothing about whether they want you — people
@@ -154,21 +169,31 @@ IPC state inside the desktop client and appear in no Gather model, no REST route
 and no delta patch. `speaking` is the honest replacement — it says who is
 *talking*, which is what you wanted to know anyway.
 
-### 📄 The one remaining scrape
-
-Presence needs no desktop client at all. Gather's own notifications do, because
-they exist nowhere else:
+### 📄 What comes from where
 
 | | source | needs the desktop app? |
 |---|---|---|
-| Someone following you, and whether they are talking | game socket | no |
-| Names, space name | game socket | no |
-| Wave, meeting invite, event reminder | `main.log` | **yes** |
+| Someone following you, and whether they are talking | game socket, state | no |
+| Names, space name | game socket, state | no |
+| Wave (with a sender), chat | game socket, **event bus** | no |
+| Meeting invite, somebody knocking on a meeting | game socket, state | no |
+| Event reminder | `main.log` | **yes** |
 | Mic / camera / screenshare | — | not available at all |
 
-One nicety falls out of this: Gather suppresses its own notification when its
-window has focus, and the bridge deliberately does not. Looking at Gather on your
-Mac is no reason to withhold a wave from the screen in your pocket.
+Almost none of this needed the desktop client, and for a long time we thought
+most of it did. `DeltaState` carries a third array beside `patches` — `events[]`,
+a genuine event bus — and the reader was throwing those frames away as
+unrecognised because their `patches` array is empty. Every wave had been arriving
+on the socket all along. See [`docs/gather-api.md`](docs/gather-api.md) for the
+measurement and the reasoning that got it wrong.
+
+An event reminder is the last thing still scraped, and only because nobody has
+implemented it from `BaseCombinedCalendarEvent.startDateTime` yet — which is
+where Gather's own client gets it.
+
+One nicety survives from the scraping era: Gather suppresses its own notification
+when its window has focus, and this does not. Looking at Gather on your Mac is no
+reason to withhold a wave from the screen in your pocket.
 
 ---
 
@@ -178,20 +203,24 @@ There are two delivery paths and they cover different moments.
 
 **Local notifications** fire from the app itself, and only while it is running —
 in the foreground, or during the short window iOS grants a backgrounded app
-before it suspends the WebSocket. After that the socket is gone.
+before it suspends its Gather socket. After that the socket is gone.
 
-**Push** is what survives that. The bridge sends through Firebase Cloud
-Messaging, so a wave reaches a locked or killed phone. Four reasons wake it:
+**Push** is what survives that, and it is the reason the bridge still exists. It
+holds its own connection to Gather precisely so that something is awake when your
+phone is not, and sends through Firebase Cloud Messaging:
 
 | reason | on by default | why |
 |---|---|---|
 | wave | ✅ | rare, deliberate, always means somebody wants you |
-| meeting invite | ✅ | scheduled and time-bound |
-| event reminder | ✅ | scheduled and time-bound |
 | someone follows you | ✅ | rare and unambiguous |
+| meeting invite | ✅ | scheduled and time-bound |
+| someone knocking on your meeting | ✅ | the only one with a deadline — measured gap between the knock and the answer was two seconds |
+| event reminder | ✅ | scheduled and time-bound |
 
-All four are deliberate acts by a person, which is the whole bar — and why there
-is no rate limiting. Any reason can be switched off per install with
+All of them are deliberate acts by a person, which is the whole bar — and why
+there is almost no rate limiting. The exception is the wave *button*, which is
+debounced per sender: one person produced **41 waves in eight seconds** while this
+was being measured. Any reason can be switched off per install with
 `push.kinds.<reason>: false` in `~/.gather-app-bridge.json`.
 
 No double-ups: iOS does not display a push while the app is frontmost unless the
@@ -276,17 +305,11 @@ into someone.
 Measured live against a 111-person space: 16 hops in 4 seconds, closest approach
 8.1 tiles.
 
-It ends on its own after **15 minutes**. The toggle is on a phone and the hopping
-happens on a computer that will happily keep going for days; between a flat
-battery and a phone left in a drawer, "on until told otherwise" eventually means
-"on all week". The app reads party state from the snapshot rather than
-remembering what it asked for, so the button goes dark by itself when that timer
-fires, when the bridge loses Gather, or when the daemon stops.
-
-```sh
-curl -X POST "localhost:7799/party?on=1&token=$TOKEN"   # if the phone is flat
-curl -X POST "localhost:7799/party?on=0&token=$TOKEN"
-```
+It ends on its own after **15 minutes**, and it runs *in the app*, against the
+socket the app already holds — so a tap is instantly true, with no round trip to
+the computer to be optimistic about. It also dies with the app, which the older
+bridge-side version did not: that one would happily keep hopping for the rest of
+the quarter-hour after your phone went flat.
 
 Entering the space is **not** required to move — `SpaceUser` is
 per-person-per-space, so an observer connection drives the same avatar the
@@ -444,7 +467,12 @@ suspend without erroring.
 
 ## 📡 HTTP / WebSocket API
 
-Everything except `/health` needs `?token=<token>`.
+Everything except `/health` and `/pair/claim` needs `?token=<token>`.
+
+The app uses exactly one of these — `POST /push/register` — and only
+opportunistically, whenever it happens to be able to reach the computer. The rest
+are the operator surface that `gather-bridge watch`, `replay`, `resync` and
+`doctor` are built on; they go dormant when nothing is attached.
 
 | endpoint | what |
 |---|---|
@@ -456,9 +484,8 @@ Everything except `/health` needs `?token=<token>`.
 | `WS /ws?raw=1` | additionally the unfiltered firehose, as `kind: "raw"` frames |
 | `GET /resync` | force a full state resync (reconnects the game socket) |
 | `POST /push/register` | phone hands over its FCM token (idempotent) |
-| `POST /party?on=1\|0` | party mode on/off; `GET /party` reads it |
 | `GET /pair/offer` | mint a pairing code (used by `pair`) |
-| `GET /pair/claim?code=` | **no token** — trade a code for the token, once |
+| `GET /pair/claim?code=` | **no token** — trade a code for the bridge token *and your Gather session*, once |
 
 Every event carries `type`, `at`, `source` (`gather` \| `log` \| `bridge`) and
 `confidence` (`observed` \| `inferred`). Frames are
@@ -513,14 +540,20 @@ personal device installs.
   so a desktop build has to fall back to the type-the-code path, which already
   exists and is a first-class route rather than a fallback.
 
-While working on the feed, `--dart-define=GATHER_PAIR=host:port:token` skips the
-scanner, which a simulator or emulator has no camera for:
+While working on the feed,
+`--dart-define=GATHER_PAIR=host:port:token:refreshToken` skips the scanner, which
+a simulator or emulator has no camera for. It needs the Gather refresh token too,
+since that is what the app actually connects with — read it out of
+`~/.gather-app-bridge.json`:
 
 ```sh
-flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
+flutter run -d <device> \
+  --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>:$(node -p \
+    "require(require('os').homedir()+'/.gather-app-bridge.json').gather.refreshToken")
 ```
 
-Your phone and computer have to be on the same network. Phone platforms ask for
+Your phone and computer have to be on the same network **to pair**, and for push
+registration afterwards. Presence itself needs neither. Phone platforms ask for
 local-network permission the first time, and for the camera the first time you
 scan.
 
@@ -528,8 +561,17 @@ scan.
 
 Modelled on Superset's flow: scan the square, or type the eight characters. The
 long token is never typed or shown — the QR carries a short code which the app
-trades for the token exactly once (`GET /pair/claim`). The code lives for fifteen
-minutes, only after somebody ran `pair`, and a few wrong guesses destroy it.
+trades exactly once (`GET /pair/claim`). The code lives for fifteen minutes, only
+after somebody ran `pair`, and a few wrong guesses destroy it.
+
+What crosses at that moment got more valuable: it used to be a token scoped to
+one daemon on one LAN, and it is now **your Gather identity**, because that is
+what lets the phone read presence without the computer. The protections are
+unchanged and still the right ones — no code exists until you run `pair`, single
+use, fifteen minutes, eight wrong guesses and it is gone — but the stakes are
+higher, and the app stores what it receives in the iOS keychain
+(`first_unlock_this_device`) rather than in a preferences plist that device
+backups would include.
 
 The alphabet excludes `0`, `1`, `I`, `L` and `O`, so there is nothing to misread.
 A character outside it is refused rather than guessed at — pairing on a

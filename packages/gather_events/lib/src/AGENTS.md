@@ -51,6 +51,14 @@ socket, distinguished by the frame's `kind`.
   whether they are following you, and nothing about where they are standing.
   Proximity was removed on purpose; do not reintroduce `isNear`, `distance` or
   coordinates to make a UI easier.
+- `CollectorHealth.gather` is now the app's *own* connection to Gather, not a
+  report about the bridge's. `cdp` is a dead field kept only because
+  `hasRichData` reads `gather || cdp` and a bridge older than the app still sets
+  it; `logTail` is likewise vestigial and gates nothing.
+- `NotificationShownEvent.senderId` carries who did it, for the kinds that come
+  off Gather's event bus or its meeting state. A wave scraped from the desktop
+  log could never say — the IPC line has only a type — which is why it is nullable
+  and why the fallback wording is "Someone".
 - `CollectorHealth.hasRichData` is what the UI reads to decide whether to admit
   the follow-detection limitation. It is not decoration.
 - `copyWith` on `PlayerRef` carries an explicit `clearFollowingMeSince` flag,

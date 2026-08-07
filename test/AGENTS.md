@@ -14,7 +14,7 @@ a real running bridge.
 | File | Description |
 |------|-------------|
 | `relevance_test.dart` | The feed's editorial policy — which events are alerts, which are notable, which are background — plus the pairing-code and address parsers. The most specified file in the app. |
-| `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also empty states, the background-tier toggle, the log-only fidelity notice, and the refresh duration. |
+| `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also empty states, the background-tier toggle, the fidelity notice, and the refresh duration. Builds `AppState` with `EventLogStore.disabled()`: the real one debounces its writes on a `Timer`, and a timer outliving the widget tree fails the test outright. |
 | `live_bridge_test.dart` | End-to-end against a real bridge, exercising the app's own pairing and client code rather than mocks. **Skipped unless configured**, so `flutter test` stays green on a machine with no Gather on it. |
 
 ## For AI Agents
@@ -40,7 +40,7 @@ a real running bridge.
 ```sh
 node bridge/bin/gather-bridge.js run --port 7830 --token t --log-file /tmp/f.log &
 node bridge/bin/gather-bridge.js pair --port 7830   # note the code
-GATHER_TEST_PORT=7830 GATHER_TEST_CODE=XXXXXXXX GATHER_TEST_LOG=/tmp/f.log flutter test
+GATHER_TEST_PORT=7830 GATHER_TEST_CODE=XXXXXXXX flutter test test/live_bridge_test.dart
 ```
 
 Without all three environment variables the test skips itself. CI does not run

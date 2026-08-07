@@ -5,16 +5,28 @@
 
 ## Purpose
 
-`gather-app-bridge` — the computer half. A zero-dependency Node daemon that
-connects to Gather V2 with the user's own session and serves what it sees over
-the LAN as HTTP and WebSocket. Installed as a macOS LaunchAgent by default, so it
-starts at login and survives crashes and sleep.
+`gather-app-bridge` — the computer half. A zero-dependency Node daemon,
+installed as a macOS LaunchAgent by default, so it starts at login and survives
+crashes and sleep.
+
+**It is no longer how the app sees Gather.** The phone holds its own authenticated
+socket (`packages/gather_client`), so this daemon is down to two jobs:
+
+1. **Pairing.** `/pair/claim` hands the phone the bridge token *and the Gather
+   session*, which is the only moment the phone can be given one.
+2. **Push.** Something has to be awake when the app is not, notice a follow or a
+   wave, and hand it to FCM. That is the whole reason this still connects to
+   Gather at all.
 
 ```
   Gather's game server ─────────────▶ DirectCollector ────────────┐
-                                                                  ├─▶ PresenceTracker ─▶ WS clients
-  ~/Library/Logs/GatherV2/main.log ─▶ DesktopNotificationReader ──┘
+                                                                  ├─▶ PresenceTracker ─▶ push
+  ~/Library/Logs/GatherV2/main.log ─▶ DesktopNotificationReader ──┘        └─▶ WS (operators)
 ```
+
+The HTTP and WebSocket surface still exists and still works — `watch`, `replay`,
+`resync` and `doctor` are built on it — but nothing on a phone uses it except one
+idempotent `POST /push/register`. It is dormant when nothing is attached.
 
 - **`DirectCollector` is the whole presence story.** It authenticates with the
   session `gather-app-bridge adopt` copied out of the desktop client, then opens
@@ -22,12 +34,19 @@ starts at login and survives crashes and sleep.
   cluster adjacency, real `followTargetId` follow detection and live voice
   activity. No debug port, and it keeps working with the desktop app closed. Every
   connection replays the full state dump, so `resync` is just a reconnect.
-- **`DesktopNotificationReader` is the only thing still scraped**, and it reads
-  exactly one line shape: `IPC Event: SHOW_NOTIFICATION`. Waves, meeting invites
-  and event reminders are decisions Gather's *client* makes and hands to macOS —
-  they are in no model, no REST route and no delta patch. They are also precisely
-  the events worth waking a phone for, which is why the dependency is worth
-  keeping. Presence does not depend on it.
+- **`DesktopNotificationReader` is the last scraper, and it is nearly gone.** It
+  reads one line shape (`IPC Event: SHOW_NOTIFICATION`) and is down to **event
+  reminders**. It used to carry waves and meeting invites too, on the belief that
+  those were decisions Gather's *client* made and handed to macOS, appearing in no
+  model or patch. That was wrong on both counts:
+  - a **wave** arrives on `DeltaState.events[]`, Gather's own event bus, with a
+    `senderId` — see `lib/game-protocol.js`;
+  - a **meeting invite** is `MeetingParticipant{spaceUserId, inviterId}` in state.
+
+  Both now come from the socket, which is better in every way: earlier, attributed
+  to a person, and working with the desktop app closed. An event reminder is
+  derivable too (`BaseCombinedCalendarEvent.startDateTime`) and nobody has done it
+  yet, which is the only reason this file survives.
 
 Two collectors were deleted in favour of this, and should not come back:
 `CdpCollector` (attached to the desktop renderer's devtools port — required a

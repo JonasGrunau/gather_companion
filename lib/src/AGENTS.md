@@ -13,7 +13,7 @@ rules that decide which events are worth a person's attention.
 
 | File | Description |
 |------|-------------|
-| `app_state.dart` | `AppState extends ChangeNotifier` — the one object the UI reads. Owns the event log (1000 max, newest first), the presence snapshot, the link status, the classified-feed cache, and the client lifecycle (`boot`, `pair`, `unpair`, `reconnect`, `_attach`/`_detach`). |
+| `app_state.dart` | `AppState extends ChangeNotifier` — the one object the UI reads. Drives the **Gather** connection (`DirectCollector` + `PresenceTracker` + `PartyMode` from `package:gather_client`), and owns the event log (1000 in memory, newest first), the presence snapshot, the link status, the classified-feed cache, and the lifecycle (`boot`, `pair`, `unpair`, `reconnect`, `_attach`/`_detach`). No socket to the computer: the bridge is reached only by an opportunistic `POST /push/register`. |
 | `link_status.dart` | `LinkState` / `LinkStatus` — how good our connection to **Gather** is. Carries `needsPairing`, the one state that asks the user to act rather than wait. |
 | `credentials.dart` | `GatherCredentialStore` — the Gather refresh token, in the platform keychain. Not `SharedPreferences`: this is the user's whole Gather identity and backups include plists. |
 | `event_log.dart` | `EventLogStore` — the feed, persisted on the phone, debounced. Replaces the bridge's 500-event replay ring. `EventLogStore.disabled()` for widget tests. |

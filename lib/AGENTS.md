@@ -6,14 +6,17 @@
 ## Purpose
 
 The Flutter app, **Gather Companion** — the phone half. It pairs with a bridge on
-your computer, holds one WebSocket to it, and shows two things: who is around you
-*right now* (from the bridge's snapshot) and what has happened (from the event
-stream).
+your computer *once*, is handed your Gather session, and from then on holds its
+own authenticated socket to Gather's game server (`packages/gather_client`). It
+shows who is following you right now, and what has happened.
 
-Nothing here is platform-specific. It is plain Flutter over an HTTP and WebSocket
-contract, so the same code targets phones and desktops; only the iOS runner is
-scaffolded so far. The one mobile-only dependency is the QR scanner, and typing
-the code is already a first-class alternative rather than a fallback.
+The computer is not in the loop after pairing: presence works on cellular with the
+Mac shut. The bridge is needed only to push while this app is not running, which
+is the one thing a suspended app cannot do for itself.
+
+Nothing here is platform-specific. The one mobile-only dependency is the QR
+scanner, and typing the code is already a first-class alternative rather than a
+fallback.
 
 ## Key Files
 

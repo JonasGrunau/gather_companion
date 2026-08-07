@@ -48,6 +48,13 @@ git push --tags
   red runs and presents as the same misleading 404.
 - **`id-token: write` is load-bearing.** There is no `NPM_TOKEN` anywhere — npm
   mints a short-lived credential from the OIDC token GitHub provides.
+- **The Gather client's tests need their own `dart pub get`.** A path dependency
+  does not get its `dev_dependencies` resolved by the root `flutter pub get`, and
+  `flutter analyze` reads the whole tree — so without that step every
+  `package:test` import under `packages/*/test` is an unresolved URI and analysis
+  fails with ~224 errors before a line of app code is read. It also means those
+  tests were not running at all, which is why the step runs `dart test` too: they
+  are the only coverage the Gather protocol has, and the app now depends on it.
 - `npm publish` runs at `--loglevel verbose` on purpose: npm reports OIDC
   failures at verbose level *only*. The line that matters is `npm verbose oidc`.
   `--provenance` is explicit because trusted publishing did not attach it on its
