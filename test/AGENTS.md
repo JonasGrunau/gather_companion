@@ -12,6 +12,7 @@ end-to-end test against a real running bridge.
 
 | File | Description |
 |------|-------------|
+| `map_screen_test.dart` | The map screen: that "no map yet" and "not connected" stay different sentences, that offline avatars are not drawn, and that the room you are standing in is named. |
 | `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also the party card, the link strip's deliberate delay before it admits to being disconnected, and the refresh duration. |
 | `live_bridge_test.dart` | End-to-end against a real bridge, exercising the app's own pairing and client code rather than mocks. **Skipped unless configured**, so `flutter test` stays green on a machine with no Gather on it. |
 

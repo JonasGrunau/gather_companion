@@ -14,6 +14,7 @@ needed to be shared twice yet.
 | File | Description |
 |------|-------------|
 | `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`. Answers "is anyone following me" from the snapshot, and carries the party switch. Named for the scrolling activity feed it used to have; the name outlived it. |
+| `map_screen.dart` | The office, drawn. `_Waiting`, `_Plan`, `_Key`, `_PlanPainter`. A floor plan rather than a game view — at 124 tiles across a phone there are about three pixels a tile, so it is blocks of colour, pannable and zoomable. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 

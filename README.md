@@ -283,21 +283,23 @@ Two things make that less trivial than picking coordinates.
 **Gather's server does not check walkability.** Every tile on the grid is
 accepted — walls, scenery, the void outside the map. Collision is enforced
 client-side only, so uniform random coordinates put you inside furniture about as
-often as not. Rather than rebuild the collision map out of `MapObject` and
-`CatalogItemVariant.collision` — whose encoding has never been captured, so
-building on it would be guesswork that lands you in walls — party mode takes the
-empirical route: **a tile somebody has been on is a tile you can be on.**
+often as not.
 
-Two sources feed that, and it needs both. The state dump carries every member with
-their last position, which sounds like plenty until you notice most of them are
-parked at a desk: it is worth about one tile per member, 78 on a 124×82 map, under
-one percent of the floor. That alone is why party mode used to circle the same
-dozen tiles — after the safety radius, eighteen were left, and four hops a second
-exhausts eighteen tiles in five seconds. So it also watches people **walk**.
-Positions arrive four times a second, and the tiles between two sightings of the
-same person are walkable floor, kept whenever the step is short and straight enough
-that no other path could have produced it. The pool reaches a few hundred tiles
-within a minute of connecting and a few thousand within fifteen.
+So party mode reads the actual floor plan. **Gather sends the whole map in every
+state dump** — `MapArea` rectangles, 1140 `MapObject`s and the
+`CatalogItemVariant.collision` shapes behind them — and this client used to throw
+all of it away. Decoding it gives **9156 walkable tiles of 10168**, walls and
+furniture removed, updated live as people rearrange things. There is no REST route
+for any of this; `/spaces/<id>/maps`, `/floors` and `/map` all 404. It was only ever
+on the socket.
+
+It used to guess instead, and that was the whole of the "party mode keeps revisiting
+the same tiles" bug. The old rule was *a tile somebody has been seen on is a tile you
+can stand on* — true, and nowhere near enough. Most members are parked at a desk, so
+a state dump was worth about one tile per member: **78 tiles of a 124×82 map**, under
+one percent of the floor, and after the safety radius **eighteen** were left. Four
+hops a second exhausts eighteen tiles in five seconds. The picker was never at fault
+— it was already visiting everything it was offered.
 
 **Landing next to someone opens the video bubble on their screen.** Doing that
 four times a second, to a different colleague each time, would be a genuinely
@@ -305,9 +307,8 @@ antisocial thing to inflict on an office. So every candidate tile is held at
 least **5 tiles** from everyone currently connected — two clear of the 3 tiles at
 which Gather connects media, with the margin covering the fact that the roster is
 always a beat behind. It was 8, which bought margin nobody can perceive at the
-price of a third of the usable floor. Offline rows donate their tile without
-defending it: a parked avatar is proof a body fits there and proof nobody is on
-it.
+price of a third of the usable floor. Offline rows cost nothing: somebody who logged
+off at a desk is not standing there.
 
 When nothing clears, the hop is **skipped** rather than approximated, and the
 card says why. A party that pauses is a smaller problem than a party that walks
@@ -366,8 +367,9 @@ are exactly three ops:
   `followTargetId` is an optional column, so it is *absent* rather than null when
   unset — and the bridge tells the two apart, because absent means "this space
   never said" while null means "nobody".
-- 📐 **position** — still decoded, but no longer to judge who is near whom. It
-  feeds party mode's pool of tiles a body is known to fit on. Position mutates
+- 📐 **position** — still decoded, but no longer to judge who is near whom. It is
+  where party mode measures its clearance from, and where the map screen draws
+  people. Position mutates
   component-wise, so walking arrives as `/position/x` and `/position/y`; a
   teleport replaces `/position` wholesale with an ext-0 `Position` value object.
   Both shapes are handled.
@@ -588,7 +590,23 @@ The alphabet excludes `0`, `1`, `I`, `L` and `O`, so there is nothing to misread
 A character outside it is refused rather than guessed at — pairing on a
 misread code would be worse than asking someone to look again.
 
-### 📋 What the screen shows
+### 🗺️ The map
+
+The map icon in the header opens the office as a floor plan: rooms tinted and
+named, walls and furniture blocked out, everyone who is actually connected drawn
+where they are, and you in Gather blue. Pinch to zoom, drag to pan. Switch party
+mode on and your own marker picks up a ring, which is the one time the screen is
+worth watching rather than glancing at.
+
+It is deliberately not a game view. At 124 tiles across a phone there are roughly
+three pixels a tile, so anything more detailed than a block of colour is a smudge.
+The questions it answers are *where are the rooms*, *where is everyone*, and *where
+am I*.
+
+Offline avatars are not drawn. Their coordinates are wherever somebody logged off,
+and a map full of people who went home is worse than a map with nobody on it.
+
+### 📋 What the main screen shows
 
 Who is following you, which of them is talking, and whether the party is on. That
 is the whole screen, and all of it is *now* — read from the live Gather socket, not

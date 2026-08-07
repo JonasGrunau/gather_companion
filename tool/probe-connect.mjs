@@ -728,34 +728,216 @@ async function map(args) {
   console.log('\nmap models in the state dump:');
   for (const [model, list] of rows) console.log(`  ${model.padEnd(22)} ${list.length}`);
 
-  const describe = (value) => {
+  // msgpack ext values decode to objects carrying Symbol keys, and `undefined`
+  // (ext-4) comes back as a Symbol outright, so nothing here may assume a value
+  // survives String().
+  const show = (value) => {
+    if (typeof value === 'symbol') return `«${String(value)}»`;
     if (value === null || value === undefined) return String(value);
-    if (Array.isArray(value)) return `array[${value.length}] e.g. ${JSON.stringify(value.slice(0, 8))}`;
-    if (typeof value === 'string') return `string[${value.length}] ${JSON.stringify(value.slice(0, 80))}`;
-    if (typeof value === 'object') return `object ${JSON.stringify(value).slice(0, 160)}`;
-    return `${typeof value} ${value}`;
+    if (typeof value === 'bigint') return `${value}n`;
+    if (typeof value !== 'object') return `${typeof value} ${JSON.stringify(value)}`;
+    try {
+      return JSON.stringify(value, (k, v) =>
+        typeof v === 'symbol' ? String(v) : typeof v === 'bigint' ? String(v) : v,
+      );
+    } catch (error) {
+      return `<unstringifiable ${error.message}>`;
+    }
   };
+  const kind = (value) =>
+    typeof value === 'symbol'
+      ? 'symbol'
+      : value === null
+        ? 'null'
+        : Array.isArray(value)
+          ? 'array'
+          : typeof value;
 
   // THE question: how is walkability encoded?
   const variants = rows.get('CatalogItemVariant');
-  console.log(`\ncollision encoding (${variants.length} CatalogItemVariant rows):`);
-  const shapes = new Map();
-  for (const v of variants) {
-    const shape = describe(v?.collision).split(' ')[0];
-    if (!shapes.has(shape)) shapes.set(shape, v);
+  const withPoints = variants.filter((v) => v?.collision?.points?.length);
+  console.log(
+    `\ncollision (${variants.length} variants; ${withPoints.length} carry a non-empty points list):`,
+  );
+  for (const v of withPoints.slice(0, 6)) {
+    console.log(`  points  ${show(v.collision.points).slice(0, 200)}`);
+    console.log(
+      `     dimensionsInPixels ${show(v.dimensionsInPixels)}  origin ${v.originX},${v.originY}  sittable ${show(v.sittable)}`,
+    );
   }
-  for (const [shape, sample] of shapes) {
-    console.log(`  ${shape}`);
-    console.log(`     collision:         ${describe(sample.collision)}`);
-    console.log(`     dimensionsInPixels ${describe(sample.dimensionsInPixels)}`);
-    console.log(`     origin             ${sample.originX},${sample.originY}`);
+  // The distribution matters: if most variants collide over their whole box, a
+  // points list may be the exception rather than the rule.
+  const counts = new Map();
+  for (const v of variants) {
+    const n = v?.collision?.points?.length ?? -1;
+    counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  console.log(
+    `  points-per-variant: ${[...counts].sort((a, b) => a[0] - b[0]).map(([n, c]) => `${n === -1 ? 'none' : n}×${c}`).join(' ')}`,
+  );
+
+  for (const model of ['FloorMap', 'MapArea', 'MapObject']) {
+    const list = rows.get(model);
+    if (!list.length) continue;
+    console.log(`\n${model} — field shapes across ${list.length} rows:`);
+    const fields = new Map();
+    for (const row of list) {
+      for (const [k, v] of Object.entries(row ?? {})) {
+        if (!fields.has(k)) fields.set(k, new Set());
+        fields.get(k).add(kind(v));
+      }
+    }
+    for (const [k, kinds] of fields) console.log(`  ${k.padEnd(24)} ${[...kinds].join('|')}`);
+    console.log(`  sample: ${show(list[0]).slice(0, 700)}`);
   }
 
-  for (const model of ['MapArea', 'MapObject', 'FloorMap']) {
-    const sample = rows.get(model)[0];
-    if (!sample) continue;
-    console.log(`\nsample ${model}:`);
-    for (const [k, v] of Object.entries(sample)) console.log(`  ${k.padEnd(24)} ${describe(v)}`);
+  // The base area is the whole floor, and its dimensions are the grid we would be
+  // painting walkability onto.
+  const floor = rows.get('FloorMap')[0];
+  const base = rows.get('MapArea').find((a) => a?.id === floor?.baseAreaId);
+  console.log(`\nbase area: ${show(base ?? null).slice(0, 400)}`);
+}
+
+/**
+ * Turn the map models into a walkable grid, and check the answer against reality.
+ *
+ * The decoding, as read off `map`:
+ *
+ *  - `FloorMap.baseAreaId` names the base `MapArea`, whose `dimensionsInTiles` is
+ *    the whole grid (124×82 here).
+ *  - `MapArea` and `MapObject` both carry `relativeX/relativeY` against a parent —
+ *    `parentAreaId` or `parentObjectId` — so an absolute position is the sum up
+ *    the chain. Objects nest inside objects, not just inside areas.
+ *  - `CatalogItemVariant.collision.points` is a list of tile offsets the object
+ *    blocks. 341 of 477 variants block nothing at all; the rest block 1–6 tiles.
+ *    Offsets are near-integers with a sub-tile render nudge (-0.0625, 0.9375), so
+ *    they round to tiles.
+ *
+ * The check is what makes this trustworthy: **every member of the space is
+ * standing somewhere**, so if the derived grid says a tile somebody occupies is a
+ * wall, the decoding is wrong. That turns 111 live positions into a test.
+ */
+async function walkable(args) {
+  const spaceId = args.space;
+  if (!spaceId) throw new Error('need --space <uuid>');
+  if (!args.yes) throw new Error('refusing without --yes (same risk as `connect`)');
+
+  const token = await idToken();
+  const authUserId = readCache().uid ?? uidFromIdToken(token);
+  const seconds = Number(args.seconds ?? 25);
+
+  const KEEP = new Set(['MapArea', 'MapObject', 'CatalogItemVariant', 'FloorMap', 'SpaceUser']);
+  const rows = new Map([...KEEP].map((m) => [m, new Map()]));
+
+  const url = `${GAME_SOCKET}?spaceId=${encodeURIComponent(spaceId)}&authUserId=${encodeURIComponent(authUserId)}`;
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.addEventListener('open', () => {
+    for (const frame of handshake({ token, spaceId, spaceUserId: null, enter: false })) {
+      ws.send(enc(frame));
+    }
+  });
+  ws.addEventListener('message', (event) => {
+    let frame;
+    try {
+      frame = decode(Buffer.from(event.data));
+    } catch {
+      return;
+    }
+    for (const patch of [
+      ...(Array.isArray(frame?.fullStatePatches) ? frame.fullStatePatches : []),
+      ...(Array.isArray(frame?.patches) ? frame.patches : []),
+    ]) {
+      if (patch?.op !== 'addmodel' || !KEEP.has(patch.model)) continue;
+      if (patch.data?.id) rows.get(patch.model).set(patch.data.id, patch.data);
+    }
+  });
+  const closed = new Promise((resolve) => ws.addEventListener('close', resolve));
+  const timer = setTimeout(() => ws.close(), seconds * 1000);
+  await closed;
+  clearTimeout(timer);
+
+  // One capture, many hypotheses: getting the rounding rule right takes several
+  // passes over the same data, and each pass should not be another socket into
+  // somebody's workspace.
+  if (typeof args.dump === 'string') {
+    const plain = JSON.stringify(
+      Object.fromEntries([...rows].map(([m, byId]) => [m, [...byId.values()]])),
+      (k, v) => (typeof v === 'symbol' ? undefined : typeof v === 'bigint' ? String(v) : v),
+    );
+    writeFileSync(args.dump, plain);
+    console.log(`wrote ${args.dump} (${(plain.length / 1e6).toFixed(1)} MB)`);
+  }
+
+  const areas = rows.get('MapArea');
+  const objects = rows.get('MapObject');
+  const variants = rows.get('CatalogItemVariant');
+  const floor = [...rows.get('FloorMap').values()][0];
+  const base = areas.get(floor?.baseAreaId);
+  const size = base?.dimensionsInTiles;
+  if (!size) throw new Error('no base area — cannot size the grid');
+
+  const str = (v) => (typeof v === 'string' ? v : null); // msgpack undefined is a Symbol
+  const live = (row) => row && typeof row.deletedAt !== 'string';
+
+  /** Absolute tile position, walking up the parent chain. */
+  const originOf = (row, depth = 0) => {
+    if (!row || depth > 24) return null;
+    const x = Number(row.relativeX ?? 0);
+    const y = Number(row.relativeY ?? 0);
+    const parentId = str(row.parentObjectId) ?? str(row.parentAreaId);
+    if (!parentId) return { x, y };
+    const parent = objects.get(parentId) ?? areas.get(parentId);
+    if (!parent) return null; // an unresolvable chain must not become a wrong tile
+    const up = originOf(parent, depth + 1);
+    return up && { x: up.x + x, y: up.y + y };
+  };
+
+  const blocked = new Set();
+  let placed = 0;
+  let unresolved = 0;
+  for (const object of objects.values()) {
+    if (!live(object)) continue;
+    const points = variants.get(object.catalogItemVariantId)?.collision?.points;
+    if (!Array.isArray(points) || !points.length) continue;
+    const at = originOf(object);
+    if (!at) {
+      unresolved++;
+      continue;
+    }
+    placed++;
+    for (const p of points) {
+      blocked.add(`${Math.round(at.x + Number(p.x ?? 0))},${Math.round(at.y + Number(p.y ?? 0))}`);
+    }
+  }
+
+  const total = size.width * size.height;
+  console.log(`grid ${size.width}x${size.height} = ${total} tiles`);
+  console.log(`${placed} colliding objects placed, ${unresolved} with an unresolvable parent`);
+  console.log(`blocked ${blocked.size}  ->  walkable ${total - blocked.size}`);
+
+  // THE check: everybody is standing somewhere, so nobody may be inside a wall.
+  const people = [...rows.get('SpaceUser').values()].filter((u) => u?.position);
+  const inside = people.filter((u) =>
+    blocked.has(`${Math.round(u.position.x)},${Math.round(u.position.y)}`),
+  );
+  console.log(
+    `\n${people.length} members with a position; ${inside.length} of them stand on a tile we call blocked`,
+  );
+  for (const u of inside.slice(0, 8)) {
+    console.log(`  ${(u.name ?? u.id).slice(0, 28).padEnd(28)} at ${u.position.x},${u.position.y}`);
+  }
+
+  // Eyeball it: a real office should read as rooms and corridors, not noise.
+  console.log('\ntop-left 100x40 (# blocked, · walkable, o somebody standing):');
+  const standing = new Set(people.map((u) => `${Math.round(u.position.x)},${Math.round(u.position.y)}`));
+  for (let y = 0; y < Math.min(40, size.height); y++) {
+    let line = '';
+    for (let x = 0; x < Math.min(100, size.width); x++) {
+      const k = `${x},${y}`;
+      line += standing.has(k) ? 'o' : blocked.has(k) ? '#' : '·';
+    }
+    console.log('  ' + line);
   }
 }
 
@@ -808,9 +990,12 @@ if (import.meta.main) {
       case 'map':
         await map(args);
         break;
+      case 'walkable':
+        await walkable(args);
+        break;
       default:
         console.log(
-          'commands: adopt | login | whoami | refresh | spaces | connect --space <uuid> --yes | map --space <uuid> --yes',
+          'commands: adopt | login | whoami | refresh | spaces | connect --space <uuid> --yes | map/walkable --space <uuid> --yes',
         );
         process.exitCode = 1;
     }

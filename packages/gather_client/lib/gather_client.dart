@@ -12,3 +12,4 @@ export 'src/gather_auth.dart';
 export 'src/msgpack.dart';
 export 'src/party.dart';
 export 'src/presence_tracker.dart';
+export 'src/space_map.dart';

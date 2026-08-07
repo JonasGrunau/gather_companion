@@ -14,31 +14,26 @@
 /// accepted, walls and void included. Collision is enforced client-side only, so a
 /// random tile lands you inside scenery about as often as not.
 ///
-/// Rather than reconstruct the collision map out of `MapObject` and
-/// `CatalogItemVariant.collision` — whose encoding this codebase has never actually
-/// captured, so building on it would be guesswork that lands you inside walls — this
-/// takes the empirical route: **a tile somebody has been on is a tile you can be
-/// on.** Two sources feed it, and needing both is the whole point.
+/// The answer is to read the actual floor plan, which Gather sends us and this
+/// client used to throw away. [SpaceMap] decodes it out of the state dump —
+/// `MapArea` rectangles, `MapObject` furniture and the `collision` shapes behind
+/// it — and hands back every tile on the floor with the walls and the furniture
+/// taken out. On the space this was built against that is **9156 walkable tiles of
+/// 10168**.
 ///
-/// *Standing still* is the obvious one: the full state dump carries every member of
-/// the space with their last position — 111 of them in the space this was built
-/// against. It is free and definitionally valid, and for a long time it was the only
-/// source. On its own it is also far too thin to party on. Most of those 111 are
-/// parked at a desk, so the dump is worth roughly one tile per member: **78 tiles of
-/// a 124×82 map**, under one percent of the floor. Hold [safeTilesDefault] clear of
-/// everyone connected and about eighteen survive. Eighteen tiles at four hops a
-/// second is exhausted in under five seconds, and every hop after that is a repeat —
-/// which is exactly what it looked like.
+/// It is worth being clear about how much that changed, because the old approach
+/// was the whole bug. Party mode used to infer walkability: *a tile somebody has
+/// been seen on is a tile you can stand on*. That is true, and it is nowhere near
+/// enough. A state dump is worth about one tile per member — most people are parked
+/// at a desk — so it yielded **78 tiles of a 124×82 map**, under one percent of the
+/// floor, and after holding everyone clear about eighteen were left. Eighteen tiles
+/// at four hops a second is exhausted in five seconds; everything after that was a
+/// repeat. The picker was never at fault, and no amount of cleverness in it could
+/// have helped: it was already visiting everything it was offered.
 ///
-/// *Walking* is what makes it a real map. Positions arrive about four times a second,
-/// so a colleague crossing the office is a stream of adjacent tiles, each one proof
-/// that the floor there is walkable. [_learnWalk] keeps the tiles **between**
-/// consecutive sightings too, which roughly doubles the yield again. It only does so
-/// for a short, unambiguous run — see [_walkStepTiles] — because the one thing that
-/// must not happen is inventing a tile nobody crossed.
-///
-/// The pool therefore starts thin and fills in as the space is used: a few hundred
-/// tiles within a minute of connecting, a few thousand within fifteen.
+/// The map also arrives complete and stays current — it is patched on the same
+/// socket as everything else, so somebody rearranging the furniture updates it
+/// without a reconnect.
 ///
 /// ## Where you *should not* stand
 ///
@@ -70,6 +65,7 @@ import 'package:gather_events/gather_events.dart';
 
 import 'direct_collector.dart';
 import 'game_protocol.dart';
+import 'space_map.dart';
 
 /// How often to hop.
 const hopInterval = Duration(milliseconds: 250);
@@ -87,17 +83,6 @@ const hopInterval = Duration(milliseconds: 250);
 /// perceive. The rule worth keeping is "never open a bubble", and 5 keeps it.
 const safeTilesDefault = 5;
 
-/// The longest gap between two sightings of the same person that is still read as a
-/// walk, in tiles.
-///
-/// The tiles between two sightings are only knowable if the person went in a straight
-/// line between them, and that is an assumption, not an observation — Gather paths
-/// around obstacles, so a long gap could have been a dogleg through tiles we would be
-/// inventing rather than learning. What makes the assumption safe is keeping the gap
-/// small: at four samples a second nobody outruns a couple of tiles per sample, so a
-/// run this short has no room to bend. Anything longer is treated as a teleport and
-/// only its endpoint is kept.
-const _walkStepTiles = 4;
 
 /// How long party mode runs before switching itself off.
 ///
@@ -129,12 +114,12 @@ const _jumpFractions = [0.55, 0.35, 0.2, 0.08, 0.0];
 
 /// How many tiles a hop wants to choose between.
 ///
-/// Distance and variety pull against each other, and the safe pool is small — 22
-/// tiles of 78 known in the measured space, because holding [safeTilesDefault] clear
-/// of 21 people eats most of a 52x49 floor. Demanding the longest jump available
-/// then leaves two or three places to go, and the dance degenerates into bouncing
-/// between opposite corners: 120 hops used 23 tiles and landed on one of them 42
-/// times.
+/// Distance and variety pull against each other. Demanding the longest jump
+/// available leaves two or three places to go, and the dance degenerates into
+/// bouncing between opposite corners — measured, back when the pool was small: 120
+/// hops used 23 tiles and landed on one of them 42 times. The floor plan makes that
+/// far less likely than it was, but a nearly-empty office at the far end of a long
+/// map can still narrow the top rung to a handful of tiles.
 ///
 /// So the rule is not "jump as far as possible", it is **"jump as far as possible
 /// while still having somewhere to choose from"**.
@@ -143,12 +128,12 @@ const _minChoices = 6;
 /// The shortest thing that counts as a teleport at all.
 ///
 /// [_jumpFractions] is relative to the floor, which is what makes it portable — but
-/// relative alone is not enough. The measured space has a dense knot of safe tiles in
-/// one corner, and "as far as possible while having six choices" was happy to shuffle
-/// five tiles inside that knot. Five tiles is not a teleport, it is a walk.
+/// relative alone is not enough. A dense knot of safe tiles in one corner made "as
+/// far as possible while having six choices" happy to shuffle five tiles inside that
+/// knot. Five tiles is not a teleport, it is a walk.
 ///
 /// Ten is past every radius that means anything here — Gather opens a video bubble
-/// around three, [safeTilesDefault] is eight — so a hop that clears it has
+/// around three, [safeTilesDefault] is five — so a hop that clears it has
 /// unambiguously gone somewhere else.
 const minJumpTiles = 10;
 
@@ -191,13 +176,6 @@ class PartyMode {
   final double Function() _random;
   final DateTime Function() _now;
 
-  /// floorId -> tile key -> tile.
-  final Map<String, Map<String, PartyTile>> _tiles = {};
-
-  /// Where each person was last seen, so the tiles they crossed on the way to the
-  /// next sighting can be learned. Keyed by spaceUserId; the floor is carried so a
-  /// move between floors is never joined up into a walk.
-  final Map<String, ({String floorId, int x, int y})> _lastSeen = {};
 
   /// The most recent roster, which is what "where is everyone" is answered from.
   Roster? _roster;
@@ -238,60 +216,31 @@ class PartyMode {
         detail: _detail,
       );
 
-  /// How many tiles we know about, across all floors. Diagnostics only.
-  int get knownTiles =>
-      _tiles.values.fold(0, (total, pool) => total + pool.length);
+  /// How many tiles we could stand on if nobody were in the way. Diagnostics only.
+  int get knownTiles => _mapNow()?.walkable.length ?? 0;
 
-  /// Learn from a roster: every position in it is somewhere a body fits.
-  ///
-  /// Offline rows count. Their coordinates are wherever that person logged off,
-  /// which is a real tile they really stood on — and, being offline, one nobody is
-  /// standing on now. That makes the parked half of a large space the single best
-  /// source of safe tiles rather than dead weight.
-  void noteRoster(Roster roster) {
-    _roster = roster;
+  /// The floor plan for the floor we are on, or null before it has arrived.
+  SpaceMap? _mapNow() {
+    final me = _me();
+    return _collector()?.mapFor(me?.floorId);
+  }
+
+  /// Our own roster row, which is both where we are and which floor we are on.
+  RosterRow? _me() {
+    final roster = _roster;
+    if (roster == null) return null;
     for (final row in roster.rows) {
-      final x = row.x, y = row.y;
-      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      final floorId = row.floorId ?? '';
-      final pool = _tiles.putIfAbsent(floorId, () => {});
-      final tile = PartyTile(x, y);
-      pool[tile.key] = tile;
-      _learnWalk(pool, row.id, floorId, x.round(), y.round());
+      if (row.id == roster.selfId) return row;
     }
+    return null;
   }
 
-  /// Fill in the tiles between where somebody was and where they are now.
+  /// The roster is now only "where is everyone", not "where can I stand".
   ///
-  /// The step is only joined up when the two sightings are on one row, one column or
-  /// one diagonal, and no more than [_walkStepTiles] apart. Those are the cases where
-  /// the tiles in between are not a guess: there is only one path that short and
-  /// straight, so every tile on it was walked. A dogleg is ambiguous — the walker
-  /// could have gone around either side of whatever was in the way — so it is left
-  /// alone and only the endpoint survives, from the caller.
-  void _learnWalk(
-    Map<String, PartyTile> pool,
-    String id,
-    String floorId,
-    int x,
-    int y,
-  ) {
-    final was = _lastSeen[id];
-    _lastSeen[id] = (floorId: floorId, x: x, y: y);
-    if (was == null || was.floorId != floorId) return;
-
-    final dx = x - was.x, dy = y - was.y;
-    final steps = max(dx.abs(), dy.abs());
-    if (steps < 2 || steps > _walkStepTiles) return;
-    // Straight only: along a row, along a column, or exactly diagonal.
-    if (dx != 0 && dy != 0 && dx.abs() != dy.abs()) return;
-
-    final stepX = dx ~/ steps, stepY = dy ~/ steps;
-    for (var i = 1; i < steps; i++) {
-      final tile = PartyTile(was.x + stepX * i, was.y + stepY * i);
-      pool[tile.key] = tile;
-    }
-  }
+  /// It used to be both, and conflating them is what starved the tile pool. Where
+  /// you can stand comes from [SpaceMap]; the roster answers the other question,
+  /// which it is actually authoritative about.
+  void noteRoster(Roster roster) => _roster = roster;
 
   /// Starts hopping, or refuses and says why.
   ///
@@ -401,7 +350,7 @@ class PartyMode {
     }
   }
 
-  /// Every known tile on my floor that is at least [safeTiles] from everyone
+  /// Every walkable tile on my floor that is at least [safeTiles] from everyone
   /// connected.
   ///
   /// Exposed rather than private because it is the whole interesting part, and the
@@ -412,27 +361,23 @@ class PartyMode {
       return (tiles: const [], detail: 'waiting for the first roster from Gather', me: null);
     }
 
-    RosterRow? me;
-    for (final row in roster.rows) {
-      if (row.id == roster.selfId) {
-        me = row;
-        break;
-      }
-    }
+    final me = _me();
     if (me == null || me.x == null || me.y == null) {
       return (tiles: const [], detail: 'still working out which avatar is yours', me: null);
     }
 
-    final floorId = me.floorId ?? '';
-    final pool = _tiles[floorId];
-    if (pool == null || pool.isEmpty) {
-      return (tiles: const [], detail: 'no tiles known on this floor yet', me: me);
+    final map = _collector()?.mapFor(me.floorId);
+    if (map == null) {
+      return (tiles: const [], detail: 'still reading the floor plan from Gather', me: me);
     }
 
-    // Only people who are actually here can be walked into. An offline row is an
-    // avatar parked at a desk — the same reasoning `PresenceTracker` uses to avoid
-    // reporting empty desks as colleagues standing next to you.
-    final others = <RosterRow>[];
+    // Stamp a keep-out disc around each person rather than measuring every tile
+    // against every person. The floor runs to ten thousand tiles now, so the old
+    // way was tiles x crowd — a quarter of a million comparisons a second on a
+    // phone. A disc is (2r+1)^2 per person and does not grow with the map at all.
+    final excluded = <int>{};
+    final floorId = me.floorId;
+    var crowd = 0;
     for (final row in roster.rows) {
       if (row.id == roster.selfId) continue;
       if (row.connected == false) continue;
@@ -440,35 +385,37 @@ class PartyMode {
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
       // An unknown floor is not an objection, and here that errs towards being
       // *more* careful rather than less.
-      if (row.floorId != null && floorId != '' && row.floorId != floorId) continue;
-      others.add(row);
-    }
-
-    // Squared throughout: this is the one loop that scales with the pool *and* the
-    // crowd, and now that the pool runs to thousands of tiles it is a few hundred
-    // thousand comparisons a second on a phone. Comparing squares is the same
-    // predicate without the square root.
-    final safeSquared = safeTiles * safeTiles;
-    final tiles = <PartyTile>[];
-    for (final tile in pool.values) {
-      // Standing still is not a hop.
-      if (tile.x == me.x && tile.y == me.y) continue;
-      var clear = true;
-      for (final other in others) {
-        if (_distanceSquared(tile.x, tile.y, other.x!, other.y!) < safeSquared) {
-          clear = false;
-          break;
+      if (row.floorId != null && floorId != null && row.floorId != floorId) continue;
+      crowd++;
+      final cx = x.round(), cy = y.round();
+      for (var dy = -safeTiles; dy <= safeTiles; dy++) {
+        final ty = cy + dy;
+        if (ty < 0 || ty >= map.height) continue;
+        for (var dx = -safeTiles; dx <= safeTiles; dx++) {
+          final tx = cx + dx;
+          if (tx < 0 || tx >= map.width) continue;
+          // A disc, not a square: the rule is a distance, and the corners of a
+          // square are 1.4x further out than the rule asks for.
+          if (dx * dx + dy * dy >= safeTiles * safeTiles) continue;
+          excluded.add(ty * map.width + tx);
         }
       }
-      if (clear) tiles.add(tile);
+    }
+
+    final here = me.y!.round() * map.width + me.x!.round();
+    final tiles = <PartyTile>[];
+    for (final tile in map.walkable) {
+      if (tile == here) continue; // standing still is not a hop
+      if (excluded.contains(tile)) continue;
+      tiles.add(PartyTile(map.xOf(tile), map.yOf(tile)));
     }
 
     if (tiles.isEmpty) {
       return (
         tiles: tiles,
-        detail: others.isNotEmpty
-            ? 'everywhere known is within $safeTiles tiles of someone'
-            : 'no tiles known on this floor yet',
+        detail: crowd > 0
+            ? 'everywhere on this floor is within $safeTiles tiles of someone'
+            : 'the floor plan has nowhere to stand',
         me: me,
       );
     }
@@ -482,27 +429,42 @@ class PartyMode {
   /// Distance is what makes a single hop *look* like a teleport instead of a step.
   /// Coverage is what stops a hundred hops from being the same six tiles.
   PartyTile _pick(List<PartyTile> tiles, RosterRow me) {
-    double away(PartyTile t) => _distance(t.x, t.y, me.x!, me.y!);
+    // Measured once and carried, rather than recomputed inside each filter below.
+    // There are five rungs plus the hard floor, and the candidate list is now the
+    // whole walkable floor — recomputing would be six square roots per tile per
+    // hop, four times a second.
+    final mx = me.x!, my = me.y!;
+    final away = List<double>.generate(
+      tiles.length,
+      (i) => _distance(tiles[i].x, tiles[i].y, mx, my),
+      growable: false,
+    );
 
     // The hard floor first, and everything after works inside the result — so
     // relaxing for choice or for a cramped floor can never talk us back into a short
     // hop.
-    final eligible = tiles.where((t) => away(t) >= minJumpTiles).toList();
-    final pool = eligible.isNotEmpty ? eligible : tiles;
+    var pool = [
+      for (var i = 0; i < tiles.length; i++)
+        if (away[i] >= minJumpTiles) i,
+    ];
+    if (pool.isEmpty) pool = [for (var i = 0; i < tiles.length; i++) i];
 
     // Then the longest rung that still offers a real choice. Each rung down is a
     // superset of the one above, so the search is monotonic.
-    final reach = _spread(pool);
+    final reach = _spread([for (final i in pool) tiles[i]]);
     var candidates = pool;
     for (final fraction in _jumpFractions) {
       final min = reach * fraction;
       if (min <= 0) break; // The last rung admits everything, which `candidates` is.
-      final far = pool.where((t) => away(t) >= min).toList();
+      final far = [
+        for (final i in pool)
+          if (away[i] >= min) i,
+      ];
       if (far.isEmpty) continue;
       candidates = far;
       if (far.length >= _minChoices) break;
     }
-    return _leastVisited(candidates);
+    return _leastVisited([for (final i in candidates) tiles[i]]);
   }
 
   /// How far apart the two most distant candidates could be: the diagonal of their

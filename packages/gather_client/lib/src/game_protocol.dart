@@ -47,17 +47,28 @@
 /// plus `SpaceUser.userAccountId` gives a second, slower route.
 library;
 
+import 'space_map.dart';
+
 /// Only these models matter; a full state dump is mostly calendars and catalogs.
 const _models = {
   'SpaceUser',
   'Connection',
   'UserAccount',
   'Space',
+  // The floor plan. Party mode needs to know which tiles exist before it can
+  // pick one, and the map screen draws them. See [SpaceMapBuilder].
+  'FloorMap',
+  'MapArea',
+  'MapObject',
+  'CatalogItemVariant',
   // Meetings, for the two things somebody can do *at* you that are recorded as
   // state rather than sent over the event bus. See [_MeetingWatch].
   'MeetingParticipant',
   'MeetingJoinRequest',
 };
+
+/// The map models, routed to [SpaceMapBuilder] rather than to the roster.
+const _mapModels = {'FloorMap', 'MapArea', 'MapObject', 'CatalogItemVariant'};
 
 /// SpaceUser fields worth tracking, for field-level `replace` patches.
 ///
@@ -174,6 +185,10 @@ class _Row {
 
 class GameProtocolReader {
   GameProtocolReader({void Function(String)? log}) : _log = log ?? _noop;
+
+  /// The floor plan, accumulated from the same patch stream as everything else and
+  /// rebuilt only when one of its models actually moves.
+  final SpaceMapBuilder mapBuilder = SpaceMapBuilder();
 
   static void _noop(String _) {}
 
@@ -296,6 +311,15 @@ class GameProtocolReader {
     final model = patch['model'];
     if (model is! String || !_models.contains(model)) return false;
     _patchCount++;
+
+    if (_mapModels.contains(model)) {
+      // Never "the roster changed": a map edit is not somebody moving, and
+      // republishing an 80-row roster because a plant was dragged is exactly the
+      // traffic the coalescing window exists to prevent. The map is read from
+      // `mapBuilder` when it is wanted.
+      mapBuilder.apply(model, patch);
+      return false;
+    }
 
     if (model == 'MeetingParticipant' || model == 'MeetingJoinRequest') {
       _meetings.apply(model, patch, isNews: isNews, selfId: selfId, out: _pending);

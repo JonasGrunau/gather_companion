@@ -39,6 +39,7 @@ import 'dart:typed_data';
 import 'game_protocol.dart';
 import 'gather_auth.dart';
 import 'msgpack.dart';
+import 'space_map.dart';
 
 const _gameSocket = 'wss://game-router.v2.gather.town/gather-game-v2';
 
@@ -147,6 +148,13 @@ class DirectCollector {
 
   /// Our own `SpaceUser` id, once the dump has told us which row is us.
   String? get selfId => reader.selfId;
+
+  /// The floor plan for a floor, or null until the dump has carried enough of it.
+  ///
+  /// Read through rather than cached: the builder rebuilds only when a map model
+  /// actually changed, so asking repeatedly is cheap and asking early is correct —
+  /// it starts returning a map the moment one can be built.
+  SpaceMap? mapFor(String? floorId) => reader.mapBuilder.forFloor(floorId);
 
   Map<String, Object?> stats() => {
         ...reader.stats(),

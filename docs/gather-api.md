@@ -752,6 +752,68 @@ Map bounds come from the base `MapArea`: `FloorMap.baseAreaId` names it, and its
 `dimensionsInTiles` is an ext-0 `{$type:'Dimensions', width, height}` — 124×82 for
 the space measured here.
 
+### The whole map is in the state dump
+
+Measured 2026-08-07 with `tool/probe-connect.mjs map` and `walkable`.
+
+**There is no REST route for it.** `/spaces/<id>/maps`, `/spaces/<id>/floors` and
+`/spaces/<id>/map` all 404; `/spaces/<id>` answers `{"exists":true}` and nothing
+more. None is needed — the map arrives on the game socket like everything else, and
+this client threw it away until now.
+
+Four models carry it:
+
+| model | rows | what it contributes |
+|---|---|---|
+| `FloorMap` | 1 | `baseAreaId` → the base area; `floorId` → which floor this is |
+| `MapArea` | 93 | rectangles: the grid itself, rooms, desks, team zones |
+| `MapObject` | 1140 | furniture, each naming a `CatalogItemVariant` |
+| `CatalogItemVariant` | 477 | the shapes, including `collision` |
+
+**`collision` is `{points: [{x, y}, …]}`** — a list of tile offsets the object
+blocks, *not* a bitmask. 341 of the 477 variants block nothing at all (rugs,
+posters, things standing on desks); the rest block one to six tiles. `sittable` has
+the same shape.
+
+**Positions compose through a parent chain.** `MapArea` and `MapObject` both carry
+`relativeX`/`relativeY` against a `parentAreaId` *or* a `parentObjectId` — objects
+nest inside other objects, so a monitor is positioned against its desk. Absolute
+position is the sum up the chain to the base area.
+
+**Area origins are whole tiles; object origins never are.** All 93 areas resolve to
+integers. All 1140 objects carry a fractional offset, because `relativeX` places a
+sprite that has its own pixel origin (`originX`/`originY`, `dimensionsInPixels`).
+Collision offsets are near-integers with the same kind of nudge (`-0.0625`,
+`0.9375`).
+
+**The rounding rule was measured, not reasoned.** Every combination of floor / round
+/ ceil over origin and offset was swept against the live roster, scoring each by how
+many *connected, non-bot* members it placed inside a wall — everybody is standing
+somewhere, so live positions are a free test of the decoding:
+
+| rule | blocked tiles | people in walls (of 11 connected) |
+|---|---|---|
+| `round(origin + offset)` | 516 | 7 |
+| `floor(origin + offset)` | 522 | 2 |
+| **`floor(origin) + round(offset)`** | **524** | **0** |
+| `round(origin) + floor(offset)` | 524 | 7 |
+
+Filtering to connected non-bots matters: of 112 rows with a position, only 11 were
+live people. The rest are offline members whose coordinates are wherever they logged
+off — furniture may have been placed there since — and `RecordingClient` bots, which
+are not avatars.
+
+**Walls are not objects.** They are a property of an area: `wallsTexture` is
+`NewStyleNoWall` for the 74 areas that are only logical groupings (a desk cluster, a
+team's zone) and a real texture for the 17 that are rooms. A room blocks its own
+perimeter, minus the gaps in `doorways.locations` — each `{origin:{x,y},
+orientation}` is a **two-tile** gap, extending down for `Vertical` and right for
+`Horizontal`.
+
+Together: **1012 blocked of 10168 tiles, 9156 walkable**, and zero connected members
+standing anywhere this calls blocked. `packages/gather_client/lib/src/space_map.dart`
+is the implementation.
+
 ### Entering costs something
 
 `enterSpace` increments **`numTimesEnteredSpace`** on your own `SpaceUser`, once per

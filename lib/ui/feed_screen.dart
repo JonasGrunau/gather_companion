@@ -6,6 +6,7 @@ import 'package:gather_events/gather_events.dart';
 
 import '../src/app_state.dart';
 import '../src/link_status.dart';
+import 'map_screen.dart';
 import '../theme/gather_theme.dart';
 
 /// The main screen: who is following you, right now.
@@ -108,6 +109,19 @@ class _TopBar extends StatelessWidget {
                 ),
               ],
             ),
+          ),
+          IconButton(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => ListenableBuilder(
+                  listenable: state,
+                  builder: (context, _) => MapScreen(state: state),
+                ),
+              ),
+            ),
+            visualDensity: VisualDensity.compact,
+            icon: Icon(Icons.map_outlined, color: t.mutedForeground, size: 21),
+            tooltip: 'The office',
           ),
           IconButton(
             onPressed: state.reconnect,

@@ -15,6 +15,18 @@ library;
 import 'package:gather_client/gather_client.dart';
 import 'package:test/test.dart';
 
+/// An open floor with nothing on it, which is the fixture most tests want.
+///
+/// Party mode reads walkability from the map now, so the map is what has to exist
+/// for it to do anything at all.
+SpaceMap _open({int width = 40, int height = 40, String floorId = 'f1'}) => SpaceMap(
+      floorId: floorId,
+      width: width,
+      height: height,
+      blocked: const {},
+      rooms: const [],
+    );
+
 /// A collector that records teleports instead of sending them.
 class _FakeCollector implements DirectCollector {
   _FakeCollector();
@@ -22,9 +34,13 @@ class _FakeCollector implements DirectCollector {
   String? self = 'me-1';
   final List<({num x, num y, String direction})> hops = [];
   bool refuse = false;
+  SpaceMap? map = _open();
 
   @override
   String? get selfId => self;
+
+  @override
+  SpaceMap? mapFor(String? floorId) => map;
 
   @override
   ({bool ok, String? detail}) teleport({
@@ -44,25 +60,9 @@ class _FakeCollector implements DirectCollector {
 RosterRow _row(String id, num x, num y, {bool connected = true, String floor = 'f1'}) =>
     RosterRow(id: id, x: x, y: y, floorId: floor, connected: connected);
 
-/// A floor of tiles laid out by having a crowd of offline people stand on them.
-///
-/// Offline rows are the point: their positions are real tiles nobody occupies, which
-/// is exactly the pool party mode wants.
-Roster _floor({
-  required List<RosterRow> present,
-  int width = 40,
-  int height = 40,
-  int step = 4,
-}) {
-  final rows = <RosterRow>[...present];
-  var n = 0;
-  for (var x = 0; x < width; x += step) {
-    for (var y = 0; y < height; y += step) {
-      rows.add(_row('parked-${n++}', x, y, connected: false));
-    }
-  }
-  return Roster(selfId: 'me-1', rows: rows);
-}
+/// Just the people. Where anyone *can* stand is [_open]'s business now.
+Roster _floor({required List<RosterRow> present}) =>
+    Roster(selfId: 'me-1', rows: present);
 
 void main() {
   late _FakeCollector collector;
@@ -152,29 +152,36 @@ void main() {
       expect(p.state().detail, contains('within 100 tiles of someone'));
     });
 
-    test('offline avatars are tiles, not obstacles', () {
-      // Somebody logged off at a desk is not standing there — and their last
-      // position is a tile that definitionally fits a body.
-      final p = build();
-      p.noteRoster(Roster(selfId: 'me-1', rows: [
-        _row('me-1', 0, 0),
-        _row('parked', 20, 20, connected: false),
-      ]));
+    test('an offline avatar is not somebody to avoid', () {
+      // Somebody logged off at a desk is not standing there, so their tile costs
+      // nobody any clearance. The radius here is set past the whole floor, so if
+      // they counted there would be nowhere to go at all — which is exactly what a
+      // connected person in the same spot produces.
+      final crowded = build(safeTiles: 100)
+        ..noteRoster(_floor(present: [_row('me-1', 0, 0), _row('them', 20, 20)]));
+      expect(crowded.start().ok, isTrue);
+      expect(collector.hops, isEmpty, reason: 'a connected colleague blocks the floor');
+
+      collector.hops.clear();
+      final p = party = PartyMode(collector: () => collector, safeTiles: 100, random: () => 0)
+        ..noteRoster(_floor(present: [
+          _row('me-1', 0, 0),
+          _row('parked', 20, 20, connected: false),
+        ]));
 
       expect(p.start().ok, isTrue);
-      expect(collector.hops.single, (x: 20, y: 20, direction: 'Up'));
+      expect(collector.hops, isNotEmpty, reason: 'an offline avatar blocks nothing');
     });
 
     test('someone on another floor cannot be walked into', () {
-      final p = build();
+      final p = build(safeTiles: 100);
       p.noteRoster(Roster(selfId: 'me-1', rows: [
         _row('me-1', 0, 0, floor: 'f1'),
-        _row('parked', 20, 20, connected: false, floor: 'f1'),
         _row('upstairs', 20, 20, floor: 'f2'),
       ]));
 
       expect(p.start().ok, isTrue);
-      expect(collector.hops, hasLength(1), reason: 'the other floor is irrelevant');
+      expect(collector.hops, isNotEmpty, reason: 'the other floor is irrelevant');
     });
   });
 
@@ -284,69 +291,54 @@ void main() {
     });
   });
 
-  test('tiles accumulate across rosters', () {
-    final p = build();
-    expect(p.knownTiles, 0);
+  group('the floor plan is where tiles come from', () {
+    test('there is nowhere to go until the map arrives', () {
+      collector.map = null;
+      final p = build()..noteRoster(_floor(present: [_row('me-1', 5, 5)]));
 
-    p.noteRoster(Roster(selfId: 'me-1', rows: [_row('me-1', 1, 1)]));
-    expect(p.knownTiles, 1);
-
-    p.noteRoster(Roster(selfId: 'me-1', rows: [_row('me-1', 2, 2)]));
-    expect(p.knownTiles, 2, reason: 'everyone who walks anywhere contributes tiles');
-
-    p.noteRoster(Roster(selfId: 'me-1', rows: [_row('me-1', 2, 2)]));
-    expect(p.knownTiles, 2, reason: 'and the same tile twice is still one tile');
-  });
-
-  /// The pool is the scarce resource: a state dump is worth about one tile per
-  /// member, which on a 124×82 map is under one percent of the floor and is why
-  /// party mode used to circle the same dozen tiles. Watching people walk is what
-  /// turns it into a map, so it has to pick up the tiles *between* sightings — but
-  /// only where they are an observation rather than a guess.
-  group('learning the floor from people walking', () {
-    /// Two sightings of one person, and what the pool knew afterwards.
-    int tilesAcross(PartyTile from, PartyTile to) {
-      final p = PartyMode(collector: () => _FakeCollector());
-      addTearDown(p.dispose);
-      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', from.x, from.y)]));
-      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', to.x, to.y)]));
-      return p.knownTiles;
-    }
-
-    test('a walk along a row leaves every tile it crossed behind', () {
-      // (4,7) -> (8,7): both ends plus the three tiles walked over.
-      expect(tilesAcross(const PartyTile(4, 7), const PartyTile(8, 7)), 5);
+      expect(p.start().ok, isTrue, reason: 'it starts; it just has no floor yet');
+      expect(collector.hops, isEmpty);
+      expect(p.state().detail, contains('floor plan'));
     });
 
-    test('a diagonal walk counts too', () {
-      expect(tilesAcross(const PartyTile(0, 0), const PartyTile(3, 3)), 4);
-    });
-
-    test('a dogleg is left alone, because the path it took is not knowable', () {
-      // They could have gone along x first or along y first, and the corner tile
-      // differs. Inventing one is how you end up teleporting into a wall.
-      expect(
-        tilesAcross(const PartyTile(0, 0), const PartyTile(3, 2)),
-        2,
-        reason: 'only the two sightings themselves',
+    test('walls and furniture are never landed on', () {
+      // A corridor: one open column through a floor that is otherwise solid. The
+      // server would happily accept a wall tile, so this is the only thing standing
+      // between party mode and teleporting into the scenery.
+      const width = 30, height = 30, open = 7;
+      collector.map = SpaceMap(
+        floorId: 'f1',
+        width: width,
+        height: height,
+        blocked: {
+          for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+              if (x != open) y * width + x,
+        },
+        rooms: const [],
       );
+      var roll = 0.0;
+      final p = party = PartyMode(
+        collector: () => collector,
+        random: () => (roll = (roll + 0.37) % 1.0),
+      )..noteRoster(_floor(present: [_row('me-1', open, 0)]));
+
+      p.start();
+      for (var i = 0; i < 40; i++) {
+        p.tick();
+      }
+
+      expect(collector.hops, isNotEmpty);
+      for (final hop in collector.hops) {
+        expect(hop.x, open, reason: 'hopped into a wall at (${hop.x},${hop.y})');
+      }
     });
 
-    test('a jump too far to be a walk is not joined up', () {
-      // Nobody covers this between two samples, so it is a teleport or a respawn,
-      // and the straight line between is unexplored floor.
-      expect(
-        tilesAcross(const PartyTile(0, 0), const PartyTile(40, 0)),
-        2,
-        reason: 'only the two sightings themselves',
-      );
-    });
-
-    test('changing floors is never a walk', () {
-      final p = build();
-      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', 0, 0, floor: 'f1')]));
-      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', 3, 0, floor: 'f2')]));
-      expect(p.knownTiles, 2, reason: 'the tiles between are on neither floor');
+    test('the whole floor is available, not just where people have been', () {
+      // The bug this fixes: the pool used to be tiles somebody had been seen on,
+      // which on a real map is under one percent of it.
+      final p = build()..noteRoster(_floor(present: [_row('me-1', 0, 0)]));
+      expect(p.knownTiles, 40 * 40);
     });
   });
 }

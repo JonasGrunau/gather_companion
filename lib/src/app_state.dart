@@ -6,6 +6,7 @@ import 'package:gather_events/gather_events.dart';
 
 import 'credentials.dart';
 import 'link_status.dart';
+import 'map_person.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
@@ -117,6 +118,77 @@ class AppState extends ChangeNotifier {
     final list = _snapshot.players.where((p) => p.isFollowingMe).toList()
       ..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return list;
+  }
+
+  // ---- the map ---------------------------------------------------------------
+
+  /// The last roster, kept whole.
+  ///
+  /// [PresenceSnapshot] deliberately drops positions — knowing who is *near* you
+  /// says nothing about whether they want you, which is the mistake this app was
+  /// built to stop making. The map screen is the one place where a coordinate is
+  /// the point rather than a proxy for something else, so it reads the roster
+  /// directly instead of widening `PlayerRef` for everybody.
+  Roster? _roster;
+
+  /// The floor plan, or null until enough of it has arrived.
+  SpaceMap? get map => debugMap ?? _collector?.mapFor(_myRow()?.floorId);
+
+  /// Test seam. The real map is assembled from ~1700 patches inside a live state
+  /// dump, which is not a thing a widget test can arrange.
+  @visibleForTesting
+  SpaceMap? debugMap;
+
+  RosterRow? _myRow() {
+    final roster = _roster;
+    if (roster == null) return null;
+    for (final row in roster.rows) {
+      if (row.id == roster.selfId) return row;
+    }
+    return null;
+  }
+
+  /// Where I am, in tiles, or null before the first roster.
+  ({int x, int y})? get myTile {
+    final me = _myRow();
+    final x = me?.x, y = me?.y;
+    if (x == null || y == null || !x.isFinite || !y.isFinite) return null;
+    return (x: x.round(), y: y.round());
+  }
+
+  /// Everyone else who is actually here, with somewhere to draw them.
+  ///
+  /// Offline rows are excluded: their coordinates are wherever somebody logged off,
+  /// so drawing them would populate the map with people who are not in the building.
+  List<MapPerson> get peopleOnMap {
+    final roster = _roster;
+    if (roster == null) return const [];
+    final floorId = _myRow()?.floorId;
+    final followers = {
+      for (final p in _snapshot.players)
+        if (p.isFollowingMe) p.id,
+    };
+    final speaking = {
+      for (final p in _snapshot.players)
+        if (p.speaking) p.id,
+    };
+    final out = <MapPerson>[];
+    for (final row in roster.rows) {
+      if (row.id == roster.selfId) continue;
+      if (row.connected == false) continue;
+      final x = row.x, y = row.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      if (row.floorId != null && floorId != null && row.floorId != floorId) continue;
+      out.add(MapPerson(
+        id: row.id,
+        label: row.name ?? row.id.substring(0, row.id.length.clamp(0, 6)),
+        x: x.round(),
+        y: y.round(),
+        isFollowingMe: followers.contains(row.id),
+        speaking: speaking.contains(row.id),
+      ));
+    }
+    return out;
   }
 
   PartyState get party => _snapshot.party;
@@ -281,6 +353,7 @@ class AppState extends ChangeNotifier {
         // Party mode first, so a hop fired from this same roster is judged against the
         // freshest positions we hold rather than the previous ones.
         party.noteRoster(roster);
+        _roster = roster;
         final out = _tracker.applyRoster(roster);
         _onFold(out);
       }))
@@ -385,6 +458,14 @@ class AppState extends ChangeNotifier {
   }
 
   // ---- test seams ------------------------------------------------------------
+
+  /// Feeds a roster in as though Gather had sent it, for the screens that draw
+  /// positions rather than the presence digest.
+  @visibleForTesting
+  void debugApplyRoster(Roster roster) {
+    _roster = roster;
+    notifyListeners();
+  }
 
   /// Feeds a snapshot in as though Gather had sent it, so the screens can be
   /// exercised without a connection.
