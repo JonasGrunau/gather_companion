@@ -1,13 +1,11 @@
 import { createServer } from 'node:http';
 import { hostname } from 'node:os';
 
-import { CdpCollector, DEFAULT_CDP_PORT } from './cdp.js';
+import { DesktopNotificationReader } from './desktop-notifications.js';
 import { DirectCollector } from './direct.js';
-import { hasGatherSession } from './gather-auth.js';
 import { bridgeStatus } from './events.js';
-import { GatherLogParser } from './log-parser.js';
 import { LogTail } from './log-tail.js';
-import { FollowDetector, PresenceTracker } from './presence.js';
+import { PresenceTracker } from './presence.js';
 import { PairingCodes } from './pairing.js';
 import { gatherLogFile, lanAddresses, readGatherSpace } from './paths.js';
 import { acceptWebSocket, isWebSocketUpgrade } from './ws.js';
@@ -18,47 +16,52 @@ export const DEFAULT_PORT = 7799;
 const HISTORY = 500;
 
 /**
- * The daemon: two collectors in, one WebSocket out.
+ * The daemon: Gather in, one WebSocket out.
  *
  * ```
- *   ~/Library/Logs/GatherV2/main.log ──▶ LogTail ──▶ GatherLogParser ──┐
- *                                                                      ├─▶ PresenceTracker ──▶ WS clients
- *   Gather's game server ──▶ DirectCollector    (preferred)  ──────────┘
- *   Gather renderer ──────▶ CdpCollector        (fallback)
+ *   Gather's game server ────────────▶ DirectCollector ─────────────┐
+ *                                                                   ├─▶ PresenceTracker ─▶ WS clients
+ *   ~/Library/Logs/GatherV2/main.log ─▶ DesktopNotificationReader ──┘
  * ```
  *
- * The log collector always runs, needs no setup, and is the only source of
- * mic/camera/screenshare — those are not in Gather's game state at all, so no
- * amount of protocol access replaces it.
+ * `DirectCollector` is the whole presence story: it authenticates as the user and
+ * reads the space from Gather itself. It replaced two scrapers — a CDP attachment
+ * to the desktop client's renderer, and a broad tail of that client's log — both
+ * of which were strictly worse (a debug port left open on a live session; regexes
+ * over log lines Gather never promised to keep).
  *
- * Exactly one *rich* collector runs, supplying names, coordinates, clusters and
- * real follow state. `DirectCollector` connects to Gather itself and is preferred;
- * `CdpCollector` eavesdrops on the desktop client's socket and is the fallback for
- * machines where no Gather session has been adopted. Both emit the same `roster`
- * and `status` events, so everything downstream is indifferent to which one won.
+ * The log tail survives in one narrow form, and only because there is no
+ * alternative: Gather's *own* notifications — waves, meeting invites, event
+ * reminders — are decisions its client makes and hands to the OS. They are in no
+ * model and no REST route. They are also precisely the events worth waking a
+ * phone for, so they are worth the one remaining dependency on the desktop app.
+ *
+ * Mic, camera and screenshare went with the old parser and are not coming back;
+ * they exist nowhere but that client's IPC. `SpaceUser.speaking` — live voice
+ * activity, and the most frequent delta on the wire — covers the useful half.
  */
 export class BridgeServer {
   constructor({
     token,
     port = DEFAULT_PORT,
-    cdpPort = DEFAULT_CDP_PORT,
-    logSource = gatherLogFile,
-    // null = pick automatically (direct when a session has been adopted),
-    // true = insist on direct, false = force the CDP collector.
-    direct = null,
     spaceId = null,
+    logSource = gatherLogFile,
+    // Test seams, both passed straight through to the collector. Production uses
+    // neither: it reads the adopted session and talks to Gather.
+    socketUrl = undefined,
+    getToken = undefined,
     log = () => {},
   }) {
     this.token = token;
     this.port = port;
-    this.cdpPort = cdpPort;
-    this.direct = direct;
     this.spaceId = spaceId;
     this.logSource = logSource;
+    this.socketUrl = socketUrl;
+    this.getToken = getToken;
     this.log = log;
 
-    this.tracker = new PresenceTracker({ followDetector: new FollowDetector() });
-    this.parser = new GatherLogParser();
+    this.tracker = new PresenceTracker();
+    this.notifications = new DesktopNotificationReader();
     this.pairing = new PairingCodes({ log });
 
     /** @type {Set<import('./ws.js').WsConnection>} */
@@ -70,10 +73,9 @@ export class BridgeServer {
     this._seq = 0;
 
     this._http = null;
+    /** @type {DirectCollector|null} */
+    this._collector = null;
     this._tail = null;
-    /** The active rich collector: a DirectCollector or a CdpCollector. */
-    this._rich = null;
-    this._richKind = null;
     this._startedAt = Date.now();
 
     const space = readGatherSpace();
@@ -82,13 +84,13 @@ export class BridgeServer {
 
   async start() {
     await this._startHttp();
-    this._startLogTail();
-    this._startRich();
+    this._startCollector();
+    this._startNotificationTail();
   }
 
   async stop() {
+    this._collector?.stop();
     this._tail?.stop();
-    this._rich?.stop();
     for (const client of this._clients) client.close(1001);
     this._clients.clear();
     this._rawClients.clear();
@@ -180,10 +182,10 @@ export class BridgeServer {
       }
       case '/resync': {
         // Deliberately reachable by GET as well as POST: it is idempotent-ish and
-        // the cost of getting it wrong is a two-second reconnect.
-        const rich = this._rich;
-        if (!rich) return json(503, { ok: false, detail: 'no rich collector running' });
-        rich.resync().then((r) => json(r.ok ? 200 : 409, r)).catch((e) =>
+        // the cost of getting it wrong is a one-second reconnect.
+        const collector = this._collector;
+        if (!collector) return json(503, { ok: false, detail: 'no collector running' });
+        collector.resync().then((r) => json(r.ok ? 200 : 409, r)).catch((e) =>
           json(500, { ok: false, detail: e.message }),
         );
         return undefined;
@@ -206,19 +208,13 @@ export class BridgeServer {
       case '/collectors':
         return json(200, {
           health: this.tracker.health,
+          detail: this._collector?.detail ?? null,
           logFile: this.logSource,
           logTailHealthy: this._tail?.healthy ?? false,
-          // Which rich collector actually won: 'direct' or 'cdp'.
-          richCollector: this._richKind,
-          gatherSession: hasGatherSession(),
-          cdpPort: this.cdpPort,
-          // Kept under the `cdp*` names whichever collector is running, so
-          // existing tooling and `doctor` keep working.
-          cdpDetail: this._rich?.detail ?? null,
           // Live protocol-reader stats. This is the thing to look at when the
           // collector is connected but the roster stays empty: unknown frame types
           // here mean the wire format moved.
-          cdpStats: this._rich?.stats() ?? null,
+          stats: this._collector?.stats() ?? null,
         });
       default:
         return json(404, { error: 'not found' });
@@ -313,99 +309,69 @@ export class BridgeServer {
 
   // ---- collectors ------------------------------------------------------------
 
-  _startLogTail() {
+  _startCollector() {
+    const collector = new DirectCollector({
+      spaceId: this.spaceId,
+      socketUrl: this.socketUrl,
+      getToken: this.getToken,
+      log: this.log,
+    });
+    this._collector = collector;
+    this.log('connecting to Gather as an observer');
+
+    collector.on('roster', (roster) => {
+      const out = this.tracker.applyRoster(roster);
+      this._publish(out.emit);
+      if (out.stateChanged) this._publishSnapshot();
+    });
+
+    collector.on('status', ({ healthy, detail }) => {
+      this._ingest([bridgeStatus({ at: new Date(), collector: 'gather', healthy, detail })]);
+    });
+
+    collector.start();
+  }
+
+  /**
+   * Tails the desktop client's log for Gather's own notifications, and nothing
+   * else.
+   *
+   * Unlike the collector this is optional: with the desktop app closed there are
+   * no waves to hear about, so a missing log is reported and otherwise shrugged
+   * at rather than treated as a fault.
+   */
+  _startNotificationTail() {
     const tail = new LogTail(this.logSource);
     this._tail = tail;
 
     tail.on('line', (line) => {
       let events;
       try {
-        events = this.parser.feed(line);
+        events = this.notifications.feed(line);
       } catch (err) {
-        this.log(`parser error: ${err.message}`);
+        this.log(`notification reader error: ${err.message}`);
         return;
       }
       if (events.length) this._ingest(events);
     });
 
     tail.on('presence', (present) => {
-      this.log(present ? 'gather log found; tailing' : 'gather log missing (client not running?)');
+      this.log(
+        present
+          ? 'watching the desktop client\'s log for Gather notifications'
+          : 'gather log missing — no waves or meeting invites until the desktop app runs',
+      );
       this._ingest([
         bridgeStatus({
           at: new Date(),
           collector: 'logTail',
           healthy: present,
-          detail: present ? this.logSource : 'gather log not found',
+          detail: present ? this.logSource : 'gather log not found (desktop app not running)',
         }),
       ]);
     });
 
     tail.on('error', (err) => this.log(`log tail error: ${err.message}`));
     tail.start();
-  }
-
-  /**
-   * Starts whichever rich collector can run.
-   *
-   * Direct is preferred whenever a Gather session has been adopted: it needs no
-   * debug port, survives the desktop client being closed, and gets a full state
-   * dump on every connect instead of needing `resync`. CDP remains the fallback
-   * for machines that have not run `adopt`.
-   *
-   * Only one runs. Both feed the same tracker, so running both would double every
-   * roster and make the two disagree during reconnects.
-   */
-  _startRich() {
-    if (this.direct === false || !hasGatherSession()) {
-      if (this.direct === true) {
-        this.log('direct collector requested but no Gather session — run: gather-bridge adopt');
-      }
-      this._startCdp();
-      return;
-    }
-    this._startDirect();
-  }
-
-  _startDirect() {
-    const direct = new DirectCollector({ spaceId: this.spaceId, log: this.log });
-    this._rich = direct;
-    this._richKind = 'direct';
-    this.log('starting the direct collector (observer mode; no debug port needed)');
-    this._wireRich(direct, 'direct');
-    direct.start();
-  }
-
-  _startCdp() {
-    const cdp = new CdpCollector({ port: this.cdpPort, log: this.log });
-    this._rich = cdp;
-    this._richKind = 'cdp';
-    this._wireRich(cdp, 'cdp');
-    cdp.start();
-  }
-
-  _wireRich(collector, kind) {
-    collector.on('roster', ({ selfId, rows }) => {
-      const out = this.tracker.applyRoster({ selfId, rows });
-      this._publish(out.emit);
-      if (out.stateChanged) this._publishSnapshot();
-    });
-
-    collector.on('status', ({ healthy, detail }) => {
-      this._ingest([
-        bridgeStatus({
-          at: new Date(),
-          // Always reported as `cdp`, whichever collector is running. That field
-          // is the app's "do we have rich data" flag — `CollectorHealth.cdp`
-          // drives `hasRichData`, and `PresenceTracker` sets health by this very
-          // name (`presence.js:220`). Saying `direct` here would leave `cdp`
-          // false, so already-installed app builds would show the "log-only
-          // mode: no names" banner while we were in fact holding full names.
-          // The collector's identity goes in `detail` instead.
-          collector: 'cdp',
-          healthy,
-          detail: kind === 'cdp' ? detail : `direct: ${detail}`,
-        }),
-      ]);
-    });
   }
 }

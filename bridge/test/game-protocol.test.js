@@ -158,7 +158,7 @@ test('the tracker turns that patch into a "following you" event', () => {
   assert.equal(follow.followerId, THEM);
   assert.equal(follow.targetIsSelf, true);
   assert.equal(follow.confidence, 'observed', 'read from the field, not guessed from movement');
-  assert.equal(follow.source, 'cdp');
+  assert.equal(follow.source, 'gather');
 
   assert.deepEqual(
     tracker.snapshot().players.filter((p) => p.isFollowingMe).map((p) => p.id),

@@ -1,13 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { GatherLogParser } from '../lib/log-parser.js';
 import { PresenceTracker } from '../lib/presence.js';
 
 /**
- * Regressions for three ways the tracker used to describe the world wrongly:
- * people reported as screen sharing who were not, empty desks reported as people
- * standing next to you, and `player.moved` never being emitted at all.
+ * Regressions for ways the tracker used to describe the world wrongly: empty
+ * desks reported as people standing next to you, and `player.moved` never being
+ * emitted at all. Plus the shape of what the roster can and cannot know.
  */
 
 const ME = '11111111-1111-1111-1111-111111111111';
@@ -35,75 +34,34 @@ function trackerAt(themExtra) {
 
 const playerOf = (tracker, id) => tracker.snapshot().players.find((p) => p.id === id);
 
-// ---- screen sharing --------------------------------------------------------
+// ---- what the roster cannot know -------------------------------------------
 
-/**
- * Copied verbatim from a real main.log. Gather emits this when the client
- * *subscribes* to a remote track, and never emits the matching `true`, so it
- * cannot be read as "they started sharing".
- */
-const SCREEN_UNPAUSED =
-  '[2026-08-06 12:11:31.131] [verbose] (webapp)                       GameMediaController.remoteParticipantTrackStateChangedHandler setStreamPausedState 1652d4a7-7874-4c66-b571-d55d00205705 screen false';
+test('mic, camera and screenshare stay empty because nothing can fill them', () => {
+  // Pinned deliberately. These three were read out of the desktop client's log,
+  // which only ever emitted the *unpause* — so they could be turned off and never
+  // on — and `SpaceUser` carries no media columns at all. The log parser that
+  // supplied them is gone. If a future capture proves Gather exposes them
+  // somewhere, this test is the thing to delete, on purpose rather than by
+  // accident.
+  const them = playerOf(trackerAt({ x: 10, y: 10 }), THEM);
 
-test('a track unpause does not claim someone is sharing their screen', () => {
-  const tracker = new PresenceTracker();
-  const parser = new GatherLogParser();
-
-  const events = parser.feed(SCREEN_UNPAUSED);
-  assert.equal(events.length, 1, 'the line still parses into a media event');
-  assert.equal(events[0].track, 'screen');
-  assert.equal(events[0].paused, false);
-
-  for (const e of events) tracker.apply(e);
-
-  const them = playerOf(tracker, '1652d4a7-7874-4c66-b571-d55d00205705');
-  assert.equal(them.screensharing, false, 'an unpaused subscription is not a screen share');
-});
-
-test('a pause is trusted, and turns the track off', () => {
-  const tracker = new PresenceTracker();
-  // A camera, because `screensharing` already defaults to false and so has
-  // nowhere to fall — mute and camera-off are the transitions a pause can carry.
-  const paused = SCREEN_UNPAUSED.replace('screen false', 'video true');
-
-  const [event] = new GatherLogParser().feed(paused);
-  const out = tracker.apply(event);
-
-  assert.equal(playerOf(tracker, event.playerId).cameraOn, false);
-  assert.equal(out.stateChanged, true, 'a pause is the one direction we can believe');
-});
-
-test('no log line can assert that somebody else is screen sharing', () => {
-  // Worth pinning: the desktop client only ever logs the unpause, `SpaceUser`
-  // carries no media columns at all, and so the bridge has no honest way to say
-  // this is true. If a future capture proves otherwise, this test is the thing
-  // to delete — deliberately, rather than by accident.
-  const tracker = new PresenceTracker();
-  const parser = new GatherLogParser();
-
-  for (const state of ['true', 'false']) {
-    for (const event of parser.feed(SCREEN_UNPAUSED.replace('screen false', `screen ${state}`))) {
-      tracker.apply(event);
-    }
-  }
-
-  const them = playerOf(tracker, '1652d4a7-7874-4c66-b571-d55d00205705');
+  assert.equal(them.micOn, null);
+  assert.equal(them.cameraOn, null);
   assert.equal(them.screensharing, false);
 });
 
-test('an unrecognised track name never lands on screensharing', () => {
-  const tracker = new PresenceTracker();
-  const out = tracker.apply({
-    type: 'media.changed',
-    at: new Date().toISOString(),
-    source: 'log',
-    playerId: THEM,
-    track: 'datachannel',
-    paused: true,
+test('voice activity is state, and never news', () => {
+  // `speaking` is the most frequent patch on a live socket — 13 of 46 deltas in
+  // a three-minute sample. It belongs in the snapshot and nowhere near the feed.
+  const tracker = trackerAt({ speaking: false });
+  const out = tracker.applyRoster({
+    selfId: ME,
+    rows: [row(ME), row(THEM, { speaking: true })],
   });
 
-  assert.equal(out.stateChanged, false);
-  assert.equal(playerOf(tracker, THEM).screensharing, false);
+  assert.equal(playerOf(tracker, THEM).speaking, true);
+  assert.equal(out.stateChanged, true, 'the snapshot has to be republished');
+  assert.deepEqual(out.emit, [], 'but nothing goes in the feed');
 });
 
 // ---- empty desks -----------------------------------------------------------
@@ -166,7 +124,7 @@ test('a neighbour changing tiles emits player.moved', () => {
   assert.equal(moves.length, 1);
   assert.equal(moves[0].playerId, THEM);
   assert.equal(moves[0].x, 11);
-  assert.equal(moves[0].source, 'cdp');
+  assert.equal(moves[0].source, 'gather');
   assert.equal(moves[0].distance, 1);
 });
 

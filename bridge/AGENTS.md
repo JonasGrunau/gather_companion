@@ -6,36 +6,40 @@
 ## Purpose
 
 `gather-app-bridge` — the computer half. A zero-dependency Node daemon that
-watches the Gather V2 desktop client running on the same machine and serves what
-it sees over the LAN as HTTP and WebSocket. Installed as a macOS LaunchAgent by
-default, so it starts at login and survives crashes and sleep.
-
-The log collector always runs; exactly one *rich* collector runs alongside it.
-Both feed one `PresenceTracker`:
+connects to Gather V2 with the user's own session and serves what it sees over
+the LAN as HTTP and WebSocket. Installed as a macOS LaunchAgent by default, so it
+starts at login and survives crashes and sleep.
 
 ```
-  ~/Library/Logs/GatherV2/main.log ──▶ LogTail ──▶ GatherLogParser ──┐
-                                                                    ├─▶ PresenceTracker ──▶ WS clients
-  Gather's game server ──▶ DirectCollector   (preferred) ────────────┘
-  Gather renderer ──────▶ CdpCollector       (fallback)
+  Gather's game server ─────────────▶ DirectCollector ────────────┐
+                                                                  ├─▶ PresenceTracker ─▶ WS clients
+  ~/Library/Logs/GatherV2/main.log ─▶ DesktopNotificationReader ──┘
 ```
 
-- **Log-only mode** works with no setup. Proximity is *inferred* from Gather's
-  proximity-gated media connections. No names, no coordinates, and being followed
-  cannot be detected at all.
-- **Direct mode** is the default once `gather-app-bridge adopt` has copied the
-  desktop client's Gather session. The bridge connects to Gather itself as an
-  observer — full roster, no debug port, and it keeps working with the desktop app
-  closed. Every connection replays the full state dump, so `resync` is just a
-  reconnect.
-- **CDP mode** is the fallback for machines that have not run `adopt`. Needs the
-  client started with `--remote-debugging-port`, and because the state dump is sent
-  once per *connection*, it needs a renderer reload to shake state loose.
+- **`DirectCollector` is the whole presence story.** It authenticates with the
+  session `gather-app-bridge adopt` copied out of the desktop client, then opens
+  its own game socket in observer mode: full roster, names, tile coordinates,
+  cluster adjacency, real `followTargetId` follow detection and live voice
+  activity. No debug port, and it keeps working with the desktop app closed. Every
+  connection replays the full state dump, so `resync` is just a reconnect.
+- **`DesktopNotificationReader` is the only thing still scraped**, and it reads
+  exactly one line shape: `IPC Event: SHOW_NOTIFICATION`. Waves, meeting invites
+  and event reminders are decisions Gather's *client* makes and hands to macOS —
+  they are in no model, no REST route and no delta patch. They are also precisely
+  the events worth waking a phone for, which is why the dependency is worth
+  keeping. Presence does not depend on it.
 
-Both rich modes give names, tile coordinates, cluster adjacency and real
-`followTargetId`-based follow detection. Neither gives mic/camera/screenshare:
-those are not in Gather's game state at all, so the log parser stays load-bearing
-no matter what.
+Two collectors were deleted in favour of this, and should not come back:
+`CdpCollector` (attached to the desktop renderer's devtools port — required a
+debug port open on a live authenticated session, and could not get a state dump
+without reloading the renderer) and the broad `GatherLogParser` (regexes over
+`main.log` for proximity, media and roster churn — all of it now read from the
+protocol, and better).
+
+**Mic, camera and screenshare are gone and are not recoverable.** They were IPC
+state inside the desktop client and appear in no Gather model. `SpaceUser.speaking`
+— live voice activity, and the most frequent delta on the wire — is the
+replacement, and is a better signal anyway.
 
 ## Subdirectories
 

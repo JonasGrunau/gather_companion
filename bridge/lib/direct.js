@@ -1,17 +1,18 @@
 /**
  * Reads presence by connecting to Gather ourselves.
  *
- * This is the alternative to `cdp.js`. Where the CDP collector eavesdrops on the
- * desktop client's socket, this one authenticates and opens its own — which
- * removes every awkward constraint the CDP path carries:
+ * The bridge's only collector. It replaced two scrapers — a CDP attachment to the
+ * desktop client's renderer, and a tail of that client's log file — and removed
+ * every constraint they carried:
  *
  *   - no `--remote-debugging-port`, so nothing leaves a debug port open on the
  *     user's authenticated session;
  *   - no dependency on the desktop client running at all;
+ *   - no log regexes to break the next time Gather changes a console line;
  *   - **no `resync`**. The full state dump is sent once per *connection*, which
- *     is why attaching to a long-running client yields heartbeats only and needs
- *     a renderer reload to shake state loose. When the connection is ours, every
- *     connect is a fresh dump. The whole problem disappears.
+ *     is why attaching to a long-running client yielded heartbeats only and
+ *     needed a renderer reload to shake state loose. When the connection is ours,
+ *     every connect is a fresh dump. The whole problem disappears.
  *
  * ## Observer mode, and why this is safe
  *
@@ -22,8 +23,8 @@
  * invisible to everyone in the space.
  *
  * This also settles the old fear that a second connection would evict the user's
- * own session (close 4031, `cdp.js:37-41`). Measured 2026-08-06: neither an
- * observer connection *nor* an entered one disturbed the desktop client's socket.
+ * own session (close 4031). Measured 2026-08-06: neither an observer connection
+ * *nor* an entered one disturbed the desktop client's socket.
  * `Connection` is per-connection but `SpaceUser` is per-person-per-space, so two
  * connections drive the same avatar and there is nothing to collide with.
  *
@@ -59,7 +60,11 @@ import { readGatherSpace } from './paths.js';
 
 const GAME_SOCKET = 'wss://game-router.v2.gather.town/gather-game-v2';
 
-/** Matches the CDP collector, so roster publishing is coalesced the same way. */
+/**
+ * Rosters are coalesced over this window rather than published per patch. A busy
+ * space moves several people a second, and the phone wants the result, not the
+ * frames.
+ */
 const PUBLISH_INTERVAL_MS = 250;
 
 /**
@@ -126,9 +131,9 @@ export class DirectCollector extends EventEmitter {
   }
 
   /**
-   * Whether we hold state, as opposed to merely being connected. Same discipline
-   * as the CDP collector: an empty roster reported as healthy would let the app
-   * render a confident "nobody is following you" out of nothing.
+   * Whether we hold state, as opposed to merely being connected. The distinction
+   * matters: an empty roster reported as healthy would let the app render a
+   * confident "nobody is following you" out of nothing.
    */
   get hasState() {
     return this.reader.users.size > 0;
@@ -383,7 +388,14 @@ export class DirectCollector extends EventEmitter {
     if (this._frames > 0) {
       const stats = this.reader.stats();
       if (this.hasState) {
-        this._setHealth(true, `${stats.users} space users, ${this._frames} frames (observer)`);
+        // Deliberately *not* the frame count. `_setHealth` publishes an event
+        // whenever the detail string changes, and a counter changes on every
+        // flush — four times a second, for as long as the daemon runs. That
+        // would fill the 500-event history the phone replays on reconnect with
+        // status noise and push the real events (a wave, someone arriving) out
+        // of it within minutes. The user count changes rarely and means
+        // something; the frame count lives in `stats()` where polling it is free.
+        this._setHealth(true, `${stats.users} space users (observer)`);
       } else if (Date.now() - this._handshakeAt >= HANDSHAKE_GRACE_MS) {
         // Frames arriving but still no state means the handshake was not
         // accepted — Gather stays silent rather than rejecting, so say so.

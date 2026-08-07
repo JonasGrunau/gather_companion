@@ -24,9 +24,9 @@ a real running bridge.
 - **Use the debug seams, not fakes.** `AppState.debugApplySnapshot`,
   `debugApplyEvent` and `debugApplyLink` are `@visibleForTesting` for exactly this
   reason — the tests drive the real state object.
-- **Being followed cannot be produced by the log collector at all.** Without
-  these tests the follower card would only ever be seen by arranging for a
-  colleague to follow you around a real space. That is why it is pinned here.
+- **Being followed cannot be produced on demand.** It needs a colleague to
+  actually follow you around a real space, so without these tests the follower
+  card would only ever be seen by accident. That is why it is pinned here.
 - **An empty feed has two meanings** and both are tested: "all quiet" versus "not
   connected". Do not let a change collapse them.
 - Screens must be wrapped in `buildGatherTheme()`; they read `context.tokens` and

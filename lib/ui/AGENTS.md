@@ -31,9 +31,11 @@ needed to be shared twice yet.
 - **An empty feed has two different meanings** and must say which: "nothing has
   happened" versus "not connected". `_EmptyFeed` reads `AppState.link` and
   `isPriming` to tell them apart, and there is a test for each.
-- **Log-only mode is admitted in the UI.** When `hasRichData` is false the screen
-  says being-followed cannot be detected, so a quiet screen is never mistaken for
-  "nobody is following me". Full mode does not nag. Both are tested.
+- **A degraded bridge is admitted in the UI.** When `hasRichData` is false the
+  screen says being-followed cannot be detected, so a quiet screen is never
+  mistaken for "nobody is following me". It now means the bridge has no Gather
+  session or its socket is down, rather than the old log-only mode. A healthy
+  bridge does not nag. Both are tested.
 - `pair_screen.dart` opens the camera without asking first: the screen is only
   ever reached when there is a computer to pair with, so a confirmation tap sits
   in front of the only thing anyone came here for. The instruction goes *under*
@@ -54,9 +56,9 @@ flutter test test/feed_screen_test.dart
 ```
 
 Widget tests drive real screens through `AppState`'s debug seams. Being followed
-cannot be produced by the log collector at all, so the follower card would
-otherwise only ever be seen by arranging for a colleague to follow you — that is
-why it is pinned by a test.
+requires a colleague to actually follow you around a real space, so the follower
+card would otherwise never be seen in development — that is why it is pinned by a
+test.
 
 Wrap screens in the real theme (`buildGatherTheme()`) in tests; the widgets read
 `context.tokens` and will throw without it.

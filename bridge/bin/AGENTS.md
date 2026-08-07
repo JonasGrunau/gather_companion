@@ -76,8 +76,8 @@ node bridge/bin/gather-bridge.js replay ~/Library/Logs/GatherV2/main.log
 
 ### Internal
 
-Everything in `../lib`: `cli-args`, `cdp` (`probeCdp`), `events` (`playerIdOf`),
-`launchd`, `log-parser`, `pairing`, `qr`, `paths`, `server`.
+Everything in `../lib`: `cli-args`, `desktop-notifications`, `gather-auth`,
+`launchd`, `pairing`, `qr`, `paths`, `server`.
 
 ### External
 

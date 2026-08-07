@@ -603,7 +603,7 @@ presence visible to colleagues, no second body in the room.
 
 ### Does a duplicate connection evict the desktop client? No.
 
-The long-standing fear (`bridge/lib/cdp.js:37-41`) was that a second connection on
+The long-standing fear (recorded in the since-deleted `bridge/lib/cdp.js`) was that a second connection on
 the same `spaceId` + `authUserId` would evict the user's own session with close
 code 4031. **Measured 2026-08-06 and it does not.**
 
@@ -641,7 +641,7 @@ the desktop client joined:
 `spaceUserId`, so there is no second avatar to collide with. Gather has to support
 this regardless — the desktop app hosts multiple WebContents, and web plus desktop
 can be signed in together. The `WSCloseCode.DUPLICATE_CONNECTION = 4031` belief in
-`bridge/lib/cdp.js:37-41` is therefore wrong for both observer *and* entered
+That belief was therefore wrong for both observer *and* entered
 connections.
 
 Two things it does cost, which is why `DirectCollector` still does not enter:
@@ -892,8 +892,9 @@ value objects, and as `replace` patches on `/position/x`.
 **Trust the wire over the bundled enum.** The live dump carries four fields the
 Prisma enum does not list: **`speaking`**, **`dancing`**, `hasConnectedCalendars`
 and `activeMapObjectInteractionId`. `speaking` is live voice activity — which means
-game state *does* expose who is talking, even though mic/camera/screenshare state is
-absent. The bridge uses none of the four.
+game state *does* expose who is talking, even though mic/camera/screenshare state
+is absent. **The bridge now consumes `speaking`**, which is what replaced the
+deleted mic/camera flags; the other three are still unused.
 
 | Field | Consumed by the bridge |
 |---|---|
@@ -910,6 +911,7 @@ absent. The bridge uses none of the four.
 | `shouldBeInClusterWithFollowTarget` | no |
 | `connected` | **yes** |
 | `isIdle` | **yes** |
+| `speaking` | **yes** |
 | `activeApp` | no |
 | `handRaisedAt` | no |
 | `isBot` | no |
@@ -935,7 +937,8 @@ absent. The bridge uses none of the four.
 | `speed__modifier` | no |
 | `userSetAvailability__value` | no |
 
-The bridge consumes 8 of 37. Unused fields that look immediately useful: `deskId`
+The bridge consumes 9 of 37, plus `Space.name`. Unused fields that look
+immediately useful: `deskId`
 (which desk someone is at), `handRaisedAt`, `activeApp`, `activeCustomStatusId` /
 `activeUserGeneratedStatusId` (custom status), `profilePictureId`, `aiSummary`,
 `currentTargetMeetingAreaId`.
@@ -946,10 +949,12 @@ The bridge consumes 8 of 37. Unused fields that look immediately useful: `deskId
 
 `SpaceUserMediaStatus` (11): `id`, `spaceId`, `spaceUserId`, `source`, `name`, `artist`, `artworkUrl`, `hyperlink`, `isExplicit`, `createdAt`, `updatedAt`
 
-Mic, camera and screenshare are transient AV state on the SFU/IPC side and appear in
-no Prisma model. A direct game socket does **not** replace
-`bridge/lib/log-parser.js` for those three booleans. Anyone planning to delete the
-log collector should read this line twice.
+Mic, camera and screenshare are transient AV state on the SFU/IPC side and appear
+in no Prisma model. **The log collector was deleted anyway, on 2026-08-07, and
+those three booleans went with it** — see the Verdict below for why that was the
+right call and what `speaking` replaced them with. What survives of the log
+collector is `bridge/lib/desktop-notifications.js`, which reads Gather's own
+notifications and nothing else.
 
 ## Incidental finds
 
@@ -985,28 +990,73 @@ log collector should read this line twice.
 
 ## Verdict
 
-A direct connection works, end to end, and is strictly better than the CDP
-side-channel for everything except AV state:
+**Shipped 2026-08-07.** The direct connection is now the bridge's only source of
+presence; the CDP collector and the broad log parser were deleted.
 
-| | CDP collector (today) | Direct connection |
+| | CDP collector (deleted) | Direct connection (shipped) |
 |---|---|---|
 | Needs `--remote-debugging-port` | yes | **no** |
 | Needs the desktop client running | yes | **no** (after a one-time `adopt`) |
 | Full state on demand | no — once per connection, hence `resync` | **yes, every connect** |
 | Names, positions, follow, cluster | yes | yes |
-| Mic / cam / screenshare | log parser only | log parser only — unchanged |
+| Voice activity (`speaking`) | not read | **yes** |
+| Mic / cam / screenshare | log parser only | **not available at all** |
 | Evicts the user's session | n/a | **no** (observer mode, measured) |
 | Shows up as a presence in the space | no | **no** (no `enterSpace`) |
 
-The recommended shape: adopt the desktop refresh token once, then run a direct
-observer connection. The `resync` renderer-reload hack disappears, because a fresh
-connection always yields a fresh full-state dump.
+### What could not be replaced
 
-Two caveats worth carrying forward. Mic/cam/screenshare still come from
-`bridge/lib/log-parser.js`, which still needs the client running and its log
-format unchanged — a direct connection does not free us from that. And the
-`sequenceNumber` on `FullStateChunk`/`DeltaState` is Gather's, unrelated to the
-bridge's own `seq` for the app.
+Two things resisted, and the difference between them matters.
+
+**Mic, camera and screenshare are gone.** They were IPC state inside the desktop
+client (`AUDIO_UPDATED`, `VIDEO_UPDATED`, `START_SCREEN_SHARE`) and appear in no
+Prisma model, no REST route and no delta patch. `SpaceUser.speaking` is the
+replacement and is arguably the better signal — it says who is *talking* rather
+than who has a mic enabled. Measured over three minutes on a live 111-person
+space it was the single most frequent patch of any kind: **13 of 46 deltas**.
+
+The old parser could not really produce them anyway. Gather logs
+`setStreamPausedState <id> <track> false` when the client *subscribes* to a
+remote track — which happens on proximity, not when the person starts sending —
+and never logs the matching `true`. Across 249 samples in two real logs: 74
+`screen false`, 175 `video false`, zero `true`, ever. So the flags could only be
+turned off, never on.
+
+**Gather's own notifications are still scraped, deliberately.** A `wave`, a
+`meeting invite` and an `event reminder` are decisions the *client* makes and
+hands to the OS. They are in no model either — but unlike the media booleans they
+are genuinely valuable, being exactly the events worth waking a phone for. So
+`bridge/lib/desktop-notifications.js` reads one line shape and nothing else:
+
+```
+IPC Event: SHOW_NOTIFICATION { type: 'wave' }
+```
+
+It keys off that line rather than the `Showing notification <uuid>: wave` that
+normally follows, because Gather **suppresses its own notification when its
+window has focus** — and then the second line never appears. The phone is a
+different device and should still be told.
+
+### The game socket is a state channel, not an event bus
+
+Worth recording, because it is what closes off any hope of getting the
+notifications from the protocol. Three minutes of deltas on a live 111-person
+space produced **46 patches across four models**:
+
+| Model | Patches |
+|---|---|
+| `SpaceUser` | 28 (13 `/speaking`, 5 `/updatedAt`, 2 `/position`, 2 `/clusterId`, 2 `/connected`, 2 `/lastOnlineAt`, 1 `/direction`, 1 `/activeApp`) |
+| `SpaceUserStatus` | 12 |
+| `ExternalCalendarConnection` | 5 |
+| `SpaceUserCluster` | 1 |
+
+No `ActivityEvent`, no `Meeting`, no `MeetingParticipant`, no `ChatMessage`.
+Nothing event-shaped at all. The socket reports what *is*, not what *happened*.
+
+Two further caveats carried forward. The `sequenceNumber` on
+`FullStateChunk`/`DeltaState` is Gather's, unrelated to the bridge's own `seq`
+for the app. And `Connection` has exactly one row — yours — so a second session
+of your own is invisible from state.
 
 ## Reproducing any of this
 

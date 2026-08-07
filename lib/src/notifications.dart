@@ -1,7 +1,17 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:gather_events/gather_events.dart';
 
-/// Local notifications for the two things worth interrupting you for.
+/// Local notifications for the things worth interrupting you for.
+///
+/// Three kinds, and they come from two different places. Someone standing next to
+/// you and someone following you are read off Gather's game socket. A wave, a
+/// meeting invite and an event reminder are raised by Gather's own desktop client
+/// and scraped from its log, because they exist in no Gather model — the bridge
+/// forwards them as [NotificationShownEvent].
+///
+/// Worth knowing about the waves in particular: Gather suppresses its own
+/// notification when its window has focus, and the bridge deliberately does not.
+/// Looking at Gather on your Mac is no reason to withhold a wave from your phone.
 ///
 /// A deliberate limitation, stated plainly rather than papered over: these fire
 /// only while the app is running — in the foreground, or during the short window
@@ -9,13 +19,20 @@ import 'package:gather_events/gather_events.dart';
 /// suspends the app the socket is gone and nothing can be delivered until you
 /// open it again, at which point the bridge replays everything that was missed
 /// (see `BridgeClient.lastSeq`), so the *log* stays complete even though the
-/// alerts do not. Waking a locked phone would need a push service driven from the
-/// computer, which means a developer account and push credentials per platform.
+/// alerts do not. Waking a killed phone needs push — an APNs key and an FCM
+/// sender in the bridge — which is not built yet.
 class Notifier {
-  Notifier({this.notifyOnFollow = true, this.notifyOnProximity = true});
+  Notifier({
+    this.notifyOnFollow = true,
+    this.notifyOnProximity = true,
+    this.notifyOnGather = true,
+  });
 
   bool notifyOnFollow;
   bool notifyOnProximity;
+
+  /// Waves, meeting invites and event reminders, as raised by Gather itself.
+  bool notifyOnGather;
 
   final _plugin = FlutterLocalNotificationsPlugin();
   bool _ready = false;
@@ -60,6 +77,9 @@ class Notifier {
           'Someone is next to you',
           '${nameFor(playerId)} is standing next to you',
         ),
+      NotificationShownEvent(:final notificationType, :final title, :final body)
+          when notifyOnGather =>
+        (title ?? _gatherTitle(notificationType), body ?? _gatherBody(notificationType)),
       _ => (null, null),
     };
 
@@ -75,3 +95,22 @@ class Notifier {
     );
   }
 }
+
+/// Gather sends only a `type` for its own notifications — never a title or body,
+/// on every sample seen so far. These are the sentences for the three types
+/// observed in a real client: `wave`, `meeting invite`, `event reminder`.
+String _gatherTitle(String type) => switch (type) {
+      'wave' => 'Someone waved at you',
+      'meeting invite' => 'Meeting invite',
+      'event reminder' => 'Event reminder',
+      _ => 'Gather',
+    };
+
+String _gatherBody(String type) => switch (type) {
+      'wave' => 'Someone is trying to get your attention in Gather',
+      'meeting invite' => 'You have been invited to a meeting',
+      'event reminder' => 'An event on your calendar is starting',
+      // An unrecognised type is still worth showing — Gather thought it was worth
+      // interrupting someone for, and a new one should surface rather than vanish.
+      _ => type,
+    };

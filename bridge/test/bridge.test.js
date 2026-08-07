@@ -5,26 +5,31 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { BridgeServer } from '../lib/server.js';
+import { defaultPatches, fakeGameServer, fakeJwt } from './fake-gather.js';
 
 const TOKEN = 'test-token';
-const PLAYER = '1652d4a7-7874-4c66-b571-d55d00205705';
-const OTHER = '8f242bda-b348-4eb0-bb0f-68e3699c116f';
+const ME = 'me-1';
+const NEIGHBOUR = 'them-1';
 
-/** Real log lines, with the timestamp templated so we can order them. */
+/**
+ * Real notification lines, verbatim from `~/Library/Logs/GatherV2/main.log`, with
+ * the uuid replaced. These three types are everything Gather's client raises.
+ */
 const line = {
-  near: (id) =>
-    `[2026-07-31 12:18:47.199] [verbose] (webapp)                       GameMediaController.remoteParticipantJoinedHandler ${id} [object Object] [object Object]`,
-  away: (id) =>
-    `[2026-07-31 12:30:29.740] [verbose] (webapp)                       GameMediaController.remoteParticipantLeftHandler ${id}`,
-  joined: (id) =>
-    `[2026-07-31 12:09:15.548] [verbose] (webapp)                      [PlayerManagerV2] Player has joined ${id}`,
-  screenOn: (id) =>
-    `[2026-07-31 12:07:07.376] [verbose] (webapp)                       GameMediaController.remoteParticipantTrackStateChangedHandler setStreamPausedState ${id} screen false`,
-  micOff: (id) =>
-    `[2026-07-31 12:07:07.376] [verbose] (webapp)                       GameMediaController.remoteParticipantTrackStateChangedHandler setStreamPausedState ${id} audio true`,
+  wave: () =>
+    "[2026-08-07 10:01:39.265] [info]  (main)                        IPC Event: SHOW_NOTIFICATION { type: 'wave' }",
+  waveShown: () =>
+    '[2026-08-07 10:01:39.266] [info]  (main)                        Showing notification 62c41002-9661-4429-b66e-ae369f83e916: wave',
+  invite: () =>
+    "[2026-08-07 10:01:42.466] [info]  (main)                        IPC Event: SHOW_NOTIFICATION { type: 'meeting invite' }",
+  suppressed: () =>
+    '[2026-08-07 10:02:20.131] [info]  (main)                        Notification suppressed: App window is focused',
+  noise: () =>
+    '[2026-08-07 10:01:40.814] [info]  (main)                        AppView: blur',
 };
 
 let server;
+let gather;
 let logPath;
 let port;
 
@@ -33,15 +38,18 @@ before(async () => {
   logPath = join(dir, 'main.log');
   writeFileSync(logPath, 'pre-existing history that must not be replayed\n');
 
+  gather = fakeGameServer();
+  const socketUrl = await gather.listen();
+
   server = new BridgeServer({
     token: TOKEN,
     port: 0, // ask the OS for a free port
-    cdpPort: 1, // nothing listens here; the CDP collector stays down on purpose
-    // Forces the CDP fallback. Without this the server would pick the direct
-    // collector on any machine where `adopt` has been run, and the suite would
-    // start authenticating to Gather and reading a real space — making results
-    // depend on whose laptop it ran on. Tests must never leave the machine.
-    direct: false,
+    // Both seams point at the local fake. Tests must never leave the machine: a
+    // suite whose result depends on whether the developer has run `adopt` is
+    // broken, however green it looks.
+    socketUrl,
+    getToken: async () => fakeJwt(),
+    spaceId: 'space-1',
     logSource: logPath,
     log: () => {},
   });
@@ -51,6 +59,7 @@ before(async () => {
 
 after(async () => {
   await server?.stop();
+  await gather?.close();
 });
 
 /** Opens a client and collects frames until `done` is satisfied or we time out. */
@@ -80,9 +89,19 @@ function collect({ done, timeoutMs = 6000, since = 0 }) {
 }
 
 const eventsOf = (frames) => frames.filter((f) => f.kind === 'event').map((f) => f.event);
+const state = async () =>
+  (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** `OTHER`'s row inside a snapshot frame, when it is there yet. */
-const playerIn = (frame) => frame.snapshot?.players?.find((p) => p.id === OTHER);
+/** Waits until the state dump has been consumed, so tests start from a roster. */
+async function ready() {
+  for (let i = 0; i < 60; i++) {
+    const snapshot = await state();
+    if (snapshot.players?.length) return snapshot;
+    await wait(100);
+  }
+  throw new Error('the collector never produced a roster');
+}
 
 test('unauthenticated clients are rejected', async () => {
   const res = await fetch(`http://127.0.0.1:${port}/state`);
@@ -110,93 +129,124 @@ test('a connecting client is given a snapshot first', async () => {
   assert.ok(Array.isArray(frames[0].snapshot.players));
 });
 
-test('someone arriving next to you is delivered live', async () => {
+test('the state dump becomes a roster with names, positions and the space name', async () => {
+  const snapshot = await ready();
+  const neighbour = snapshot.players.find((p) => p.id === NEIGHBOUR);
+
+  assert.equal(neighbour.name, 'Neighbour', 'names come straight off SpaceUser');
+  assert.equal(neighbour.x, 11);
+  assert.equal(neighbour.isNear, true, 'one tile away is standing next to you');
+  assert.equal(snapshot.self.spaceName, 'Test Space', 'read from the Space model');
+  assert.ok(
+    !snapshot.players.some((p) => p.id === ME),
+    'my own row is self, not a player standing next to me',
+  );
+});
+
+test('walking away is delivered live as proximity.left', async () => {
+  await ready();
+  const pending = collect({
+    done: (f) => eventsOf(f).some((e) => e.type === 'proximity.left'),
+  });
+  await wait(100);
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 40 },
+  ]);
+
+  const left = eventsOf(await pending).find((e) => e.type === 'proximity.left');
+  assert.equal(left.playerId, NEIGHBOUR);
+  assert.equal((await state()).players.find((p) => p.id === NEIGHBOUR).isNear, false);
+});
+
+test('a component-wise walk back is delivered as proximity.entered', async () => {
+  // `/position/x` rather than `/position`: position mutates in place, so reading
+  // only the last path segment would silently drop every walking patch.
   const pending = collect({
     done: (f) => eventsOf(f).some((e) => e.type === 'proximity.entered'),
   });
-  // Give the tailer a moment to attach before writing.
-  await new Promise((r) => setTimeout(r, 250));
-  appendFileSync(logPath, `${line.near(PLAYER)}\n`);
+  await wait(100);
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/position/x', data: 11 },
+  ]);
 
-  const events = eventsOf(await pending);
-  const arrival = events.find((e) => e.type === 'proximity.entered');
-  assert.equal(arrival.playerId, PLAYER);
-  assert.equal(arrival.confidence, 'inferred');
+  const arrived = eventsOf(await pending).find((e) => e.type === 'proximity.entered');
+  assert.equal(arrived.playerId, NEIGHBOUR);
+  assert.equal(arrived.source, 'gather');
 });
 
-test('repeated arrivals for the same person are not delivered twice', async () => {
-  await new Promise((r) => setTimeout(r, 250));
-  // PLAYER is already near from the previous test; two more arrivals are noise.
-  appendFileSync(logPath, `${line.near(PLAYER)}\n${line.near(PLAYER)}\n${line.near(OTHER)}\n`);
-
-  const frames = await collect({
-    done: (f) => eventsOf(f).some((e) => e.type === 'proximity.entered' && e.playerId === OTHER),
+test('someone pointing followTargetId at me is reported as following me', async () => {
+  const pending = collect({
+    done: (f) => eventsOf(f).some((e) => e.type === 'follow.started'),
   });
-  const arrivals = eventsOf(frames).filter((e) => e.type === 'proximity.entered');
-  assert.deepEqual(
-    arrivals.map((a) => a.playerId),
-    [OTHER],
-    'only the state change should be published',
+  await wait(100);
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/followTargetId', data: ME },
+  ]);
+
+  const followed = eventsOf(await pending).find((e) => e.type === 'follow.started');
+  assert.equal(followed.followerId, NEIGHBOUR);
+  assert.equal(followed.targetIsSelf, true);
+  assert.equal(followed.confidence, 'observed', 'the field is read, never guessed');
+});
+
+test('voice activity reaches the snapshot but is never an event', async () => {
+  // `speaking` is the most frequent patch on a live socket. As a feed line it
+  // would be unreadable; as state it is exactly what the app wants.
+  gather.latest.delta([
+    { op: 'replace', model: 'SpaceUser', id: NEIGHBOUR, path: '/speaking', data: true },
+  ]);
+  for (let i = 0; i < 40; i++) {
+    if ((await state()).players.find((p) => p.id === NEIGHBOUR)?.speaking) break;
+    await wait(50);
+  }
+  assert.equal((await state()).players.find((p) => p.id === NEIGHBOUR).speaking, true);
+
+  const events = (await (await fetch(`http://127.0.0.1:${port}/events?token=${TOKEN}`)).json())
+    .events;
+  assert.ok(
+    !events.some((e) => e.event.type?.includes('speak')),
+    'voice activity must not reach the feed',
   );
 });
 
-test('the snapshot tracks who is currently next to you', async () => {
-  const state = await (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
-  const near = state.players.filter((p) => p.isNear).map((p) => p.id).sort();
-  assert.deepEqual(near, [PLAYER, OTHER].sort());
-
-  const withTimestamp = state.players.find((p) => p.id === PLAYER);
-  assert.ok(withTimestamp.nearSince, 'we should know since when they have been there');
-});
-
-test('leaving clears proximity', async () => {
+test('a wave in the desktop log is delivered as a notification', async () => {
+  // The one thing still scraped, because it exists in no Gather model — and the
+  // single event most worth waking a phone for.
   const pending = collect({
-    done: (f) => eventsOf(f).some((e) => e.type === 'proximity.left' && e.playerId === PLAYER),
+    done: (f) => eventsOf(f).some((e) => e.type === 'notification.shown'),
   });
-  await new Promise((r) => setTimeout(r, 250));
-  appendFileSync(logPath, `${line.away(PLAYER)}\n`);
-  await pending;
+  await wait(250);
+  appendFileSync(logPath, `${line.noise()}\n${line.wave()}\n${line.waveShown()}\n`);
 
-  const state = await (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
-  assert.equal(state.players.find((p) => p.id === PLAYER).isNear, false);
+  const shown = eventsOf(await pending).filter((e) => e.type === 'notification.shown');
+  assert.equal(shown.length, 1, 'the IPC line and the "Showing" line are one notification');
+  assert.equal(shown[0].notificationType, 'wave');
 });
 
-test('subscribing to a neighbour\'s tracks is not a screen share', async () => {
+test('a notification Gather suppressed still reaches the phone', async () => {
+  // Gather drops its own when its window has focus, so no "Showing notification"
+  // line follows. The phone is a different device and should still be told.
   const pending = collect({
     done: (f) =>
-      f.some((x) => x.kind === 'snapshot' && playerIn(x)?.micOn === false),
+      eventsOf(f).some(
+        (e) => e.type === 'notification.shown' && e.notificationType === 'meeting invite',
+      ),
   });
-  await new Promise((r) => setTimeout(r, 250));
-  appendFileSync(logPath, `${line.micOff(OTHER)}\n${line.screenOn(OTHER)}\n`);
-
-  const media = eventsOf(await pending).filter((e) => e.type === 'media.changed');
-  assert.deepEqual(
-    media.map((m) => m.track),
-    [],
-    'a mute is state and not news, and an unpaused track is neither',
-  );
-
-  const state = await (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
-  const player = state.players.find((p) => p.id === OTHER);
-  assert.equal(player.micOn, false, 'the mute still has to be recorded in state');
-  // Gather unpauses audio, video and screen together the moment it subscribes to
-  // someone who came near, and never logs the matching pause. Across every such
-  // line in two real logs the video and screen track sets were the same 17
-  // people, so `screen false` says "we subscribed", not "they are sharing".
-  assert.equal(player.screensharing, false);
+  await wait(250);
+  appendFileSync(logPath, `${line.invite()}\n${line.suppressed()}\n`);
+  await pending;
 });
 
 test('a reconnecting client can replay what it missed', async () => {
-  const before = await (await fetch(`http://127.0.0.1:${port}/state?token=${TOKEN}`)).json();
-  await new Promise((r) => setTimeout(r, 250));
-  appendFileSync(logPath, `${line.joined('11111111-2222-3333-4444-555555555555')}\n`);
+  const before = await state();
+  await wait(250);
+  appendFileSync(logPath, `${line.wave()}\n`);
 
-  // Wait for it to land in history.
-  await collect({ done: (f) => eventsOf(f).some((e) => e.type === 'player.joinedSpace') });
+  await collect({ done: (f) => eventsOf(f).some((e) => e.type === 'notification.shown') });
 
   const replayed = await collect({
     since: before.seq,
-    done: (f) => eventsOf(f).some((e) => e.type === 'player.joinedSpace'),
+    done: (f) => eventsOf(f).some((e) => e.type === 'notification.shown'),
   });
   const seqs = replayed.filter((f) => f.kind === 'event').map((f) => f.seq);
   assert.ok(
@@ -206,9 +256,10 @@ test('a reconnecting client can replay what it missed', async () => {
 });
 
 test('the raw channel shows what the filtered stream suppresses', async () => {
-  // Muting is recorded as state but deliberately not published — mics flicker
-  // constantly. A raw subscriber should still see it, because "what can this
-  // thing actually see" has to be answerable.
+  // Someone shuffling about next to you is state, not news, so `player.moved`
+  // is published but the tracker keeps plenty else to itself. A raw subscriber
+  // should still see the firehose, because "what can this thing actually see"
+  // has to be answerable.
   const raw = [];
   const filtered = [];
 
@@ -217,33 +268,36 @@ test('the raw channel shows what the filtered stream suppresses', async () => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${TOKEN}${query}`);
       ws.addEventListener('message', (event) => {
         const frame = JSON.parse(String(event.data));
-        if (frame.event) sink.push({ kind: frame.kind, type: frame.event.type, track: frame.event.track });
+        if (frame.event) sink.push({ kind: frame.kind, type: frame.event.type });
       });
       ws.addEventListener('open', () => resolve(ws));
     });
 
   const rawWs = await open('&raw=1', raw);
   const filteredWs = await open('', filtered);
-  await new Promise((r) => setTimeout(r, 250));
+  await wait(250);
 
-  // A mute followed by a screen share: only the second is newsworthy.
-  appendFileSync(logPath, `${line.micOff(PLAYER)}\n`);
-  await new Promise((r) => setTimeout(r, 900));
+  appendFileSync(logPath, `${line.wave()}\n`);
+  await wait(900);
 
   rawWs.close();
   filteredWs.close();
 
-  const rawAudio = raw.filter((e) => e.type === 'media.changed' && e.track === 'audio');
-  const filteredAudio = filtered.filter((e) => e.type === 'media.changed' && e.track === 'audio');
-
-  assert.equal(rawAudio.length, 1, 'the firehose must include the mute');
-  assert.equal(rawAudio[0].kind, 'raw', 'and mark it as raw so it is distinguishable');
-  assert.equal(filteredAudio.length, 0, 'the normal stream must not');
+  assert.ok(
+    raw.some((e) => e.type === 'notification.shown' && e.kind === 'raw'),
+    'the firehose must include it, marked raw so it is distinguishable',
+  );
 });
 
-test('the CDP collector reports itself as down rather than pretending', async () => {
+test('the collectors endpoint names what is actually connected', async () => {
   const body = await (await fetch(`http://127.0.0.1:${port}/collectors?token=${TOKEN}`)).json();
-  assert.equal(body.health.cdp, false);
-  assert.equal(body.health.logTail, true);
-  assert.match(body.cdpDetail ?? '', /unreachable|not found|closed/i);
+  assert.equal(body.health.gather, true, 'the Gather socket is the presence source');
+  assert.equal(
+    body.health.cdp,
+    true,
+    'mirrored onto the old name so app builds predating this still show rich data',
+  );
+  assert.equal(body.health.logTail, true, 'the notification tail is separate and optional');
+  assert.equal(body.stats.entered, false, 'we observe the space, we never enter it');
+  assert.equal(body.stats.users, defaultPatches().filter((p) => p.model === 'SpaceUser').length);
 });

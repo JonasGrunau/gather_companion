@@ -5,52 +5,52 @@
  *
  *  - `type`       stable discriminator; the app switches on it
  *  - `at`         ISO-8601, taken from the client's own clock, not ours
- *  - `source`     `log` | `cdp` | `bridge` — which collector saw it
+ *  - `source`     `gather` | `bridge` — where it came from
  *  - `confidence` `observed` | `inferred` — whether we read the thing itself
  *                 or derived it from a proxy signal
  *
  * These names are the contract with `packages/gather_events` on the Dart side.
  * Renaming a field breaks the app.
+ *
+ * ## Why `source` still admits `log` and `cdp`
+ *
+ * Both collectors that produced those values are gone — everything now comes from
+ * Gather's own game socket. The two strings survive in the *type* only because
+ * phones in the wild parse them, and an app build that predates this change must
+ * not choke on an event stream it can otherwise read perfectly well.
  */
 
-/** @typedef {'log'|'cdp'|'bridge'} EventSource */
+/** @typedef {'gather'|'bridge'|'log'|'cdp'} EventSource */
 /** @typedef {'observed'|'inferred'} Confidence */
-/** @typedef {'audio'|'video'|'screen'} MediaTrack */
 
 /** @param {Date} at @param {EventSource} source @param {Confidence} confidence */
 function base(at, source, confidence = 'observed') {
   return { at: at.toISOString(), source, confidence };
 }
 
-export function spaceChanged({ at, source = 'log', spaceId = null, spaceName = null }) {
+export function spaceChanged({ at, source = 'gather', spaceId = null, spaceName = null }) {
   return { type: 'space.changed', ...base(at, source), spaceId, spaceName };
 }
 
-export function selfChanged({
-  at,
-  source = 'log',
-  userId = null,
-  audioEnabled = null,
-  videoEnabled = null,
-  inOffice = null,
-  screensharing = null,
-}) {
+/**
+ * Something about *you* changed.
+ *
+ * `inOffice` is the only field still carried. Mic, camera and screenshare were
+ * read out of the desktop client's IPC log and are in no part of Gather's game
+ * state, so they are no longer knowable — see docs/gather-api.md. They stay in
+ * the signature as explicit nulls rather than vanishing, because the app's
+ * `SelfState` still has the fields and a missing key and a null key are
+ * different things to a JSON decoder.
+ */
+export function selfChanged({ at, source = 'gather', userId = null, inOffice = null }) {
   return {
     type: 'self.changed',
     ...base(at, source),
     userId,
-    audioEnabled,
-    videoEnabled,
+    audioEnabled: null,
+    videoEnabled: null,
     inOffice,
-    screensharing,
-  };
-}
-
-export function playerSpace({ at, source = 'log', playerId, joined }) {
-  return {
-    type: joined ? 'player.joinedSpace' : 'player.leftSpace',
-    ...base(at, source),
-    playerId,
+    screensharing: null,
   };
 }
 
@@ -60,8 +60,8 @@ export function playerSpace({ at, source = 'log', playerId, joined }) {
  */
 export function proximity({
   at,
-  source = 'log',
-  confidence = 'inferred',
+  source = 'gather',
+  confidence = 'observed',
   playerId,
   near,
   distance = null,
@@ -74,22 +74,10 @@ export function proximity({
   };
 }
 
-export function audioRange({ at, source = 'log', playerId, inRange, volume = null }) {
-  return { type: 'audio.range', ...base(at, source), playerId, inRange, volume };
-}
-
-export function mediaChanged({ at, source = 'log', playerId, track, paused }) {
-  return { type: 'media.changed', ...base(at, source), playerId, track, paused };
-}
-
-export function mediaConnection({ at, source = 'log', playerId, state }) {
-  return { type: 'media.connection', ...base(at, source), playerId, state };
-}
-
 /** `targetIsSelf: true` is the one that matters: you are being followed. */
 export function follow({
   at,
-  source = 'cdp',
+  source = 'gather',
   confidence = 'observed',
   followerId,
   targetId,
@@ -105,14 +93,17 @@ export function follow({
   };
 }
 
-export function playerMoved({ at, source = 'cdp', playerId, x, y, distance = null }) {
+export function playerMoved({ at, source = 'gather', playerId, x, y, distance = null }) {
   return { type: 'player.moved', ...base(at, source), playerId, x, y, distance };
 }
 
-export function chatMessage({ at, source = 'cdp', playerId, text, channel = null }) {
-  return { type: 'chat.message', ...base(at, source), playerId, text, channel };
-}
-
+/**
+ * Gather's own desktop client raised a notification: a wave, a meeting invite, an
+ * event reminder.
+ *
+ * The one thing still read from the client's log rather than from Gather's API,
+ * because it exists nowhere else. See `desktop-notifications.js`.
+ */
 export function notificationShown({
   at,
   source = 'log',
@@ -133,19 +124,6 @@ export function bridgeStatus({ at, collector, healthy, detail = null }) {
   return { type: 'bridge.status', ...base(at, 'bridge'), collector, healthy, detail };
 }
 
-/** Anything interesting we don't model yet — keeps the pipeline lossless. */
-export function raw({ at, source = 'log', type, text }) {
-  return { type, ...base(at, source), text };
-}
-
-/** The other player an event is about, when there is one. */
-export function playerIdOf(event) {
-  if (event.type === 'follow.started' || event.type === 'follow.stopped') {
-    return event.targetIsSelf ? event.followerId : event.targetId;
-  }
-  return typeof event.playerId === 'string' ? event.playerId : null;
-}
-
 export function newPlayer(id) {
   return {
     id,
@@ -154,6 +132,9 @@ export function newPlayer(id) {
     isNear: false,
     inAudioRange: false,
     isFollowingMe: false,
+    /** Live voice activity, straight from `SpaceUser.speaking`. */
+    speaking: false,
+    // Kept null forever. The app still has the fields; nothing can fill them.
     micOn: null,
     cameraOn: null,
     screensharing: false,

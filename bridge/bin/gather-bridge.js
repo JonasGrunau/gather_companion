@@ -5,11 +5,9 @@ import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import { flagValue, parseCommand, parsePort } from '../lib/cli-args.js';
-import { DEFAULT_CDP_PORT, probeCdp } from '../lib/cdp.js';
+import { DesktopNotificationReader } from '../lib/desktop-notifications.js';
 import { adoptDesktopSession, gatherUid, hasGatherSession } from '../lib/gather-auth.js';
-import { playerIdOf } from '../lib/events.js';
 import * as launchd from '../lib/launchd.js';
-import { GatherLogParser } from '../lib/log-parser.js';
 import { pairPayload } from '../lib/pairing.js';
 import { render as renderQr } from '../lib/qr.js';
 import {
@@ -140,17 +138,23 @@ async function cmdInstall() {
 async function cmdRun() {
   const port = resolvePort();
   const token = ensureToken(flagValue(argv, '--token'));
-  const cdpPort = Number(flagValue(argv, '--cdp-port') ?? DEFAULT_CDP_PORT);
-  const logSource = flagValue(argv, '--log-file') ?? gatherLogFile;
-  // `--no-direct` forces the CDP collector even when a session has been adopted,
-  // which is the escape hatch if Gather ever changes the handshake.
-  const direct = argv.includes('--no-direct') ? false : null;
   const spaceId = flagValue(argv, '--space') ?? null;
+  const logSource = flagValue(argv, '--log-file') ?? gatherLogFile;
   ensureStateDir();
   rotateLogIfLarge();
 
   const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
-  const server = new BridgeServer({ token, port, cdpPort, logSource, direct, spaceId, log });
+
+  // Everything the bridge can see now needs a Gather session. Fail loudly here
+  // rather than starting a daemon that answers on its port and knows nothing.
+  if (!hasGatherSession()) {
+    throw new Error(
+      `No Gather session.\n  Run ${INVOKE} adopt once — it reuses the session the\n` +
+        '  GatherV2 desktop app is already signed in with.',
+    );
+  }
+
+  const server = new BridgeServer({ token, port, spaceId, logSource, log });
 
   try {
     await server.start();
@@ -168,7 +172,6 @@ async function cmdRun() {
   }
 
   log(`listening on 0.0.0.0:${port}`);
-  log(`tailing ${logSource}`);
 
   const shutdown = async () => {
     log('shutting down');
@@ -197,7 +200,6 @@ async function cmdStatus() {
   const port = resolvePort();
   const state = launchd.supported ? launchd.status() : { installed: false, running: false, pid: null };
   const up = await pingBridge(port);
-  const cdp = await probeCdp(Number(flagValue(argv, '--cdp-port') ?? DEFAULT_CDP_PORT));
 
   console.log('');
   console.log(`  ${bold('Gather bridge')}`);
@@ -205,26 +207,30 @@ async function cmdStatus() {
   line('installed', state.installed ? green('yes') : red('no'));
   line('running', state.running ? green(`yes (pid ${state.pid})`) : red('no'));
   line('answering', up ? green(`yes on :${port}`) : red(`no on :${port}`));
-  line('gather log', existsSync(gatherLogFile) ? green('present') : yellow('not found'));
-  line('devtools', cdp ? green(`yes — ${cdp.Browser ?? 'connected'}`) : dim('not enabled (optional)'));
+  line(
+    'gather session',
+    hasGatherSession() ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : red('not adopted'),
+  );
 
   if (up) {
     const collectors = await getJson(port, '/collectors', config.token);
     if (collectors) {
-      line('log collector', collectors.health?.logTail ? green('live') : red('down'));
-      // `health.cdp` is the "rich collector is live" flag whichever one won, so
-      // label it by what is actually running rather than by the field name.
-      const kind = collectors.richCollector === 'direct' ? 'direct collector' : 'cdp collector';
       line(
-        kind,
-        collectors.health?.cdp ? green('live') : dim(collectors.cdpDetail ?? 'not attached'),
+        'gather socket',
+        collectors.health?.gather ? green('live') : dim(collectors.detail ?? 'not connected'),
+      );
+      // Only carries Gather's own notifications now, so its being down costs
+      // waves and meeting invites and nothing else.
+      line(
+        'notifications',
+        collectors.health?.logTail ? green('live') : yellow('desktop app not running'),
       );
     }
     const snapshot = await getJson(port, '/state', config.token);
     if (snapshot) {
       const near = (snapshot.players ?? []).filter((p) => p.isNear);
       const followers = (snapshot.players ?? []).filter((p) => p.isFollowingMe);
-      line('space', snapshot.self?.spaceId ?? dim('unknown'));
+      line('space', snapshot.self?.spaceName ?? snapshot.self?.spaceId ?? dim('unknown'));
       line('next to you', near.length ? near.map(labelOf).join(', ') : dim('nobody'));
       line('following you', followers.length ? followers.map(labelOf).join(', ') : dim('nobody'));
     }
@@ -253,18 +259,11 @@ function cmdToken() {
 }
 
 /**
- * Explains, concretely, what the bridge can and cannot see right now.
- *
- * The interesting case is the CDP collector: without it there are no names, no
- * coordinates and no `followTargetId`, so "someone is following you" cannot be
- * observed — only guessed from movement. This prints the exact command that
- * fixes that.
- */
-/**
  * Copies the desktop client's Gather session into the bridge's own config.
  *
  * One read, then independence: refresh tokens are long-lived, so from here on the
  * bridge mints its own and needs neither the desktop client nor a debug port.
+ * This is the one setup step there is — nothing else works without it.
  */
 async function cmdAdopt() {
   console.log('');
@@ -273,13 +272,9 @@ async function cmdAdopt() {
     console.log(`  ${green('Adopted your Gather session.')}`);
     console.log(`  ${dim(`account ${String(uid).slice(0, 8)}… · read from ${file}`)}`);
     console.log('');
-    console.log('  The bridge will now connect to Gather directly, as an observer:');
-    console.log('  it reads the whole space — names, positions, who is following you —');
-    console.log('  without joining it, so nobody sees an extra avatar.');
-    console.log('');
-    console.log(`  ${bold('What this replaces:')} the devtools port. You no longer need to`);
-    console.log('  relaunch GatherV2 with --remote-debugging-port, and the bridge keeps');
-    console.log('  working when the desktop app is closed.');
+    console.log('  The bridge connects to Gather directly, as an observer: it reads');
+    console.log('  the whole space — names, positions, who is following you — without');
+    console.log('  joining it, so nobody sees an extra avatar.');
     console.log('');
     console.log(`  Restart to pick it up:  ${bold(`${INVOKE} restart`)}`);
     console.log('');
@@ -288,93 +283,73 @@ async function cmdAdopt() {
     console.log(`  ${error.message}`);
     console.log('');
     console.log('  Sign in to the GatherV2 desktop app, then run this again.');
-    console.log(`  Until then the bridge falls back to ${bold('doctor')}'s devtools route.`);
     console.log('');
     process.exit(1);
   }
 }
 
 async function cmdDoctor() {
-  const cdpPort = Number(flagValue(argv, '--cdp-port') ?? DEFAULT_CDP_PORT);
-  const running = isGatherRunning();
-  const cdp = await probeCdp(cdpPort);
   const space = readGatherSpace();
   const adopted = hasGatherSession();
 
   console.log('');
   console.log(`  ${bold('Gather bridge — doctor')}`);
   console.log(`  ${'─'.repeat(56)}`);
-  line('GatherV2 app', existsSync(GATHER_BINARY) ? green('installed') : red('not found'));
+  const running = isGatherRunning();
+  line('GatherV2 app', existsSync(GATHER_BINARY) ? green('installed') : yellow('not found'));
   line('GatherV2 running', running ? green('yes') : yellow('no'));
-  line('log file', existsSync(gatherLogFile) ? green(gatherLogFile) : yellow('not created yet'));
+  line('log file', existsSync(gatherLogFile) ? green('present') : yellow('not created yet'));
   line('last space', space.spaceId ?? dim('unknown'));
   line(
     'gather session',
-    adopted ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : yellow('not adopted'),
+    adopted ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : red('not adopted'),
   );
-  line('devtools port', cdp ? green(`open on ${cdpPort}`) : yellow(`closed on ${cdpPort}`));
   console.log('');
 
-  if (adopted) {
-    console.log(green('  Full fidelity, the direct way.'));
-    console.log('  The bridge connects to Gather itself as an observer: names,');
-    console.log('  positions, cluster adjacency and real follow detection, with no');
-    console.log('  devtools port and no need for the desktop app to be running.');
+  if (!adopted) {
+    console.log(red('  The bridge cannot see anything yet.'));
+    console.log('  It talks to Gather as you, so it needs your session.');
     console.log('');
-    console.log(dim('  Mic, camera and screenshare still come from the log — they are not'));
-    console.log(dim('  part of Gather\'s game state, so nothing can change that.'));
+    console.log(`    1. Sign in to the GatherV2 desktop app.`);
+    console.log(`    2. Run ${bold(`${INVOKE} adopt`)}.`);
+    console.log('');
+    console.log(dim('  That reads the refresh token the desktop client already stored and'));
+    console.log(dim('  keeps a copy in ~/.gather-app-bridge.json (mode 0600). After that'));
+    console.log(dim('  the desktop app can be closed; the bridge mints its own tokens.'));
     console.log('');
     return;
   }
 
-  if (cdp) {
-    console.log(green('  Full fidelity available.'));
-    console.log('  Names, positions, cluster-based adjacency and real follow');
-    console.log('  detection are all readable over devtools.');
-    console.log('');
-    console.log(`  ${bold('Simpler option:')} run ${bold(`${INVOKE} adopt`)} once and the bridge`);
-    console.log('  connects to Gather directly instead — no devtools port, and it keeps');
-    console.log('  working with the desktop app closed.');
-    console.log('');
-    return;
-  }
+  console.log(green('  Connected to Gather directly.'));
+  console.log('  Names, positions, cluster adjacency, real follow detection and live');
+  console.log('  voice activity, with no devtools port and no need for the desktop');
+  console.log('  app to be running.');
+  console.log('');
 
-  console.log(yellow('  Running in log-only mode.'));
-  console.log('  You still get: who joined or left the space, who came near you');
-  console.log('  (from Gather\'s own proximity-gated media connections), who muted,');
-  console.log('  who shared a screen, and notification types.');
+  if (running) {
+    console.log(green('  Gather\'s own notifications are being picked up too.'));
+    console.log('  Waves, meeting invites and event reminders reach the phone even');
+    console.log('  when your Mac suppressed them because the window had focus.');
+  } else {
+    console.log(yellow('  No waves or meeting invites while GatherV2 is closed.'));
+    console.log('  Those three — wave, meeting invite, event reminder — are raised by');
+    console.log('  the desktop client itself and appear in no part of Gather\'s game');
+    console.log('  state, so they are the one thing that still needs it running.');
+    console.log('');
+    console.log(dim('  Everything else — who is next to you, who is following you — keeps'));
+    console.log(dim('  working with the app closed.'));
+  }
   console.log('');
-  console.log('  Not available without devtools: display names, coordinates, and');
-  console.log('  reliable "someone is following me" — that field lives in the web');
-  console.log('  app\'s own state, not in the log.');
-  console.log('');
-  console.log(`  ${bold('To enable it — easiest route:')}`);
-  console.log(`    Run ${bold(`${INVOKE} adopt`)}. It reuses the Gather session the desktop`);
-  console.log('    app is already signed in with, and the bridge then connects to Gather');
-  console.log('    directly. No relaunching, no devtools port, works app-closed.');
-  console.log('');
-  console.log(`  ${bold('Or, the devtools route:')}`);
-  console.log('    1. Quit GatherV2 completely (Cmd+Q — it holds a single-instance lock,');
-  console.log('       so launching a second copy just focuses the first one).');
-  console.log('    2. Start it with the devtools port open:');
-  console.log('');
-  console.log(`       ${dim('"' + GATHER_BINARY + '" \\')}`);
-  console.log(`       ${dim(`  --remote-debugging-port=${cdpPort} --remote-allow-origins='*' &`)}`);
-  console.log('');
-  console.log('    3. Sign in as usual. The bridge attaches on its own within a few');
-  console.log('       seconds — no restart needed.');
-  console.log('');
-  console.log(dim('  --remote-debugging-port is a stock Chromium switch; Electron passes it'));
-  console.log(dim('  through and Gather\'s own debug-flag gate does not apply to it.'));
+  console.log(dim('  Not available at all: mic, camera and screenshare state. They were'));
+  console.log(dim('  IPC state in the desktop client and are in no Gather model.'));
   console.log('');
 }
 
 /**
  * Forces a full state resync.
  *
- * The game server sends its full state dump once per connection, so a bridge
- * that attached to an already-running client sees only heartbeats until somebody
- * moves. This reloads the Gather renderer (~2s) to make the dump happen again.
+ * Cheap now: the game server replays its whole state dump on every connection, so
+ * this is a reconnect. It used to mean reloading the Gather renderer and waiting.
  */
 async function cmdResync() {
   const port = resolvePort();
@@ -584,9 +559,7 @@ function describe(event, nameFor) {
     event.type.startsWith('follow') && event.targetIsSelf ? event.followerId : event.playerId,
   );
   const conf = event.confidence === 'inferred' ? 'inferred' : '';
-  const meta = [conf, event.source === 'log' ? 'log' : event.source === 'cdp' ? 'cdp' : '']
-    .filter(Boolean)
-    .join(' · ');
+  const meta = [conf, event.source === 'log' ? 'desktop log' : ''].filter(Boolean).join(' · ');
 
   switch (event.type) {
     case 'follow.started':
@@ -607,48 +580,26 @@ function describe(event, nameFor) {
       };
     case 'proximity.left':
       return { mark: dim('○'), text: `${who} moved away`, meta };
-    case 'audio.range':
+    case 'player.moved':
       return {
-        mark: dim(event.inRange ? '♪' : '·'),
-        text: `${who} ${event.inRange ? 'came into' : 'left'} earshot`,
-        meta,
+        mark: dim('→'),
+        text: `${who} moved`,
+        meta: event.distance != null ? `${event.distance.toFixed(1)} tiles` : '',
       };
-    case 'player.joinedSpace':
-      return { mark: dim('+'), text: `${who} joined the space`, meta };
-    case 'player.leftSpace':
-      return { mark: dim('-'), text: `${who} left the space`, meta };
-    case 'media.changed': {
-      const what =
-        event.track === 'screen'
-          ? event.paused
-            ? 'stopped sharing their screen'
-            : 'started sharing their screen'
-          : event.track === 'audio'
-            ? event.paused
-              ? 'muted'
-              : 'unmuted'
-            : event.paused
-              ? 'turned their camera off'
-              : 'turned their camera on';
-      return { mark: dim('◐'), text: `${who} ${what}`, meta };
-    }
-    case 'chat.message':
-      return { mark: '💬', text: `${who}: ${event.text}`, meta };
     case 'notification.shown':
+      // A wave is the loudest thing Gather itself will tell you about, and the
+      // one most worth seeing here.
       return {
-        mark: dim('!'),
+        mark: event.notificationType === 'wave' ? yellow('✋') : dim('!'),
         text: event.title ?? `notification: ${event.notificationType}`,
-        meta,
+        meta: [event.body, meta].filter(Boolean).join(' · '),
       };
-    case 'self.changed': {
-      const bits = [
-        event.audioEnabled != null ? `mic ${event.audioEnabled ? 'on' : 'off'}` : '',
-        event.videoEnabled != null ? `cam ${event.videoEnabled ? 'on' : 'off'}` : '',
-        event.screensharing != null ? (event.screensharing ? 'screensharing' : 'stopped sharing') : '',
-        event.inOffice != null ? (event.inOffice ? 'in office' : 'left office') : '',
-      ].filter(Boolean);
-      return { mark: dim('you'), text: bits.join(', ') || 'state changed', meta: '' };
-    }
+    case 'self.changed':
+      return {
+        mark: dim('you'),
+        text: event.inOffice != null ? (event.inOffice ? 'in office' : 'left office') : 'state changed',
+        meta: '',
+      };
     case 'space.changed':
       return { mark: dim('#'), text: `space ${event.spaceName ?? event.spaceId ?? 'unknown'}`, meta };
     case 'bridge.status':
@@ -662,34 +613,42 @@ function describe(event, nameFor) {
   }
 }
 
-/** Replay a log file through the parser — the fastest way to check the regexes. */
+/**
+ * Replay a log file through the notification reader.
+ *
+ * The fastest way to check the regex still matches after a Gather update: point
+ * it at a log you know contained a wave and see whether one comes out. Zero
+ * notifications over a long log is the failure signature.
+ */
 async function cmdReplay() {
   const file = argv.find((a) => !a.startsWith('-') && a !== 'replay') ?? gatherLogFile;
   const asJson = argv.includes('--json');
-  const parser = new GatherLogParser();
+  const reader = new DesktopNotificationReader();
   const counts = new Map();
-  const players = new Set();
   let lines = 0;
 
   const rl = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
   for await (const line of rl) {
     lines++;
-    for (const event of parser.feed(line)) {
-      counts.set(event.type, (counts.get(event.type) ?? 0) + 1);
-      const id = playerIdOf(event);
-      if (id) players.add(id);
+    for (const event of reader.feed(line)) {
+      counts.set(event.notificationType, (counts.get(event.notificationType) ?? 0) + 1);
       if (asJson) console.log(JSON.stringify(event));
     }
   }
 
   if (asJson) return;
+  const total = [...counts.values()].reduce((a, b) => a + b, 0);
   console.log('');
   console.log(`  ${bold(file)}`);
   console.log(`  ${'─'.repeat(56)}`);
   line('lines read', String(lines));
-  line('distinct players', String(players.size));
-  for (const [type, n] of [...counts].sort((a, b) => b[1] - a[1])) {
-    line(type, String(n));
+  line('notifications', String(total));
+  for (const [type, n] of [...counts].sort((a, b) => b[1] - a[1])) line(type, String(n));
+  if (total === 0) {
+    console.log('');
+    console.log(yellow('  Nothing matched. If this log should contain a wave or a meeting'));
+    console.log(yellow('  invite, the IPC line has changed shape — see'));
+    console.log(yellow('  bridge/lib/desktop-notifications.js.'));
   }
   console.log('');
 }

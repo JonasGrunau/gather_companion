@@ -489,12 +489,13 @@ class _PersonChip extends StatelessWidget {
             person.label,
             style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.foreground),
           ),
-          if (person.screensharing) ...[
+          // Talking, from Gather's own `speaking` field. This used to be a
+          // mic-off icon driven by the desktop client's log, which could only
+          // ever be turned *off* and so almost never showed. Voice activity is
+          // both readable and the thing you actually want to know.
+          if (person.speaking) ...[
             const SizedBox(width: 6),
-            Icon(Icons.screen_share_rounded, size: 13, color: t.brandSoft),
-          ] else if (person.micOn == false) ...[
-            const SizedBox(width: 6),
-            Icon(Icons.mic_off_rounded, size: 13, color: t.faint),
+            Icon(Icons.graphic_eq_rounded, size: 13, color: t.brandSoft),
           ],
         ],
       ),

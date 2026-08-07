@@ -8,12 +8,18 @@ library;
 /// Where an event was observed. Different collectors have different fidelity,
 /// so the app can tell the user *how* it knows something.
 enum EventSource {
-  /// Parsed out of the desktop client's log file. Always available, but only
-  /// carries player ids — never names or coordinates.
+  /// Read from Gather's own game socket, which the bridge connects to as the
+  /// user. Names, coordinates, clusters, follow state, voice activity.
+  gather,
+
+  /// Parsed out of the desktop client's log file. Now only Gather's own
+  /// notifications — waves, meeting invites, event reminders — which exist in no
+  /// Gather model and can be read nowhere else.
   log,
 
-  /// Read out of the live renderer over the Chrome DevTools Protocol. Richer:
-  /// names, coordinates, and explicit follow state.
+  /// Was: read out of the live renderer over the Chrome DevTools Protocol. That
+  /// collector is gone, replaced by [gather]. Kept so events recorded by an older
+  /// bridge still decode.
   cdp,
 
   /// Emitted by the bridge itself (status, derived/inferred events).

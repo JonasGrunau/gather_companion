@@ -1,20 +1,30 @@
 /**
- * Folds the event stream into "what does the world look like right now", and
- * suppresses the duplicates the client emits.
+ * Folds the roster into "what does the world look like right now".
  *
- * There are two fidelities of input, and the tracker accepts both:
+ * There used to be two fidelities of input here: inferred log events and observed
+ * `SpaceUser` rows. Only the second remains. Everything now arrives as Gather's
+ * own model rows from `DirectCollector`, so proximity comes from `clusterId`
+ * (Gather's own notion of "standing together") and following from
+ * `followTargetId`, and both are *observed* rather than guessed.
  *
- *  - **Log events** (always available). Proximity is *inferred* from Gather's
- *    proximity-gated media connections; there are no names and no coordinates.
- *  - **CDP roster rows** (when the collector is attached). These are the web
- *    app's own `SpaceUser` records, so proximity and following are *observed*:
- *    `clusterId` says who you are grouped with and `followTargetId` says who is
- *    following whom, by name.
+ * What that removed, and why it is not missed:
+ *
+ *  - The movement-based follow detector. It existed because the log had no
+ *    `followTargetId` to read. With the real field always present, guessing from
+ *    convergence is strictly worse — and it had already stopped being reachable.
+ *  - Per-player mic/camera/screenshare. Those came from the client's log and are
+ *    in no Gather model at all. `speaking` — live voice activity — is in the game
+ *    state and is the better signal anyway: it says who is *talking*, not who
+ *    happens to have a mic enabled.
+ *
+ * One log-derived event still passes through `apply`: `notification.shown`, for
+ * the waves and meeting invites Gather's own client raises. It needs no folding —
+ * it is news, not state — so it falls through to the default branch.
  */
 
 import { bridgeStatus, emptySelf, follow, newPlayer, playerMoved, proximity } from './events.js';
 
-/** How close, in tiles, counts as "standing next to me" when we have coordinates. */
+/** How close, in tiles, counts as "standing next to me". */
 export const ADJACENT_TILES = 3;
 
 /**
@@ -25,18 +35,14 @@ export const ADJACENT_TILES = 3;
  */
 export const LEAVE_TILES = 4.5;
 
-/** Which player field each media track drives. Nothing else is a media track. */
-const MEDIA_KEYS = { audio: 'micOn', video: 'cameraOn', screen: 'screensharing' };
-
 export class PresenceTracker {
-  constructor({ followDetector = null } = {}) {
-    this.followDetector = followDetector;
+  constructor() {
     /** @type {Map<string, object>} */
     this._players = new Map();
     this._self = emptySelf();
-    this._health = { logTail: false, cdp: false, detail: null };
+    this._health = { gather: false, cdp: false, logTail: false, detail: null };
     this._selfPosition = null;
-    /** My own SpaceUser id and cluster, learned from the CDP roster. */
+    /** My own SpaceUser id and cluster, learned from the roster. */
     this._selfId = null;
     this._selfClusterId = null;
     this._selfFloorId = null;
@@ -78,132 +84,23 @@ export class PresenceTracker {
   }
 
   /**
-   * Apply one event. Returns `{ emit, stateChanged }` where `emit` holds only
-   * the events worth showing a human — the client double-reports plenty (a
-   * proximity change arrives once from the media handler and again from the
-   * volume line), and the app should not show that twice.
+   * Apply one event the collector produced directly, rather than via the roster.
+   *
+   * That is now a short list — status and the space the bridge was told to watch.
+   * Everything about *people* comes through `applyRoster`.
+   *
+   * Returns `{ emit, stateChanged }` where `emit` holds only the events worth
+   * showing a human.
    */
   apply(event) {
-    const none = { emit: [], stateChanged: false };
-
     switch (event.type) {
-      case 'proximity.entered':
-      case 'proximity.left': {
-        const near = event.type === 'proximity.entered';
-        const p = this._player(event.playerId);
-        if (p.isNear === near) {
-          if (event.distance != null) {
-            p.distance = event.distance;
-            return { emit: [], stateChanged: true };
-          }
-          return none;
-        }
-        p.isNear = near;
-        p.distance = event.distance ?? p.distance;
-        p.nearSince = near ? event.at : null;
-        return { emit: [event], stateChanged: true };
-      }
-
-      case 'audio.range': {
-        const p = this._player(event.playerId);
-        if (p.inAudioRange === event.inRange) return none;
-        const hadProximity = p.isNear;
-        p.inAudioRange = event.inRange;
-        // Audio range is a weaker signal than the media handler; only surface it
-        // when we have no proximity information for this player at all.
-        return { emit: hadProximity ? [] : [event], stateChanged: true };
-      }
-
-      case 'player.joinedSpace': {
-        const existing = this._players.get(event.playerId);
-        if (existing?.inSpace === true) return none;
-        const p = this._player(event.playerId);
-        p.inSpace = true;
-        return { emit: [event], stateChanged: true };
-      }
-
-      case 'player.leftSpace': {
-        const p = this._players.get(event.playerId);
-        if (!p) return none;
-        p.inSpace = false;
-        p.isNear = false;
-        p.inAudioRange = false;
-        p.isFollowingMe = false;
-        p.nearSince = null;
-        p.followingMeSince = null;
-        this.followDetector?.forget(event.playerId);
-        return { emit: [event], stateChanged: true };
-      }
-
-      case 'media.changed': {
-        const p = this._player(event.playerId);
-        // An unrecognised track name must not fall through onto screensharing —
-        // that is the loudest field in the app and the least safe default.
-        const key = MEDIA_KEYS[event.track];
-        if (!key) return none;
-
-        // Only a *pause* is trustworthy here. Gather logs
-        // `setStreamPausedState <id> <track> false` when the client subscribes to
-        // a remote track — which happens on proximity, not when the person
-        // actually starts sending — and never logs the matching `true`. Verified
-        // against every such line in main.log and main.old.log: 249 samples, 74
-        // `screen false`, 175 `video false`, zero `true`, ever. So reading "not
-        // paused" as "on" latches a flag that nothing can ever clear, and
-        // everyone who walks past you is reported as sharing their screen
-        // forever. Turning state *off* on a pause stays sound.
-        if (event.paused !== true) return none;
-        if (p[key] === false) return none;
-        p[key] = false;
-        // Only screen sharing is worth a line in the feed; mic and camera
-        // flicker constantly as people talk.
-        return {
-          emit: event.track === 'screen' ? [event] : [],
-          stateChanged: true,
-        };
-      }
-
-      case 'media.connection':
-        // Transport noise. Recorded so the player is known to exist, never shown.
-        this._player(event.playerId);
-        return none;
-
-      case 'player.moved': {
-        const p = this._player(event.playerId);
-        p.x = event.x;
-        p.y = event.y;
-        if (event.distance != null) p.distance = event.distance;
-        const out = [];
-        const verdict = this.followDetector?.observe({
-          playerId: event.playerId,
-          x: event.x,
-          y: event.y,
-          selfPosition: this._selfPosition,
-          at: new Date(event.at),
-        });
-        if (verdict) out.push(...this._applyFollow(verdict));
-        return { emit: out, stateChanged: true };
-      }
-
-      case 'follow.started':
-      case 'follow.stopped':
-        return { emit: this._applyFollow(event), stateChanged: true };
-
       case 'self.changed': {
         const before = { ...this._self };
         if (event.userId != null) this._self.userId = event.userId;
-        if (event.audioEnabled != null) this._self.micOn = event.audioEnabled;
-        if (event.videoEnabled != null) this._self.cameraOn = event.videoEnabled;
         if (event.inOffice != null) this._self.inOffice = event.inOffice;
-        if (event.screensharing != null) this._self.screensharing = event.screensharing;
         const changed =
-          before.userId !== this._self.userId ||
-          before.micOn !== this._self.micOn ||
-          before.cameraOn !== this._self.cameraOn ||
-          before.inOffice !== this._self.inOffice ||
-          before.screensharing !== this._self.screensharing;
-        if (!changed) return none;
-        // Leaving the office invalidates everything we knew about who was around.
-        if (event.inOffice === false) this._clearRoom();
+          before.userId !== this._self.userId || before.inOffice !== this._self.inOffice;
+        if (!changed) return { emit: [], stateChanged: false };
         return { emit: [event], stateChanged: true };
       }
 
@@ -215,63 +112,67 @@ export class PresenceTracker {
         return { emit: [event], stateChanged: true };
       }
 
-      case 'bridge.status':
-        this.setHealth({
+      case 'bridge.status': {
+        const patch = {
           [event.collector]: event.healthy,
           detail: event.detail ?? this._health.detail,
-        });
+        };
+        // `cdp` is a compatibility alias, not a second collector. App builds
+        // already on people's phones compute `hasRichData` from
+        // `CollectorHealth.cdp`, so publishing only the honest name would make
+        // them show the "log-only mode: no names" banner while we hold the full
+        // roster. Newer builds read `gather` and ignore this.
+        if (event.collector === 'gather') patch.cdp = event.healthy;
+        this.setHealth(patch);
         return { emit: [event], stateChanged: true };
+      }
 
       default:
-        // chat.message, notification.shown, app.badge, raw — pass through.
         return { emit: [event], stateChanged: false };
     }
   }
 
-  _applyFollow(event) {
-    if (!event.targetIsSelf) {
-      this._self.followingPlayerId = event.started ? event.targetId : null;
-      return [event];
-    }
-    const p = this._player(event.followerId);
-    if (p.isFollowingMe === event.started) return [];
-    p.isFollowingMe = event.started;
-    p.followingMeSince = event.started ? event.at : null;
-    return [event];
-  }
-
   _clearRoom() {
     this._players.clear();
-    this.followDetector?.reset();
     this._selfClusterId = null;
   }
 
   /**
-   * Replace what we know from the live web app's own `SpaceUser` records.
+   * Replace what we know from Gather's own `SpaceUser` records.
    *
-   * `rows` are the decoded model rows the CDP collector scraped out of the
-   * renderer. This is the authoritative path: proximity comes from `clusterId`
-   * (Gather groups people who are standing together into a cluster) and
-   * following from `followTargetId`, so both become `observed` rather than
-   * inferred.
-   *
-   * @param {{ selfId: string|null, rows: Array<object> }} roster
+   * @param {{ selfId: string|null, rows: Array<object>, spaceName?: string|null }} roster
    * @returns {{ emit: object[], stateChanged: boolean }}
    */
-  applyRoster({ selfId, rows }) {
+  applyRoster({ selfId, rows, spaceName = null }) {
     const emit = [];
     let stateChanged = false;
     const at = new Date();
 
+    if (spaceName && spaceName !== this._self.spaceName) {
+      this._self.spaceName = spaceName;
+      stateChanged = true;
+    }
+
     if (selfId) this._selfId = selfId;
     const me = rows.find((r) => r.id === this._selfId) ?? null;
+
+    // Whether *you* are in the space at all. Our own connection is an observer —
+    // it never calls `enterSpace` — so this reflects your real clients, not us.
+    //
+    // It matters because your avatar does not disappear when you close Gather: it
+    // stays parked wherever you left it, usually at your desk. Judging proximity
+    // against a parked avatar reports every passer-by as standing next to you, all
+    // night. So when you are offline, nobody is near you, by definition.
+    const selfOnline = me?.connected !== false;
+    if (me && this._self.inOffice !== selfOnline) {
+      this._self.inOffice = selfOnline;
+      stateChanged = true;
+    }
+
     if (me) {
       this._selfClusterId = me.clusterId ?? null;
       this._selfFloorId = me.floorId ?? null;
-      if (me.x != null && me.y != null) {
-        this._selfPosition = [me.x, me.y];
-        this.followDetector?.observeSelf({ x: me.x, y: me.y, at });
-      }
+      if (me.x != null && me.y != null) this._selfPosition = [me.x, me.y];
       if (me.followTargetId !== undefined) {
         const wanted = me.followTargetId ?? null;
         if (wanted !== this._self.followingPlayerId) {
@@ -281,10 +182,9 @@ export class PresenceTracker {
       }
     }
 
-    // Without knowing which row is *me*, "next to me" and "following me" are
-    // both undefined. Merge the identity information the roster does give us —
-    // names and coordinates are still worth having — and leave proximity to the
-    // log collector, which needs no self identity.
+    // Without knowing which row is *me*, "next to me" and "following me" are both
+    // undefined. Merge the identity information the roster does give us — names
+    // and coordinates are still worth having — and judge nothing.
     const knowSelf = this._selfId != null;
 
     const seen = new Set();
@@ -296,6 +196,12 @@ export class PresenceTracker {
 
       if (row.name && row.name !== p.name) {
         p.name = row.name;
+        stateChanged = true;
+      }
+      if (row.speaking != null && row.speaking !== p.speaking) {
+        // State only, never an event: voice activity toggles every few seconds
+        // while someone talks, and a feed of that is unreadable.
+        p.speaking = row.speaking;
         stateChanged = true;
       }
       // Whether they actually changed tiles, decided before the row overwrites
@@ -319,9 +225,9 @@ export class PresenceTracker {
       // its coordinates, so on distance alone it is indistinguishable from
       // somebody standing next to you, and walking past an empty desk reports its
       // owner as having walked up. The full state dump carries every member of
-      // the space, not just the ones online: 80 rows here, 25 of them connected,
-      // 54 of the rest still holding coordinates. Only the connected ones can be
-      // standing anywhere. `null` stays judgeable — unknown is not absent.
+      // the space, not just the ones online: 111 rows in the measured space, most
+      // of them offline and still holding coordinates. Only the connected ones can
+      // be standing anywhere. `null` stays judgeable — unknown is not absent.
       const online = row.connected !== false;
 
       // Gather's own proximity predicate requires the same floor before any
@@ -337,18 +243,18 @@ export class PresenceTracker {
         this._selfClusterId != null && row.clusterId != null && row.clusterId === this._selfClusterId;
       const closeEnough =
         distance != null && distance <= (p.isNear ? LEAVE_TILES : ADJACENT_TILES);
-      const near = online && sameFloor && (sameCluster || closeEnough);
+      const near = selfOnline && online && sameFloor && (sameCluster || closeEnough);
 
       // With neither a position nor a cluster there is nothing to judge on. Say
-      // nothing rather than reporting everyone as having walked off — the log
-      // collector may well know they are near. Going offline is always judgeable:
-      // whatever we thought before, they are not standing there now.
-      const canJudge = !online || sameCluster || distance != null;
+      // nothing rather than reporting everyone as having walked off. Going offline
+      // is always judgeable: whatever we thought before, they are not standing
+      // there now. So is our own absence.
+      const canJudge = !selfOnline || !online || sameCluster || distance != null;
 
       // Someone next to you shifting around is worth saying out loud; the other
-      // seventy-nine rows changing tiles four times a second is not, and the
-      // snapshot already carries every position for anyone who wants the map. So
-      // this is deliberately scoped to the people the app is actually watching.
+      // hundred rows changing tiles four times a second is not, and the snapshot
+      // already carries every position for anyone who wants the map. So this is
+      // deliberately scoped to the people the app is actually watching.
       if (moved && online && p.isNear) {
         emit.push(playerMoved({ at, playerId: row.id, x: p.x, y: p.y, distance }));
       }
@@ -360,7 +266,6 @@ export class PresenceTracker {
         emit.push(
           proximity({
             at,
-            source: 'cdp',
             confidence: sameCluster ? 'observed' : 'inferred',
             playerId: row.id,
             near,
@@ -380,8 +285,6 @@ export class PresenceTracker {
           emit.push(
             follow({
               at,
-              source: 'cdp',
-              confidence: 'observed',
               followerId: row.id,
               targetId: this._selfId ?? 'self',
               started: followsMe,
@@ -401,12 +304,12 @@ export class PresenceTracker {
     for (const [id, p] of this._players) {
       if (!knowSelf) break;
       if (seen.has(id) || !p.inSpace) continue;
-      if (rows.length === 0) break; // an empty scrape means "unknown", not "empty"
+      if (rows.length === 0) break; // an empty roster means "unknown", not "empty"
       p.inSpace = false;
       if (p.isNear) {
         p.isNear = false;
         p.nearSince = null;
-        emit.push(proximity({ at, source: 'cdp', playerId: id, near: false }));
+        emit.push(proximity({ at, playerId: id, near: false }));
       }
       if (p.isFollowingMe) {
         p.isFollowingMe = false;
@@ -414,7 +317,6 @@ export class PresenceTracker {
         emit.push(
           follow({
             at,
-            source: 'cdp',
             followerId: id,
             targetId: this._selfId ?? 'self',
             started: false,
@@ -432,112 +334,4 @@ export class PresenceTracker {
     this.setHealth({ [collector]: healthy, detail: detail ?? null });
     return bridgeStatus({ at: new Date(), collector, healthy, detail });
   }
-}
-
-/**
- * Infers "this person is following me" from movement alone.
- *
- * Only used when the roster does not give us `followTargetId` — the log-only
- * path has no such field. The idea: a follower repeatedly closes the gap after
- * *I* move. Someone who merely happens to stand near me never re-converges,
- * because they never move at all.
- */
-export class FollowDetector {
-  constructor({ windowMs = 25_000, minConvergences = 3, reactionMs = 4000 } = {}) {
-    this.windowMs = windowMs;
-    this.minConvergences = minConvergences;
-    this.reactionMs = reactionMs;
-    /** @type {Array<{x:number,y:number,t:number}>} */
-    this._mine = [];
-    /** @type {Map<string, Array<{x:number,y:number,t:number}>>} */
-    this._theirs = new Map();
-    /** @type {Map<string, boolean>} */
-    this._verdict = new Map();
-  }
-
-  reset() {
-    this._mine = [];
-    this._theirs.clear();
-    this._verdict.clear();
-  }
-
-  forget(playerId) {
-    this._theirs.delete(playerId);
-    this._verdict.delete(playerId);
-  }
-
-  observeSelf({ x, y, at }) {
-    this._mine.push({ x, y, t: at.getTime() });
-    this._prune(this._mine, at.getTime());
-  }
-
-  /** Returns a follow event only when the verdict flips, so callers see edges. */
-  observe({ playerId, x, y, selfPosition, at }) {
-    if (!selfPosition) return null;
-    const t = at.getTime();
-    let samples = this._theirs.get(playerId);
-    if (!samples) {
-      samples = [];
-      this._theirs.set(playerId, samples);
-    }
-    samples.push({ x, y, t });
-    this._prune(samples, t);
-
-    const following = this._looksLikeFollowing(samples);
-    if (this._verdict.get(playerId) === following) return null;
-    this._verdict.set(playerId, following);
-
-    return follow({
-      at,
-      source: 'cdp',
-      confidence: 'inferred',
-      followerId: playerId,
-      targetId: 'self',
-      started: following,
-      targetIsSelf: true,
-    });
-  }
-
-  _looksLikeFollowing(samples) {
-    if (this._mine.length < 2 || samples.length < 2) return false;
-    let convergences = 0;
-    for (let i = 1; i < this._mine.length; i++) {
-      const myMove = this._mine[i];
-      if (dist(this._mine[i - 1], myMove) < 1) continue; // I barely moved
-
-      const before = latestBefore(samples, myMove.t);
-      const after = firstAfter(samples, myMove.t, this.reactionMs);
-      if (!before || !after) continue;
-
-      const gapBefore = dist(before, myMove);
-      const gapAfter = dist(after, myMove);
-      if (gapAfter <= ADJACENT_TILES && gapAfter < gapBefore) convergences++;
-    }
-    return convergences >= this.minConvergences;
-  }
-
-  _prune(samples, now) {
-    const cutoff = now - this.windowMs;
-    while (samples.length && samples[0].t < cutoff) samples.shift();
-  }
-}
-
-function dist(a, b) {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
-function latestBefore(samples, t) {
-  let found = null;
-  for (const s of samples) {
-    if (s.t > t) break;
-    found = s;
-  }
-  return found;
-}
-
-function firstAfter(samples, t, within) {
-  for (const s of samples) {
-    if (s.t > t && s.t <= t + within) return s;
-  }
-  return null;
 }

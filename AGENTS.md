@@ -57,16 +57,22 @@ ships both.**
   directly, with no `node_modules` to resolve. Adding an npm dependency breaks
   every installed daemon. This is why msgpack, the WebSocket server and the QR
   encoder are all hand-rolled.
-- **Read-only, always.** No writing to Gather, no sending actions, no patching
-  the client (`app.asar` is integrity-checked anyway). The CDP collector reads
-  frames the client is already exchanging; it must never open its own game
-  socket — the gateway keys connection identity on `spaceId` + `authUserId` and
-  a second connection could evict the user's own.
+- **Observe, never participate.** The bridge opens its own authenticated game
+  socket — that used to be forbidden, on the belief that the gateway evicts a
+  duplicate `spaceId` + `authUserId` with close 4031. Measured 2026-08-06 against
+  a live space: it does not, because `Connection` is per-connection while
+  `SpaceUser` is per-person-per-space, so both connections drive the same avatar.
+  What remains binding is what the bridge is allowed to *send*: `Authenticate`,
+  `ConnectToSpace`, `Subscribe`, one `Action{loadSpaceUser}` and a heartbeat.
+  Never `enterSpace` (it puts an avatar in the room and permanently increments
+  `numTimesEnteredSpace`), never a move, a chat or a setting. The desktop client
+  is never patched — `app.asar` is integrity-checked anyway.
 - **Honesty over confidence.** Where the bridge does not know something it says
-  so rather than guessing: `confidence: 'inferred'` vs `'observed'`, and the CDP
-  collector reports itself *unhealthy* while attached-but-stateless rather than
+  so rather than guessing: `confidence: 'inferred'` vs `'observed'`, and the
+  collector reports itself *unhealthy* while connected-but-stateless rather than
   rendering an empty room as "nobody is following you". Preserve that property
-  in any change.
+  in any change. The same rule is why mic/camera/screenshare were deleted rather
+  than left as fields nothing could fill.
 - **The README is not decoration.** It records findings that cost real
   investigation (the npm owner-field case sensitivity, the cloud-signing
   failure, the two log id namespaces). Keep it current when behaviour changes.
@@ -120,6 +126,6 @@ See `.github/AGENTS.md` and the README's Releasing section for the constraints
 - **App:** `flutter_local_notifications`, `mobile_scanner` (7.x, Swift Package
   Manager — *not* CocoaPods), `shared_preferences`, `web_socket_channel`.
 - **Runtime target being read:** the Gather V2 Electron desktop client — its
-  `~/Library/Logs/GatherV2/main.log` and, optionally, its devtools port.
+  `~/Library/Logs/GatherV2/main.log`, for Gather's own notifications only.
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->

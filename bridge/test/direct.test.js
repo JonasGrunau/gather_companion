@@ -1,158 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
 
 import { DirectCollector } from '../lib/direct.js';
 import { decode, encode } from '../lib/msgpack.js';
-import { encodeFrame } from '../lib/ws.js';
-
-/**
- * A fake Gather game server.
- *
- * Test-only, like the encoder in `msgpack.test.js` used to be. `WsConnection`
- * only surfaces *text* frames — it exists to serve JSON to phones — and the game
- * protocol is binary, so the framing here is hand-rolled rather than reused.
- *
- * It speaks just enough of the real protocol to be worth testing against: the
- * handshake is recorded verbatim so assertions can check what the collector sent,
- * and state is only dumped for a connection that actually authenticated.
- */
-function fakeGameServer({ requireAuth = true } = {}) {
-  const connections = [];
-  const server = createServer();
-
-  server.on('upgrade', (req, socket) => {
-    const key = req.headers['sec-websocket-key'];
-    const accept = createHash('sha1')
-      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-      .digest('base64');
-    socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Upgrade: websocket\r\n' +
-        'Connection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-
-    const conn = { url: req.url, received: [], authenticated: false, socket };
-    connections.push(conn);
-
-    const send = (frame) => socket.write(encodeFrame(2, encode(frame)));
-    // The real server heartbeats before the first state chunk, which is what
-    // makes a premature "handshake rejected" verdict so tempting.
-    send({ type: 'Heartbeat', timestamp: 1, origin: 'Server' });
-
-    let buf = Buffer.alloc(0);
-    socket.on('data', (chunk) => {
-      buf = Buffer.concat([buf, chunk]);
-      for (;;) {
-        const frame = readClientFrame(buf);
-        if (!frame) break;
-        buf = frame.rest;
-        if (frame.opcode >= 0x8) continue; // control frames: ignore
-        let decoded;
-        try {
-          decoded = decode(frame.payload);
-        } catch {
-          continue;
-        }
-        conn.received.push(decoded);
-
-        if (decoded?.type === 'Authenticate') {
-          conn.authenticated = decoded?.credential?.type === 'JWT' && !!decoded?.credential?.jwt;
-        }
-        if (decoded?.action === 'loadSpaceUser') {
-          if (requireAuth && !conn.authenticated) continue; // stay silent, as Gather does
-          send({ type: 'SpaceStatus', warmInGatewayServer: true });
-          send({
-            type: 'FullStateChunk',
-            sequenceNumber: 1,
-            fullStatePatches: [
-              {
-                op: 'addmodel',
-                model: 'Connection',
-                data: {
-                  id: 'conn-1',
-                  spaceId: 'space-1',
-                  authUserId: 'uid-1',
-                  spaceUserId: 'me-1',
-                  entered: false,
-                  target: 'OfficeView',
-                },
-              },
-              {
-                op: 'addmodel',
-                model: 'SpaceUser',
-                data: {
-                  id: 'me-1',
-                  name: 'Me',
-                  position: { $type: 'Position', x: 10, y: 10 },
-                  floorId: 'floor-1',
-                  connected: true,
-                  isBot: false,
-                },
-              },
-              {
-                op: 'addmodel',
-                model: 'SpaceUser',
-                data: {
-                  id: 'them-1',
-                  name: 'Neighbour',
-                  position: { $type: 'Position', x: 11, y: 10 },
-                  floorId: 'floor-1',
-                  connected: true,
-                  isBot: false,
-                },
-              },
-            ],
-          });
-        }
-      }
-    });
-    socket.on('error', () => {});
-  });
-
-  return {
-    connections,
-    listen: () =>
-      new Promise((resolve) => {
-        server.listen(0, '127.0.0.1', () => resolve(`ws://127.0.0.1:${server.address().port}`));
-      }),
-    close: () => {
-      for (const c of connections) {
-        try {
-          c.socket.destroy();
-        } catch {
-          /* gone */
-        }
-      }
-      return new Promise((resolve) => server.close(resolve));
-    },
-  };
-}
-
-/** Minimal masked-frame reader; returns null until a whole frame is buffered. */
-function readClientFrame(buf) {
-  if (buf.length < 2) return null;
-  const opcode = buf[0] & 0x0f;
-  let length = buf[1] & 0x7f;
-  let offset = 2;
-  if (length === 126) {
-    if (buf.length < 4) return null;
-    length = buf.readUInt16BE(2);
-    offset = 4;
-  } else if (length === 127) {
-    if (buf.length < 10) return null;
-    length = Number(buf.readBigUInt64BE(2));
-    offset = 10;
-  }
-  if (buf.length < offset + 4 + length) return null;
-  const mask = buf.subarray(offset, offset + 4);
-  offset += 4;
-  const payload = Buffer.from(buf.subarray(offset, offset + length));
-  for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
-  return { opcode, payload, rest: buf.subarray(offset + length) };
-}
+import { fakeGameServer, fakeJwt } from './fake-gather.js';
 
 /**
  * A collector wired to the fake server, with auth injected.
@@ -161,16 +12,6 @@ function readClientFrame(buf) {
  * `getToken` is the seam, and `spaceId` is passed explicitly so no API lookup
  * happens either.
  */
-/**
- * A syntactically valid JWT carrying a chosen uid. The collector reads the uid
- * straight out of the token, so this also keeps the test from falling back to
- * whatever session the developer happens to have adopted.
- */
-function fakeJwt(uid = 'uid-1') {
-  const claims = Buffer.from(JSON.stringify({ user_id: uid, exp: 4e9 })).toString('base64url');
-  return `eyJhbGciOiJub25lIn0.${claims}.sig`;
-}
-
 async function startCollector({ requireAuth = true, token = fakeJwt() } = {}) {
   const fake = fakeGameServer({ requireAuth });
   servers.push(fake);
@@ -228,6 +69,27 @@ test('connects as an observer and publishes a roster from the state dump', async
 
   const connectUrl = fake.connections[0].url;
   assert.match(connectUrl, /spaceId=space-1/);
+});
+
+test('a steady connection stops announcing itself once it is up', async () => {
+  // Regression: the health detail used to carry a frame counter, so it changed on
+  // every 250ms flush and published a `bridge.status` event each time. Left alone
+  // that fills the 500-event history the phone replays on reconnect with status
+  // noise, evicting the events worth catching up on within minutes.
+  const { collector } = await startCollector();
+  const statuses = [];
+  collector.on('status', (s) => statuses.push(s));
+
+  const rosterPromise = firstRoster(collector);
+  collector.start();
+  await rosterPromise;
+  await wait(400); // let the healthy status land
+  const settled = statuses.length;
+  await wait(1200); // several publish intervals
+
+  assert.equal(statuses.length, settled, 'a connection that has not changed says nothing');
+  assert.match(collector.detail, /space users/);
+  assert.ok(!/frames/.test(collector.detail), 'the frame counter must stay out of the detail');
 });
 
 test('a rejected handshake is reported as connected-but-no-state, not as healthy', async () => {

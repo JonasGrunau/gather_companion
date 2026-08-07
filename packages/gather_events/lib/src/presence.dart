@@ -12,6 +12,7 @@ class PlayerRef {
     this.isNear = false,
     this.inAudioRange = false,
     this.isFollowingMe = false,
+    this.speaking = false,
     this.micOn,
     this.cameraOn,
     this.screensharing = false,
@@ -25,7 +26,7 @@ class PlayerRef {
   /// Gather's player uuid. Stable for the duration of a session.
   final String id;
 
-  /// Display name, only known when the CDP collector is attached.
+  /// Display name, straight from Gather's `SpaceUser.name`.
   final String? name;
 
   final bool inSpace;
@@ -37,11 +38,18 @@ class PlayerRef {
   /// This person is following me around.
   final bool isFollowingMe;
 
+  /// Talking right now — Gather's own `SpaceUser.speaking`, and the most
+  /// frequently updated field on the whole game socket.
+  final bool speaking;
+
+  /// Always null. Mic, camera and screenshare were only ever readable by
+  /// scraping the desktop client's log and are in no Gather model; [speaking]
+  /// is the signal that replaced them. Kept so older snapshots still decode.
   final bool? micOn;
   final bool? cameraOn;
   final bool screensharing;
 
-  /// Distance in tiles, when known (CDP only).
+  /// Distance in tiles.
   final double? distance;
   final double? x;
   final double? y;
@@ -58,6 +66,7 @@ class PlayerRef {
     bool? isNear,
     bool? inAudioRange,
     bool? isFollowingMe,
+    bool? speaking,
     bool? micOn,
     bool? cameraOn,
     bool? screensharing,
@@ -76,6 +85,7 @@ class PlayerRef {
       isNear: isNear ?? this.isNear,
       inAudioRange: inAudioRange ?? this.inAudioRange,
       isFollowingMe: isFollowingMe ?? this.isFollowingMe,
+      speaking: speaking ?? this.speaking,
       micOn: micOn ?? this.micOn,
       cameraOn: cameraOn ?? this.cameraOn,
       screensharing: screensharing ?? this.screensharing,
@@ -96,6 +106,7 @@ class PlayerRef {
         'isNear': isNear,
         'inAudioRange': inAudioRange,
         'isFollowingMe': isFollowingMe,
+        'speaking': speaking,
         'micOn': micOn,
         'cameraOn': cameraOn,
         'screensharing': screensharing,
@@ -113,6 +124,7 @@ class PlayerRef {
         isNear: json['isNear'] as bool? ?? false,
         inAudioRange: json['inAudioRange'] as bool? ?? false,
         isFollowingMe: json['isFollowingMe'] as bool? ?? false,
+        speaking: json['speaking'] as bool? ?? false,
         micOn: json['micOn'] as bool?,
         cameraOn: json['cameraOn'] as bool?,
         screensharing: json['screensharing'] as bool? ?? false,
@@ -196,29 +208,44 @@ class SelfState {
       );
 }
 
-/// Which collectors are currently feeding the bridge, so the app can show
-/// honestly how good its information is.
+/// What the bridge is currently connected to, so the app can show honestly how
+/// good its information is.
 class CollectorHealth {
   const CollectorHealth({
+    this.gather = false,
     this.logTail = false,
     this.cdp = false,
     this.detail,
   });
 
+  /// The connection to Gather's own game socket. Everything about people —
+  /// names, positions, proximity, following, voice activity — comes from here.
+  final bool gather;
+
+  /// The tail of the desktop client's log, which now carries exactly one thing:
+  /// Gather's own notifications (waves, meeting invites, event reminders). Down
+  /// simply means the desktop app is not running; presence is unaffected.
   final bool logTail;
+
+  /// Was the CDP collector, which no longer exists. Still read because a bridge
+  /// older than this app build sets it and nothing else, and because the current
+  /// bridge mirrors [gather] onto it for app builds older than *it*.
   final bool cdp;
+
   final String? detail;
 
-  /// Names, coordinates and explicit follow state need the CDP collector.
-  bool get hasRichData => cdp;
+  /// Whether we have names, coordinates and explicit follow state.
+  bool get hasRichData => gather || cdp;
 
   Map<String, Object?> toJson() => {
+        'gather': gather,
         'logTail': logTail,
         'cdp': cdp,
         'detail': detail,
       };
 
   static CollectorHealth fromJson(Map<String, Object?> json) => CollectorHealth(
+        gather: json['gather'] as bool? ?? false,
         logTail: json['logTail'] as bool? ?? false,
         cdp: json['cdp'] as bool? ?? false,
         detail: json['detail'] as String?,

@@ -14,15 +14,14 @@ platform plumbing — launchd installation, paths, pairing codes.
 
 | File | Description |
 |------|-------------|
-| `server.js` | `BridgeServer` — owns the collectors, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
-| `presence.js` | `PresenceTracker` (folds events into current state, suppresses duplicates, decides what a human should see) and `FollowDetector` (infers following from movement when `followTargetId` is unavailable). Exports `ADJACENT_TILES` / `LEAVE_TILES`. |
+| `server.js` | `BridgeServer` — owns the collector, the notification tail, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
+| `presence.js` | `PresenceTracker` — folds the roster into current state, suppresses duplicates, decides what a human should see. Exports `ADJACENT_TILES` / `LEAVE_TILES`. |
 | `events.js` | Every event constructor, and therefore the wire format. `{type, at, source, confidence, ...payload}`. Also `newPlayer()` / `emptySelf()` snapshot shapes. |
-| `direct.js` | `DirectCollector` — **the preferred rich collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
+| `direct.js` | `DirectCollector` — **the only collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
-| `cdp.js` | `CdpCollector` — the **fallback** rich collector. Attaches to the Chrome DevTools browser endpoint, discovers every target, enables the Network domain, and routes binary WebSocket frames to the protocol reader. Also `probeCdp()`. |
-| `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster and resolves which row is *me*. |
+| `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster, reads the space name off the `Space` row, and resolves which row is *me*. |
 | `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
-| `log-parser.js` | `GatherLogParser` — regexes over `main.log`, both the `(webapp)` and `(main)` scopes, plus `parseInspect()` for `util.inspect` bodies. |
+| `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper. One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. |
 | `log-tail.js` | `LogTail` — follows a growing file across rotation, truncation and machine sleep. |
 | `ws.js` | Minimal RFC 6455 **server** (handshake, framing, backpressure limits). |
 | `pairing.js` | `PairingCodes` — short-lived single-use codes, the unambiguous 31-character alphabet, `pairPayload()` and `normalise()`. |
@@ -49,21 +48,24 @@ platform plumbing — launchd installation, paths, pairing codes.
   values it cannot represent faithfully rather than emitting something plausible,
   and `direct.js` reports "connected but holding no state" instead of "healthy".
   If the roster is ever empty while frames flow, suspect the frame shape.
-- **The status event always says `collector: 'cdp'`**, whichever collector is
-  running, because `PresenceTracker` sets health by that name (`presence.js:220`)
-  and the app's `CollectorHealth.cdp` drives `hasRichData`. Saying `direct` would
-  make shipped app builds show the "log-only mode: no names" banner while the
-  bridge held full names. The real collector goes in `detail` and in
-  `/collectors.richCollector`.
+- **`health.cdp` is a compatibility alias, not a collector.** The status event
+  says `collector: 'gather'`, and `PresenceTracker` mirrors that onto `cdp`
+  because app builds already on phones compute `hasRichData` from
+  `CollectorHealth.cdp`. Publishing only the honest name would make them show the
+  "log-only mode: no names" banner while the bridge held the full roster. Newer
+  builds read `gather`. Do not remove the mirror until those builds are gone.
 - **`events.js` is a published contract.** Field names are mirrored in
   `packages/gather_events/lib/src/events.dart` and documented in the root
   `README.md`. Renaming one breaks the app with no compile error.
-- **`log-parser.js` has an id-namespace trap.** `GameMediaController.*` and
-  `[Vol]` lines carry **player ids**; `*SFU`, `participantUserAccountIdMap` and
-  `[BitM]` lines carry a **different participant id** namespace with zero
-  overlap, despite the method names saying "player". Proximity must only ever be
-  derived from the former. This was established empirically over ~2.5 MB of real
-  logs.
+- **`desktop-notifications.js` keys off the IPC line, not the `Showing
+  notification` line that follows it.** Gather suppresses its own notification
+  when its window has focus, and then the second line never appears — but the
+  phone is a different device and should still be told. Keying off the IPC line
+  also stops each notification being reported twice.
+- **Do not grow `desktop-notifications.js` back into a general log parser.**
+  Everything the old one produced — proximity, roster churn, media — now comes
+  from the protocol, observed rather than inferred. The scrape survives only for
+  what genuinely exists nowhere else.
 - **`game-protocol.js` patch paths are addressed to the row**, so the field is
   the *first* segment (`/position/x` → `position`). Reading the last segment
   would silently drop every walking patch. `followTargetId` and `clusterId` are
@@ -72,15 +74,19 @@ platform plumbing — launchd installation, paths, pairing codes.
 - **`presence.js` hysteresis is deliberate.** `ADJACENT_TILES` (3) for arriving,
   `LEAVE_TILES` (4.5) for leaving. Collapsing them to one threshold makes anyone
   loitering at the boundary flap forever, and every flap is a phone notification.
-- **`cdp.js` distinguishes "attached" from "holding state".** The full state dump
-  is sent once per client connection, so a bridge that attaches to a long-running
-  client sees only heartbeats. `hasState` gates health for that reason; do not
-  report healthy without it.
+- **`direct.js` distinguishes "connected" from "holding state".** `hasState`
+  gates health, because an empty roster reported confidently lets the app render
+  "nobody is following you" out of nothing.
+- **Keep counters out of the health `detail` string.** `_setHealth` publishes an
+  event whenever the detail changes, and a frame counter changes on every 250ms
+  flush — that fills the 500-event history the phone replays on reconnect with
+  status noise and evicts the real events within minutes. Counters belong in
+  `stats()`, which is polled.
 - `log-tail.js` polls `stat` as the primary trigger and uses `fs.watch` only as
   an accelerator, because `fs.watch` stops delivering events after a macOS
   suspend *without erroring*. Do not invert that.
 - Filtering happens in three places (`PresenceTracker` drops non-state-changes,
-  `GameProtocolReader` keeps 3 of ~45 models, both collectors drop heartbeats and
+  `GameProtocolReader` keeps 4 of ~47 models, the collector drops heartbeats and
   bots). `?raw=1` subscribers bypass the first. Keep the firehose reachable.
 
 ### Testing Requirements
@@ -89,10 +95,12 @@ platform plumbing — launchd installation, paths, pairing codes.
 npm test
 ```
 
-`log-parser`, `msgpack`, `game-protocol` and `pairing`/`qr` have dedicated
-suites; `server.js`, `presence.js` and `ws.js` are covered end-to-end by
-`../test/bridge.test.js`. Fixtures are real captured data — add to them in the
-same style rather than inventing plausible-looking lines.
+`desktop-notifications`, `msgpack`, `game-protocol`, `direct`, `gather-auth`,
+`presence` and `pairing`/`qr` have dedicated suites; `server.js` and `ws.js` are
+covered end-to-end by `../test/bridge.test.js`, which drives a real
+`BridgeServer` against the fake Gather in `../test/fake-gather.js`. Fixtures are
+real captured data — add to them in the same style rather than inventing
+plausible-looking lines.
 
 ### Common Patterns
 
@@ -130,8 +138,9 @@ pins them.
 
 ### Internal
 
-`server.js` composes `cdp`, `log-parser`, `log-tail`, `presence`, `pairing`,
-`paths`, `ws` and `events`. `cdp.js` uses `game-protocol` and `msgpack`.
+`server.js` composes `direct`, `desktop-notifications`, `log-tail`, `presence`,
+`pairing`, `paths`, `ws` and `events`. `direct.js` uses `game-protocol`,
+`msgpack`, `gather-auth` and `paths`.
 `launchd.js` uses `paths`. Consumed by `../bin/gather-bridge.js`.
 
 ### External

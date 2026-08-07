@@ -1,7 +1,7 @@
 {
   "name": "gather-app-bridge",
   "version": "0.1.2",
-  "description": "Watches the Gather V2 desktop client on your computer and streams presence events — who is standing next to you, who is following you — to the Gather Companion phone app over your LAN.",
+  "description": "Connects to Gather V2 with your own session and streams presence events \u2014 who is standing next to you, who is following you, who is talking \u2014 to the Gather Companion phone app over your LAN.",
   "license": "MIT",
   "author": "Jonas Grunau",
   "repository": {
@@ -35,7 +35,7 @@
     "proximity",
     "follow",
     "bridge",
-    "cdp"
+    "websocket"
   ],
   "os": [
     "darwin"

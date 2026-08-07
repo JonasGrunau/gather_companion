@@ -21,8 +21,10 @@ export const configFile = join(homedir(), '.gather-app-bridge.json');
 /**
  * Where the Gather V2 desktop client writes its log.
  *
- * This is the bridge's zero-setup data source. electron-log caps the file at
- * 2 MB and rolls it to `main.old.log`, which the tailer has to survive.
+ * Read for exactly one thing now — Gather's own notifications, see
+ * `desktop-notifications.js`. Presence comes from the game socket and does not
+ * need this file, or the desktop client, at all. electron-log caps it at 2 MB and
+ * rolls it to `main.old.log`, which the tailer has to survive.
  */
 export const gatherLogFile = join(homedir(), 'Library', 'Logs', 'GatherV2', 'main.log');
 

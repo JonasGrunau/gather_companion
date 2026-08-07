@@ -1,11 +1,11 @@
 /**
  * Interprets Gather V2's game-server protocol.
  *
- * The desktop client holds one binary WebSocket to
+ * One binary WebSocket to
  * `wss://game-router.v2.gather.town/gather-game-v2?spaceId=<uuid>&authUserId=<firebaseUid>`
- * carrying msgpack frames. The bridge reads those frames off CDP's Network
- * domain — the client's own authenticated stream — so it never authenticates,
- * never joins the space, and never shows up as a second presence.
+ * carrying msgpack frames. `DirectCollector` opens it and authenticates as the
+ * user, then stops at `loadSpaceUser` — it never sends `enterSpace`, so it reads
+ * the whole space without showing up as a presence in it.
  *
  * ## Verified wire format
  *
@@ -38,15 +38,22 @@
  *
  * Which row is *me* is answered by the `Connection` model, which carries both
  * halves: `{authUserId: <firebase uid>, spaceUserId: <my SpaceUser id>}`. The
- * firebase uid is read separately from the renderer's IndexedDB. `UserAccount`
- * (`{id, firebaseAuthId}`) plus `SpaceUser.userAccountId` gives a second, slower
- * route in case no Connection row is seen.
+ * firebase uid comes from our own ID token. `UserAccount` (`{id, firebaseAuthId}`)
+ * plus `SpaceUser.userAccountId` gives a second, slower route in case no
+ * Connection row is seen.
  */
 
 /** Only these models matter; a full state dump is mostly calendars and catalogs. */
-const MODELS = new Set(['SpaceUser', 'Connection', 'UserAccount']);
+const MODELS = new Set(['SpaceUser', 'Connection', 'UserAccount', 'Space']);
 
-/** SpaceUser fields worth tracking, for field-level `replace` patches. */
+/**
+ * SpaceUser fields worth tracking, for field-level `replace` patches.
+ *
+ * `speaking` earns its place: measured over three minutes on a 111-person space
+ * it was the most frequent delta of any kind (13 of 46 patches). It is live voice
+ * activity — who is actually talking — and it is the nearest thing Gather's state
+ * has to the mic/camera booleans that only ever existed in the client's log.
+ */
 const TRACKED_FIELDS = new Set([
   'followTargetId',
   'clusterId',
@@ -55,6 +62,7 @@ const TRACKED_FIELDS = new Set([
   'name',
   'connected',
   'isIdle',
+  'speaking',
   'userAccountId',
 ]);
 
@@ -72,6 +80,9 @@ export class GameProtocolReader {
 
     /** UserAccount id belonging to me, the slower route to `selfId`. */
     this._myUserAccountId = null;
+
+    /** The space's display name, from the single `Space` row in the dump. */
+    this.spaceName = null;
 
     this._frameTypes = new Map();
     this._unknownFrames = 0;
@@ -179,6 +190,16 @@ export class GameProtocolReader {
       return false;
     }
 
+    if (model === 'Space') {
+      // Exactly one row, and it is the space we asked for. Its name used to come
+      // out of the desktop client's IPC log; it is cheaper and more reliable here.
+      if (typeof data.name === 'string' && data.name !== this.spaceName) {
+        this.spaceName = data.name;
+        return true;
+      }
+      return false;
+    }
+
     return false;
   }
 
@@ -243,6 +264,7 @@ export class GameProtocolReader {
     if ('floorId' in data) set('floorId', nullableString(data.floorId));
     if ('connected' in data) set('connected', asBool(data.connected));
     if ('isIdle' in data) set('isIdle', asBool(data.isIdle));
+    if ('speaking' in data) set('speaking', asBool(data.speaking));
     if ('isBot' in data) set('isBot', asBool(data.isBot));
     if ('type' in data) set('kind', nullableString(data.type));
 
@@ -289,10 +311,11 @@ export class GameProtocolReader {
         clusterId: row.clusterId ?? null,
         floorId: row.floorId ?? null,
         connected: row.gone ? false : (row.connected ?? null),
+        speaking: row.speaking ?? null,
         ...('followTargetId' in row ? { followTargetId: row.followTargetId ?? null } : {}),
       });
     }
-    return { selfId: this.selfId, rows };
+    return { selfId: this.selfId, rows, spaceName: this.spaceName };
   }
 }
 
