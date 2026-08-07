@@ -5,12 +5,10 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
 import 'credentials.dart';
-import 'event_log.dart';
 import 'link_status.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
-import 'relevance.dart';
 import 'settings.dart';
 
 /// Everything the UI reads. One object, so the whole app is a single
@@ -30,9 +28,11 @@ import 'settings.dart';
 ///  * **The computer can be asleep.** Presence works on cellular, from anywhere.
 ///  * **Party mode is instant.** It runs here, against a socket we already hold, so
 ///    the optimistic-UI dance that hid a LAN round trip is gone entirely.
-///  * **The feed is ours.** There is no 500-event ring on the bridge to replay, so
-///    [EventLogStore] keeps one on the phone. Activity while the app was closed is
-///    gone unless a push recorded it.
+///  * **Nothing is remembered.** There is no 500-event ring on the bridge to
+///    replay, and the phone does not keep one either: a log that can only record
+///    what happened while the app was open is empty exactly when it would be worth
+///    reading. Events exist to be notified about. `_onFold` hands each one to
+///    [Notifier] and lets it go.
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -40,14 +40,12 @@ class AppState extends ChangeNotifier {
     Notifier? notifier,
     PushRegistrar? push,
     GatherCredentialStore? credentials,
-    EventLogStore? eventLog,
     // Test seam: lets a suite drive a fake Gather without a network.
     DirectCollector Function(GatherAuth auth, String? spaceId)? buildCollector,
   })  : _notifier = notifier ?? Notifier(),
         // ignore: prefer_initializing_formals
         _push = push,
         _credentialStore = credentials ?? GatherCredentialStore(),
-        _eventLog = eventLog ?? EventLogStore(),
         _buildCollector = buildCollector ?? _realCollector;
 
   static DirectCollector _realCollector(GatherAuth auth, String? spaceId) =>
@@ -57,7 +55,6 @@ class AppState extends ChangeNotifier {
   Notifier get notifier => _notifier;
 
   final GatherCredentialStore _credentialStore;
-  final EventLogStore _eventLog;
   final DirectCollector Function(GatherAuth auth, String? spaceId) _buildCollector;
 
   /// Built lazily and never eagerly: `FirebaseMessaging.instance` throws when
@@ -86,29 +83,23 @@ class AppState extends ChangeNotifier {
   GatherCredentials _credentials = GatherCredentials.empty;
   String? _spaceId;
 
-  /// Newest first, so the list view needs no reversing.
-  List<GatherEvent> _log = [];
-  static const _logLimit = 1000;
-
   PresenceSnapshot _snapshot = PresenceSnapshot.empty;
   LinkStatus _link = const LinkStatus(LinkState.idle);
   bool _loaded = false;
-  bool _showEverything = false;
   String? _bridgeName;
 
   BridgeSettings get settings => _settings;
   PresenceSnapshot get snapshot => _snapshot;
   LinkStatus get link => _link;
   bool get isLoaded => _loaded;
-  bool get showEverything => _showEverything;
   String? get bridgeName => _bridgeName;
 
   /// Whether this phone can read Gather on its own.
   ///
-  /// The Gather credential, not the bridge token, because that is what the feed needs.
-  /// A pairing that produced no session leaves the app here, which is correct: the fix
-  /// is one command on the Mac, and pretending otherwise would show an empty feed
-  /// with no explanation.
+  /// The Gather credential, not the bridge token: reading presence is what the screen
+  /// is for. A pairing that produced no session leaves the app here, which is correct:
+  /// the fix is one command on the Mac, and pretending otherwise would show a screen
+  /// that can never answer anything.
   bool get isConfigured => _credentials.isComplete;
 
   /// Whether the bridge can wake this phone while the app is closed.
@@ -116,10 +107,6 @@ class AppState extends ChangeNotifier {
   /// Independent of [isConfigured] on purpose: presence works without it, and losing
   /// push is a degradation rather than a failure.
   bool get canBeWoken => _settings.isComplete;
-
-  /// True while the persisted feed is still being read off disk.
-  bool _primed = true;
-  bool get isPriming => !_primed && _log.isEmpty;
 
   /// Who is following me — the only thing this app claims to know about anyone.
   ///
@@ -132,10 +119,6 @@ class AppState extends ChangeNotifier {
     return list;
   }
 
-  /// Whether we are holding real state, as opposed to merely being connected. Shown
-  /// in the UI, because it changes what a quiet screen means.
-  bool get hasRichData => _snapshot.health.hasRichData;
-
   PartyState get party => _snapshot.party;
 
   /// Party mode runs in this process now, so what it says is what is true — no
@@ -143,43 +126,11 @@ class AppState extends ChangeNotifier {
   bool get partyMode => _snapshot.party.active;
   bool get partyPending => false;
 
-  // ---- feed classification ---------------------------------------------------
-
-  List<({GatherEvent event, EventLook look})>? _feed;
-  int _hidden = 0;
-
-  void _invalidateFeed() => _feed = null;
-
-  void _classify() {
-    final out = <({GatherEvent event, EventLook look})>[];
-    var hidden = 0;
-    for (final event in _log) {
-      final look = lookOf(event, nameFor);
-      if (look.relevance == Relevance.ambient) {
-        hidden++;
-        if (!_showEverything) continue;
-      }
-      out.add((event: event, look: look));
-    }
-    _feed = out;
-    _hidden = _showEverything ? 0 : hidden;
-  }
-
-  List<({GatherEvent event, EventLook look})> get feed {
-    if (_feed == null) _classify();
-    return _feed!;
-  }
-
-  int get hiddenCount {
-    if (_feed == null) _classify();
-    return _hidden;
-  }
-
   /// Development shortcut past the scanner:
   /// `--dart-define=GATHER_PAIR=host:port:token:refreshToken`.
   ///
-  /// The simulator has no camera, so without this there is no way to reach the feed
-  /// while working on it. Empty in any normal build.
+  /// The simulator has no camera, so without this there is no way to reach the main
+  /// screen while working on it. Empty in any normal build.
   static const _devPair = String.fromEnvironment('GATHER_PAIR');
 
   Future<void> boot() async {
@@ -205,31 +156,7 @@ class AppState extends ChangeNotifier {
     await _notifier.init();
     notifyListeners();
 
-    if (_credentials.isComplete) {
-      _attach();
-      unawaited(_loadPersistedFeed());
-    }
-  }
-
-  /// Fills the feed from disk, so opening the app does not show an empty screen.
-  Future<void> _loadPersistedFeed() async {
-    _primed = false;
-    final stored = await _eventLog.load();
-    if (stored.isEmpty) {
-      _primed = true;
-      notifyListeners();
-      return;
-    }
-    // Anything the live connection already produced stays on top.
-    final seen = _log.map((e) => '${e.type}@${e.at.toIso8601String()}').toSet();
-    _log = [
-      ..._log,
-      ...stored.where((e) => !seen.contains('${e.type}@${e.at.toIso8601String()}')),
-    ];
-    if (_log.length > _logLimit) _log = _log.sublist(0, _logLimit);
-    _primed = true;
-    _invalidateFeed();
-    notifyListeners();
+    if (_credentials.isComplete) _attach();
   }
 
   /// Trades a scanned or typed pairing code for both credentials.
@@ -260,10 +187,7 @@ class AppState extends ChangeNotifier {
         await _credentialStore.saveSpaceId(spaceId);
 
         await _notifier.requestPermission();
-        _log = [];
-        await _eventLog.clear();
         _snapshot = PresenceSnapshot.empty;
-        _invalidateFeed();
         notifyListeners();
         _attach();
         return null;
@@ -273,14 +197,11 @@ class AppState extends ChangeNotifier {
   Future<void> unpair() async {
     await BridgeSettings.clear();
     await _credentialStore.clear();
-    await _eventLog.clear();
     _settings = BridgeSettings.empty;
     _credentials = GatherCredentials.empty;
     _spaceId = null;
     _bridgeName = null;
     _snapshot = PresenceSnapshot.empty;
-    _log = [];
-    _invalidateFeed();
     await _detach();
     _link = const LinkStatus(LinkState.idle);
     notifyListeners();
@@ -316,16 +237,6 @@ class AppState extends ChangeNotifier {
     await collector.resync();
   }
 
-  /// Writes the feed to disk now. Called on the way to the background, where a
-  /// pending debounce would otherwise never fire.
-  Future<void> persistNow() => _eventLog.flush();
-
-  void setShowEverything(bool value) {
-    _showEverything = value;
-    _invalidateFeed();
-    notifyListeners();
-  }
-
   /// Reconnects, and resolves only once there is something to show for it.
   ///
   /// The floor is what makes pull-to-refresh feel like an action rather than a
@@ -336,13 +247,6 @@ class AppState extends ChangeNotifier {
     final collector = _collector;
     if (collector == null) return floor;
     await Future.wait([collector.resync(), floor]);
-  }
-
-  void clearLog() {
-    _log = [];
-    _invalidateFeed();
-    unawaited(_eventLog.clear());
-    notifyListeners();
   }
 
   /// Best available name for a player id, falling back to a short id.
@@ -427,21 +331,13 @@ class AppState extends ChangeNotifier {
   }
 
   void _onFold(FoldResult out) {
+    // Events are no longer kept — the screen has nowhere to put them. They exist to
+    // be notified about, and nothing else, so this is the only thing left to do with
+    // one. Fire and forget: a failed notification must never break the fold.
     for (final event in out.emit) {
-      _log.insert(0, event);
-      // Fire and forget: a failed notification must never break the log.
       _notifier.consider(event, nameFor);
     }
-    if (_log.length > _logLimit) _log = _log.sublist(0, _logLimit);
-
-    if (out.emit.isNotEmpty) {
-      _invalidateFeed();
-      _eventLog.save(_log);
-    }
     if (out.emit.isNotEmpty || out.stateChanged) {
-      // Names are resolved during classification, so a new roster can relabel events
-      // already in the log.
-      _invalidateFeed();
       _snapshot = _tracker.snapshot();
       notifyListeners();
     }
@@ -496,7 +392,6 @@ class AppState extends ChangeNotifier {
   void debugApplySnapshot(PresenceSnapshot snapshot) {
     _loaded = true;
     _snapshot = snapshot;
-    _invalidateFeed();
     notifyListeners();
   }
 
@@ -516,7 +411,6 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     unawaited(_detach());
-    _eventLog.dispose();
     // Outside `_detach` on purpose: token rotation is about this device, not about any
     // one connection, so it must survive a reconnect and only end with the app.
     _pushRefresh?.cancel();

@@ -69,10 +69,10 @@ socket, distinguished by the frame's `kind`.
 Covered indirectly by the app's tests, which construct these models directly:
 
 ```sh
-flutter test test/relevance_test.dart
+flutter test
 ```
 
-A new event type should arrive with a `relevance_test.dart` case asserting its
+A new event type should arrive with a case in `notifications.dart` asserting its
 tier, since the classification switch is where the analyzer will demand it.
 
 ### Common Patterns

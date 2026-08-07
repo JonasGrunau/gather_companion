@@ -297,4 +297,56 @@ void main() {
     p.noteRoster(Roster(selfId: 'me-1', rows: [_row('me-1', 2, 2)]));
     expect(p.knownTiles, 2, reason: 'and the same tile twice is still one tile');
   });
+
+  /// The pool is the scarce resource: a state dump is worth about one tile per
+  /// member, which on a 124×82 map is under one percent of the floor and is why
+  /// party mode used to circle the same dozen tiles. Watching people walk is what
+  /// turns it into a map, so it has to pick up the tiles *between* sightings — but
+  /// only where they are an observation rather than a guess.
+  group('learning the floor from people walking', () {
+    /// Two sightings of one person, and what the pool knew afterwards.
+    int tilesAcross(PartyTile from, PartyTile to) {
+      final p = PartyMode(collector: () => _FakeCollector());
+      addTearDown(p.dispose);
+      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', from.x, from.y)]));
+      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', to.x, to.y)]));
+      return p.knownTiles;
+    }
+
+    test('a walk along a row leaves every tile it crossed behind', () {
+      // (4,7) -> (8,7): both ends plus the three tiles walked over.
+      expect(tilesAcross(const PartyTile(4, 7), const PartyTile(8, 7)), 5);
+    });
+
+    test('a diagonal walk counts too', () {
+      expect(tilesAcross(const PartyTile(0, 0), const PartyTile(3, 3)), 4);
+    });
+
+    test('a dogleg is left alone, because the path it took is not knowable', () {
+      // They could have gone along x first or along y first, and the corner tile
+      // differs. Inventing one is how you end up teleporting into a wall.
+      expect(
+        tilesAcross(const PartyTile(0, 0), const PartyTile(3, 2)),
+        2,
+        reason: 'only the two sightings themselves',
+      );
+    });
+
+    test('a jump too far to be a walk is not joined up', () {
+      // Nobody covers this between two samples, so it is a teleport or a respawn,
+      // and the straight line between is unexplored floor.
+      expect(
+        tilesAcross(const PartyTile(0, 0), const PartyTile(40, 0)),
+        2,
+        reason: 'only the two sightings themselves',
+      );
+    });
+
+    test('changing floors is never a walk', () {
+      final p = build();
+      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', 0, 0, floor: 'f1')]));
+      p.noteRoster(Roster(selfId: 'me-1', rows: [_row('w', 3, 0, floor: 'f2')]));
+      expect(p.knownTiles, 2, reason: 'the tiles between are on neither floor');
+    });
+  });
 }

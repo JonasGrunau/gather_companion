@@ -132,10 +132,10 @@ line is a small problem; a feed that dies on an unknown string is a large one.
 
 1. Add the constructor in `bridge/lib/events.js` and emit it from a collector.
 2. Add the subclass here, and a `case` in `GatherEvent.fromJson`.
-3. Run `flutter analyze` — the exhaustive switch in `lib/src/relevance.dart` will
+3. Run `flutter analyze` — the exhaustive switch in the app's `lib/src/notifications.dart` will
    fail, telling you exactly where the app has to decide how the event reads and
    which tier it belongs to.
-4. Add a case to `test/relevance_test.dart` pinning that tier.
+4. Add a case pinning the title and body it produces.
 5. Update the event-type list in the root README.
 
 ## Tests

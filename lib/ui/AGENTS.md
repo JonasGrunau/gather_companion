@@ -13,7 +13,7 @@ needed to be shared twice yet.
 
 | File | Description |
 |------|-------------|
-| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`, `_SectionLabel`, `_EventRow`, `_BackgroundToggle`, `_EmptyFeed`. Answers "is anyone following me" at the top from the snapshot, history underneath. |
+| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`. Answers "is anyone following me" from the snapshot, and carries the party switch. Named for the scrolling activity feed it used to have; the name outlived it. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 
@@ -21,13 +21,14 @@ needed to be shared twice yet.
 
 ### Working In This Directory
 
-- **The split in `feed_screen.dart` is the design.** The top answers a question
-  you have *right now*, straight from the bridge's snapshot, so it is correct
-  even if the app was closed when it happened. The list underneath is history and
-  carries only what is worth reading; the ambient tier sits behind
-  "Show N background events".
-- `CustomScrollView` needs `AlwaysScrollableScrollPhysics` or a short feed cannot
-  be over-scrolled and pull-to-refresh silently does nothing on a quiet screen.
+- **The screen only says what it can currently answer.** It used to be a snapshot
+  card over a scrolling history. The history is gone — once the app talked to
+  Gather itself, the log only recorded what happened while the app was open, so it
+  was empty exactly when it mattered. Push notifications carry that job now.
+  `_SectionLabel`, `_EventRow`, `_EmptyFeed` and `_BackgroundToggle` went with it.
+- `CustomScrollView` needs `AlwaysScrollableScrollPhysics` or the screen — now
+  shorter than the viewport — cannot be over-scrolled, and pull-to-refresh
+  silently does nothing.
 - **`_PartyCard` renders the snapshot, never its own memory.** The bridge stops
   party mode by itself — on its 15-minute timer, when it loses Gather, when the
   daemon exits — so a button holding local state would keep glowing through all
@@ -39,14 +40,11 @@ needed to be shared twice yet.
   what makes it read as a status light rather than as decoration; the controller
   is stopped when the card is off, and `MediaQuery.disableAnimationsOf` is
   honoured.
-- **An empty feed has two different meanings** and must say which: "nothing has
-  happened" versus "not connected". `_EmptyFeed` reads `AppState.link` and
-  `isPriming` to tell them apart, and there is a test for each.
-- **A degraded bridge is admitted in the UI.** When `hasRichData` is false the
-  screen says being-followed cannot be detected, so a quiet screen is never
-  mistaken for "nobody is following me". It now means the bridge has no Gather
-  session or its socket is down, rather than the old log-only mode. A healthy
-  bridge does not nag. Both are tested.
+- **The follower card no longer hedges.** It used to carry a "log-only mode"
+  notice for when the bridge could only tail the desktop log and had to guess at
+  being followed. The app reads follow state from its own Gather socket now, so
+  there is no degraded tier left to admit to: either the socket is up and the
+  card is authoritative, or the link strip already says it is not.
 - `pair_screen.dart` opens the camera without asking first: the screen is only
   ever reached when there is a computer to pair with, so a confirmation tap sits
   in front of the only thing anyone came here for. The instruction goes *under*
@@ -86,7 +84,7 @@ Wrap screens in the real theme (`buildGatherTheme()`) in tests; the widgets read
 
 ### Internal
 
-`../src/app_state.dart`, `../src/relevance.dart`, `../src/pairing.dart`,
+`../src/app_state.dart`, `../src/pairing.dart`,
 `../src/link_status.dart`, `../theme/gather_theme.dart`,
 `package:gather_events`.
 

@@ -5,16 +5,14 @@
 
 ## Purpose
 
-Flutter tests for the app. Three files, three levels: the classification rules in
-isolation, the feed screen as a widget, and one optional end-to-end test against
-a real running bridge.
+Flutter tests for the app: the main screen as a widget, and one optional
+end-to-end test against a real running bridge.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `relevance_test.dart` | The feed's editorial policy — which events are alerts, which are notable, which are background — plus the pairing-code and address parsers. The most specified file in the app. |
-| `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also empty states, the background-tier toggle, the fidelity notice, and the refresh duration. Builds `AppState` with `EventLogStore.disabled()`: the real one debounces its writes on a `Timer`, and a timer outliving the widget tree fails the test outright. |
+| `feed_screen_test.dart` | Widget tests for the one thing the screen exists to say: who is following you, and which of them is talking. Also the party card, the link strip's deliberate delay before it admits to being disconnected, and the refresh duration. |
 | `live_bridge_test.dart` | End-to-end against a real bridge, exercising the app's own pairing and client code rather than mocks. **Skipped unless configured**, so `flutter test` stays green on a machine with no Gather on it. |
 
 ## For AI Agents
@@ -27,12 +25,10 @@ a real running bridge.
 - **Being followed cannot be produced on demand.** It needs a colleague to
   actually follow you around a real space, so without these tests the follower
   card would only ever be seen by accident. That is why it is pinned here.
-- **An empty feed has two meanings** and both are tested: "all quiet" versus "not
-  connected". Do not let a change collapse them.
 - Screens must be wrapped in `buildGatherTheme()`; they read `context.tokens` and
   throw without it.
-- Test names are sentences stating the guarantee ("a quiet feed with no link says
-  'not connected', not 'all quiet'"). Keep that style — they are the readable
+- Test names are sentences stating the guarantee ("an unreachable link says so,
+  but not straight away"). Keep that style — they are the readable
   index of what the UI promises.
 
 ### Running the live test

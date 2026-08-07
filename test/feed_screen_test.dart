@@ -1,18 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_companion/src/app_state.dart';
-import 'package:gather_companion/src/event_log.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/feed_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
-/// Widget-level checks for the two things the screen exists to say: who is next
-/// to you, and who is following you.
+/// Widget-level checks for the one thing the screen exists to say: who is
+/// following you.
 ///
-/// Being followed cannot be produced by the log collector at all, so it would
-/// otherwise only ever be seen by arranging for a colleague to follow you — which
-/// is no way to know whether the card renders.
+/// Being followed would otherwise only ever be seen by arranging for a colleague
+/// to actually follow you, which is no way to know whether the card renders.
 void main() {
   final at = DateTime(2026, 8, 4, 12, 30);
 
@@ -24,7 +22,7 @@ void main() {
       );
 
   /// A state that believes it is connected, which is the normal case.
-  AppState connected(PresenceSnapshot snapshot) => AppState(eventLog: EventLogStore.disabled())
+  AppState connected(PresenceSnapshot snapshot) => AppState()
     ..debugApplyLink(const LinkStatus(LinkState.live))
     ..debugApplySnapshot(snapshot);
 
@@ -41,31 +39,25 @@ void main() {
     await tester.pump();
 
     expect(find.text('Nobody is following you'), findsOneWidget);
-    expect(find.text('All quiet'), findsOneWidget);
   });
 
-  testWidgets('a quiet feed with no link says "not connected", not "all quiet"', (tester) async {
+  testWidgets('an unreachable link says so, but not straight away', (tester) async {
     // The difference matters: silence because nothing happened is reassuring,
-    // silence because the bridge is unreachable is not.
-    final state = AppState(eventLog: EventLogStore.disabled())..debugApplySnapshot(snapshotWith(const []));
+    // silence because Gather is unreachable is not. Only the strip says which.
+    final state = AppState()..debugApplySnapshot(snapshotWith(const []));
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
     // Not straight away: a launch that connects quickly must not flash a banner
     // in and out, so an unhealthy link has to persist before it takes a row.
     expect(find.text('Not connected'), findsNothing);
-    expect(find.text('All quiet'), findsNothing);
 
     // Explicit pumps rather than pumpAndSettle: the strip carries an
     // indeterminate spinner, so the tree is never quiescent.
     await tester.pump(const Duration(milliseconds: 700)); // past the grace
     await tester.pump(const Duration(milliseconds: 300)); // past the reveal
 
-    // The strip carries the connection state; the feed says only that it is
-    // empty, so the screen does not say the same thing twice.
     expect(find.text('Not connected'), findsOneWidget);
-    expect(find.text('No activity yet'), findsOneWidget);
-    expect(find.text('All quiet'), findsNothing);
   });
 
   testWidgets('being followed shows the alert card by name', (tester) async {
@@ -126,64 +118,6 @@ void main() {
     expect(find.byIcon(Icons.graphic_eq_rounded), findsNothing);
   });
 
-  testWidgets('the background tier is hidden until asked for', (tester) async {
-    final state = connected(snapshotWith(const []));
-    // One notable, two ambient.
-    state
-      ..debugApplyEvent(NotificationShownEvent(
-        at: at,
-        source: EventSource.log,
-        notificationType: 'wave',
-      ))
-      ..debugApplyEvent(PlayerSpaceEvent(
-        at: at,
-        source: EventSource.log,
-        playerId: 'b',
-        joined: true,
-      ))
-      ..debugApplyEvent(MediaChangedEvent(
-        at: at,
-        source: EventSource.log,
-        playerId: 'c',
-        track: MediaTrack.audio,
-        paused: true,
-      ));
-
-    await tester.pumpWidget(wrap(state));
-    await tester.pump();
-
-    expect(find.text('Wave'), findsOneWidget);
-    expect(find.textContaining('joined the space'), findsNothing);
-    expect(find.text('Show 2 background events'), findsOneWidget);
-
-    await tester.tap(find.text('Show 2 background events'));
-    await tester.pump();
-
-    expect(find.textContaining('joined the space'), findsOneWidget);
-    expect(find.textContaining('muted'), findsOneWidget);
-    expect(find.text('Hide background activity'), findsOneWidget);
-  });
-
-  testWidgets('log-only mode admits what it cannot see', (tester) async {
-    final state = connected(PresenceSnapshot(
-        self: const SelfState(),
-        players: const [],
-        health: const CollectorHealth(logTail: true),
-        at: at,
-      ));
-    await tester.pumpWidget(wrap(state));
-    await tester.pump();
-
-    expect(find.textContaining('Log-only mode'), findsOneWidget);
-  });
-
-  testWidgets('full mode does not nag about fidelity', (tester) async {
-    await tester.pumpWidget(wrap(connected(snapshotWith(const []))));
-    await tester.pump();
-
-    expect(find.textContaining('Log-only mode'), findsNothing);
-  });
-
   testWidgets('the party button reads the bridge, not its own memory', (tester) async {
     // The bridge stops party mode by itself — on its timer, when it loses
     // Gather, when the daemon exits. A button holding local state would keep
@@ -229,7 +163,7 @@ void main() {
     // Regression: `reconnect()` used to return void, so the pull-to-refresh
     // future completed on the next microtask and the indicator snapped shut
     // within a frame or two of appearing — a twitch rather than a refresh.
-    final state = AppState(eventLog: EventLogStore.disabled());
+    final state = AppState();
     final watch = Stopwatch()..start();
     await state.reconnect();
     watch.stop();

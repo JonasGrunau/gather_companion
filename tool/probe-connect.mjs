@@ -627,6 +627,138 @@ async function connect(args) {
   }
 }
 
+/**
+ * What does the wire actually tell us about the floor plan?
+ *
+ * Party mode currently guesses at walkability by remembering tiles it has seen a
+ * body on, because the real collision data has never been decoded. But the state
+ * dump already carries the whole map — `MapArea` ×93, `MapObject` ×1140,
+ * `CatalogItemVariant` ×477 with a `collision` field — we simply throw it away in
+ * `GameProtocolReader`. The blocker is not access, it is that nobody has ever
+ * looked at how `collision` is encoded.
+ *
+ * So this looks. It connects read-only, keeps the map models the reader drops, and
+ * prints the shape of the fields that a real walkability grid would have to be
+ * built from. It also tries the obvious REST routes, because a served map would be
+ * simpler than reconstructing one.
+ *
+ * Read-only on the wire, exactly like `connect`: handshake, listen, close.
+ */
+async function map(args) {
+  const spaceId = args.space;
+  if (!spaceId) throw new Error('need --space <uuid>');
+  if (!args.yes) {
+    console.error(
+      [
+        '',
+        'REFUSING TO CONNECT without --yes.',
+        '',
+        'Same risk as `connect`: a second connection on the same account MAY evict',
+        `your desktop session. Space: ${spaceId}`,
+        '',
+      ].join('\n'),
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const token = await idToken();
+  const authUserId = readCache().uid ?? uidFromIdToken(token);
+  const seconds = Number(args.seconds ?? 30);
+
+  // --- route 1: is it served over REST? -----------------------------------
+  console.log('REST routes:');
+  for (const path of [
+    `/spaces/${spaceId}`,
+    `/spaces/${spaceId}/maps`,
+    `/spaces/${spaceId}/floors`,
+    `/spaces/${spaceId}/map`,
+  ]) {
+    try {
+      const body = await api(path);
+      const preview = JSON.stringify(body).slice(0, 300);
+      console.log(`  200 ${path}\n      ${preview}…`);
+    } catch (error) {
+      console.log(`  --- ${path}: ${error.message.slice(0, 120)}`);
+    }
+  }
+
+  // --- route 2: what the state dump already hands us ----------------------
+  const WANTED = new Set([
+    'MapArea',
+    'MapObject',
+    'CatalogItemVariant',
+    'FloorMap',
+    'MapEntityIdentifier',
+  ]);
+  const rows = new Map([...WANTED].map((m) => [m, []]));
+
+  const url = `${GAME_SOCKET}?spaceId=${encodeURIComponent(spaceId)}&authUserId=${encodeURIComponent(authUserId)}`;
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    for (const frame of handshake({ token, spaceId, spaceUserId: null, enter: false })) {
+      ws.send(enc(frame));
+    }
+  });
+
+  ws.addEventListener('message', (event) => {
+    let frame;
+    try {
+      frame = decode(Buffer.from(event.data));
+    } catch {
+      return;
+    }
+    const patches = [
+      ...(Array.isArray(frame?.fullStatePatches) ? frame.fullStatePatches : []),
+      ...(Array.isArray(frame?.patches) ? frame.patches : []),
+    ];
+    for (const patch of patches) {
+      if (patch?.op !== 'addmodel' || !WANTED.has(patch.model)) continue;
+      rows.get(patch.model).push(patch.data);
+    }
+  });
+
+  const closed = new Promise((resolve) => ws.addEventListener('close', resolve));
+  const timer = setTimeout(() => ws.close(), seconds * 1000);
+  await closed;
+  clearTimeout(timer);
+
+  console.log('\nmap models in the state dump:');
+  for (const [model, list] of rows) console.log(`  ${model.padEnd(22)} ${list.length}`);
+
+  const describe = (value) => {
+    if (value === null || value === undefined) return String(value);
+    if (Array.isArray(value)) return `array[${value.length}] e.g. ${JSON.stringify(value.slice(0, 8))}`;
+    if (typeof value === 'string') return `string[${value.length}] ${JSON.stringify(value.slice(0, 80))}`;
+    if (typeof value === 'object') return `object ${JSON.stringify(value).slice(0, 160)}`;
+    return `${typeof value} ${value}`;
+  };
+
+  // THE question: how is walkability encoded?
+  const variants = rows.get('CatalogItemVariant');
+  console.log(`\ncollision encoding (${variants.length} CatalogItemVariant rows):`);
+  const shapes = new Map();
+  for (const v of variants) {
+    const shape = describe(v?.collision).split(' ')[0];
+    if (!shapes.has(shape)) shapes.set(shape, v);
+  }
+  for (const [shape, sample] of shapes) {
+    console.log(`  ${shape}`);
+    console.log(`     collision:         ${describe(sample.collision)}`);
+    console.log(`     dimensionsInPixels ${describe(sample.dimensionsInPixels)}`);
+    console.log(`     origin             ${sample.originX},${sample.originY}`);
+  }
+
+  for (const model of ['MapArea', 'MapObject', 'FloorMap']) {
+    const sample = rows.get(model)[0];
+    if (!sample) continue;
+    console.log(`\nsample ${model}:`);
+    for (const [k, v] of Object.entries(sample)) console.log(`  ${k.padEnd(24)} ${describe(v)}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
@@ -673,9 +805,12 @@ if (import.meta.main) {
       case 'connect':
         await connect(args);
         break;
+      case 'map':
+        await map(args);
+        break;
       default:
         console.log(
-          'commands: adopt | login | whoami | refresh | spaces | connect --space <uuid> --yes',
+          'commands: adopt | login | whoami | refresh | spaces | connect --space <uuid> --yes | map --space <uuid> --yes',
         );
         process.exitCode = 1;
     }

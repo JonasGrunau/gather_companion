@@ -43,7 +43,7 @@ schema file — the two sides are kept in step by hand.
   fall back rather than throw, and unmodelled event types land in `RawEvent`, so
   a bridge newer than the app degrades instead of crashing the feed.
 - Adding an event type means adding a subclass here; the app's `lookOf()` switch
-  in `lib/src/relevance.dart` is exhaustive, so the analyzer will point at the
+  in the app's `lib/src/notifications.dart` is exhaustive, so the analyzer will point at the
   place that needs a matching case.
 
 ### Testing Requirements
@@ -51,10 +51,10 @@ schema file — the two sides are kept in step by hand.
 The package has no tests of its own. It is exercised through the app:
 
 ```sh
-flutter test        # relevance_test.dart constructs these models directly
+flutter test        # the app's tests construct these models directly
 ```
 
-`test/relevance_test.dart` and `test/feed_screen_test.dart` are the de-facto
+`test/feed_screen_test.dart` is the de-facto
 coverage. `dev_dependencies` includes `test:` if unit tests are ever added here.
 
 ### Common Patterns

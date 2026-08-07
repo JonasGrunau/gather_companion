@@ -284,17 +284,28 @@ Two things make that less trivial than picking coordinates.
 accepted — walls, scenery, the void outside the map. Collision is enforced
 client-side only, so uniform random coordinates put you inside furniture about as
 often as not. Rather than rebuild the collision map out of `MapObject` and
-`CatalogItemVariant.collision`, the bridge takes the empirical route: **a tile
-somebody has stood on is a tile you can stand on.** The state dump carries every
-member of the space with their last position — 111 of them in the space this was
-built against, most parked at a desk — and the pool grows as people walk around.
+`CatalogItemVariant.collision` — whose encoding has never been captured, so
+building on it would be guesswork that lands you in walls — party mode takes the
+empirical route: **a tile somebody has been on is a tile you can be on.**
+
+Two sources feed that, and it needs both. The state dump carries every member with
+their last position, which sounds like plenty until you notice most of them are
+parked at a desk: it is worth about one tile per member, 78 on a 124×82 map, under
+one percent of the floor. That alone is why party mode used to circle the same
+dozen tiles — after the safety radius, eighteen were left, and four hops a second
+exhausts eighteen tiles in five seconds. So it also watches people **walk**.
+Positions arrive four times a second, and the tiles between two sightings of the
+same person are walkable floor, kept whenever the step is short and straight enough
+that no other path could have produced it. The pool reaches a few hundred tiles
+within a minute of connecting and a few thousand within fifteen.
 
 **Landing next to someone opens the video bubble on their screen.** Doing that
 four times a second, to a different colleague each time, would be a genuinely
 antisocial thing to inflict on an office. So every candidate tile is held at
-least **8 tiles** from everyone currently connected — more than double the
-3 tiles at which Gather connects media, with the margin covering the fact that
-the roster is always a beat behind. Offline rows donate their tile without
+least **5 tiles** from everyone currently connected — two clear of the 3 tiles at
+which Gather connects media, with the margin covering the fact that the roster is
+always a beat behind. It was 8, which bought margin nobody can perceive at the
+price of a third of the usable floor. Offline rows donate their tile without
 defending it: a parked avatar is proof a body fits there and proof nobody is on
 it.
 
@@ -577,19 +588,19 @@ The alphabet excludes `0`, `1`, `I`, `L` and `O`, so there is nothing to misread
 A character outside it is refused rather than guessed at — pairing on a
 misread code would be worse than asking someone to look again.
 
-### 📋 What the feed shows
+### 📋 What the screen shows
 
-Only what is worth reading. Events are classified into three tiers:
+Who is following you, which of them is talking, and whether the party is on. That
+is the whole screen, and all of it is *now* — read from the live Gather socket, not
+from history.
 
-| tier | what | shown |
-|---|---|---|
-| 🔵 **alert** | someone started following you | yes, on a Gather-blue card |
-| ⚪ **notable** | someone stopped following you, Gather's own notifications | yes |
-| ▫️ **ambient** | mic and camera toggles, transport state, roster churn, your own device state | behind "Show N background events" |
-
-The top of the screen answers *now* — who is following you, and which of them is
-talking — straight from the bridge's snapshot, so it is right even if the app was
-closed when it happened. The list underneath is history.
+There used to be a scrolling activity feed underneath. It was worth having when the
+bridge kept a 500-event ring on a computer that was awake all day and replayed it on
+connect. Once the app talked to Gather itself, the log could only record what
+happened while the app was open — the one window in which you were already looking
+at the screen — so it was empty exactly when it would have been useful. Everything
+worth interrupting you for arrives as a **push notification** instead, which works
+whether the app is running or not.
 
 ### 🎨 Palette and icon
 

@@ -13,11 +13,9 @@ rules that decide which events are worth a person's attention.
 
 | File | Description |
 |------|-------------|
-| `app_state.dart` | `AppState extends ChangeNotifier` — the one object the UI reads. Drives the **Gather** connection (`DirectCollector` + `PresenceTracker` + `PartyMode` from `package:gather_client`), and owns the event log (1000 in memory, newest first), the presence snapshot, the link status, the classified-feed cache, and the lifecycle (`boot`, `pair`, `unpair`, `reconnect`, `_attach`/`_detach`). No socket to the computer: the bridge is reached only by an opportunistic `POST /push/register`. |
+| `app_state.dart` | `AppState extends ChangeNotifier` — the one object the UI reads. Drives the **Gather** connection (`DirectCollector` + `PresenceTracker` + `PartyMode` from `package:gather_client`), and owns the presence snapshot, the link status, and the lifecycle (`boot`, `pair`, `unpair`, `reconnect`, `_attach`/`_detach`). Events are not stored: `_onFold` hands each one to `Notifier` and drops it. No socket to the computer: the bridge is reached only by an opportunistic `POST /push/register`. |
 | `link_status.dart` | `LinkState` / `LinkStatus` — how good our connection to **Gather** is. Carries `needsPairing`, the one state that asks the user to act rather than wait. |
 | `credentials.dart` | `GatherCredentialStore` — the Gather refresh token, in the platform keychain. Not `SharedPreferences`: this is the user's whole Gather identity and backups include plists. |
-| `event_log.dart` | `EventLogStore` — the feed, persisted on the phone, debounced. Replaces the bridge's 500-event replay ring. `EventLogStore.disabled()` for widget tests. |
-| `relevance.dart` | `Relevance` (alert / notable / ambient), `EventLook`, and `lookOf()` — classifies *and* phrases every event in one exhaustive switch. The feed's editorial policy. |
 | `pairing.dart` | `PairPayload` parsing (`HOST:PORT:CODE`), `normaliseCode()`, `parseAddress()`, and `claimPairing()` — the one unauthenticated call in the API. |
 | `settings.dart` | `BridgeSettings` — host, port, token in `SharedPreferences`, plus `wsUri()` / `httpUri()` construction and the bridge's friendly name. |
 | `notifications.dart` | `Notifier` — local notifications for the two events worth interrupting someone for, with permission requested *after* pairing rather than at launch. |
@@ -26,26 +24,22 @@ rules that decide which events are worth a person's attention.
 
 ### Working In This Directory
 
-- **The feed cache is a performance fix, not an optimisation.** The whole app
-  hangs off one `ListenableBuilder`, so classifying 1000 events per build ran on
-  every socket frame and every refresh-indicator frame. `_invalidateFeed()` must
-  be called by anything that can change the outcome — including a new snapshot,
-  because names are resolved during classification and a late roster relabels
-  events already in the log.
+- **Events are not kept anywhere.** There was an on-phone `EventLogStore` and a
+  `relevance.dart` classifier behind a scrolling activity feed. Both are gone. Once
+  the app held its own Gather socket the log could only record what happened while
+  the app was open — the one window in which the user was already looking — so it
+  was empty exactly when it would have been useful. What it was for is push
+  notifications, which do not need it: `_onFold` calls `Notifier.consider` and lets
+  the event go. Do not reintroduce a store without solving the closed-app case
+  first.
 - **`_detach()` must stay synchronous.** It was once `async` with `_client = null`
   after an `await`, so the null landed a microtask after `_attach()` had installed
   the replacement and quietly wiped it. Disposal can finish in the background; the
   bookkeeping cannot.
-- **`lastSeq` is what keeps the log complete.** A phone drops the socket every
-  time it is locked; reconnecting with `?since=` replays exactly what was missed.
-  Do not reset it except in `updateSettings`.
 - **`whenLive()` plus a 450 ms floor** is what makes pull-to-refresh feel like an
   action. A local bridge answers in ~50 ms and an indicator that vanishes inside
   two frames reads as a rendering fault. The floor is outside the null check on
   purpose, so the gesture feels the same with or without a socket.
-- **`isPriming` exists so the feed does not lie.** It starts `true` — a state that
-  never attaches has nothing to wait for — and gates the "No activity yet" card
-  until the history fetch lands.
 - **Pairing refuses rather than guesses.** The alphabet excludes `0`, `1`, `I`,
   `L`, `O`; characters outside it are dropped, which then fails the length check.
   There is no sound way to know whether a reported `O` meant `Q` or `D`, and
@@ -60,14 +54,12 @@ rules that decide which events are worth a person's attention.
 ### Testing Requirements
 
 ```sh
-flutter test test/relevance_test.dart   # the classification rules
 flutter test                            # everything
 ```
 
-`relevance.dart` is the most heavily specified file here — every tier decision is
-pinned by a named test. Adding an event type means adding a case to `lookOf` (the
-switch is exhaustive over the sealed hierarchy, so the analyzer will tell you)
-*and* a test asserting which tier it lands in.
+Adding an event type means adding a case to the switch in `notifications.dart`,
+which decides its title and body — that is now the only place an event is phrased,
+and the only place one is judged worth interrupting someone for.
 
 Use the `@visibleForTesting` seams on `AppState` — `debugApplySnapshot`,
 `debugApplyEvent`, `debugApplyLink` — rather than standing up a fake bridge.
@@ -86,7 +78,7 @@ Use the `@visibleForTesting` seams on `AppState` — `debugApplySnapshot`,
 ### Internal
 
 `package:gather_events` for every model; `../theme` is *not* imported here (this
-layer stays free of widgets except `IconData` in `relevance.dart`).
+layer stays free of widgets entirely.
 
 ### External
 

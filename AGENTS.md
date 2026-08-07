@@ -88,7 +88,7 @@ ships both.**
 
 ```sh
 npm test                        # bridge: parser, msgpack, protocol, end-to-end over a real WS
-flutter analyze && flutter test # app: lints, relevance rules, widget behaviour
+flutter analyze && flutter test # app: lints, widget behaviour
 ```
 
 Both are the CI gate — neither half of a release ships if either is red. After a

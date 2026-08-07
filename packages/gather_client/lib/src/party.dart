@@ -15,11 +15,30 @@
 /// random tile lands you inside scenery about as often as not.
 ///
 /// Rather than reconstruct the collision map out of `MapObject` and
-/// `CatalogItemVariant.collision`, this takes the empirical route: **a tile somebody
-/// has stood on is a tile you can stand on.** The full state dump carries every
-/// member of the space with their last position — 111 of them in the space this was
-/// built against, most parked at a desk — which is a large, free, and definitionally
-/// valid set to draw from. It grows as the session runs.
+/// `CatalogItemVariant.collision` — whose encoding this codebase has never actually
+/// captured, so building on it would be guesswork that lands you inside walls — this
+/// takes the empirical route: **a tile somebody has been on is a tile you can be
+/// on.** Two sources feed it, and needing both is the whole point.
+///
+/// *Standing still* is the obvious one: the full state dump carries every member of
+/// the space with their last position — 111 of them in the space this was built
+/// against. It is free and definitionally valid, and for a long time it was the only
+/// source. On its own it is also far too thin to party on. Most of those 111 are
+/// parked at a desk, so the dump is worth roughly one tile per member: **78 tiles of
+/// a 124×82 map**, under one percent of the floor. Hold [safeTilesDefault] clear of
+/// everyone connected and about eighteen survive. Eighteen tiles at four hops a
+/// second is exhausted in under five seconds, and every hop after that is a repeat —
+/// which is exactly what it looked like.
+///
+/// *Walking* is what makes it a real map. Positions arrive about four times a second,
+/// so a colleague crossing the office is a stream of adjacent tiles, each one proof
+/// that the floor there is walkable. [_learnWalk] keeps the tiles **between**
+/// consecutive sightings too, which roughly doubles the yield again. It only does so
+/// for a short, unambiguous run — see [_walkStepTiles] — because the one thing that
+/// must not happen is inventing a tile nobody crossed.
+///
+/// The pool therefore starts thin and fills in as the space is used: a few hundred
+/// tiles within a minute of connecting, a few thousand within fifteen.
 ///
 /// ## Where you *should not* stand
 ///
@@ -33,13 +52,15 @@
 ///
 /// ## Where you *want* to go
 ///
-/// Picking uniformly from the safe set is random but does not look it. The set is
-/// small — 35 of 107 known tiles in the measured space — so hops land in the same
-/// corner over and over, and consecutive picks are often two tiles apart, which
-/// reads as a twitch rather than a teleport. So every hop must clear a minimum
-/// distance measured against the size of the floor itself ([_jumpFractions]), and
-/// among the tiles that qualify the stalest win — the floor gets covered before
-/// anywhere is repeated.
+/// Picking uniformly at random is random but does not look it: consecutive picks are
+/// often two tiles apart, which reads as a twitch rather than a teleport. So every hop
+/// must clear a minimum distance measured against the size of the floor itself
+/// ([_jumpFractions]), and among the tiles that qualify the stalest win.
+///
+/// That last rule is what "less random, so it looks more random" means here. Uniform
+/// sampling of a pool clumps and repeats; least-recently-used does not. With a pool
+/// in the thousands it means a fifteen-minute party — 3600 hops — never lands on the
+/// same tile twice.
 library;
 
 import 'dart:async';
@@ -55,11 +76,28 @@ const hopInterval = Duration(milliseconds: 250);
 
 /// Tiles of clearance from every connected person.
 ///
-/// Gather connects media at around 3 tiles. This is deliberately more than double
-/// that: positions arrive coalesced over a 250ms window, so the roster is always
-/// slightly behind, and somebody walking towards a tile we picked a moment ago
-/// should still not end up next to us.
-const safeTilesDefault = 8;
+/// Gather connects media at around 3 tiles. This keeps two tiles of margin on top,
+/// because positions arrive coalesced over a 250ms window: the roster is always
+/// slightly behind, and somebody walking towards a tile we picked a moment ago should
+/// still not end up next to us.
+///
+/// It used to be 8, on the reasoning that more clearance is strictly kinder. It is
+/// not free: clearance is subtracted from a pool that is already the scarce resource
+/// here, and 8 was costing about a third of the usable floor to buy margin nobody can
+/// perceive. The rule worth keeping is "never open a bubble", and 5 keeps it.
+const safeTilesDefault = 5;
+
+/// The longest gap between two sightings of the same person that is still read as a
+/// walk, in tiles.
+///
+/// The tiles between two sightings are only knowable if the person went in a straight
+/// line between them, and that is an assumption, not an observation — Gather paths
+/// around obstacles, so a long gap could have been a dogleg through tiles we would be
+/// inventing rather than learning. What makes the assumption safe is keeping the gap
+/// small: at four samples a second nobody outruns a couple of tiles per sample, so a
+/// run this short has no room to bend. Anything longer is treated as a teleport and
+/// only its endpoint is kept.
+const _walkStepTiles = 4;
 
 /// How long party mode runs before switching itself off.
 ///
@@ -156,6 +194,11 @@ class PartyMode {
   /// floorId -> tile key -> tile.
   final Map<String, Map<String, PartyTile>> _tiles = {};
 
+  /// Where each person was last seen, so the tiles they crossed on the way to the
+  /// next sighting can be learned. Keyed by spaceUserId; the floor is carried so a
+  /// move between floors is never joined up into a walk.
+  final Map<String, ({String floorId, int x, int y})> _lastSeen = {};
+
   /// The most recent roster, which is what "where is everyone" is answered from.
   Roster? _roster;
 
@@ -210,8 +253,42 @@ class PartyMode {
     for (final row in roster.rows) {
       final x = row.x, y = row.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      final pool = _tiles.putIfAbsent(row.floorId ?? '', () => {});
+      final floorId = row.floorId ?? '';
+      final pool = _tiles.putIfAbsent(floorId, () => {});
       final tile = PartyTile(x, y);
+      pool[tile.key] = tile;
+      _learnWalk(pool, row.id, floorId, x.round(), y.round());
+    }
+  }
+
+  /// Fill in the tiles between where somebody was and where they are now.
+  ///
+  /// The step is only joined up when the two sightings are on one row, one column or
+  /// one diagonal, and no more than [_walkStepTiles] apart. Those are the cases where
+  /// the tiles in between are not a guess: there is only one path that short and
+  /// straight, so every tile on it was walked. A dogleg is ambiguous — the walker
+  /// could have gone around either side of whatever was in the way — so it is left
+  /// alone and only the endpoint survives, from the caller.
+  void _learnWalk(
+    Map<String, PartyTile> pool,
+    String id,
+    String floorId,
+    int x,
+    int y,
+  ) {
+    final was = _lastSeen[id];
+    _lastSeen[id] = (floorId: floorId, x: x, y: y);
+    if (was == null || was.floorId != floorId) return;
+
+    final dx = x - was.x, dy = y - was.y;
+    final steps = max(dx.abs(), dy.abs());
+    if (steps < 2 || steps > _walkStepTiles) return;
+    // Straight only: along a row, along a column, or exactly diagonal.
+    if (dx != 0 && dy != 0 && dx.abs() != dy.abs()) return;
+
+    final stepX = dx ~/ steps, stepY = dy ~/ steps;
+    for (var i = 1; i < steps; i++) {
+      final tile = PartyTile(was.x + stepX * i, was.y + stepY * i);
       pool[tile.key] = tile;
     }
   }
@@ -367,13 +444,18 @@ class PartyMode {
       others.add(row);
     }
 
+    // Squared throughout: this is the one loop that scales with the pool *and* the
+    // crowd, and now that the pool runs to thousands of tiles it is a few hundred
+    // thousand comparisons a second on a phone. Comparing squares is the same
+    // predicate without the square root.
+    final safeSquared = safeTiles * safeTiles;
     final tiles = <PartyTile>[];
     for (final tile in pool.values) {
       // Standing still is not a hop.
       if (tile.x == me.x && tile.y == me.y) continue;
       var clear = true;
       for (final other in others) {
-        if (_distance(tile.x, tile.y, other.x!, other.y!) < safeTiles) {
+        if (_distanceSquared(tile.x, tile.y, other.x!, other.y!) < safeSquared) {
           clear = false;
           break;
         }
@@ -472,8 +554,11 @@ class PartyMode {
   }
 }
 
-double _distance(num ax, num ay, num bx, num by) {
+double _distance(num ax, num ay, num bx, num by) =>
+    sqrt(_distanceSquared(ax, ay, bx, by));
+
+double _distanceSquared(num ax, num ay, num bx, num by) {
   final dx = (ax - bx).toDouble();
   final dy = (ay - by).toDouble();
-  return sqrt(dx * dx + dy * dy);
+  return dx * dx + dy * dy;
 }

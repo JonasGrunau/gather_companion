@@ -6,16 +6,21 @@ import 'package:gather_events/gather_events.dart';
 
 import '../src/app_state.dart';
 import '../src/link_status.dart';
-import '../src/relevance.dart';
 import '../theme/gather_theme.dart';
 
-/// The main screen: who is following you now, and what has happened.
+/// The main screen: who is following you, right now.
 ///
-/// The split is deliberate. The top of the screen answers the question you have
-/// *right now* — is anyone following me — from the bridge's snapshot, which is
-/// authoritative and does not depend on having been running.
-/// The list underneath is history, and only carries what is worth reading; the
-/// background tier is a tap away rather than mixed in.
+/// It used to be two things — that answer at the top, and a scrolling history of
+/// everything that had happened underneath. The history is gone. It was worth
+/// keeping while the bridge held a 500-event ring on a computer that was awake all
+/// day; once the app started talking to Gather itself, the log could only record
+/// what happened while the app was open, which is the one window in which you were
+/// already looking at the screen. A list that is empty exactly when you need it and
+/// full of things you already saw otherwise is not history, it is furniture.
+///
+/// What that history was *for* survives as push notifications, which arrive whether
+/// the app is open or not. So the screen is now only the questions it can actually
+/// answer live: who is following you, and whether the party is on.
 class FeedScreen extends StatelessWidget {
   const FeedScreen({super.key, required this.state, required this.onUnpair});
 
@@ -25,7 +30,6 @@ class FeedScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final feed = state.feed;
 
     return Scaffold(
       backgroundColor: t.background,
@@ -41,34 +45,13 @@ class FeedScreen extends StatelessWidget {
                 backgroundColor: t.card,
                 onRefresh: state.reconnect,
                 child: CustomScrollView(
-                  // Without this a short feed cannot be over-scrolled, so
-                  // pull-to-refresh silently does nothing on a quiet screen.
+                  // The screen is shorter than the viewport now, so without this
+                  // there is nothing to over-scroll and pull-to-refresh silently
+                  // does nothing.
                   physics: const AlwaysScrollableScrollPhysics(),
                   slivers: [
                     SliverToBoxAdapter(child: _AroundYou(state: state)),
                     SliverToBoxAdapter(child: _PartyCard(state: state)),
-                    // Nothing at all while the backlog is in flight: showing
-                    // "No activity yet" and replacing it a moment later is the
-                    // kind of flicker that makes an app look broken on open.
-                    if (feed.isEmpty && state.isPriming)
-                      const SliverToBoxAdapter(child: SizedBox.shrink())
-                    else if (feed.isEmpty)
-                      SliverToBoxAdapter(child: _EmptyFeed(connected: state.link.isLive))
-                    else ...[
-                      const SliverToBoxAdapter(child: _SectionLabel('Activity')),
-                      // Lazy on purpose. Every row used to be constructed on
-                      // every rebuild — a thousand of them in a long session,
-                      // for the handful actually on screen.
-                      SliverList.builder(
-                        itemCount: feed.length,
-                        itemBuilder: (context, i) => _EventRow(
-                          event: feed[i].event,
-                          look: feed[i].look,
-                          state: state,
-                        ),
-                      ),
-                    ],
-                    SliverToBoxAdapter(child: _BackgroundToggle(state: state)),
                     const SliverToBoxAdapter(child: SizedBox(height: 32)),
                   ],
                 ),
@@ -141,23 +124,12 @@ class _TopBar extends StatelessWidget {
             ),
             onSelected: (value) {
               switch (value) {
-                case 'everything':
-                  state.setShowEverything(!state.showEverything);
-                case 'clear':
-                  state.clearLog();
                 case 'unpair':
                   onUnpair();
               }
             },
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: 'everything',
-                child: Text(
-                  state.showEverything ? 'Show only what matters' : 'Show everything',
-                ),
-              ),
-              const PopupMenuItem(value: 'clear', child: Text('Clear activity')),
-              const PopupMenuItem(value: 'unpair', child: Text('Forget this computer')),
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'unpair', child: Text('Forget this computer')),
             ],
           ),
         ],
@@ -325,10 +297,7 @@ class _AroundYou extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(kGutter, 4, kGutter, 4),
-      child: _FollowerCard(
-        followers: state.followers,
-        hasRichData: state.hasRichData,
-      ),
+      child: _FollowerCard(followers: state.followers),
     );
   }
 }
@@ -625,10 +594,9 @@ class _PartySwitch extends StatelessWidget {
 /// broken; "nobody is following you" is an answer, and the difference between
 /// the two is the whole reason anyone opens this.
 class _FollowerCard extends StatelessWidget {
-  const _FollowerCard({required this.followers, required this.hasRichData});
+  const _FollowerCard({required this.followers});
 
   final List<PlayerRef> followers;
-  final bool hasRichData;
 
   @override
   Widget build(BuildContext context) {
@@ -716,18 +684,6 @@ class _FollowerCard extends StatelessWidget {
               children: [
                 for (final person in followers) _PersonChip(person: person, onBrand: true),
               ],
-            ),
-          ],
-          if (!hasRichData) ...[
-            const SizedBox(height: 12),
-            Text(
-              'Log-only mode: no names, and being followed can only be guessed. '
-              'Run gather-app-bridge doctor on your computer to turn the rest on.',
-              style: TextStyle(
-                fontSize: 11.5,
-                height: 1.45,
-                color: empty ? t.faint : Colors.white.withValues(alpha: 0.8),
-              ),
             ),
           ],
         ],
@@ -825,199 +781,4 @@ class _Avatar extends StatelessWidget {
       ),
     );
   }
-}
-
-class _SectionLabel extends StatelessWidget {
-  const _SectionLabel(this.text);
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(kTextGutter, 20, kTextGutter, 8),
-      child: Text(
-        text.toUpperCase(),
-        style: TextStyle(
-          fontSize: 10.5,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 1.1,
-          color: t.faint,
-        ),
-      ),
-    );
-  }
-}
-
-class _EventRow extends StatelessWidget {
-  const _EventRow({required this.event, required this.look, required this.state});
-
-  final GatherEvent event;
-  final EventLook look;
-  final AppState state;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    final alert = look.isAlert;
-    final ambient = look.relevance == Relevance.ambient;
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(kGutter, 0, kGutter, 6),
-      padding: const EdgeInsets.fromLTRB(12, 11, 12, 11),
-      decoration: BoxDecoration(
-        color: alert ? t.brand.withValues(alpha: 0.13) : t.card,
-        borderRadius: BorderRadius.circular(t.radius - 2),
-        border: Border.all(
-          color: alert ? t.brand.withValues(alpha: 0.45) : t.border,
-        ),
-      ),
-      child: Row(
-        // With a subline the text block is taller than the avatar, so the avatar
-        // belongs beside the title rather than floating in the middle of the
-        // block. Without one there is nothing to align to, and a single short
-        // line pinned to the top of a 30px avatar reads as a layout fault — a
-        // wave, or an observed follow, carries no supporting text at all.
-        crossAxisAlignment:
-            look.detail == null ? CrossAxisAlignment.center : CrossAxisAlignment.start,
-        children: [
-          if (look.subject != null)
-            _Avatar(id: look.subject!, label: state.nameFor(look.subject!))
-          else
-            Container(
-              width: 30,
-              height: 30,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: t.secondary,
-                shape: BoxShape.circle,
-                border: Border.all(color: t.border),
-              ),
-              child: Icon(look.icon, size: 15, color: t.mutedForeground),
-            ),
-          const SizedBox(width: 11),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    if (look.subject != null) ...[
-                      Icon(
-                        look.icon,
-                        size: 13,
-                        color: alert ? t.brandSoft : t.faint,
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                    Expanded(
-                      child: Text(
-                        look.title,
-                        style: TextStyle(
-                          fontSize: 14,
-                          height: 1.25,
-                          fontWeight: alert ? FontWeight.w700 : FontWeight.w500,
-                          color: ambient ? t.mutedForeground : t.foreground,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                if (look.detail != null) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    look.detail!,
-                    style: TextStyle(fontSize: 12, height: 1.35, color: t.faint),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            _clock(event.at),
-            style: TextStyle(
-              fontSize: 11,
-              color: t.faint,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _BackgroundToggle extends StatelessWidget {
-  const _BackgroundToggle({required this.state});
-
-  final AppState state;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    final hidden = state.hiddenCount;
-    if (!state.showEverything && hidden == 0) return const SizedBox(height: 8);
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(kGutter, 14, kGutter, 4),
-      child: TextButton.icon(
-        onPressed: () => state.setShowEverything(!state.showEverything),
-        icon: Icon(
-          state.showEverything ? Icons.filter_list_off_rounded : Icons.filter_list_rounded,
-          size: 17,
-          color: t.mutedForeground,
-        ),
-        label: Text(
-          state.showEverything
-              ? 'Hide background activity'
-              : 'Show $hidden background ${hidden == 1 ? 'event' : 'events'}',
-          style: TextStyle(fontSize: 13, color: t.mutedForeground),
-        ),
-      ),
-    );
-  }
-}
-
-class _EmptyFeed extends StatelessWidget {
-  const _EmptyFeed({required this.connected});
-
-  final bool connected;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(kTextGutter, 44, kTextGutter, 20),
-      child: Column(
-        children: [
-          Icon(Icons.check_circle_outline_rounded, size: 28, color: t.faint),
-          const SizedBox(height: 14),
-          Text(
-            // Not "Not connected": the strip above already says that, and saying
-            // it twice on one screen reads as a stutter rather than as emphasis.
-            connected ? 'All quiet' : 'No activity yet',
-            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.mutedForeground),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            connected
-                ? 'Nothing worth interrupting you for. Anyone who starts '
-                    'following you shows up here.'
-                : 'Waiting for the bridge on your computer.',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 12.5, height: 1.5, color: t.faint),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-String _clock(DateTime at) {
-  final local = at.toLocal();
-  final h = local.hour.toString().padLeft(2, '0');
-  final m = local.minute.toString().padLeft(2, '0');
-  return '$h:$m';
 }
