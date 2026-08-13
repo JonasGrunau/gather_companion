@@ -394,6 +394,11 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     // wire reports, with no walk between them — which is what the desktop client
     // does with the same preference, rather than a degraded version of it.
     _motion.enabled = !MediaQuery.disableAnimationsOf(context);
+    // Before the roster, not after: a hop we fired ourselves is the better answer for
+    // the next few hundred milliseconds, and it has to be in place before the tiles
+    // that follow it are applied. Replaying is not a risk — the hop carries a
+    // sequence number and `noteTeleport` ignores one it has already drawn.
+    _motion.noteTeleport(state.lastTeleport);
     _motion.update(people);
 
     return Stack(
@@ -654,7 +659,7 @@ class _OfficePainter extends CustomPainter {
     _paintProps(canvas, art, paint, visible, where, now);
     // Names and room labels last: they are the one thing that must never end up
     // behind a pot plant.
-    _paintLabels(canvas, visible, base * zoom, where);
+    _paintLabels(canvas, visible, base * zoom, where, now);
 
     canvas.restore();
   }
@@ -770,23 +775,54 @@ class _OfficePainter extends CustomPainter {
     // A body's depth is the line it stands on: the bottom of its own tile — and the
     // tile it is drawn on rather than the one the wire last named, or somebody walking
     // out from behind a desk pops in front of it a quarter of a second early.
-    final bodies = [...people]
-      ..sort((a, b) => where[a.id]!.dy.compareTo(where[b.id]!.dy));
+    //
+    // Somebody mid-teleport is two entries rather than one. The body they left is at a
+    // different place on the floor and has to sort by *that* line, or a ghost left
+    // behind a desk is drawn standing on it.
+    final bodies = <({MapPerson person, Offset at, double alpha, double scale})>[];
+    for (final person in people) {
+      final flash = motion?.flashOf(person, now);
+      bodies.add((
+        person: person,
+        at: where[person.id]!,
+        alpha: flash?.alpha ?? 1,
+        scale: flash?.scale ?? 1,
+      ));
+      if (flash != null) {
+        bodies.add((
+          person: person,
+          at: flash.ghostAt,
+          alpha: flash.ghostAlpha,
+          scale: 1,
+        ));
+      }
+    }
+    bodies.sort((a, b) => a.at.dy.compareTo(b.at.dy));
 
     // A merge, not a concatenation: `props` is already sorted and the bodies now are
     // too, so this walks both once.
     final props = art?.props ?? const <ArtSprite>[];
     var next = 0;
+    void body(int i) => _paintPerson(
+          canvas,
+          bodies[i].person,
+          paint,
+          bodies[i].at,
+          now,
+          alpha: bodies[i].alpha,
+          scale: bodies[i].scale,
+        );
+
     for (final prop in props) {
       if (prop.foreground) continue;
-      while (next < bodies.length && (where[bodies[next].id]!.dy + 1) * _tile <= prop.depth) {
-        _paintPerson(canvas, bodies[next], paint, where[bodies[next].id]!, now);
+      while (next < bodies.length && (bodies[next].at.dy + 1) * _tile <= prop.depth) {
+        body(next);
         next++;
       }
       _paintProp(canvas, prop, paint, visible);
     }
     while (next < bodies.length) {
-      _paintPerson(canvas, bodies[next], paint, where[bodies[next].id]!, now);
+      body(next);
       next++;
     }
 
@@ -806,7 +842,18 @@ class _OfficePainter extends CustomPainter {
   /// Nothing is drawn around a body — no ring, no shadow. Gather draws people as
   /// people, and "which one is me" is answered by the name plate above the head
   /// rather than by a halo on the floor.
-  void _paintPerson(Canvas canvas, MapPerson person, Paint paint, Offset at, Duration now) {
+  /// [alpha] and [scale] are the teleport, and are 1 for everybody standing still.
+  /// A body arriving fades and grows into place; the one it left behind dissolves at
+  /// full size. See `../src/map_motion.dart`.
+  void _paintPerson(
+    Canvas canvas,
+    MapPerson person,
+    Paint paint,
+    Offset at,
+    Duration now, {
+    double alpha = 1,
+    double scale = 1,
+  }) {
     final sheet = person.avatarUrl == null ? null : cache[person.avatarUrl!];
 
     if (sheet == null) {
@@ -818,14 +865,23 @@ class _OfficePainter extends CustomPainter {
           : person.isFollowingMe
               ? tokens.ok
               : tokens.mutedForeground;
-      canvas.drawCircle(middle, _tile * 0.42 + 3, Paint()..color = tokens.background.withValues(alpha: 0.55));
-      canvas.drawCircle(middle, _tile * 0.42, Paint()..color = colour);
+      final radius = _tile * 0.42 * scale;
+      canvas.drawCircle(
+          middle, radius + 3, Paint()..color = tokens.background.withValues(alpha: 0.55 * alpha));
+      canvas.drawCircle(middle, radius, Paint()..color = colour.withValues(alpha: alpha));
       return;
     }
 
     final posture = _posture(person, now);
     final frame = avatarAnimation(facing: posture.facing, pose: posture.pose)
         .frameAt(motion?.phaseOf(person, now) ?? Duration.zero);
+
+    // Grown about the feet rather than the middle: a sprite scaled around its centre
+    // sinks into the floor on the way in, and the tile somebody stands on is the one
+    // thing about a body that must not move.
+    final width = avatarFrameWidth * scale;
+    final height = avatarFrameHeight * scale;
+    final floor = at.dy * _tile + avatarOffsetY + avatarFrameHeight;
     canvas.drawImageRect(
       sheet,
       Rect.fromLTWH(
@@ -835,12 +891,20 @@ class _OfficePainter extends CustomPainter {
         avatarFrameHeight.toDouble(),
       ),
       Rect.fromLTWH(
-        at.dx * _tile,
-        at.dy * _tile + avatarOffsetY,
-        avatarFrameWidth.toDouble(),
-        avatarFrameHeight.toDouble(),
+        at.dx * _tile + (avatarFrameWidth - width) / 2,
+        floor - height,
+        width,
+        height,
       ),
-      paint,
+      // The shared paint carries the pixel-art settings and is reused for everybody
+      // at full opacity; a fading body needs its own, since the alpha that fades it
+      // is the paint's own colour.
+      alpha >= 1
+          ? paint
+          : (Paint()
+            ..isAntiAlias = false
+            ..filterQuality = FilterQuality.none
+            ..color = const Color(0xFFFFFFFF).withValues(alpha: alpha.clamp(0.0, 1.0))),
     );
   }
 
@@ -885,7 +949,13 @@ class _OfficePainter extends CustomPainter {
   /// on the glass at every zoom, which is what a label is for; and because the font
   /// size never changes, a name's [TextPainter] is laid out once and kept, instead of
   /// every person on the map being re-laid-out on every frame of a pinch.
-  void _paintLabels(Canvas canvas, Rect visible, double onGlass, Map<String, Offset> where) {
+  void _paintLabels(
+    Canvas canvas,
+    Rect visible,
+    double onGlass,
+    Map<String, Offset> where,
+    Duration now,
+  ) {
     // Map pixels per screen pixel — the factor that undoes the zoom.
     final scale = 1 / onGlass;
 
@@ -939,6 +1009,20 @@ class _OfficePainter extends CustomPainter {
         body.dy * _tile - _tile * 0.5 - _plateHeight(label) / 2 * scale,
       );
       if (!visible.contains(at)) continue;
+      // A plate arrives with the body it names. Faded through a layer rather than by
+      // tinting the text: a colour is part of a [TextPainter]'s cache key, so fading
+      // one that way would lay a name out afresh on every frame of the effect.
+      final arriving = motion?.flashOf(person, now)?.alpha ?? 1;
+      if (arriving < 1) {
+        canvas.saveLayer(
+          Rect.fromCenter(
+            center: at,
+            width: (_plateWidth(label, dot: true) + 2) * scale,
+            height: (_plateHeight(label) + 2) * scale,
+          ),
+          Paint()..color = const Color(0xFFFFFFFF).withValues(alpha: arriving.clamp(0.0, 1.0)),
+        );
+      }
       _plate(
         canvas,
         at,
@@ -952,6 +1036,7 @@ class _OfficePainter extends CustomPainter {
         fill: person.isMe ? tokens.brand : tokens.background,
         dot: _availability(person.availability),
       );
+      if (arriving < 1) canvas.restore();
     }
   }
 

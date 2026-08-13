@@ -206,6 +206,7 @@ class PartyMode {
 
   final _changes = StreamController<PartyState>.broadcast();
   final _progress = StreamController<PartyState>.broadcast();
+  final _hopped = StreamController<PartyTile>.broadcast();
 
   /// The answer to "is this on, and if not why not" changed. Worth a full repaint.
   Stream<PartyState> get changes => _changes.stream;
@@ -213,6 +214,19 @@ class PartyMode {
   /// The hop counter moved. Cheap, once a second, and not worth a repaint of
   /// anything but the counter.
   Stream<PartyState> get progress => _progress.stream;
+
+  /// One event per hop actually sent, carrying where it went.
+  ///
+  /// The map draws a teleport differently from a walk, and telling the two apart by
+  /// how far the body moved is a guess: the roster arrives coalesced over 250ms and
+  /// component-wise (`/position/x` and `/position/y` are separate patches), so one
+  /// hop can reach a screen as two short moves that look exactly like walking. This
+  /// is the fact rather than the inference — we know it is a teleport because we are
+  /// the thing that teleported.
+  ///
+  /// Emitted only when the action actually went out. A hop that could not reach
+  /// Gather moved nobody and must not animate.
+  Stream<PartyTile> get hops => _hopped.stream;
 
   bool get active => _active;
 
@@ -299,6 +313,7 @@ class PartyMode {
     _timer = null;
     await _changes.close();
     await _progress.close();
+    await _hopped.close();
   }
 
   /// Why party mode cannot run right now, or null if it can.
@@ -349,6 +364,7 @@ class PartyMode {
     _hops++;
     _visits[tile.key] = _hops;
     _setDetail(null);
+    if (!_hopped.isClosed) _hopped.add(tile);
 
     final now = _now();
     final last = _progressAt;

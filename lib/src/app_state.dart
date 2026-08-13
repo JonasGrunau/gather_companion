@@ -147,6 +147,21 @@ class AppState extends ChangeNotifier {
   Listenable get positions => _positions;
   final _positions = _Ticker();
 
+  /// The last hop party mode fired, for the map to draw as a teleport.
+  ///
+  /// The map cannot tell a teleport from a walk by looking at the roster. Positions
+  /// arrive component-wise and coalesced over 250ms, so one hop can reach the screen
+  /// as two short moves that are indistinguishable from somebody walking — which is
+  /// how a teleport ends up being drawn as a slow glide across the office. This is
+  /// the fact instead: we fired it, so we know.
+  ///
+  /// [seq] is what makes it safe to read from `build`. A rebuild happens for all
+  /// sorts of reasons and must not replay the same hop; the map remembers the last
+  /// sequence it drew and ignores anything it has already seen.
+  ({String id, double x, double y, int seq})? get lastTeleport => _lastTeleport;
+  ({String id, double x, double y, int seq})? _lastTeleport;
+  int _teleportSeq = 0;
+
   /// The space's own name, as Gather has it — "SafeNow", not "The office".
   ///
   /// From the single `Space` row in the state dump, carried through the snapshot.
@@ -455,7 +470,8 @@ class AppState extends ChangeNotifier {
       }))
       ..add(collector.statuses.listen(_onCollectorStatus))
       ..add(party.changes.listen(_onPartyChanged))
-      ..add(party.progress.listen(_onPartyProgress));
+      ..add(party.progress.listen(_onPartyProgress))
+      ..add(party.hops.listen(_onPartyHop));
 
     collector.start();
     unawaited(_registerForPush());
@@ -470,6 +486,9 @@ class AppState extends ChangeNotifier {
     _collector = null;
     _party = null;
     _walk = null;
+    // A hop belongs to the connection that made it. Kept across a reconnect it would
+    // teleport a body on the first frame after the map came back.
+    _lastTeleport = null;
 
     for (final sub in subs) {
       await sub.cancel();
@@ -557,6 +576,27 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// A hop went out. Tell the map where the body landed, now rather than later.
+  ///
+  /// [_positions] and not [notifyListeners]: this is movement, and waking the whole
+  /// tree four times a second is the cost that [positions] exists to avoid. Ticking
+  /// it at all — rather than waiting for the roster that follows — is what keeps the
+  /// body from standing on the old tile for up to a quarter of a second before it
+  /// vanishes from it.
+  void _onPartyHop(PartyTile tile) {
+    final id = _collector?.selfId;
+    // Party mode cannot start without knowing which avatar is ours, so this is
+    // belt and braces rather than a real case.
+    if (id == null) return;
+    _lastTeleport = (
+      id: id,
+      x: tile.x.toDouble(),
+      y: tile.y.toDouble(),
+      seq: ++_teleportSeq,
+    );
+    _positions.tick();
+  }
+
   // ---- test seams ------------------------------------------------------------
 
   /// Feeds a roster in as though Gather had sent it, for the screens that draw
@@ -572,6 +612,17 @@ class AppState extends ChangeNotifier {
     _roster = roster;
     _positions.tick();
     _onFold(_tracker.applyRoster(roster));
+  }
+
+  /// Feeds a hop in as though party mode had fired one, for the map to draw.
+  ///
+  /// The live path reads our own id off the collector, which a widget test does not
+  /// have — so it is given here instead. Everything downstream of that is the same
+  /// path, including the tick that gets it to the screen.
+  @visibleForTesting
+  void debugTeleport(String id, double x, double y) {
+    _lastTeleport = (id: id, x: x, y: y, seq: ++_teleportSeq);
+    _positions.tick();
   }
 
   /// Feeds a snapshot in as though Gather had sent it, so the screens can be

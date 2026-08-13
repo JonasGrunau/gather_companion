@@ -257,4 +257,36 @@ void main() {
 
     expect(find.text('20×10 tiles'), findsOneWidget);
   });
+
+  testWidgets('a teleport is drawn from both ends at once', (tester) async {
+    // Two bodies of the same person on the map for a moment — one dissolving where
+    // they were, one arriving where they went — plus a name plate faded through its
+    // own layer. Nothing here has a widget to find, so what this pins is the paint
+    // itself: a ghost sorted into the depth list at the wrong end, or a `saveLayer`
+    // without its `restore`, throws rather than merely looking wrong.
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    state.debugTeleport('me', 18, 8);
+    await tester.pump();
+
+    // The rosters that follow a hop still name the tile it left, for up to the 250ms
+    // the collector coalesces over. The map must not walk anybody back to it.
+    state.debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+    await tester.pump(const Duration(milliseconds: 60));
+    await tester.pump(const Duration(milliseconds: 60));
+
+    // Then Gather catches up and says the same thing we did.
+    state.debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 18, 8, name: 'Me')]));
+    await tester.pump(const Duration(milliseconds: 120));
+    await tester.pump(const Duration(milliseconds: 200));
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('1 here'), findsOneWidget, reason: 'one person, however many bodies');
+  });
 }

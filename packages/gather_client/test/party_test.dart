@@ -282,6 +282,42 @@ void main() {
       expect(collector.hops, hasLength(before), reason: 'nothing more was sent');
     });
 
+    test('every hop is announced, so the map can draw it as a teleport', () async {
+      // The map cannot tell a teleport from a walk by watching the roster: positions
+      // arrive coalesced and component-wise, so one hop can reach a screen as two
+      // short moves that look exactly like walking. This stream is how it knows.
+      final p = build();
+      p.noteRoster(_floor(present: [_row('me-1', 20, 20)]));
+      final announced = <PartyTile>[];
+      p.hops.listen(announced.add);
+
+      p.start();
+      p.tick();
+      await pumpEventQueue();
+
+      expect(announced, hasLength(collector.hops.length));
+      expect(
+        announced.map((t) => (x: t.x, y: t.y)),
+        collector.hops.map((h) => (x: h.x, y: h.y)),
+        reason: 'the tile announced is the tile sent',
+      );
+    });
+
+    test('a hop that never reached Gather is not announced', () async {
+      // Nobody moved, so nothing should dissolve.
+      final p = build();
+      p.noteRoster(_floor(present: [_row('me-1', 20, 20)]));
+      final announced = <PartyTile>[];
+      p.hops.listen(announced.add);
+
+      collector.refuse = true;
+      p.start();
+      p.tick();
+      await pumpEventQueue();
+
+      expect(announced, isEmpty);
+    });
+
     test('stopping twice is not an error', () {
       final p = build();
       p.noteRoster(_floor(present: [_row('me-1', 20, 20)]));
