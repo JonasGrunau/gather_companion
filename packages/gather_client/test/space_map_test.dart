@@ -429,12 +429,23 @@ void main() {
       }));
 
       // doorwayPositionHashes expands {origin, orientation} into two tiles — the
-      // origin plus one down for Vertical, one right for Horizontal. Nothing here
-      // blocks a tile either way, so the assertion is that the room still parses
-      // and stays private.
+      // origin plus one down for Vertical, one right for Horizontal — in coordinates
+      // relative to the area, so the room's own width is the stride.
+      //
+      // The room is 4x6 at (2,2), so its east wall is the column at x=5 and the
+      // doorway is the two tiles of it at y=4 and y=5. Nothing blocks a *tile* either
+      // way: a doorway is a gap in the line between two tiles.
       final map = b.forFloor('floor-1')!;
       expect(map.blockedCount, 0);
       expect(map.rooms.any((r) => r.walled), isTrue);
+
+      expect(map.canPassThrough(5, 4, 6, 4), isTrue, reason: 'through the door');
+      expect(map.canPassThrough(5, 5, 6, 5), isTrue);
+      expect(map.canPassThrough(5, 3, 6, 3), isFalse, reason: 'the wall above it');
+      expect(map.canPassThrough(5, 6, 6, 6), isFalse);
+      // Twenty lines around a 4x6 room — six a side, four top and bottom — less the
+      // two the door opens.
+      expect(map.edgeCount, 18);
     });
 
     test('the smallest named room wins when they overlap', () {
@@ -459,6 +470,106 @@ void main() {
       }
 
       expect(b.forFloor('floor-1')!.roomAt(3, 3)?.name, 'Ada');
+    });
+  });
+
+  group('walls', () {
+    /// A 4x6 walled room at (2,2), so it covers x 2..5 and y 2..7.
+    SpaceMapBuilder walled({String texture = 'PlainGreen'}) {
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'room',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(4, 6),
+        'mapAreaType': 'MeetingRoom',
+        'wallsTexture': texture,
+      }));
+      return b;
+    }
+
+    test('a wall is a line between tiles, not a tile', () {
+      // `Collisions.addArea` records `addBlockedDirection(outsideTile, wallTile)` and
+      // `blockedAtPosition` never consults it, so the perimeter stays standable. This
+      // is the finding the whole floor plan turned on: treating walls as blocked tiles
+      // deleted 488 perfectly good tiles from the measured space.
+      final map = walled().forFloor('floor-1')!;
+
+      expect(map.blockedCount, 0);
+      expect(map.isWalkable(2, 2), isTrue, reason: 'the north-west corner of the wall');
+      expect(map.isWalkable(5, 7), isTrue);
+      expect(map.edgeCount, 20);
+    });
+
+    test('the line stops you both ways round', () {
+      // `canPassThrough` asks its set for `A.hashPair(e)` and `e.hashPair(A)`, so a
+      // wall keeps you in exactly as firmly as it keeps you out. Storing one ordering
+      // and forgetting the other would let anyone walk out of every meeting room.
+      final map = walled().forFloor('floor-1')!;
+
+      expect(map.canPassThrough(2, 1, 2, 2), isFalse, reason: 'in through the north');
+      expect(map.canPassThrough(2, 2, 2, 1), isFalse, reason: 'and back out');
+      expect(map.canStep(2, 1, 'Down'), isFalse);
+      expect(map.canStep(2, 2, 'Up'), isFalse);
+    });
+
+    test('the side walls run the full height of the room', () {
+      // The one place the art and the physics disagree, and the reason this is not
+      // copied from `space_art.dart`: the drawing loop stops at `tilesHigh - 2`
+      // because the north and south bands are two tiles tall and cover the corners.
+      // `addArea` has no bands, and its `I` runs to `height - 1`. Following the art
+      // would leave a walkable gap in the bottom of every room in the office.
+      final map = walled().forFloor('floor-1')!;
+
+      for (var y = 2; y <= 7; y++) {
+        expect(map.canPassThrough(1, y, 2, y), isFalse, reason: 'west wall at y=$y');
+        expect(map.canPassThrough(6, y, 5, y), isFalse, reason: 'east wall at y=$y');
+      }
+    });
+
+    test('an area with no walls draws no lines', () {
+      // `if (!A.isWalled) return`, and `isWalled` is `wallsTexture !== 'NewStyleNoWall'`.
+      // Team zones are areas too, and a zone whose edges stopped people would turn the
+      // office into a maze of invisible pens.
+      final map = walled(texture: 'NewStyleNoWall').forFloor('floor-1')!;
+
+      expect(map.edgeCount, 0);
+      expect(map.canPassThrough(2, 1, 2, 2), isTrue);
+    });
+
+    test('a step is refused off the grid, into furniture, or through a wall', () {
+      final b = walled();
+      _variant(b, 'v1', [
+        [0, 0],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 9,
+        'relativeY': 5,
+        'catalogItemVariantId': 'v1',
+      }));
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.canStep(0, 0, 'Left'), isFalse, reason: 'off the west edge');
+      expect(map.canStep(0, 0, 'Up'), isFalse, reason: 'off the north edge');
+      expect(map.canStep(8, 5, 'Right'), isFalse, reason: 'into the desk at (9,5)');
+      expect(map.canStep(1, 4, 'Right'), isFalse, reason: 'through the room wall');
+      expect(map.canStep(8, 5, 'Down'), isTrue, reason: 'open floor');
+      expect(map.canStep(8, 5, 'Sideways'), isFalse, reason: 'not a direction');
+    });
+
+    test('walking about inside a room is not walking through its walls', () {
+      // The lines are on the perimeter, so the inside of the room has none of them.
+      final map = walled().forFloor('floor-1')!;
+
+      expect(map.canStep(3, 4, 'Right'), isTrue);
+      expect(map.canStep(3, 4, 'Left'), isTrue);
+      expect(map.canStep(3, 4, 'Up'), isTrue);
+      expect(map.canStep(3, 4, 'Down'), isTrue);
     });
   });
 

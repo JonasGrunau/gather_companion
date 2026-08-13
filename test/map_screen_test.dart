@@ -14,6 +14,7 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
+import 'package:gather_companion/ui/dpad.dart';
 import 'package:gather_companion/ui/map_screen.dart';
 
 SpaceMap _map({Set<int> blocked = const {}, List<SpaceRoom> rooms = const []}) => SpaceMap(
@@ -86,6 +87,36 @@ void main() {
     await tester.pump();
 
     expect(find.text('3 here'), findsOneWidget, reason: 'me and two others; the parked one does not count');
+  });
+
+  testWidgets('the pad appears only once there is something for it to drive',
+      (tester) async {
+    // Both halves are needed and neither is optional: the socket to send the step on,
+    // and the tile to judge it from. A pad shown without them is a control that cannot
+    // be told apart from a broken one, so it is absent instead.
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+    expect(find.byType(DPad), findsNothing, reason: 'no live Gather behind it');
+
+    state
+      ..debugCanWalk = true
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
+    await tester.pump();
+
+    expect(find.byType(DPad), findsOneWidget);
+    // Centred across the bottom, so it is the same reach from either hand.
+    final size = tester.getSize(find.byType(MapScreen));
+    expect(
+      tester.getCenter(find.byType(DPad)).dx,
+      moreOrLessEquals(size.width / 2, epsilon: 0.5),
+    );
+    expect(tester.getCenter(find.byType(DPad)).dy, greaterThan(size.height / 2),
+        reason: 'the half of the screen a thumb reaches');
   });
 
   testWidgets('somebody still marked connected but away is not here', (tester) async {

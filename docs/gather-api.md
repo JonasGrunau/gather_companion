@@ -745,14 +745,50 @@ Two things follow, and both matter:
 - **Writing costs nothing.** `numTimesEnteredSpace` is only touched by
   `enterSpace`, so a collector that moves the user around still never increments
   the one counter that cannot be undone.
-- **Read-only is a choice, not a property.** `DirectCollector` sends exactly one
-  kind of write (`teleport`, for party mode) and nothing else, because the
-  gateway would let it send anything.
+- **Read-only is a choice, not a property.** `DirectCollector` sends two kinds of
+  write — `teleport` for party mode and `move` for the D-pad — and nothing else,
+  because the gateway would let it send anything.
 
-`packages/gather_client/lib/src/party.dart` is the consumer — party mode moved
-into the app when the app got its own socket — and it is the reason the
-walkability finding
-below is load-bearing rather than trivia.
+`packages/gather_client/lib/src/party.dart` and `walk.dart` are the consumers —
+party mode moved into the app when the app got its own socket, and the D-pad was
+only ever possible there — and they are the reason the walkability finding below is
+load-bearing rather than trivia.
+
+### `move` checks nothing, so the client is the only thing that does
+
+Read off the model, 2026-08-13. The action Gather's own client sends for a keypress
+is three lines and a delta:
+
+```js
+w(this, "move", MethodAction({
+  target: this, id: "move", optimistic: true,
+  requiredPermission: SpaceUserPermission.Move,
+  argSchema: () => z.object({direction: z.nativeEnum(MoveDirection)}),
+  fn: () => A => {
+    const e = new Direction(A.direction).toPositionDelta();
+    const g = new Position({x: this.x + e.x, y: this.y + e.y});
+    this.direction = new Direction(A.direction);
+    this.setPosition(g, {map: this.floor.activeMapOrThrow, prevPosition: this.position})
+  }
+}));
+```
+
+No collision test, no bounds test, no walkability test — the same finding as
+`teleport`, arrived at from the other end. Whether a step is legal is decided
+entirely on the client *before* the action is sent, by `Position#isBlockedBy(map,
+prevPosition)`, which is `blockedAtPosition` for the destination tile and
+`canPassThrough` for the line between the two.
+
+Three consequences for anything driving an avatar over this socket:
+
+- **It turns whether or not it moves.** `direction` is written before the position
+  is touched, so `move` is also the turn.
+- **A second client must re-implement collision or it walks through the office.**
+  `SpaceMap.canStep` is that re-implementation; `walk.dart` is the caller.
+- **`optimistic: true` is a hint about latency, not about trust.** The client draws
+  the step immediately and the confirming patch arrives later, which is why the
+  phone has to track its own tile: the roster is coalesced at 250ms and a walk runs
+  at seven tiles a second, so the wire is always two steps behind the thumb.
 
 ### The server does not validate walkability
 
@@ -860,8 +896,28 @@ not move between — not impassable tiles:
 ```js
 addArea(A){
   if (!A.isWalled) return;
-  // for each perimeter tile, excluding doorways:
-  //   addBlockedDirection(A.id, hashOf(tileOutside), hashOf(wallTile))
+  const e = A.absolutePosition;
+  const g = new Set(A.doorwayPositionHashes);              // relative to the area
+  for (let t = 0; t < A.dimensionsInTiles.width; t++) {
+    if (t === 0 || t === A.dimensionsInTiles.width - 1) {  // the sides
+      for (let I = 0; I < A.dimensionsInTiles.height; I++) {
+        if (g.has(Position.hashOf({x: t, y: I}))) continue;
+        const i = Position.hashOf({x: e.x + t, y: e.y + I});
+        const outside = Position.hashOf({x: e.x + t + (t === 0 ? -1 : 1), y: e.y + I});
+        this.addBlockedDirection(A.id, outside, i)
+      }
+    }
+    if (!g.has(Position.hashOf({x: t, y: 0}))) {           // the top
+      this.addBlockedDirection(A.id,
+        Position.hashOf({x: e.x + t, y: e.y}),
+        Position.hashOf({x: e.x + t, y: e.y - 1}))
+    }
+    if (!g.has(Position.hashOf({x: t, y: A.dimensionsInTiles.height - 1}))) {
+      this.addBlockedDirection(A.id,                        // and the bottom
+        Position.hashOf({x: e.x + t, y: e.y + A.dimensionsInTiles.height - 1}),
+        Position.hashOf({x: e.x + t, y: e.y + A.dimensionsInTiles.height}))
+    }
+  }
 }
 blockedAtPosition(A){ return this.mapEntitiesAtPosition(A).size > 0 }   // objects only
 canPassThrough(A,e){ return !blockedDirections.has(A.hashPair(e)) && !...has(e.hashPair(A)) }
@@ -869,7 +925,20 @@ canPassThrough(A,e){ return !blockedDirections.has(A.hashPair(e)) && !...has(e.h
 
 `blockedAtPosition` consults only the object map, so **a wall tile is standable** —
 488 perimeter tiles the first version excluded are perfectly good floor. Since a
-teleport is not a move, blocked directions never apply to it at all.
+teleport is not a move, blocked directions never apply to it at all; the D-pad walks,
+so they are the only thing keeping it indoors.
+
+Two details of `addArea` are not what the wall *art* would lead you to expect, and
+both were only settled by reading it:
+
+- **The side walls run the full height** — `I` from 0 to `height - 1`. The drawing
+  loop in `space_art.dart` stops three rows short, because the north and south bands
+  are two tiles tall and cover the corners visually. Following the art here would
+  leave a walkable gap at the bottom of every room in the office.
+- **`canPassThrough` asks its set both ways round**, so a wall keeps you in exactly
+  as firmly as it keeps you out. `space_map.dart` gets the same answer by naming each
+  line once — against the further of the two tiles it separates — instead of storing
+  both orderings.
 
 **`isWalled`** is `wallsTexture !== "NewStyleNoWall"` — 19 of 93 areas here. Gather
 also defines `get isPrivate(){ return this.isWalled }`, which is a statement about
@@ -1253,16 +1322,100 @@ Two absences that contradict the bundle reading and matter for planning:
 - **No RTX.** mediasoup usually offers a retransmission codec alongside video; this
   router does not, so there is no `apt` mapping to reconcile.
 
-SFU, request/response: `get-rtp-capabilities`, `transport-create {direction,
-iceTransportRequestOptions}`, `transport-connect`, `produce {transportId, tag, kind,
-rtpParameters, highQualityScreenShare}`, `consume`, `consume-created`,
-`consume-request {srcId, srcStreamId, requested}`, `consume-set-priority`,
-`consume-set-spatial`, `restart-ice`, `get-player-data`,
-`set-player-conversation-metadata`. Fire-and-forget: `consume-allow {dstId, allowed}`,
-`produce-close/pause/resume/migrate`, `transport-close`. Server→client:
-`consume-close/connected/not-allowed/try`, `disable-video`, `double-connected`,
-`move-off`, `producer-paused/resumed`, `set-max-spatial-layer`, `client-ip-info`,
-`server-info`.
+### The call protocol, measured
+
+Captured 2026-08-13 across a real two-person call with camera, mic, mute toggles and
+screen share. Every payload below is off the wire.
+
+The envelope is exactly what the bundle claimed: `{wsSequenceNumber, zodData}`, with
+`get-addr` / `addrs` / `unsubscribe` exempt and sending their arguments bare.
+
+**Client → server**, each returning its answer in the Socket.IO ack:
+
+| Message | `zodData` | Ack returns |
+|---|---|---|
+| `consume-request` | `{srcId, srcStreamId, requested: bool}` | `[]` |
+| `consume` | `{transportId, srcId, srcStreamId, tag, rtpCapabilities}` | `{id, producerId, producerPaused, rtpParameters}` |
+| `consume-created` | `{srcId, srcStreamId, tag, consumerId}` | `[]` |
+| `consume-pause` / `consume-resume` | `{srcId, srcStreamId, tag, consumerId}` | `[]` |
+| `consume-set-spatial` | `{srcId, srcStreamId, tag, spatialLayer}` | `[]` |
+| `consume-set-priority` | `{srcStreamId, tag, srcIds[]}` | `{result:[{srcId, priority}]}` |
+| `consume-allow` | `{dstId, allowed: bool}` | — |
+| `produce` | `{transportId, tag, kind, rtpParameters}` | `{id}` |
+| `produce-pause` / `produce-resume` / `produce-close` | `{tag}` | — |
+| `set-player-conversation-metadata` | `{meetingId, clusterId}` | `[]` |
+| `get-addr` *(router, bare)* | `{srcId, srcStreamId}` | `{addrFound: bool}` |
+| `unsubscribe` *(router, bare)* | `{srcId, srcStreamId}` | — |
+
+Note `produce-pause`/`resume`/`close` take **only a tag** — the SFU knows which
+producer is yours. And `tag` is not the same axis as `kind`: screen share is
+`{tag:'screen', kind:'video'}`.
+
+**Server → client**, unsolicited:
+
+| Message | Payload |
+|---|---|
+| `consume-try` | `{srcId, srcStreamId, producerIdMap}` — see below |
+| `consume-close` | `{srcId, tag, consumerId}` |
+| `producer-paused` / `producer-resumed` | `{srcId, tag}` |
+| `set-max-spatial-layer` | `{layer, kind}` |
+| `server-info` | `{transport:{id, availableBitrate, bitrate}, producers:{a[],v[]}, consumers{}}`, ~every 5s |
+
+### `consume-try` is how you learn a remote producer exists
+
+This was the last real unknown, and the answer is friendlier than expected: the server
+pushes the peer's **complete** producer set every time it changes.
+
+```jsonc
+{ "srcId": "<their UserAccount.id>", "srcStreamId": "<spaceId>",
+  "producerIdMap": { "audio": "97b1fa40-…", "video": "fe165daf-…", "screen": "ea8d04de-…" } }
+```
+
+It is a **full-state announcement, not a delta.** Across the capture the same peer's
+map went `{audio}` → `{}` → `{audio}` → `{audio,video}` → `{audio,video,screen}` →
+`{audio,video}` as they muted, enabled video and shared their screen. An empty map
+means they are publishing nothing.
+
+So the correct client design is *reconciliation*, not event-handling: keep a desired
+set of `(srcId, tag)` and diff it against `producerIdMap` on every `consume-try`.
+That is what the plan already assumed, for once for the right reason.
+
+The full subscribe path, in order:
+
+```
+← consume-try {srcId, producerIdMap:{audio:…}}
+→ get-addr    {srcId, srcStreamId}            (router — where is their stream?)
+← addrs       {srcId, sfuAddr, distance}
+→ consume     {transportId, srcId, srcStreamId, tag, rtpCapabilities}
+← ack         {id, producerId, producerPaused, rtpParameters}
+→ consume-created {srcId, srcStreamId, tag, consumerId}
+→ consume-resume  {…, consumerId}
+```
+
+`consume-created` going *back* to the server after the ack is unusual and easy to miss:
+the SFU wants confirmation that the client actually built the consumer.
+
+### Simulcast: three layers declared, one active
+
+The client declares all three encodings and activates only the lowest:
+
+```jsonc
+[{ "rid":"r0", "active":true,  "scaleResolutionDownBy":4, "maxBitrate":120000,  "maxFramerate":18, "scalabilityMode":"L1T2" },
+ { "rid":"r1", "active":false, "scaleResolutionDownBy":2, "maxBitrate":350000,  "maxFramerate":24, "scalabilityMode":"L1T2" },
+ { "rid":"r2", "active":false, "scaleResolutionDownBy":1, "maxBitrate":1500000, "maxFramerate":24, "scalabilityMode":"L1T2" }]
+```
+
+This matters for a phone. The worry about three concurrent software VP8 encodes is
+misplaced: **Gather itself encodes one layer at a time** and flips `active` as
+consumers ask for more, with the server steering via `set-max-spatial-layer {layer,
+kind}`. Declaring three costs nothing; only active ones are encoded.
+
+### Screen share is VP8, not H264
+
+Settled by capture. A real screen share produced
+`{tag:'screen', kind:'video', rtpParameters:{codecs:[{mimeType:'video/VP8', payloadType:96}]}}`.
+The bundle's H264 mention is either a fallback that never fires or was misread. The
+router's advertised capabilities contain no H264 at all, which agrees.
 
 Codecs: **VP8** camera, **H264** screen share, Opus with DTX/NACK/FEC. Three simulcast
 layers via `scaleResolutionDownBy` and per-layer `active`. **TURN credentials rotate
@@ -1658,9 +1811,13 @@ positions, and `Authenticate` frames contain a live JWT.
    untouched, but AV state was never instrumented.
 4. ~~**The SFU signalling socket's authentication.**~~ **Resolved 2026-08-13** — a
    Socket.IO v4 `CONNECT` payload of `{spaceId, token}`, the same Firebase ID token
-   the game socket carries. See "Media — the SFU". What remains open there is
-   narrower: where the `sessionId` in the SFU socket's URL comes from, and how a
-   client learns that a *remote* producer exists.
+   the game socket carries. Remote producer discovery is resolved too: the server
+   pushes `consume-try` carrying the peer's whole `producerIdMap`. See "Media — the
+   SFU". One narrow thing is still open: **where the `sessionId` in the SFU socket's
+   URL query comes from.** It is not in the `addrs` reply, and the socket that
+   carried it opened before the capture attached, so it is either client-generated
+   or held from an earlier exchange. A `probe-sfu.mjs reload` while *in* a call
+   would settle it.
 5. **Token lifetime in practice.** Refresh works (~60 min ID tokens), but nothing has
    run long enough to see whether a refresh token survives the desktop client
    signing out.

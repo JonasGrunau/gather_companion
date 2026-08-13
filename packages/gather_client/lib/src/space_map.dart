@@ -63,8 +63,12 @@
 /// impassable; it records *blocked directions* — pairs of adjacent tiles you may not
 /// move between — via `addBlockedDirection(outsideTile, wallTile)`. `blockedAtPosition`
 /// consults only the object map. So **a wall tile is a tile you can stand on**, and
-/// 488 perimeter tiles this used to exclude are perfectly good floor. Since party
-/// mode teleports rather than walks, blocked directions never apply to it at all.
+/// 488 perimeter tiles this used to exclude are perfectly good floor.
+///
+/// Which of the two questions you are asking decides which rule applies. Party mode
+/// teleports, so blocked directions never touch it — that is why [walkable] and
+/// [open] are built from the object map alone. The D-pad walks, so they are the only
+/// thing keeping it indoors, and [canStep] is where they are enforced.
 ///
 /// **Doorways** are two tiles. `doorwayPositionHashes` expands each
 /// `{origin, orientation}` into the origin plus one more — right for `Horizontal`,
@@ -120,6 +124,26 @@ const _noWall = 'NewStyleNoWall';
 /// everybody actually is.
 const _privateTypes = {'MeetingRoom', 'Desk'};
 
+/// The four words `SpaceUser.direction` and the `move` action both use.
+///
+/// `move`'s schema is `z.object({direction: z.nativeEnum(MoveDirection)})`, and
+/// `MoveDirection` is these — so anything else is rejected by the gateway before it
+/// reaches the model.
+const moveDirections = ['Up', 'Down', 'Left', 'Right'];
+
+/// Which tile a step lands on, relative to the one you are standing on.
+///
+/// `new Direction(A.direction).toPositionDelta()` in the `move` action's body. Y grows
+/// downwards, as it does everywhere in this space: `Up` is towards the top of the map.
+/// Null for anything that is not one of [moveDirections].
+({int dx, int dy})? stepOf(String direction) => switch (direction) {
+      'Up' => (dx: 0, dy: -1),
+      'Down' => (dx: 0, dy: 1),
+      'Left' => (dx: -1, dy: 0),
+      'Right' => (dx: 1, dy: 0),
+      _ => null,
+    };
+
 /// One rectangle on the floor: a room, a desk, a team's corner.
 ///
 /// Carried because a map of anonymous blocked tiles is a maze, and a map with
@@ -168,7 +192,9 @@ class SpaceMap {
     Set<int>? private,
     Set<int>? inside,
     Map<int, String?>? seats,
+    Set<int>? edges,
   })  : _blocked = blocked,
+        _edges = edges ?? const {},
         _private = private ?? const {},
         _inside = inside ?? const {},
         _seats = seats ?? const {},
@@ -190,6 +216,10 @@ class SpaceMap {
   final int width;
   final int height;
   final Set<int> _blocked;
+
+  /// Every pair of adjacent tiles a wall stands between. See [canPassThrough].
+  final Set<int> _edges;
+
   final Set<int> _private;
 
   /// Every tile covered by an area other than the base one: the office's footprint.
@@ -228,6 +258,69 @@ class SpaceMap {
 
   bool isWalkable(int x, int y) =>
       x >= 0 && y >= 0 && x < width && y < height && !_blocked.contains(y * width + x);
+
+  /// How many walls there are to walk into. Diagnostics.
+  int get edgeCount => _edges.length;
+
+  /// Whether a body may cross the line between two adjacent tiles.
+  ///
+  /// `Collisions.canPassThrough`, which asks its set both ways round:
+  ///
+  /// ```js
+  /// canPassThrough(A, e) {
+  ///   const g = A.hashPair(e); const t = e.hashPair(A);
+  ///   return !this.blockedDirections.has(g) && !this.blockedDirections.has(t)
+  /// }
+  /// ```
+  ///
+  /// So a wall is a property of the line, not of a direction of travel: it stops you
+  /// leaving a room exactly as firmly as it stops you walking in. [_edgeKey] gets the
+  /// same answer by naming the line once instead of storing both orderings.
+  ///
+  /// Only meaningful for neighbours. Two tiles that are not adjacent have no line
+  /// between them for a wall to stand on, and this says so by answering true.
+  bool canPassThrough(int ax, int ay, int bx, int by) {
+    final key = _edgeKey(ax, ay, bx, by);
+    return key == null || !_edges.contains(key);
+  }
+
+  /// Whether somebody standing on a tile may take one step [direction].
+  ///
+  /// The three rules the client applies before it sends `move`, and the reason it has
+  /// to: the `move` action's own body is `position += direction.toPositionDelta()`
+  /// with no check of any kind, so a client that does not ask this walks through
+  /// furniture and out of the building.
+  ///
+  /// Off the grid, into furniture, or through a wall. In that order, because the
+  /// first two are cheap and the third is the only one that needs the edge set.
+  bool canStep(int x, int y, String direction) {
+    final step = stepOf(direction);
+    if (step == null) return false;
+    final tx = x + step.dx;
+    final ty = y + step.dy;
+    if (!isWalkable(tx, ty)) return false;
+    return canPassThrough(x, y, tx, ty);
+  }
+
+  /// The line between two adjacent tiles, named once.
+  ///
+  /// Recorded against the further of the pair — its north side when they are stacked,
+  /// its west side when they are side by side — so `(a, b)` and `(b, a)` are the same
+  /// line and the set needs one entry rather than two. Null when the pair are not
+  /// neighbours, or when the tile the line belongs to is off the grid, which is a line
+  /// nobody can be standing on either side of.
+  int? _edgeKey(int ax, int ay, int bx, int by) {
+    final dx = bx - ax;
+    final dy = by - ay;
+    final horizontal = dy == 0 && (dx == 1 || dx == -1);
+    final vertical = dx == 0 && (dy == 1 || dy == -1);
+    if (!horizontal && !vertical) return null;
+
+    final x = horizontal ? (ax > bx ? ax : bx) : ax;
+    final y = horizontal ? ay : (ay > by ? ay : by);
+    if (x < 0 || y < 0 || x >= width || y >= height) return null;
+    return (y * width + x) * 2 + (horizontal ? 1 : 0);
+  }
 
   /// Inside a closed room: standable, but not somewhere to teleport for fun.
   bool isPrivate(int x, int y) => _private.contains(y * width + x);
@@ -513,6 +606,94 @@ class SpaceMapBuilder {
     return tiles;
   }
 
+  /// Every line a walled area's perimeter draws between two tiles.
+  ///
+  /// `Collisions.addArea`, transcribed. Its shape is worth keeping in view because two
+  /// details of it are not what the wall *art* would lead you to expect:
+  ///
+  /// ```js
+  /// addArea(A) {
+  ///   if (!A.isWalled) return;
+  ///   const e = A.absolutePosition;
+  ///   const g = new Set(A.doorwayPositionHashes);
+  ///   for (let t = 0; t < A.dimensionsInTiles.width; t++) {
+  ///     if (t === 0 || t === A.dimensionsInTiles.width - 1) {
+  ///       for (let I = 0; I < A.dimensionsInTiles.height; I++) {
+  ///         if (g.has(Position.hashOf({x: t, y: I}))) continue;
+  ///         const i = Position.hashOf({x: e.x + t, y: e.y + I});
+  ///         if (t === 0) {
+  ///           const g = Position.hashOf({x: e.x + t - 1, y: e.y + I});
+  ///           this.addBlockedDirection(A.id, g, i)
+  ///         } else if (t === A.dimensionsInTiles.width - 1) {
+  ///           const g = Position.hashOf({x: e.x + t + 1, y: e.y + I});
+  ///           this.addBlockedDirection(A.id, g, i)
+  ///         }
+  ///       }
+  ///     }
+  ///     if (!g.has(Position.hashOf({x: t, y: 0}))) {
+  ///       this.addBlockedDirection(A.id,
+  ///         Position.hashOf({x: e.x + t, y: e.y}),
+  ///         Position.hashOf({x: e.x + t, y: e.y - 1}))
+  ///     }
+  ///     if (!g.has(Position.hashOf({x: t, y: A.dimensionsInTiles.height - 1}))) {
+  ///       this.addBlockedDirection(A.id,
+  ///         Position.hashOf({x: e.x + t, y: e.y + A.dimensionsInTiles.height - 1}),
+  ///         Position.hashOf({x: e.x + t, y: e.y + A.dimensionsInTiles.height}))
+  ///     }
+  ///   }
+  /// }
+  /// ```
+  ///
+  /// **The side walls run the full height**, `I` from 0 to `height - 1`. The drawing
+  /// loop in `space_art.dart` stops three short of it, because the north and south
+  /// bands are two tiles tall and cover the corners visually. Collision has no bands
+  /// and no corners to cover, so copying the art's range would leave a walkable gap at
+  /// the bottom of every room in the office.
+  ///
+  /// **The doorway hashes are relative to the area**, so they are indexed by the
+  /// area's own width — which is what [_doorways] already returns. Two of the three
+  /// lookups here use a relative coordinate against a *relative* stride, and the third
+  /// (`{x: t, y: 0}`) is just `t`.
+  void _wallEdges({
+    required Map<String, Object?> area,
+    required int x0,
+    required int y0,
+    required int w,
+    required int h,
+    required int width,
+    required int height,
+    required Set<int> edges,
+  }) {
+    final doorways = _doorways(area, w);
+
+    void add(int ax, int ay, int bx, int by) {
+      final horizontal = ay == by;
+      final x = horizontal ? (ax > bx ? ax : bx) : ax;
+      final y = horizontal ? ay : (ay > by ? ay : by);
+      // A line whose own tile is off the grid is one nobody can stand on either side
+      // of — the map bounds refuse that step long before the wall would.
+      if (x < 0 || y < 0 || x >= width || y >= height) return;
+      edges.add((y * width + x) * 2 + (horizontal ? 1 : 0));
+    }
+
+    for (var t = 0; t < w; t++) {
+      if (t == 0 || t == w - 1) {
+        for (var i = 0; i < h; i++) {
+          if (doorways.contains(i * w + t)) continue;
+          final wallX = x0 + t;
+          final wallY = y0 + i;
+          add(t == 0 ? wallX - 1 : wallX + 1, wallY, wallX, wallY);
+        }
+      }
+      if (!doorways.contains(t)) {
+        add(x0 + t, y0, x0 + t, y0 - 1);
+      }
+      if (!doorways.contains((h - 1) * w + t)) {
+        add(x0 + t, y0 + h - 1, x0 + t, y0 + h);
+      }
+    }
+  }
+
   /// `updateDepth`: the sprite's fold line, or its parent's with the child's own
   /// tucked in behind the decimal point so a lamp travels with the desk it stands on.
   /// One level deep, exactly as the client does it.
@@ -756,6 +937,7 @@ class SpaceMapBuilder {
       if (width <= 0 || height <= 0) continue;
 
       final blocked = <int>{};
+      final edges = <int>{};
       final private = <int>{};
       final inside = <int>{};
       final seats = <int, String?>{};
@@ -810,6 +992,19 @@ class SpaceMapBuilder {
           walled: walled,
         ));
 
+        if (walled) {
+          _wallEdges(
+            area: area,
+            x0: x0,
+            y0: y0,
+            w: w,
+            h: h,
+            width: width,
+            height: height,
+            edges: edges,
+          );
+        }
+
         // The base area is the grid itself. Counting it as building would make the
         // whole map "inside", which is the thing the footprint exists to disprove.
         if (id == baseId) continue;
@@ -832,6 +1027,7 @@ class SpaceMapBuilder {
         width: width,
         height: height,
         blocked: blocked,
+        edges: edges,
         private: private,
         inside: inside,
         seats: seats,

@@ -9,6 +9,7 @@ import '../src/art_cache.dart';
 import '../src/map_motion.dart';
 import '../src/map_person.dart';
 import '../theme/gather_theme.dart';
+import 'dpad.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -465,6 +466,21 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
           bottom: 12,
           child: SafeArea(top: false, child: _Legend(cache: cache, art: art)),
         ),
+        // Centred across the bottom, so it is the same reach from either hand. High
+        // enough off the edge to sit above the home indicator rather than fight it for
+        // the same gesture, and above the legend rather than over it.
+        if (state.canWalk)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 64,
+            child: SafeArea(
+              top: false,
+              child: Center(
+                child: DPad(onPress: state.walk, onRelease: state.stopWalking),
+              ),
+            ),
+          ),
       ],
     );
   }

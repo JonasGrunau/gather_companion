@@ -15,3 +15,4 @@ export 'src/party.dart';
 export 'src/presence_tracker.dart';
 export 'src/space_art.dart';
 export 'src/space_map.dart';
+export 'src/walk.dart';

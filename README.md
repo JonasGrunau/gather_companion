@@ -49,10 +49,10 @@ push them.
        └─────────────────────────┘   └────────────┬────────────┘
                     ▲                             │
                     │                             │
-                    │  ① pairing, once:           │
+                    │  1. pairing, once:          │
                     │     your Gather session ────┘
                     │
-                    └──── ② push, via FCM, when the app is asleep
+                    └──── 2. push, via FCM, when the app is asleep
 ```
 
 The two connections do not fight: `Connection` is per-connection but `SpaceUser`
@@ -660,6 +660,32 @@ while they are speaking, all off the client's own animation table. Turn animatio
 in your system settings and everybody stands on their tile, which is exactly what the
 desktop client does with that setting.
 
+**And you can walk.** A translucent pad sits across the bottom of the map: hold a
+quarter to walk that way, roll your thumb to the next one to turn a corner without
+stopping, slide back to the middle to stand still. It is one gesture rather than four
+buttons for exactly that reason — four buttons make going round a corner a stutter,
+because you have to lift, find the next one, and press again.
+
+Getting that right needed two things Gather does not hand you. The first is that
+**`move` checks nothing**: its entire body on the model is `position += delta`, so
+whether a step is legal is decided on the client or nowhere, and a pad that sends
+steps blind walks you through the desks and out into the void around the office. So
+the wall rule was read out of the client bundle the same way the rest of the floor
+plan was — walls are *lines between tiles*, not tiles, which is why you can stand on
+one and why a doorway is a gap in a line rather than a hole in a wall.
+
+The second is that **the wire is always two steps behind your thumb**. Positions are
+coalesced at a quarter of a second and a walk runs at seven tiles a second, so a step
+judged against the roster's idea of where you are is judged against where you were two
+steps ago — into the first wall you meet. So the phone keeps its own count of which
+tile you are on and lets the roster correct it: a position it never claimed to be
+heading for wins outright, which is what makes it safe to drive one avatar from the
+pad, the desktop client and party mode at the same time.
+
+No arrow is ever greyed out. An earlier version dimmed the ones that led into a wall
+and it read as a fault — the arrows flickered as you walked past doorways. You find a
+wall the way you find one in any game: by walking into it and stopping.
+
 **None of that art is bundled, and Gather ships no tileset.** The client resolves one
 image per floor texture, per wall piece and per furniture variant and fetches each on
 its own; so does this. On the space it was built against that is **573 images
@@ -836,9 +862,9 @@ re-run gets a fresh build number, so neither half objects to going twice.
   ten seconds. It mutates no game state — no move, chat, follow or setting — and it
   never sends `enterSpace`, so no avatar appears.
   *The app* additionally sends `enterSpace` and `reportActivity`, so it **is**
-  present in the room, and it can move your avatar for party mode. What it still
-  never does is speak for anyone but you: same account, same `SpaceUser`, your own
-  credential, no fabricated second identity. The desktop client itself is never
+  present in the room, and it moves your avatar: `teleport` for party mode and
+  `move` for the D-pad. What it still never does is speak for anyone but you: same
+  account, same `SpaceUser`, your own credential, no fabricated second identity. The desktop client itself is never
   modified — `app.asar` integrity validation is enabled, so patching it is not
   possible anyway.
 - 🔑 **The bridge stores a Gather credential.** `adopt` copies a Firebase refresh

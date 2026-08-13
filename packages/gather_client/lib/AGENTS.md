@@ -13,12 +13,13 @@ you change something here, look at the JS twin named in the table.
 | `msgpack.dart` | `bridge/lib/msgpack.js` | Decoder for everything Gather sends, incl. 5 ext types. Shallow encoder for the 5 frames we send. |
 | `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, plus `MeetingWatch` for invites and knocks. |
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
-| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, backoff. |
+| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, backoff. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
 | `party.dart` | *(deleted from the bridge)* | `PartyMode`. Lives only here now — the app holds the socket, and two parties driving one avatar would fight. Draws its tiles from `space_map.dart`. |
 | `space_art.dart` | *(no counterpart)* | `SpaceArt` / `ArtGround` / `ArtFloor` / `ArtWall` / `ArtSprite`, and the URL rules for Gather's floor, wall and furniture art. **Transcribed from the client bundle.** Gather ships no tileset: this is the list of images to fetch and where each one goes, 573 of them totalling 222 KB on the measured space. Note the two depths a wall can have — the sides are `ArtWall` in `ground`, while the north and south bands are `ArtSprite`s in `props`, because `ensureImmersiveWalls` gives them depths of their own. |
 | `avatar.dart` | *(no counterpart)* | `hashOutfit` / `avatarSpriteUrl` / `avatarAnimation` / `AvatarAnimation` / `avatarFrame` / `Facing` / `Pose`. The sprite service composites an outfit into one 72-frame sheet; the "hash" is the wearable ids joined with dots plus a timestamp, and getting its order or format wrong is a 404 rather than a wrong-looking person. The animation table is `Ae` from the client, transcribed with its frame rates: walking at 7fps, talking at 4, a still pose declared as one frame at 60. |
-| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas), "what is this room called" and "is somebody standing here sitting down" (`isSeat` — `playerState` never reaches the wire, so it is derived from the chair). `artFor()` builds the drawable scene from the same rows. |
+| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas), "may I take *this* step" (`canStep` / `canPassThrough` — walls are lines between tiles, not tiles), "what is this room called" and "is somebody standing here sitting down" (`isSeat` — `playerState` never reaches the wire, so it is derived from the chair). `artFor()` builds the drawable scene from the same rows. |
+| `walk.dart` | *(no counterpart)* | `Walk` — the D-pad's half of movement. Repeats `move` at Gather's own walking pace while a direction is held, applies `SpaceMap.canStep` to every step, and tracks its own tile because the roster is always two steps behind a walk. |
 
 ## Things that will bite you
 
@@ -61,7 +62,23 @@ you change something here, look at the JS twin named in the table.
   among ~1500, so `MeetingWatch` parks anything it cannot judge and
   `resolvePending` re-reads it once `selfId` is known.
 - **`PartyMode.tick()` is public** so tests can drive a hundred hops without a
-  hundred real quarter-seconds. The timer does nothing but call it.
+  hundred real quarter-seconds. The timer does nothing but call it. `Walk.step()`
+  is public for the same reason.
+- **`move` checks nothing server-side.** Its whole body is
+  `position += direction.toPositionDelta()`. Every rule about where an avatar may go
+  lives in `SpaceMap.canStep`, and anything that sends `move` without asking first
+  walks the user through the furniture and out of the building — the office footprint
+  is 96×52 of a 124×82 grid and the void around it is walkable as far as the game
+  server is concerned.
+- **Wall collision does not follow the wall art.** `Collisions.addArea` runs its side
+  walls the full height of the room; `space_art.dart`'s drawing loop stops three rows
+  short because the north and south bands are two tiles tall and cover the corners.
+  Copying the art's range leaves a walkable gap at the bottom of every room.
+- **`Walk` tracks its own tile and lets the roster correct it.** Positions are
+  coalesced at 250ms and a walk runs at seven tiles a second, so a step judged against
+  the roster's tile is judged against where you were two steps ago. A roster naming a
+  tile it never claimed wins outright — that is what keeps it safe to share one avatar
+  with the desktop client and with party mode.
 
 ## Testing
 

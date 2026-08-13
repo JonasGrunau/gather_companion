@@ -15,6 +15,7 @@ needed to be shared twice yet.
 |------|-------------|
 | `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`. Answers "is anyone following me" from the snapshot, and carries the party switch. Named for the scrolling activity feed it used to have; the name outlived it. |
 | `map_screen.dart` | The office, drawn in Gather's own artwork. `_Where`, `_HeadCount`, `_Waiting`, `_Plan`, `_Legend`, `_OfficePainter`, plus the `officePainter()` and `framedOn()` test seams. Floors, walls, furniture and avatars, sorted into one depth order; the old schematic is still underneath for while the art is in flight. People walk rather than hop — see `../src/map_motion.dart` — and are drawn on the client's own animation table: the walk cycle while they are mid-step, `idle-sit` on a chair, the talking loop while they are speaking. Labels are Gather's own capsules: a name plate above each head with an availability dot, and the ten **team** zones named above themselves — the fourteen meeting rooms are deliberately not written on the floor, since the one you are standing in is already in the app bar. Covers the screen at minimum zoom and cannot be panned off it (`boundaryMargin: EdgeInsets.zero`, and `framedOn` clamps the transforms the screen sets itself); opens centred on you at 3×, pinch/double-tap to 20×. Opened by `feed_screen.dart` on `Listenable.merge([state, state.positions])`; `state` alone leaves it frozen, because walking changes nothing the presence tracker reports. |
+| `dpad.dart` | `DPad` — the pad that walks your own avatar, floating over the lower half of the map. One `Listener` rather than four buttons, so rolling a thumb from one quarter to the next changes direction without the walk ever stopping; the hub in the middle is how you stop without lifting. Each direction owns a full quarter of the disc, split on the same diagonals the hit test uses, so what you aim at is what you get. `../../packages/gather_client/lib/src/walk.dart` does the stepping. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 
@@ -67,11 +68,24 @@ needed to be shared twice yet.
   viewer transform and `MapMotion` all drive the painter directly; a footstep must not
   rebuild the widget tree. `MapMotion`'s ticker stops itself when nobody is moving or
   talking, so an office standing still costs no frames.
+- **No arrow on the D-pad is ever greyed out.** An earlier version dimmed the
+  directions that led into a wall, using the same rule that decides whether the step
+  is sent. It read as a fault: the arrows flickered between live and dead as you
+  walked past doorways, and a control that keeps changing which parts of it work is
+  one you stop trusting. You find a wall the way you find one in any game — by
+  walking into it and stopping.
+- **The pad is only shown when it can actually drive something** (`AppState.canWalk`:
+  a live collector *and* a tile to judge steps from). A pad that does nothing cannot
+  be told apart from a broken one. `debugCanWalk` is the seam, since knowing where you
+  are takes a real roster.
+- **Pressed is a step of opacity, not a colour.** The brand blue was tried on the held
+  quarter and made the pad look like it was reporting something rather than being
+  pushed; a heavier dark read as a hole cut in the disc.
 
 ### Testing Requirements
 
 ```sh
-flutter test test/feed_screen_test.dart
+flutter test test/feed_screen_test.dart test/map_screen_test.dart test/dpad_test.dart
 ```
 
 Widget tests drive real screens through `AppState`'s debug seams. Being followed

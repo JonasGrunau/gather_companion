@@ -76,6 +76,7 @@ class AppState extends ChangeNotifier {
 
   DirectCollector? _collector;
   PartyMode? _party;
+  Walk? _walk;
   final PresenceTracker _tracker = PresenceTracker();
   final _subs = <StreamSubscription<dynamic>>[];
 
@@ -361,6 +362,27 @@ class AppState extends ChangeNotifier {
     return result.ok ? null : (result.state.detail ?? 'Party mode could not start.');
   }
 
+  // ---- walking ---------------------------------------------------------------
+
+  /// Whether there is anything for a D-pad to drive.
+  ///
+  /// Both halves are needed and neither is optional: the socket to send the step on,
+  /// and the tile to judge it from. A pad shown without them is a control that cannot
+  /// be told apart from a broken one.
+  bool get canWalk => debugCanWalk ?? (_walk?.at != null && _collector != null);
+
+  /// Test seam, as [debugMap]: knowing where you are takes a live roster.
+  @visibleForTesting
+  bool? debugCanWalk;
+
+  /// Start walking, or turn a walk already under way.
+  ///
+  /// Held rather than tapped: the pad calls this for as long as a thumb is down, and
+  /// [Walk] repeats the step at Gather's own walking pace until [stopWalking].
+  void walk(String direction) => _walk?.press(direction);
+
+  void stopWalking() => _walk?.release();
+
   /// Confirms the connection is really up, and reconnects only if it is not.
   ///
   /// What iOS resume calls. A suspended app's socket dies without an error, so the
@@ -411,6 +433,7 @@ class AppState extends ChangeNotifier {
 
     final collector = _collector = _buildCollector(auth, _spaceId);
     final party = _party = PartyMode(collector: () => _collector);
+    final walk = _walk = Walk(collector: () => _collector, map: () => map);
 
     _subs
       ..add(collector.rosters.listen((roster) {
@@ -418,6 +441,9 @@ class AppState extends ChangeNotifier {
         // freshest positions we hold rather than the previous ones.
         party.noteRoster(roster);
         _roster = roster;
+        // After `_roster`, so the floor plan `walk` looks up per step is the one for
+        // the floor this roster puts us on — `map` reads `_myRow()` to find it.
+        walk.noteRoster(roster);
         // The collector already coalesces and only publishes when something in the
         // state actually moved, so this is "the map changed", not a clock.
         _positions.tick();
@@ -439,15 +465,17 @@ class AppState extends ChangeNotifier {
     final subs = List.of(_subs);
     final collector = _collector;
     final party = _party;
+    final walk = _walk;
     _subs.clear();
     _collector = null;
     _party = null;
-
+    _walk = null;
 
     for (final sub in subs) {
       await sub.cancel();
     }
     await party?.dispose();
+    await walk?.dispose();
     await collector?.dispose();
   }
 
@@ -500,8 +528,13 @@ class AppState extends ChangeNotifier {
     };
 
     // A party cannot run without Gather, and a switch left glowing through a dropped
-    // connection would be asserting something untrue.
-    if (!status.healthy) _party?.stop(status.detail ?? 'lost the connection to Gather');
+    // connection would be asserting something untrue. A held D-pad is the same
+    // problem with a worse ending: the timer keeps firing into a socket that refuses
+    // every step, and the reconnect turns that into a walk nobody is still asking for.
+    if (!status.healthy) {
+      _party?.stop(status.detail ?? 'lost the connection to Gather');
+      _walk?.release();
+    }
 
     _snapshot = _tracker.snapshot();
     notifyListeners();

@@ -215,6 +215,36 @@ class DirectCollector {
     return (ok: true, detail: 'reconnecting; a full state dump follows immediately');
   }
 
+  /// Takes one step. What the D-pad sends.
+  ///
+  /// `move` is the action Gather's own client sends for a keypress, and its whole body
+  /// is a delta and a turn:
+  ///
+  /// ```js
+  /// fn: () => A => {
+  ///   const e = new Direction(A.direction).toPositionDelta();
+  ///   const g = new Position({x: this.x + e.x, y: this.y + e.y});
+  ///   this.direction = new Direction(A.direction);
+  ///   this.setPosition(g, {map: ..., prevPosition: this.position})
+  /// }
+  /// ```
+  ///
+  /// **There is no collision check in it.** Whether the step is legal is decided
+  /// entirely on the client, before this is sent — see [SpaceMap.canStep], which is
+  /// the rule, and `walk.dart`, which is the caller that applies it. Sending this
+  /// blind walks the user's avatar through the office wall and out into the void.
+  ///
+  /// One tile per call, and it turns whether or not it moves: [direction] is written
+  /// to `SpaceUser.direction` before the position is touched.
+  ///
+  /// Fire-and-forget for the same reason [teleport] is.
+  ({bool ok, String? detail}) move({required String direction}) {
+    if (!moveDirections.contains(direction)) {
+      return (ok: false, detail: '$direction is not a direction');
+    }
+    return _act('move', {'direction': direction});
+  }
+
   /// Moves our avatar to a tile. The one thing this collector writes.
   ///
   /// `SpaceUser` is per-person-per-space rather than per-connection, so this moves
@@ -235,6 +265,16 @@ class DirectCollector {
     required num y,
     String direction = 'Down',
   }) {
+    if (!x.isFinite || !y.isFinite) {
+      return (ok: false, detail: 'teleport needs finite coordinates');
+    }
+    // Flat x/y — `{position:{x,y}}` is rejected — and `direction` is required even
+    // though teleporting does not pass through any tiles.
+    return _act('teleport', {'x': x, 'y': y, 'direction': direction});
+  }
+
+  /// One action against our own `SpaceUser` row, on the socket we already hold.
+  ({bool ok, String? detail}) _act(String action, Map<String, Object?> args) {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) {
       return (ok: false, detail: 'not connected to Gather');
@@ -243,22 +283,13 @@ class DirectCollector {
     if (self == null) {
       return (ok: false, detail: 'do not know which avatar is ours yet');
     }
-    if (!x.isFinite || !y.isFinite) {
-      return (ok: false, detail: 'teleport needs finite coordinates');
-    }
 
     try {
       ws.add(msgpackEncode({
         'type': 'Action',
         'txnId': _txnId(),
-        'action': 'teleport',
-        // Flat x/y — `{position:{x,y}}` is rejected — and `direction` is required
-        // even though teleporting does not pass through any tiles.
-        'args': [
-          'SpaceUser',
-          self,
-          {'x': x, 'y': y, 'direction': direction},
-        ],
+        'action': action,
+        'args': ['SpaceUser', self, args],
       }));
       return (ok: true, detail: null);
     } on Object catch (error) {
