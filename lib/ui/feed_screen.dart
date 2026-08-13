@@ -415,7 +415,7 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
       (true, final String why) => why,
       (true, _) => 'Hopping four times a second',
       (false, final String why) => why,
-      _ => 'Teleport around the map, never next to anyone',
+      _ => 'Teleport around the map!',
     };
 
     return Padding(

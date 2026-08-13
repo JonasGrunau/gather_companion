@@ -127,7 +127,7 @@ void main() {
     await tester.pump();
 
     expect(find.text('Party mode'), findsOneWidget);
-    expect(find.text('Teleport around the map, never next to anyone'), findsOneWidget);
+    expect(find.text('Teleport around the map!'), findsOneWidget);
 
     state.debugApplySnapshot(PresenceSnapshot(
       self: const SelfState(spaceId: 'space-1'),
