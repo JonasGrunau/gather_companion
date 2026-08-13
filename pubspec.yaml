@@ -14,6 +14,24 @@ dependencies:
   # The user's whole Gather identity now lives on the phone, so it goes in the
   # keychain rather than in a preferences plist that device backups include.
   flutter_secure_storage: ^11.0.0
+  # The media engine, and **pinned to 1.6.0 for a specific reason**: 1.6.0 is the
+  # release that added Swift Package Manager support. Anything resolving to 1.5.x
+  # has only a podspec, which silently drags this project back onto CocoaPods —
+  # the same trap `flutter_secure_storage: ^11` exists to avoid. The mediasoup
+  # client declares `flutter_webrtc: ^1.5.2`, so without this pin the transitive
+  # resolution is free to pick a version that reintroduces pods.
+  flutter_webrtc: ^1.6.0
+  # mediasoup's client half: ORTC capability matching, the Unified Plan SDP
+  # handler, and the transport state machine. A maintained Dart-3 fork of the
+  # abandoned `mediasoup_client_flutter`, which cannot resolve against Dart 3 at
+  # all. It is signalling-agnostic by design — we own the wire format in
+  # `gather_client`'s `SfuSignalling`, it owns SDP and RTP — which is the only
+  # reason a stock mediasoup client works against Gather's bespoke protocol.
+  #
+  # Deliberately *not* in `packages/gather_client`: it depends on flutter_webrtc,
+  # and a Flutter plugin in that package would end `dart test` running without a
+  # device. The split is media plumbing here, protocol there.
+  mediasfu_mediasoup_client: ^0.1.4
   gather_client:
     path: packages/gather_client
   gather_events:

@@ -59,8 +59,16 @@
 	     answered by hand. -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<!-- Two uses now, and the string has to cover both. It said only "scanning
+	     the pairing square" while the app also published video, which is a
+	     rejection at App Review and a lie to the person reading the prompt. -->
 	<key>NSCameraUsageDescription</key>
-	<string>Scanning the pairing square shown by the bridge on your Mac.</string>
+	<string>Scanning the pairing square shown by the bridge on your Mac, and showing your face to the people you are talking to in Gather.</string>
+	<!-- Absent, this is a hard crash rather than a denial: iOS terminates the
+	     process the first time an audio session is activated for recording with
+	     no purpose string. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Talking to the people standing next to you in your Gather space.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Gather Companion connects to the bridge running on your Mac to show who is next to you and who is following you.</string>
 	<key>NSAppTransportSecurity</key>

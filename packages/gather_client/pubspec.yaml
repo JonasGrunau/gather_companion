@@ -9,6 +9,13 @@ environment:
 dependencies:
   gather_events:
     path: ../gather_events
+  # Gather's media plane is Socket.IO, not the game socket's msgpack — both the
+  # router and the per-node SFU connect with `EIO=4&transport=websocket` and
+  # authenticate in the Socket.IO CONNECT packet. This package is pure Dart rather
+  # than a Flutter plugin, so `dart test` still runs the whole suite with no
+  # device; it is, however, the first runtime dependency this package has ever
+  # had. See `lib/src/sfu_signalling.dart`.
+  socket_io_client: ^3.1.6
 
 dev_dependencies:
   lints: ^6.0.0

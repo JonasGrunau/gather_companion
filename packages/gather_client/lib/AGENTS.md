@@ -1,8 +1,16 @@
 # `gather_client` — Gather V2's protocol, spoken from the phone
 
-Pure Dart, **no dependencies** beyond `gather_events`. That is deliberate: it runs
-in a Flutter app but has no Flutter in it, so `dart test` exercises the whole thing
-in six seconds without a device.
+**Pure Dart — no Flutter.** That is the property to protect: this package runs
+inside a Flutter app but contains none of it, so `dart test` exercises the whole
+thing in seconds with no device, no simulator and no plugin registry.
+
+It used to have **no dependencies at all** beyond `gather_events`, and that is no
+longer true: `socket_io_client` arrived with `sfu_signalling.dart`, because
+Gather's media plane is Socket.IO rather than the game socket's msgpack. It is a
+pure-Dart package, not a Flutter plugin, so the testability property survives
+intact — but the bar for the *next* dependency should stay exactly where it was.
+msgpack, the WebSocket server, the QR encoder and the PNG encoder are all still
+hand-rolled for good reasons.
 
 This is a port of the bridge's own collector. The bridge still runs its copy (for
 push), so **two implementations of one wire format exist and must not drift.** When
@@ -15,6 +23,7 @@ you change something here, look at the JS twin named in the table.
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
 | `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, backoff. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
+| `sfu_signalling.dart` | *(no counterpart)* | `SfuSignalling` — the media plane's Socket.IO transport: CONNECT auth, ack-keyed `sendWithResponse`, the `{wsSequenceNumber, zodData}` envelope, server-push notifications, backoff. The bridge will never speak to the SFU. |
 | `party.dart` | *(deleted from the bridge)* | `PartyMode`. Lives only here now — the app holds the socket, and two parties driving one avatar would fight. Draws its tiles from `space_map.dart`. |
 | `space_art.dart` | *(no counterpart)* | `SpaceArt` / `ArtGround` / `ArtFloor` / `ArtWall` / `ArtSprite`, and the URL rules for Gather's floor, wall and furniture art. **Transcribed from the client bundle.** Gather ships no tileset: this is the list of images to fetch and where each one goes, 573 of them totalling 222 KB on the measured space. Note the two depths a wall can have — the sides are `ArtWall` in `ground`, while the north and south bands are `ArtSprite`s in `props`, because `ensureImmersiveWalls` gives them depths of their own. |
 | `avatar.dart` | *(no counterpart)* | `hashOutfit` / `avatarSpriteUrl` / `avatarAnimation` / `AvatarAnimation` / `avatarFrame` / `Facing` / `Pose`. The sprite service composites an outfit into one 72-frame sheet; the "hash" is the wearable ids joined with dots plus a timestamp, and getting its order or format wrong is a 404 rather than a wrong-looking person. The animation table is `Ae` from the client, transcribed with its frame rates: walking at 7fps, talking at 4, a still pose declared as one frame at 60. |
@@ -45,6 +54,14 @@ you change something here, look at the JS twin named in the table.
   connection. **The JS twin `bridge/lib/direct.js` must never grow these frames** —
   that divergence is the one exception to the never-drift rule, and
   `bridge/test/direct.test.js` guards it.
+- **Never use `emitWithAckAsync` on the SFU sockets.** `socket_io_client`
+  dispatches an ack with `Function.apply(ack, args)`, so an ack whose payload is
+  `[]` calls back with **zero** arguments — and that method's internal callback
+  requires one. It throws, the completer never completes, and the call hangs.
+  Six of Gather's twelve client calls answer `[]` (`consume-request`,
+  `consume-created`, `consume-pause`, `consume-resume`, `consume-set-spatial`,
+  `set-player-conversation-metadata`), so half the protocol would stall.
+  `sendWithResponse` uses `emitWithAck` with an all-optional callback instead.
 - **`GatherAuthException.permanent` is load-bearing.** A revoked refresh token must
   stop retrying and ask for pairing; a 503 must retry silently. Confusing the two
   either strands the user at a spinner or sends them to the pairing screen over a

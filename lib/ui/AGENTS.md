@@ -5,7 +5,7 @@
 
 ## Purpose
 
-The three screens. Each file holds one public entry point plus the private
+The screens. Each file holds one public entry point plus the private
 widgets it composes — there is no shared widget library, because nothing has
 needed to be shared twice yet.
 
@@ -17,6 +17,7 @@ needed to be shared twice yet.
 | `map_screen.dart` | The office, drawn in Gather's own artwork. `_Where`, `_HeadCount`, `_Waiting`, `_Plan`, `_Legend`, `_OfficePainter`, plus the `officePainter()` and `framedOn()` test seams. Floors, walls, furniture and avatars, sorted into one depth order; the old schematic is still underneath for while the art is in flight. People walk rather than hop — see `../src/map_motion.dart` — and are drawn on the client's own animation table: the walk cycle while they are mid-step, `idle-sit` on a chair, the talking loop while they are speaking. Labels are Gather's own capsules: a name plate above each head with an availability dot, and the ten **team** zones named above themselves — the fourteen meeting rooms are deliberately not written on the floor, since the one you are standing in is already in the app bar. Covers the screen at minimum zoom and cannot be panned off it (`boundaryMargin: EdgeInsets.zero`, and `framedOn` clamps the transforms the screen sets itself); opens centred on you at 3×, pinch/double-tap to 20×. Opened by `feed_screen.dart` on `Listenable.merge([state, state.positions])`; `state` alone leaves it frozen, because walking changes nothing the presence tracker reports. |
 | `dpad.dart` | `DPad` — the pad that walks your own avatar, floating over the lower half of the map. One `Listener` rather than four buttons, so rolling a thumb from one quarter to the next changes direction without the walk ever stopping; the hub in the middle is how you stop without lifting. Each direction owns a full quarter of the disc, split on the same diagonals the hit test uses, so what you aim at is what you get. `../../packages/gather_client/lib/src/walk.dart` does the stepping. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
+| `media_check_screen.dart` | `MediaCheckScreen` — mic and camera, before you need them. `_Preview`, `_Message`, `_Controls`, `_Toggle`. Talks to no server; it opens the hardware, draws it and lets go. Owns an `RTCVideoRenderer`, which is why it is stateful: the texture must be initialised before use and disposed with the widget, and `srcObject` is cleared *before* the engine stops the tracks under it. Three distinct states — starting, permission denied, no camera — because a refused permission is fixed in Settings and a busy camera is not, and neither is a spinner. |
 | `type_code_dialog.dart` | `showTypeCode()` — a modal sheet with two fields (code and address), plus `UpperCaseFormatter`. The route when the camera is refused, unavailable, or on desktop. |
 
 ## For AI Agents

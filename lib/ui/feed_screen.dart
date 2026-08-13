@@ -7,6 +7,7 @@ import 'package:gather_events/gather_events.dart';
 import '../src/app_state.dart';
 import '../src/link_status.dart';
 import 'map_screen.dart';
+import 'media_check_screen.dart';
 import '../theme/gather_theme.dart';
 
 /// The main screen: who is following you, right now.
@@ -74,39 +75,40 @@ class _TopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final subtitle = state.bridgeName ?? state.settings.host;
 
     return Padding(
-      padding: const EdgeInsets.fromLTRB(kTextGutter, 10, kGutter - 6, 8),
+      // Symmetric on purpose: 10/8 left the whole block sitting a pixel high of
+      // centre against the icon buttons, which is small enough to look like a
+      // mistake rather than a choice.
+      padding: const EdgeInsets.fromLTRB(kTextGutter, 10, kGutter - 6, 10),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           Expanded(
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Row(
+                  // The dot is 7pt against a titleLarge line box, so it has to be
+                  // told where to sit; left alone it hangs off whatever the row's
+                  // tallest child happens to be.
+                  crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
                     // Flexible because the name is long enough to crowd the
                     // header buttons on a 320pt phone.
                     Flexible(
-                      child: Text(
-                        'Gather Companion',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleLarge,
-                      ),
+                      child: Text('Gather Companion', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge),
                     ),
                     const SizedBox(width: 8),
                     _LiveDot(live: state.link.isLive),
                   ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12, color: t.faint),
-                ),
+                // No subtitle. It used to name the paired computer, from when the
+                // bridge relayed everything the app knew — but the phone talks to
+                // Gather directly now and the bridge only does pairing and push,
+                // so which computer it is stopped being a thing worth a permanent
+                // row. It was also what pushed this title off centre: blank in
+                // normal use, and an empty `Text` still occupies a full line box.
               ],
             ),
           ),
@@ -141,13 +143,13 @@ class _TopBar extends StatelessWidget {
             ),
             onSelected: (value) {
               switch (value) {
+                case 'media':
+                  Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const MediaCheckScreen()));
                 case 'unpair':
                   onUnpair();
               }
             },
-            itemBuilder: (context) => const [
-              PopupMenuItem(value: 'unpair', child: Text('Forget this computer')),
-            ],
+            itemBuilder: (context) => const [PopupMenuItem(value: 'media', child: Text('Mic & camera')), PopupMenuItem(value: 'unpair', child: Text('Forget this computer'))],
           ),
         ],
       ),
@@ -169,9 +171,7 @@ class _LiveDot extends StatelessWidget {
       decoration: BoxDecoration(
         color: live ? t.ok : t.faint,
         shape: BoxShape.circle,
-        boxShadow: live
-            ? [BoxShadow(color: t.ok.withValues(alpha: 0.5), blurRadius: 6, spreadRadius: 1)]
-            : null,
+        boxShadow: live ? [BoxShadow(color: t.ok.withValues(alpha: 0.5), blurRadius: 6, spreadRadius: 1)] : null,
       ),
     );
   }
@@ -243,9 +243,7 @@ class _LinkStripState extends State<_LinkStrip> {
       duration: const Duration(milliseconds: 220),
       curve: Curves.easeOutCubic,
       alignment: Alignment.topCenter,
-      child: _visible
-          ? _LinkStripBody(status: widget.status)
-          : const SizedBox(width: double.infinity),
+      child: _visible ? _LinkStripBody(status: widget.status) : const SizedBox(width: double.infinity),
     );
   }
 }
@@ -279,19 +277,12 @@ class _LinkStripBody extends StatelessWidget {
       child: Row(
         children: [
           if (!status.needsPairing)
-            SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(strokeWidth: 1.6, color: tint),
-            )
+            SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: tint))
           else
             Icon(Icons.link_off_rounded, size: 13, color: tint),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(
-              text,
-              style: TextStyle(fontSize: 12.5, color: tint),
-            ),
+            child: Text(text, style: TextStyle(fontSize: 12.5, color: tint)),
           ),
         ],
       ),
@@ -341,24 +332,13 @@ class _PartyCard extends StatefulWidget {
 class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMixin {
   /// Slow enough to read as a drift rather than a strobe. This sits on a screen
   /// someone may leave open.
-  late final AnimationController _spin = AnimationController(
-    vsync: this,
-    duration: const Duration(seconds: 5),
-  );
+  late final AnimationController _spin = AnimationController(vsync: this, duration: const Duration(seconds: 5));
 
   bool _reduceMotion = false;
 
   /// The palette opens and closes on Gather's own accent so the sweep meets
   /// itself: a gradient whose ends differ shows a seam every time it comes round.
-  static const _palette = [
-    Color(0xFF4257DA),
-    Color(0xFF7B3FE4),
-    Color(0xFFD33EF7),
-    Color(0xFFE0A22F),
-    Color(0xFF3FBF87),
-    Color(0xFF2C86C4),
-    Color(0xFF4257DA),
-  ];
+  static const _palette = [Color(0xFF4257DA), Color(0xFF7B3FE4), Color(0xFFD33EF7), Color(0xFFE0A22F), Color(0xFF3FBF87), Color(0xFF2C86C4), Color(0xFF4257DA)];
 
   @override
   void didChangeDependencies() {
@@ -429,22 +409,8 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
               borderRadius: BorderRadius.circular(t.radius),
               color: on ? null : t.card,
               border: on ? null : Border.all(color: t.border),
-              gradient: on
-                  ? LinearGradient(
-                      colors: _palette,
-                      transform: GradientRotation(phase * 2 * math.pi),
-                    )
-                  : null,
-              boxShadow: on
-                  ? [
-                      BoxShadow(
-                        color: _palette[1].withValues(alpha: 0.34),
-                        blurRadius: 24,
-                        spreadRadius: -6,
-                        offset: const Offset(0, 8),
-                      ),
-                    ]
-                  : null,
+              gradient: on ? LinearGradient(colors: _palette, transform: GradientRotation(phase * 2 * math.pi)) : null,
+              boxShadow: on ? [BoxShadow(color: _palette[1].withValues(alpha: 0.34), blurRadius: 24, spreadRadius: -6, offset: const Offset(0, 8))] : null,
             ),
             child: child,
           );
@@ -471,12 +437,7 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
                           children: [
                             Text(
                               'Party mode',
-                              style: TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: -0.2,
-                                color: on ? Colors.white : t.foreground,
-                              ),
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: -0.2, color: on ? Colors.white : t.foreground),
                             ),
                             if (on && party.hops > 0) ...[
                               const SizedBox(width: 8),
@@ -497,11 +458,7 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
                           subtitle,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            height: 1.35,
-                            color: on ? Colors.white.withValues(alpha: 0.86) : t.faint,
-                          ),
+                          style: TextStyle(fontSize: 12, height: 1.35, color: on ? Colors.white.withValues(alpha: 0.86) : t.faint),
                         ),
                       ],
                     ),
@@ -547,11 +504,7 @@ class _PartyGlyph extends StatelessWidget {
           shape: BoxShape.circle,
           border: on ? null : Border.all(color: t.border),
         ),
-        child: Icon(
-          Icons.celebration_rounded,
-          size: 20,
-          color: on ? Colors.white : t.mutedForeground,
-        ),
+        child: Icon(Icons.celebration_rounded, size: 20, color: on ? Colors.white : t.mutedForeground),
       ),
     );
   }
@@ -580,9 +533,7 @@ class _PartySwitch extends StatelessWidget {
       decoration: BoxDecoration(
         color: on ? Colors.white.withValues(alpha: 0.28) : t.secondary,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: on ? Colors.white.withValues(alpha: 0.4) : t.border,
-        ),
+        border: Border.all(color: on ? Colors.white.withValues(alpha: 0.4) : t.border),
       ),
       child: AnimatedAlign(
         duration: const Duration(milliseconds: 220),
@@ -593,10 +544,7 @@ class _PartySwitch extends StatelessWidget {
           child: Container(
             width: 20,
             height: 20,
-            decoration: BoxDecoration(
-              color: on ? Colors.white : t.faint,
-              shape: BoxShape.circle,
-            ),
+            decoration: BoxDecoration(color: on ? Colors.white : t.faint, shape: BoxShape.circle),
           ),
         ),
       ),
@@ -630,13 +578,7 @@ class _FollowerCard extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(14, 14, 14, 15),
       decoration: BoxDecoration(
         color: empty ? t.card : null,
-        gradient: empty
-            ? null
-            : LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [t.brand, t.brand.withValues(alpha: 0.72)],
-              ),
+        gradient: empty ? null : LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [t.brand, t.brand.withValues(alpha: 0.72)]),
         borderRadius: BorderRadius.circular(t.radius),
         border: empty ? Border.all(color: t.border) : null,
       ),
@@ -648,44 +590,26 @@ class _FollowerCard extends StatelessWidget {
               Container(
                 width: 38,
                 height: 38,
-                decoration: BoxDecoration(
-                  color: empty ? t.secondary : Colors.white.withValues(alpha: 0.18),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(
-                  Icons.directions_walk_rounded,
-                  color: empty ? t.faint : Colors.white,
-                  size: 21,
-                ),
+                decoration: BoxDecoration(color: empty ? t.secondary : Colors.white.withValues(alpha: 0.18), shape: BoxShape.circle),
+                child: Icon(Icons.directions_walk_rounded, color: empty ? t.faint : Colors.white, size: 21),
               ),
               const SizedBox(width: 13),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      switch (followers.length) {
-                        0 => 'Nobody is following you',
-                        1 => '${followers.first.label} is following you',
-                        final n => '$n people are following you',
-                      },
-                      style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.2,
-                        color: empty ? t.mutedForeground : Colors.white,
-                      ),
-                    ),
+                    Text(switch (followers.length) {
+                      0 => 'Nobody is following you',
+                      1 => '${followers.first.label} is following you',
+                      final n => '$n people are following you',
+                    }, style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: -0.2, color: empty ? t.mutedForeground : Colors.white)),
                     if (single) ...[
                       const SizedBox(height: 2),
                       Text(
                         _since(followers.first.followingMeSince),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.white.withValues(alpha: 0.85),
-                        ),
+                        style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.85)),
                       ),
                     ],
                   ],
@@ -695,13 +619,7 @@ class _FollowerCard extends StatelessWidget {
           ),
           if (showChips) ...[
             const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (final person in followers) _PersonChip(person: person, onBrand: true),
-              ],
-            ),
+            Wrap(spacing: 8, runSpacing: 8, children: [for (final person in followers) _PersonChip(person: person, onBrand: true)]),
           ],
         ],
       ),
@@ -734,9 +652,7 @@ class _PersonChip extends StatelessWidget {
       decoration: BoxDecoration(
         color: onBrand ? Colors.white.withValues(alpha: 0.16) : t.secondary,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: onBrand ? Colors.white.withValues(alpha: 0.22) : t.border,
-        ),
+        border: Border.all(color: onBrand ? Colors.white.withValues(alpha: 0.22) : t.border),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -745,25 +661,14 @@ class _PersonChip extends StatelessWidget {
           const SizedBox(width: 8),
           Text(
             person.label,
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
-              color: onBrand ? Colors.white : t.foreground,
-            ),
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: onBrand ? Colors.white : t.foreground),
           ),
           // Talking, from Gather's own `speaking` field. This used to be a
           // mic-off icon driven by the desktop client's log, which could only
           // ever be turned *off* and so almost never showed. Voice activity is
           // both readable and the thing you actually want to know — somebody
           // following you *and* talking is this app's whole reason to exist.
-          if (person.speaking) ...[
-            const SizedBox(width: 6),
-            Icon(
-              Icons.graphic_eq_rounded,
-              size: 13,
-              color: onBrand ? Colors.white : t.brandSoft,
-            ),
-          ],
+          if (person.speaking) ...[const SizedBox(width: 6), Icon(Icons.graphic_eq_rounded, size: 13, color: onBrand ? Colors.white : t.brandSoft)],
         ],
       ),
     );
@@ -790,11 +695,7 @@ class _Avatar extends StatelessWidget {
       decoration: BoxDecoration(color: colour, shape: BoxShape.circle),
       child: Text(
         initial,
-        style: TextStyle(
-          fontSize: size * 0.44,
-          fontWeight: FontWeight.w700,
-          color: Colors.white,
-        ),
+        style: TextStyle(fontSize: size * 0.44, fontWeight: FontWeight.w700, color: Colors.white),
       ),
     );
   }

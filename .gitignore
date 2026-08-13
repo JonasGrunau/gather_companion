@@ -55,10 +55,16 @@ app.*.map.json
 *-firebase-adminsdk-*.json
 service-account*.json
 
-# Unredacted SFU captures from `tool/probe-sfu.mjs --raw`. These carry a live
-# Firebase ID token, TURN credentials, DTLS fingerprints and ICE candidates
-# naming your LAN and public IPs. The probe writes a redacted transcript by
-# default and only produces this when explicitly asked; committing one would
-# publish a working credential.
+# SFU captures from `tool/probe-sfu.mjs`.
+#
+# `--raw` carries a live Firebase ID token, TURN credentials, DTLS fingerprints
+# and ICE candidates naming your LAN and public IPs. Committing one would publish
+# a working credential.
+#
+# The *redacted* transcript is ignored too, and deliberately: redaction removes
+# credentials and the identity keys it knows about, but a capture is still a few
+# hundred KB of one workspace's live traffic — colleague ids, tile positions, who
+# was talking to whom. It is a working file, not a finding. Findings belong in
+# docs/gather-api.md, written by a person who read the capture.
 *.raw.jsonl
-sfu-capture.raw*
+sfu-capture*.jsonl

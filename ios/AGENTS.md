@@ -37,9 +37,13 @@ Bundle id `com.jonasgrunau.gatherCompanion`, team `JQ4STVWTQ3`, minimum iOS 15.5
 
 - **Swift Package Manager, not CocoaPods.** `mobile_scanner` 7.x is a Swift
   package, and every other plugin here was chosen or pinned to keep it that way —
-  `flutter_secure_storage` is on 11.x specifically because 9.x has no SPM support
-  and adding it silently reintroduces a `Podfile`, a `Pods` project and Pods
-  wiring in `project.pbxproj`. If pods ever come back and are then removed again,
+  `flutter_secure_storage` is on 11.x specifically because 9.x has no SPM support,
+  and **`flutter_webrtc` is pinned to `^1.6.0` for exactly the same reason**: 1.6.0
+  is the release that added SPM, and 1.5.x ships only a podspec. That pin is
+  load-bearing rather than tidy — `mediasfu_mediasoup_client` declares
+  `flutter_webrtc: ^1.5.2`, so without the explicit root pin, transitive resolution
+  is free to pick a version that silently reintroduces a `Podfile`, a `Pods`
+  project and Pods wiring in `project.pbxproj`. If pods ever come back and are then removed again,
   run `flutter clean`: the generated plugin package keeps a stale
   `platforms: [.iOS("13.0")]` from the pods round-trip and Firebase's SPM products
   demand 15.0, which fails the archive with a confusing version error.
@@ -47,6 +51,16 @@ Bundle id `com.jonasgrunau.gatherCompanion`, team `JQ4STVWTQ3`, minimum iOS 15.5
   the build with a misleading *"missing expected TARGET_BUILD_DIR"*. Version 7
   also dropped GoogleMLKit, which had no arm64 simulator slices — on 6.x the app
   could not run on an arm64 simulator at all.
+- **A missing usage string is a crash, not a denial.** iOS terminates the process
+  the first time it activates an audio session for recording with no
+  `NSMicrophoneUsageDescription`, and does the same for the camera. Both are now
+  in `Runner/Info.plist`, and `NSCameraUsageDescription` had to be **rewritten**
+  rather than left alone: it described only QR scanning while the app also
+  publishes video, which is both a lie to the person reading the prompt and a
+  rejection at App Review.
+  There is deliberately **no `audio` in `UIBackgroundModes`**. Calls are
+  foreground-only for now, so the entitlement would be unused — and an unused
+  background mode is something App Review asks about.
 - **Signing is manual on purpose, and this is the single most expensive thing to
   re-learn.** Automatic signing asks Apple to update the Xcode-managed profile
   during export; that is a *cloud signing* operation and an App Store Connect API
