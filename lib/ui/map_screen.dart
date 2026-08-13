@@ -807,7 +807,8 @@ class _OfficePainter extends CustomPainter {
       return;
     }
 
-    final frame = avatarAnimation(facing: Facing.of(person.direction), pose: _pose(person, now))
+    final posture = _posture(person, now);
+    final frame = avatarAnimation(facing: posture.facing, pose: posture.pose)
         .frameAt(motion?.phaseOf(person, now) ?? Duration.zero);
     canvas.drawImageRect(
       sheet,
@@ -827,7 +828,7 @@ class _OfficePainter extends CustomPainter {
     );
   }
 
-  /// What somebody is doing, in the order the client decides it.
+  /// What somebody is doing and which way they are pointing.
   ///
   /// `updateMoveStateVisuals` asks moving-then-sitting-then-idle, and speaking is
   /// layered over the idles by `handleAnimationEnds`. Sitting is not on the wire —
@@ -836,12 +837,28 @@ class _OfficePainter extends CustomPainter {
   /// `sittable` tile. The tile asked about is the one the wire named rather than the
   /// one the body is sliding across, or somebody walking over a chair sits down for a
   /// frame on their way past.
-  Pose _pose(MapPerson person, Duration now) {
-    if (motion?.walking(person, now) ?? false) return Pose.walking;
-    if (map.isSeat(person.x.round(), person.y.round())) {
-      return person.speaking ? Pose.talkingSitting : Pose.sitting;
+  ///
+  /// A sitter faces their chair rather than the way they walked in. The client turns
+  /// them in `applySittingDirection` and publishes the turn, but it does so as a
+  /// patch of its own, arriving separately from the position — so a roster can carry
+  /// somebody sat down and still facing the corridor. `seatFacing` is the same answer
+  /// without the race; somebody's own direction is the fallback for a chair that
+  /// names no orientation.
+  ({Pose pose, Facing facing}) _posture(MapPerson person, Duration now) {
+    final facing = Facing.of(person.direction);
+    if (motion?.walking(person, now) ?? false) {
+      return (pose: Pose.walking, facing: facing);
     }
-    return person.speaking ? Pose.talking : Pose.standing;
+    final x = person.x.round();
+    final y = person.y.round();
+    if (map.isSeat(x, y)) {
+      final chair = map.seatFacing(x, y);
+      return (
+        pose: person.speaking ? Pose.talkingSitting : Pose.sitting,
+        facing: chair == null ? facing : Facing.of(chair),
+      );
+    }
+    return (pose: person.speaking ? Pose.talking : Pose.standing, facing: facing);
   }
 
   /// Team-area names and name plates, laid out on the glass and scaled into the map.

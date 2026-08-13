@@ -167,7 +167,7 @@ class SpaceMap {
     required this.rooms,
     Set<int>? private,
     Set<int>? inside,
-    Set<int>? seats,
+    Map<int, String?>? seats,
   })  : _blocked = blocked,
         _private = private ?? const {},
         _inside = inside ?? const {},
@@ -199,13 +199,18 @@ class SpaceMap {
   final Set<int> _inside;
 
   /// Tiles you sit down on: a chair's `sittable` points, placed the same way its
-  /// collision points are.
+  /// collision points are, against the way that chair is turned.
   ///
   /// Not a physical fact like [walkable] and not manners like [open] — it is what
   /// somebody standing here *looks* like. The client keeps `playerState` for this
   /// and never sends it, so a second client has to work it out the way Gather does:
   /// you are sitting when you are standing on a seat.
-  final Set<int> _seats;
+  ///
+  /// The value is the chair's `CatalogItemVariant.orientation` — `Up`, `Down`,
+  /// `Left` or `Right`, the same words `SpaceUser.direction` uses — and null for a
+  /// variant that does not name one. All 115 sittable variants on the measured space
+  /// do. See [seatFacing].
+  final Map<int, String?> _seats;
 
   final List<SpaceRoom> rooms;
 
@@ -228,7 +233,26 @@ class SpaceMap {
   bool isPrivate(int x, int y) => _private.contains(y * width + x);
 
   /// Whether somebody standing here is sitting down. See [_seats].
-  bool isSeat(int x, int y) => _seats.contains(y * width + x);
+  bool isSeat(int x, int y) => _seats.containsKey(y * width + x);
+
+  /// Which way the chair on this tile is turned, if it says.
+  ///
+  /// A sitter faces their chair, not wherever they were walking when they reached it.
+  /// `applySittingDirection` is the client turning them:
+  ///
+  /// ```js
+  /// const seat = user.sittableAtPosition; if (!seat) return;
+  /// const facing = CATALOG_ORIENTATION_TO_MOVE_DIRECTION[seat.orientation];
+  /// if (facing === user.direction.value) return;
+  /// user.faceDirection(facing);
+  /// ```
+  ///
+  /// and that table is the identity — `Up→Up`, `Down→Down`, `Left→Left`,
+  /// `Right→Right`. It runs on `currentSpaceUser` only, so the turn reaches the wire
+  /// as a *separate* patch from the position, one that another client may not have
+  /// yet — which is why somebody freshly sat down can be seen facing the way they
+  /// walked in. The chair is the reliable answer, and it is the one Gather draws.
+  String? seatFacing(int x, int y) => _seats[y * width + x];
 
   int get seatCount => _seats.length;
 
@@ -734,7 +758,7 @@ class SpaceMapBuilder {
       final blocked = <int>{};
       final private = <int>{};
       final inside = <int>{};
-      final seats = <int>{};
+      final seats = <int, String?>{};
       final rooms = <SpaceRoom>[];
 
       // Furniture, and only furniture. Walls are directions, not tiles — see the
@@ -753,7 +777,9 @@ class SpaceMapBuilder {
         // shares the loop rather than repeating it.
         for (final tile in _pointsOf(object, variant, 'sittable')) {
           if (tile.x < 0 || tile.y < 0 || tile.x >= width || tile.y >= height) continue;
-          seats.add(tile.y * width + tile.x);
+          // Which way the chair is turned, kept with the tile: it is what the sitter
+          // is drawn facing. See [SpaceMap.seatFacing].
+          seats[tile.y * width + tile.x] = _str(variant['orientation']);
         }
       }
 

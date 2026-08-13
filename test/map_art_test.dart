@@ -98,7 +98,7 @@ SpaceMapBuilder _bareMap() {
 SpaceMap _map() => _bareMap().forFloor('floor-1')!;
 
 /// The same map with a chair you can sit on at tile (4, 2).
-SpaceMap _seatedMap() {
+SpaceMap _seatedMap({String? orientation}) {
   final b = _bareMap();
   b.apply('CatalogItem', _add({'id': 'i-chair', 'family': 'Chair'}));
   b.apply('CatalogItemVariant', _add({
@@ -107,6 +107,7 @@ SpaceMap _seatedMap() {
     'originX': 0,
     'originY': 0,
     'dimensionsInPixels': _dims(32, 32),
+    'orientation': ?orientation,
     'mainRenderable': {'imageUrl': '/catalog/assets/stg/chair.png', 'fold': 0},
     'collision': {'points': const []},
     'sittable': {
@@ -393,12 +394,9 @@ void main() {
       }
     });
 
-    test('somebody on a chair is drawn sitting, facing the same way', () async {
-      // `playerState` is the client's own and never reaches the wire, so sitting is
-      // worked out from the map: a `sittable` tile under the body. idle-sit-s is
-      // frame 5, idle-sit-n 21.
+    Future<double> paintSeated({String? chair, String? facing}) async {
       final art = _art();
-      final map = _seatedMap();
+      final map = _seatedMap(orientation: chair);
       final sheet = await _sheet();
       final cache = ArtCache(fetch: (url) async => url == _avatarUrl ? sheet : _colours(url));
       cache.prefetch([...art.urls, _avatarUrl]);
@@ -412,7 +410,7 @@ void main() {
         cache,
         map: map,
         people: [
-          const MapPerson(
+          MapPerson(
             id: 'a',
             label: 'Ada',
             x: 4,
@@ -420,11 +418,32 @@ void main() {
             isFollowingMe: false,
             speaking: false,
             avatarUrl: _avatarUrl,
-            direction: 'Up',
+            direction: facing,
           ),
         ],
       );
-      expect((await image.toByteData())!.at(image.width, 4, 2).r * 255, closeTo(21, 1));
+      return (await image.toByteData())!.at(image.width, 4, 2).r * 255;
+    }
+
+    test('somebody sits the way their chair is turned, not the way they walked in', () {
+      // The bug: a sitter was drawn on their own `direction`, and that is a separate
+      // patch from the position. The client turns you in `applySittingDirection` —
+      // `CATALOG_ORIENTATION_TO_MOVE_DIRECTION[seat.orientation]`, which is the
+      // identity — and publishes the turn afterwards, so a roster can carry somebody
+      // sat down and still facing the corridor they arrived along. idle-sit-w is
+      // frame 14, idle-sit-n 21, idle-sit-s 5.
+      return Future.wait([
+        paintSeated(chair: 'Left', facing: 'Up').then((f) => expect(f, closeTo(14, 1))),
+        paintSeated(chair: 'Down', facing: 'Right').then((f) => expect(f, closeTo(5, 1))),
+      ]);
+    });
+
+    test('a chair that names no orientation leaves them as they were', () async {
+      // `playerState` is the client's own and never reaches the wire, so sitting is
+      // still worked out from the map: a `sittable` tile under the body. All 115
+      // sittable variants on the measured space name an orientation, so this is the
+      // defensive path rather than the usual one.
+      expect(await paintSeated(facing: 'Up'), closeTo(21, 1));
     });
 
     test('somebody with no outfit keeps the dot', () async {

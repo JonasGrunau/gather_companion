@@ -48,6 +48,7 @@ void _variant(
   num originY = 0,
   String? family,
   List<List<num>> sittable = const [],
+  String? orientation,
 }) {
   if (family != null) {
     b.apply('CatalogItem', _add({'id': 'item-$id', 'family': family}));
@@ -57,6 +58,7 @@ void _variant(
     'catalogItemId': 'item-$id',
     'originX': originX,
     'originY': originY,
+    'orientation': ?orientation,
     'collision': {
       'points': [
         for (final p in points) {'x': p[0], 'y': p[1]},
@@ -578,6 +580,33 @@ void main() {
       // A seat is not furniture: you stand on it, so it must stay walkable.
       expect(map.isWalkable(6, 4), isTrue);
       expect(map.seatCount, 1);
+      expect(map.seatFacing(6, 4), isNull, reason: 'this fixture names no orientation');
+    });
+
+    test('a seat remembers which way its chair is turned', () {
+      // `applySittingDirection` faces the sitter along the variant's `orientation`,
+      // through a `CATALOG_ORIENTATION_TO_MOVE_DIRECTION` table that is the identity.
+      // It runs on the local player only and publishes the turn as its own patch, so
+      // another client can see somebody sat down still facing the way they walked in.
+      // The chair is the answer that does not race.
+      final b = _base();
+      _variant(b, 'v1', const [], family: 'Chair', orientation: 'Left', sittable: [
+        [0, 0],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'chair',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 6,
+        'relativeY': 4,
+        'catalogItemVariantId': 'v1',
+      }));
+
+      final map = b.forFloor('floor-1')!;
+      // The same four words `SpaceUser.direction` uses, which is what makes the
+      // client's mapping table an identity rather than a translation.
+      expect(map.seatFacing(6, 4), 'Left');
+      expect(map.seatFacing(6, 5), isNull);
     });
 
     test('a chair standing on something else seats nobody', () {
