@@ -66,6 +66,9 @@ const _models = {
   // `family`, which decides whether an object can be wall-snapped and so whether
   // it collides at all.
   'CatalogItem',
+  // Whether a room's door is shut. `MapArea` does not carry it; it hangs off the
+  // identifier row the area points at. 93 rows on the measured space.
+  'MapEntityIdentifier',
   // Meetings, for the two things somebody can do *at* you that are recorded as
   // state rather than sent over the event bus. See [_MeetingWatch].
   'MeetingParticipant',
@@ -75,6 +78,9 @@ const _models = {
   // so the sprite URL needs both. See `avatar.dart`.
   'SpaceUserOutfit',
   'Wearable',
+  // The line under somebody's name. Kept because `SpaceUser` carries no readable
+  // pointer to it — see [_noteStatus] — so this row is the only route to it.
+  'SpaceUserStatus',
 };
 
 /// The map models, routed to [SpaceMapBuilder] rather than to the roster.
@@ -84,6 +90,7 @@ const _mapModels = {
   'MapObject',
   'CatalogItemVariant',
   'CatalogItem',
+  'MapEntityIdentifier',
 };
 
 /// SpaceUser fields worth tracking, for field-level `replace` patches.
@@ -115,6 +122,10 @@ const _trackedFields = {
   // Whether they are actually there. `connected` alone is not that — see
   // [RosterRow.availability].
   'userSetAvailability',
+  // The face. A `UserFile` id when somebody has set a picture and absent when
+  // they have not — measured on a live space, 45 of 98 rows carried one. It is
+  // not a URL and cannot be turned into one here: see `profile_photos.dart`.
+  'profilePictureId',
 };
 
 /// One interaction off `DeltaState.events[]`.
@@ -168,6 +179,8 @@ class RosterRow {
     this.clusterId,
     this.direction,
     this.availability,
+    this.profilePictureId,
+    this.status,
   });
 
   final String id;
@@ -222,6 +235,13 @@ class RosterRow {
   /// people leave it on `Active` when they close the app — so presence is the pair:
   /// connected *and* not `Offline`.
   final String? availability;
+
+  /// The `UserFile` id of their profile picture, or null if they have not set
+  /// one. Resolve it with `ProfilePhotos`; it is not itself fetchable.
+  final String? profilePictureId;
+
+  /// The line under their name, if it has not expired.
+  final PersonStatus? status;
 
   /// Connected, and not away. See [availability].
   bool get isPresent => connected == true && availability != 'Offline';
@@ -292,7 +312,45 @@ class _Row {
   String? clusterId;
   String? direction;
   String? availability;
+  String? profilePictureId;
   bool gone = false;
+}
+
+/// The line under somebody's name: "Lunch 🥗", "Heads down 🎧".
+///
+/// Two kinds arrive on the same model and both are worth showing. [type] `Custom`
+/// is one a person typed; `CalendarInferred` is one Gather wrote from their
+/// calendar, which is why half a busy office has a status nobody set by hand.
+class PersonStatus {
+  const PersonStatus({
+    required this.text,
+    this.emoji,
+    required this.type,
+    this.clearAt,
+  });
+
+  final String text;
+  final String? emoji;
+
+  /// `Custom` or `CalendarInferred`.
+  final String type;
+
+  /// When Gather drops it by itself, if it said.
+  final DateTime? clearAt;
+
+  bool get isCustom => type == 'Custom';
+
+  /// Whether this has outlived its own expiry.
+  ///
+  /// It has to be asked rather than assumed, because **the row outlives the
+  /// status**: an expired one is still in the state dump, unchanged, with a
+  /// `clearAt` in the past. Measured — a status set at 16:33 to clear at 17:03
+  /// was still on the wire at 20:20. Gather's own client evidently filters on
+  /// read, so a client that does not shows people at lunch all evening.
+  bool expiredAt(DateTime now) => clearAt != null && !clearAt!.isAfter(now);
+
+  @override
+  String toString() => 'PersonStatus(${emoji ?? ''}$text, $type)';
 }
 
 class GameProtocolReader {
@@ -321,6 +379,9 @@ class GameProtocolReader {
 
   /// UserAccount id belonging to me, the slower route to [selfId].
   String? _myUserAccountId;
+
+  /// Status rows, by their own id. See [_noteStatus] for why not by person.
+  final Map<String, ({String owner, PersonStatus status})> _statuses = {};
 
   /// My `UserAccount` id, which is a different identity from [selfId].
   ///
@@ -527,6 +588,14 @@ class GameProtocolReader {
 
     if (model == 'SpaceUser') return _merge(_row(id), raw);
 
+    // The status line, which joins the *other* way round from everything else
+    // here. `SpaceUser` carries `activeCustomStatusId` and
+    // `activeUserGeneratedStatusId`, and on a live 98-row space **neither was
+    // ever set** — both were absent on every row, including rows whose status
+    // was on screen at the time. The row carries `spaceUserId` instead, so the
+    // link is read from this side.
+    if (model == 'SpaceUserStatus') return _noteStatus(id, raw);
+
     if (model == 'Connection') {
       // The direct answer to "which SpaceUser am I".
       final spaceUserId = raw['spaceUserId'];
@@ -562,7 +631,11 @@ class GameProtocolReader {
   }
 
   bool _deleteModel(String model, Object? id) {
-    if (model != 'SpaceUser' || id is! String) return false;
+    if (id is! String) return false;
+    // Clearing a status deletes its row, which is the only signal that it is
+    // gone — the `SpaceUser` side carries no pointer to drop.
+    if (model == 'SpaceUserStatus') return _statuses.remove(id) != null;
+    if (model != 'SpaceUser') return false;
     final row = _users[id];
     if (row == null) return false;
     row.connected = false;
@@ -571,6 +644,24 @@ class GameProtocolReader {
   }
 
   bool _replaceField(String model, Map<String, Object?> patch) {
+    // A status being edited in place rather than replaced — the text changing, or
+    // `clearAt` being pushed back. The row is small, so it is re-read whole
+    // instead of patched field by field.
+    if (model == 'SpaceUserStatus') {
+      final id = patch['id'];
+      final existing = id is String ? _statuses[id] : null;
+      if (existing == null || id is! String) return false;
+      final field = (patch['path'] as String? ?? '').split('/').where((s) => s.isNotEmpty);
+      if (field.isEmpty) return false;
+      return _noteStatus(id, {
+        'spaceUserId': existing.owner,
+        'text': existing.status.text,
+        'emoji': existing.status.emoji,
+        'type': existing.status.type,
+        'clearAt': existing.status.clearAt,
+        field.first: patch['data'],
+      });
+    }
     if (model != 'SpaceUser') return false;
 
     final id = patch['id'];
@@ -635,6 +726,10 @@ class GameProtocolReader {
     }
     if (data.containsKey('floorId')) {
       set(row.floorId, _nullableString(data['floorId']), (v) => row.floorId = v);
+    }
+    if (data.containsKey('profilePictureId')) {
+      set(row.profilePictureId, _nullableString(data['profilePictureId']),
+          (v) => row.profilePictureId = v);
     }
     if (data.containsKey('connected')) {
       set(row.connected, _asBool(data['connected']), (v) => row.connected = v);
@@ -721,6 +816,60 @@ class GameProtocolReader {
     return changed;
   }
 
+  /// Files one `SpaceUserStatus` row against the person it belongs to.
+  ///
+  /// Keyed by the status row's own id, because that is what `deletemodel` names
+  /// when a status is cleared — indexing by `spaceUserId` would leave no way to
+  /// remove the right one.
+  bool _noteStatus(String id, Map<String, Object?> raw) {
+    final owner = _nullableString(raw['spaceUserId']);
+    final text = _nullableString(raw['text']);
+    if (owner == null || text == null || text.isEmpty) {
+      return _statuses.remove(id) != null;
+    }
+
+    final next = (
+      owner: owner,
+      status: PersonStatus(
+        text: text,
+        emoji: _nullableString(raw['emoji']),
+        // Absent on nothing seen so far, but a status with no type is still a
+        // status and should not vanish because of a missing label.
+        type: _nullableString(raw['type']) ?? 'Custom',
+        clearAt: raw['clearAt'] is DateTime ? raw['clearAt'] as DateTime : null,
+      ),
+    );
+
+    final before = _statuses[id];
+    if (before != null &&
+        before.owner == next.owner &&
+        before.status.text == next.status.text &&
+        before.status.emoji == next.status.emoji &&
+        before.status.clearAt == next.status.clearAt) {
+      return false;
+    }
+    _statuses[id] = next;
+    return true;
+  }
+
+  /// The one worth showing for a person, or null.
+  ///
+  /// A person can hold both kinds at once — one they typed and one their calendar
+  /// wrote — and the typed one wins, because it is the one they chose. Expired
+  /// rows are skipped rather than deleted: the server leaves them on the wire and
+  /// may well revive one by patching `clearAt`.
+  PersonStatus? _statusFor(String spaceUserId, DateTime now) {
+    PersonStatus? best;
+    for (final entry in _statuses.values) {
+      if (entry.owner != spaceUserId) continue;
+      if (entry.status.expiredAt(now)) continue;
+      if (best == null || (entry.status.isCustom && !best.isCustom)) {
+        best = entry.status;
+      }
+    }
+    return best;
+  }
+
   /// Fallback route to identity when no Connection row named us.
   void _identifySelf() {
     if (selfId != null || _myUserAccountId == null) return;
@@ -736,6 +885,9 @@ class GameProtocolReader {
   /// The roster in the shape [PresenceTracker] consumes.
   Roster roster() {
     final rows = <RosterRow>[];
+    // Sampled once for the whole roster rather than per person, so two people
+    // whose statuses expire in the same second cannot disagree about the time.
+    final now = DateTime.now().toUtc();
     for (final row in _users.values) {
       // Recording clients and bots are not people who can follow you.
       if (row.isBot == true || row.kind == 'RecordingClient') continue;
@@ -753,6 +905,8 @@ class GameProtocolReader {
         clusterId: row.clusterId,
         direction: row.direction,
         availability: row.availability,
+        profilePictureId: row.profilePictureId,
+        status: _statusFor(row.id, now),
       ));
     }
     return Roster(selfId: selfId, rows: rows, spaceName: spaceName);

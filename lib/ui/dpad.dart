@@ -46,6 +46,12 @@ import 'package:flutter/services.dart';
 
 import '../theme/gather_theme.dart';
 
+/// Whether the map shows the pad at all. Shelved for now — walking from the
+/// phone is off until it earns its place — but shelved, not deleted: the pad,
+/// its walk plumbing and its tests stay live, so bringing it back is flipping
+/// this to `true`.
+const bool kShowDPad = false;
+
 /// How wide the pad is.
 ///
 /// Each quarter is therefore about 100 points across at its widest — a target you can

@@ -104,6 +104,8 @@
 /// and 94 of the 112 people were standing in that set.
 library;
 
+import 'dart:typed_data';
+
 import 'space_art.dart';
 
 /// Pixels per tile. `const l=32` in the bundle, exported as `TILE_SIZE`.
@@ -158,6 +160,7 @@ class SpaceRoom {
     required this.width,
     required this.height,
     required this.walled,
+    this.locked = false,
   });
 
   final String id;
@@ -176,6 +179,15 @@ class SpaceRoom {
   /// Whether this area draws walls. Gather treats this as the definition of a
   /// private area, and so does party mode.
   final bool walled;
+
+  /// Whether the door is shut. `MapEntityIdentifier.isLocked`.
+  ///
+  /// Not on `MapArea` — it lives on the identifier row the area points at, which is
+  /// also where the chat channel and the lock *state* are. Carried because the server
+  /// does not enforce it: `teleport` and `move` validate nothing, so a client that
+  /// does not ask walks into a meeting somebody deliberately shut the door on. The
+  /// desktop client refuses with `AttemptToMoveToLockedArea`.
+  final bool locked;
 
   bool contains(int tx, int ty) =>
       tx >= x && tx < x + width && ty >= y && ty < y + height;
@@ -371,6 +383,272 @@ class SpaceMap {
     }
     return best;
   }
+
+  /// The smallest area containing a tile, named or not.
+  ///
+  /// [roomAt]'s twin, and deliberately a separate one: that answers "what do I call
+  /// where you are standing" and skips the 62 unnamed desks, while this answers
+  /// "which area are you *in*" for [routeTo], where a desk is exactly the thing that
+  /// has to count. `MapAreaPositions.areaAtPosition`.
+  SpaceRoom? areaAt(int x, int y) {
+    SpaceRoom? best;
+    for (final room in rooms) {
+      if (!room.contains(x, y)) continue;
+      if (best == null || room.width * room.height < best.width * best.height) {
+        best = room;
+      }
+    }
+    return best;
+  }
+
+  /// The shortest walk from one tile to another, tiles inclusive of both ends, or
+  /// null when there is no way to walk there.
+  ///
+  /// Transcribed from the client's `Hh` (bundle module 22795) rather than invented,
+  /// because the interesting parts of it are not the parts you would think of:
+  ///
+  /// ```js
+  /// const m = (A, e, g, t) => {                      // A: node, e: its parent
+  ///   const B = A.x + (A.x - e.x);                   // the tile straight ahead
+  ///   const C = A.y + (A.y - e.y);
+  ///   const Q = A.getNeighbors().map(e => new p(e.x, e.y,
+  ///     A.cost + (S[g[toRowMajorIndex(e, i)]] || 1)  // S = {Impassable: Infinity}
+  ///           + (e.x === B && e.y === C ? -.001 : 0)));
+  ///   for (const e of Q) if (!y(map, e, A) && e.cost < Infinity) I.push(e);
+  ///   return I };
+  /// const G = A => A.cost + Position.manhattanDistance(A, D);   // f = g + h
+  /// ```
+  ///
+  /// Three things worth keeping:
+  ///
+  ///  * **The −0.001 is what stops a route looking drunk.** Every step costs 1, so on
+  ///    an open floor a staircase and a straight line are the same length and the heap
+  ///    picks between them arbitrarily. Continuing in the direction you were already
+  ///    going is shaved a thousandth, which is far too small to beat a genuinely
+  ///    shorter route and just large enough to break the tie.
+  ///  * **A node is enqueued once and never re-opened** — the client's came-from map
+  ///    doubles as its visited set (`if (!(e in o))`), with no decrease-key. So this
+  ///    is not textbook A\*, and a node first reached expensively keeps that parent.
+  ///    Transcribed as-is: with a consistent heuristic on a uniform grid it costs
+  ///    nothing, and diverging here would put this client on different routes from
+  ///    the desktop one.
+  ///  * **[budget] counts pops, not tiles.** The client picks 2500/2000/1500 by
+  ///    device tier and reports `pathfinding-depth-limit-reached` when it runs out.
+  ///
+  /// [avoid] is the client's `extraBlocked` — tiles to route around that the floor
+  /// plan does not know about, which is how a tile somebody is standing on is kept
+  /// out of a route.
+  List<({int x, int y})>? routeTo({
+    required int fromX,
+    required int fromY,
+    required int toX,
+    required int toY,
+    Iterable<({int x, int y})> avoid = const [],
+    int budget = 2500,
+  }) {
+    if (!isWalkable(toX, toY) || !isWalkable(fromX, fromY)) return null;
+    if (fromX == toX && fromY == toY) return [(x: fromX, y: fromY)];
+
+    final blocked = _closedAreas(fromX, fromY, toX, toY);
+    for (final tile in avoid) {
+      if (tile.x < 0 || tile.y < 0 || tile.x >= width || tile.y >= height) continue;
+      if (tile.x == toX && tile.y == toY) continue;
+      blocked[tile.y * width + tile.x] = 1;
+    }
+
+    final goal = toY * width + toX;
+    final start = fromY * width + fromX;
+    // Parent per visited tile, and the visited set itself: -1 is unvisited, and the
+    // start points at itself so the walk back terminates.
+    final cameFrom = Int32List(width * height)..fillRange(0, width * height, -1);
+    cameFrom[start] = start;
+
+    // Cost so far per tile, only meaningful for visited ones. Doubles as the heap's
+    // ordering input, so the −0.001 has to live in here rather than in the compare.
+    final cost = Float64List(width * height);
+    final queue = _TileHeap((tile) => cost[tile] + (toX - xOf(tile)).abs() + (toY - yOf(tile)).abs());
+    queue.add(start);
+
+    var pops = 0;
+    while (queue.isNotEmpty) {
+      final tile = queue.removeFirst();
+      if (++pops == budget) return null;
+      if (tile == goal) return _walkBack(cameFrom, start, goal);
+
+      final x = xOf(tile);
+      final y = yOf(tile);
+      // The tile directly ahead, if we came from somewhere: `A.x + (A.x - e.x)`.
+      final parent = cameFrom[tile];
+      final ahead = parent == tile ? -1 : tile + (tile - parent);
+
+      for (final direction in moveDirections) {
+        final step = stepOf(direction)!;
+        final nx = x + step.dx;
+        final ny = y + step.dy;
+        if (!canStep(x, y, direction)) continue;
+        final next = ny * width + nx;
+        if (cameFrom[next] != -1) continue;
+        if (blocked[next] == 1) continue;
+        cameFrom[next] = tile;
+        cost[next] = cost[tile] + 1 + (next == ahead ? -0.001 : 0);
+        queue.add(next);
+      }
+    }
+    return null;
+  }
+
+  /// Every tile the route may not cross because it belongs to somebody else's room.
+  ///
+  /// `Hh` again, and the rule that does the most work:
+  ///
+  /// ```js
+  /// const c = Object.values(E.areas).filter(A => !A.isPublicWalkway);
+  /// const w = f.areaAtPosition(d);   // the area you are standing in
+  /// const R = f.areaAtPosition(D);   // the area the goal is in
+  /// for (const A of c) if (w?.id !== A.id && R !== A)
+  ///   for (const e of A.positions) n[e.toRowMajorIndex(s)] = "Impassable";
+  /// ```
+  ///
+  /// Without it a walk to the far side of the office cuts straight through the desks
+  /// and coworking areas in between, because only a *walled* area has edges to stop
+  /// it and `Desk` and `Common` are usually not walled. With it, the only closed
+  /// areas a route may enter are the one it starts in and the one it is aimed at.
+  Uint8List _closedAreas(int fromX, int fromY, int toX, int toY) {
+    final blocked = Uint8List(width * height);
+    final from = areaAt(fromX, fromY);
+    final to = areaAt(toX, toY);
+    for (final room in rooms) {
+      if (isPublicWalkway(room)) continue;
+      if (room.id == from?.id || room.id == to?.id) continue;
+      for (var y = room.y; y < room.y + room.height; y++) {
+        if (y < 0 || y >= height) continue;
+        for (var x = room.x; x < room.x + room.width; x++) {
+          if (x < 0 || x >= width) continue;
+          blocked[y * width + x] = 1;
+        }
+      }
+    }
+    return blocked;
+  }
+
+  List<({int x, int y})> _walkBack(Int32List cameFrom, int start, int goal) {
+    final route = <({int x, int y})>[];
+    var tile = goal;
+    while (tile != start) {
+      route.add((x: xOf(tile), y: yOf(tile)));
+      tile = cameFrom[tile];
+    }
+    route.add((x: xOf(start), y: yOf(start)));
+    return route.reversed.toList();
+  }
+
+  /// Where to stand when the target is a whole room, best first.
+  ///
+  /// `getAbsoluteTilesClosestToPrioritizedBySeats`: seats before standing room, and
+  /// within each, nearest [toward] — the tile that was actually tapped. The client
+  /// keeps the rest as `altMoveGoals` so a seat somebody took while you were walking
+  /// falls through to the next one, and [routeTo] being cheap means this can do the
+  /// same by simply trying them in order.
+  List<({int x, int y})> tilesClosestTo(SpaceRoom room, ({int x, int y}) toward) {
+    final tiles = <({int x, int y})>[];
+    for (var y = room.y; y < room.y + room.height; y++) {
+      for (var x = room.x; x < room.x + room.width; x++) {
+        if (!isWalkable(x, y)) continue;
+        tiles.add((x: x, y: y));
+      }
+    }
+    tiles.sort((a, b) {
+      final seats = (isSeat(b.x, b.y) ? 1 : 0) - (isSeat(a.x, a.y) ? 1 : 0);
+      if (seats != 0) return seats;
+      final da = (a.x - toward.x).abs() + (a.y - toward.y).abs();
+      final db = (b.x - toward.x).abs() + (b.y - toward.y).abs();
+      return da.compareTo(db);
+    });
+    return tiles;
+  }
+}
+
+/// Whether a route may pass through an area on its way somewhere else.
+///
+/// `MapArea.isPublicWalkway`, transcribed whole:
+///
+/// ```js
+/// get isPublicWalkway() { switch (this.mapAreaType) {
+///   case Public: case Lobby: case Team: return true;
+///   case Common: case MeetingRoom: case Desk: return false } }
+/// ```
+///
+/// Note this is the same partition as [navigatesToTile], and that is not a
+/// coincidence worth collapsing: they answer different questions that happen to
+/// agree, and Gather keeps them as two getters.
+bool isPublicWalkway(SpaceRoom room) => switch (room.type) {
+      'Public' || 'Lobby' || 'Team' => true,
+      _ => false,
+    };
+
+/// Whether tapping inside an area means the tile you tapped, or the area itself.
+///
+/// `MapArea.shouldNavigateToTile`:
+///
+/// ```js
+/// shouldNavigateToTile() { switch (this.mapAreaType) {
+///   case Public: case Team: case Lobby: return true;
+///   case Desk: case Common: case MeetingRoom: return false } }
+/// ```
+///
+/// So a tap on the main floor or in a team's corner picks that tile, and a tap
+/// anywhere in a meeting room, a coworking area or at a desk picks the *room* — you
+/// meant "go to the Boardroom", not "stand on that exact square of the Boardroom".
+bool navigatesToTile(SpaceRoom room) => switch (room.type) {
+      'Public' || 'Lobby' || 'Team' => true,
+      _ => false,
+    };
+
+/// A binary heap keyed on `f`, because the route search pops the cheapest tile a few
+/// thousand times and a list scan would be the whole cost of it.
+///
+/// Tiles are `y * width + x`, and `f` is read through a closure rather than stored so
+/// the caller keeps one array of costs instead of this keeping a parallel copy.
+class _TileHeap {
+  _TileHeap(this._f);
+
+  final double Function(int tile) _f;
+  final _tiles = <int>[];
+
+  bool get isNotEmpty => _tiles.isNotEmpty;
+
+  void add(int tile) {
+    _tiles.add(tile);
+    var child = _tiles.length - 1;
+    while (child > 0) {
+      final parent = (child - 1) ~/ 2;
+      if (_f(_tiles[parent]) <= _f(_tiles[child])) break;
+      final swap = _tiles[parent];
+      _tiles[parent] = _tiles[child];
+      _tiles[child] = swap;
+      child = parent;
+    }
+  }
+
+  int removeFirst() {
+    final first = _tiles.first;
+    final last = _tiles.removeLast();
+    if (_tiles.isEmpty) return first;
+    _tiles[0] = last;
+    var parent = 0;
+    while (true) {
+      final left = parent * 2 + 1;
+      final right = left + 1;
+      var best = parent;
+      if (left < _tiles.length && _f(_tiles[left]) < _f(_tiles[best])) best = left;
+      if (right < _tiles.length && _f(_tiles[right]) < _f(_tiles[best])) best = right;
+      if (best == parent) return first;
+      final swap = _tiles[parent];
+      _tiles[parent] = _tiles[best];
+      _tiles[best] = swap;
+      parent = best;
+    }
+  }
 }
 
 /// Accumulates the map models as patches arrive, and rebuilds when they change.
@@ -384,6 +662,9 @@ class SpaceMapBuilder {
   final Map<String, Map<String, Object?>> _variants = {};
   final Map<String, Map<String, Object?>> _items = {};
   final Map<String, Map<String, Object?>> _floors = {};
+
+  /// The identifier rows areas hang their lock and their chat channel off.
+  final Map<String, Map<String, Object?>> _identifiers = {};
 
   bool _dirty = true;
   Map<String, SpaceMap> _maps = const {};
@@ -434,6 +715,7 @@ class SpaceMapBuilder {
         'CatalogItemVariant' => _variants,
         'CatalogItem' => _items,
         'FloorMap' => _floors,
+        'MapEntityIdentifier' => _identifiers,
         _ => null,
       };
 
@@ -868,10 +1150,20 @@ class SpaceMapBuilder {
       }
     }
 
+    // Furniture we know is there and cannot draw. See [SpaceArt.awaiting]: the areas
+    // arrive long before the catalog does, so this is how far off "the office" is
+    // from what has actually been received.
+    var awaiting = 0;
+
     for (final object in _objects.values) {
       if (object['mapId'] != mapId || !_live(object)) continue;
       final variant = _variants[_str(object['catalogItemVariantId']) ?? ''];
-      if (variant == null) continue;
+      if (variant == null) {
+        // Only when the object names one. An object with no variant at all is not
+        // furniture waiting on a picture, it is a row we have no use for.
+        if (_str(object['catalogItemVariantId']) != null) awaiting++;
+        continue;
+      }
       final topLeft = _topLeft(object, variant);
       if (topLeft == null) continue;
 
@@ -914,6 +1206,7 @@ class SpaceMapBuilder {
       height: (map.height * _tileSize).toDouble(),
       ground: List.unmodifiable(ground),
       props: List.unmodifiable(props),
+      awaiting: awaiting,
     );
   }
 
@@ -980,6 +1273,10 @@ class SpaceMapBuilder {
         final y0 = at.y.round();
         final type = _str(area['mapAreaType']) ?? 'Public';
         final walled = id != baseId && area['wallsTexture'] != _noWall;
+        // One join, through `mapEntityIdentifierId`. Absent on a space whose dump
+        // predates the row, which reads as unlocked — the same thing an empty
+        // `isLocked` means.
+        final identifier = _identifiers[_str(area['mapEntityIdentifierId']) ?? ''];
 
         rooms.add(SpaceRoom(
           id: id,
@@ -990,6 +1287,7 @@ class SpaceMapBuilder {
           width: w,
           height: h,
           walled: walled,
+          locked: identifier?['isLocked'] == true,
         ));
 
         if (walled) {

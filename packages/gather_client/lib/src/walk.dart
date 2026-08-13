@@ -78,6 +78,8 @@ class Walk {
     required DirectCollector? Function() collector,
     required SpaceMap? Function() map,
     void Function(String)? log,
+    /// Called when a route stops running, for whatever reason. See [release].
+    void Function()? onRouteEnded,
     this.interval = walkStep,
     this.holdLimit = maxHold,
     // Test seam. Production uses the wall clock.
@@ -89,6 +91,8 @@ class Walk {
         // ignore: prefer_initializing_formals
         _map = map,
         _log = log ?? _noop,
+        // ignore: prefer_initializing_formals
+        _onRouteEnded = onRouteEnded,
         _now = now ?? DateTime.now;
 
   static void _noop(String _) {}
@@ -98,6 +102,7 @@ class Walk {
   final DirectCollector? Function() _collector;
   final SpaceMap? Function() _map;
   final void Function(String) _log;
+  final void Function()? _onRouteEnded;
   final Duration interval;
   final Duration holdLimit;
   final DateTime Function() _now;
@@ -114,10 +119,27 @@ class Walk {
   /// always where we believe we are.
   final _pending = <({int x, int y})>[];
 
+  /// The tiles left to walk through, nearest first, or empty when nothing is routed.
+  ///
+  /// Held as tiles rather than as directions on purpose. The roster is allowed to
+  /// correct us mid-route — that is the whole point of [noteRoster] — and a list of
+  /// directions applied from a tile we turned out not to be standing on walks the
+  /// rest of the route somewhere nobody asked for. Tiles re-derive the direction
+  /// from wherever we actually are, and can tell when the answer is nonsense.
+  final _route = <({int x, int y})>[];
+
   /// Which way the finger is pushing, or null when nothing is held.
   String? get direction => _direction;
 
   bool get walking => _timer != null;
+
+  /// Whether a tapped destination is being walked to, as opposed to a held D-pad.
+  ///
+  /// Its own flag rather than `_route.isNotEmpty`: the last step of a route empties
+  /// the list and *then* stops the walk, so the list is already empty by the time
+  /// anything gets to ask why.
+  bool get onRoute => _routing;
+  bool _routing = false;
 
   /// The tile this believes the avatar is on, which during a walk is ahead of the
   /// roster. Null until a roster has said once.
@@ -129,6 +151,15 @@ class Walk {
   /// as the button having missed the press.
   void press(String direction) {
     if (!moveDirections.contains(direction)) return;
+    // A held direction outranks a route, always. Somebody reaching for the pad while
+    // their avatar is walking itself somewhere has changed their mind, and two things
+    // stepping one avatar would fight — which is the same reason party mode lives on
+    // the phone rather than on the bridge.
+    if (_routing) {
+      _routing = false;
+      _route.clear();
+      _onRouteEnded?.call();
+    }
     if (_direction == direction && _timer != null) return;
 
     _direction = direction;
@@ -138,13 +169,52 @@ class Walk {
     step();
   }
 
+  /// Walk a route to its end, the way a double-click on the floor does on the desktop.
+  ///
+  /// [route] is what [SpaceMap.routeTo] returns — every tile including the one being
+  /// stood on now. Replaces whatever was being walked before, because tapping a second
+  /// destination means the second one.
+  ///
+  /// The desktop client re-runs its pathfinder on every tick and takes `moveRoute[1]`,
+  /// which is how it copes with the floor changing underneath a walk. This walks the
+  /// route it was given and stops the moment that route stops making sense — see
+  /// [step]. Cheaper, and the recovery is the same one either way: tap again.
+  void follow(List<({int x, int y})> route) {
+    _route
+      ..clear()
+      ..addAll(route);
+    // The tile we are already on is not a step.
+    if (_route.isNotEmpty && _route.first.x == _x && _route.first.y == _y) {
+      _route.removeAt(0);
+    }
+    if (_route.isEmpty) return;
+
+    _routing = true;
+    _direction = null;
+    _startedAt = _now();
+    _timer?.cancel();
+    _timer = Timer.periodic(interval, (_) => step());
+    step();
+  }
+
   /// Stop. Idempotent, because a pointer can be cancelled twice.
   void release() {
-    if (_timer == null && _direction == null) return;
+    // A route ends by itself — on arrival, on a wall, on a roster that moved us — and
+    // the screen has a control whose whole label depends on whether one is running.
+    // Without this it would keep saying "Stop" until the next roster happened to wake
+    // the tree, which is up to a quarter of a second of a button that lies.
+    final wasOnRoute = _routing;
+    _routing = false;
+    _route.clear();
+    if (_timer == null && _direction == null) {
+      if (wasOnRoute) _onRouteEnded?.call();
+      return;
+    }
     _timer?.cancel();
     _timer = null;
     _direction = null;
     _startedAt = null;
+    if (wasOnRoute) _onRouteEnded?.call();
   }
 
   Future<void> dispose() async => release();
@@ -155,11 +225,14 @@ class Walk {
   /// which is what lets a test walk somebody across a room without waiting out a
   /// real second per seven tiles.
   ({bool ok, String? detail}) step() {
-    final direction = _direction;
-    if (direction == null) return (ok: false, detail: 'nothing is held');
+    final held = _direction;
+    if (held == null && _route.isEmpty) return (ok: false, detail: 'nothing is held');
 
     final startedAt = _startedAt;
-    if (startedAt != null && _now().difference(startedAt) >= holdLimit) {
+    // Only a held direction can be held too long. A route is a finite list that ends
+    // itself, and the longest one this floor can produce is within a tile or two of
+    // the limit — dropping it at 30 seconds would abandon the walk almost home.
+    if (held != null && startedAt != null && _now().difference(startedAt) >= holdLimit) {
       _log('walk: dropped a hold that lasted ${holdLimit.inSeconds}s');
       release();
       return (ok: false, detail: 'held too long');
@@ -175,10 +248,28 @@ class Walk {
 
     final map = _map();
     if (map == null) return (ok: false, detail: 'still reading the floor plan');
-    if (!map.canStep(x, y, direction)) return (ok: false, detail: 'blocked');
+
+    final direction = held ?? _towards(x, y);
+    // The route no longer starts where we are standing: a roster corrected us onto a
+    // tile it does not pass through, or the desktop client moved this same avatar.
+    // Everything after this point would be walked from the wrong place, so stop.
+    if (direction == null) {
+      release();
+      return (ok: false, detail: 'lost the way there');
+    }
+
+    if (!map.canStep(x, y, direction)) {
+      // A refused step is a wall, and for a held direction that is all it is. For a
+      // route it is somebody having moved a chair into it, which invalidates the rest.
+      if (held == null) release();
+      return (ok: false, detail: 'blocked');
+    }
 
     final sent = collector.move(direction: direction);
-    if (!sent.ok) return sent;
+    if (!sent.ok) {
+      if (held == null) release();
+      return sent;
+    }
 
     // Believed only once it is actually on the wire, so a socket that refused it does
     // not leave this walking on ahead of an avatar that never moved.
@@ -187,7 +278,22 @@ class Walk {
     _y = y + delta.dy;
     _pending.add((x: _x!, y: _y!));
     if (_pending.length > _maxPending) _pending.removeAt(0);
+
+    if (held == null) {
+      _route.removeAt(0);
+      if (_route.isEmpty) release();
+    }
     return (ok: true, detail: null);
+  }
+
+  /// The way to the next tile on the route, or null when it is not next to us.
+  String? _towards(int x, int y) {
+    final next = _route.first;
+    for (final direction in moveDirections) {
+      final step = stepOf(direction)!;
+      if (x + step.dx == next.x && y + step.dy == next.y) return direction;
+    }
+    return null;
   }
 
   /// What Gather says about where we are. See the library doc.

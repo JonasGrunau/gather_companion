@@ -95,7 +95,8 @@ flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
 
 ### External
 
-`flutter_local_notifications`, `mobile_scanner` (7.x, SPM), `shared_preferences`,
-`web_socket_channel`, `cupertino_icons`.
+`flutter_local_notifications`, `mobile_scanner` (7.x, SPM),
+`flutter_secure_storage`, `shared_preferences` (a migration path only),
+`firebase_core`, `firebase_messaging`, `cupertino_icons`.
 
 <!-- MANUAL: -->

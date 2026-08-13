@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { FcmSender, buildAssertion, readServiceAccount } from '../lib/fcm.js';
-import { PushNotifier, PushRegistry, describe } from '../lib/push.js';
+import { PushNotifier, PushRegistry, STALE_AFTER_DAYS, describe } from '../lib/push.js';
 
 /**
  * A throwaway RSA key, generated per run. Never a real service account — the
@@ -340,4 +340,134 @@ test('config overrides the default reasons without losing the rest', () => {
   assert.equal(kinds.follow, false);
   assert.equal(kinds.wave, false);
   assert.equal(kinds['meeting invite'], true, 'unmentioned reasons keep their default');
+});
+
+test('a reinstalled app replaces its own entry rather than leaving a dead one', () => {
+  // The bug this exists for: a reinstall mints a new FCM token, so keying on the
+  // token left the previous install's token in the list. FCM answers 200 for it,
+  // the notification goes nowhere, and nothing anywhere reports a problem.
+  const registry = memoryRegistry();
+  registry.register({ token: TOKEN, platform: 'ios', installId: 'phone-1' });
+  registry.register({ token: OTHER, platform: 'ios', installId: 'phone-1' });
+
+  assert.deepEqual(
+    registry.list().map((d) => d.token),
+    [OTHER],
+    'the token from before the reinstall must not survive',
+  );
+
+  registry.register({ token: TOKEN, platform: 'ios', installId: 'phone-2' });
+  assert.equal(registry.list().length, 2, 'a different install is a different phone');
+});
+
+test('an install id is not required, so an older app build still registers', () => {
+  const registry = memoryRegistry();
+  registry.register({ token: TOKEN, platform: 'ios' });
+  registry.register({ token: TOKEN, platform: 'ios' });
+  assert.equal(registry.list().length, 1);
+  assert.equal(registry.list()[0].installId, undefined);
+});
+
+test('re-registering unchanged stays quiet in the log', () => {
+  // The app re-registers on every resume. One line per resume is how the single
+  // registration that mattered got buried under thirty that did not.
+  const lines = [];
+  let config = {};
+  const registry = new PushRegistry({
+    log: (line) => lines.push(line),
+    read: () => config,
+    write: (next) => (config = next),
+  });
+
+  registry.register({ token: TOKEN, platform: 'ios', installId: 'phone-1' });
+  assert.equal(lines.length, 1, 'the first one is worth saying');
+
+  registry.register({ token: TOKEN, platform: 'ios', installId: 'phone-1' });
+  assert.equal(lines.length, 1, 'nothing changed, so nothing to report');
+
+  registry.register({ token: OTHER, platform: 'ios', installId: 'phone-1' });
+  assert.equal(lines.length, 2);
+  assert.match(lines[1], /rotated its token/);
+});
+
+test('a successful send is logged, and stamped on the device', async () => {
+  // Without the log line there was no evidence a push had ever been attempted.
+  const lines = [];
+  const registry = memoryRegistry({ push: { devices: [{ token: TOKEN, platform: 'ios' }] } });
+  const notifier = new PushNotifier({
+    sender: { send: async () => ({ ok: true }) },
+    registry,
+    log: (line) => lines.push(line),
+  });
+
+  await notifier.consider({ type: 'notification.shown', notificationType: 'wave' });
+
+  assert.ok(
+    lines.some((l) => /^push: sent "Someone waved at you" to 1 device\(s\)$/.test(l)),
+    `expected a send line, got ${JSON.stringify(lines)}`,
+  );
+  assert.ok(registry.list()[0].lastSentAt, 'the device carries when it was last reached');
+});
+
+test('a push with nobody registered says so rather than passing silently', async () => {
+  const lines = [];
+  const notifier = new PushNotifier({
+    sender: { send: async () => ({ ok: true }) },
+    registry: memoryRegistry(),
+    log: (line) => lines.push(line),
+  });
+
+  await notifier.consider({ type: 'notification.shown', notificationType: 'wave' });
+  assert.ok(lines.some((l) => /no device has registered/.test(l)));
+});
+
+test('a device nobody has reached in months is dropped, generously', () => {
+  const now = Date.parse('2026-08-13T00:00:00Z');
+  const day = 86_400_000;
+  const registry = memoryRegistry({
+    push: {
+      devices: [
+        { token: TOKEN, platform: 'ios', registeredAt: new Date(now - 90 * day).toISOString() },
+        { token: OTHER, platform: 'ios', registeredAt: new Date(now - 10 * day).toISOString() },
+      ],
+    },
+  });
+
+  assert.equal(registry.prune({ now }), 1);
+  assert.deepEqual(
+    registry.list().map((d) => d.token),
+    [OTHER],
+  );
+});
+
+test('a phone away from the LAN but still being pushed to is kept', () => {
+  // `registeredAt` only refreshes on the LAN, so someone remote for two months has
+  // a live token that never re-registers. `lastSentAt` is what proves it is alive.
+  const now = Date.parse('2026-08-13T00:00:00Z');
+  const day = 86_400_000;
+  const registry = memoryRegistry({
+    push: {
+      devices: [
+        {
+          token: TOKEN,
+          platform: 'ios',
+          registeredAt: new Date(now - 90 * day).toISOString(),
+          lastSentAt: new Date(now - 2 * day).toISOString(),
+        },
+      ],
+    },
+  });
+
+  assert.equal(registry.prune({ now }), 0);
+});
+
+test('a device with no dates at all predates the field and is kept', () => {
+  const registry = memoryRegistry({ push: { devices: [{ token: TOKEN, platform: 'ios' }] } });
+  assert.equal(registry.prune({ now: Date.parse('2026-08-13T00:00:00Z') }), 0);
+});
+
+test('the staleness window is configurable per install', () => {
+  const registry = memoryRegistry({ push: { staleAfterDays: 7 } });
+  assert.equal(registry.staleAfterDays(), 7);
+  assert.equal(memoryRegistry().staleAfterDays(), STALE_AFTER_DAYS);
 });

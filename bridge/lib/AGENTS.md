@@ -17,10 +17,10 @@ platform plumbing — launchd installation, paths, pairing codes.
 | `server.js` | `BridgeServer` — owns the collector, the notification tail, the HTTP routes, the WS fan-out, the sequence numbers and the 500-event history buffer. The composition root. |
 | `presence.js` | `PresenceTracker` — folds the roster into current state, suppresses duplicates, decides what a human should see. Answers one question about other people: who is following me. |
 | `events.js` | Every event constructor, and therefore the wire format. `{type, at, source, confidence, ...payload}`. Also `newPlayer()` / `emptySelf()` snapshot shapes. |
-| `direct.js` | `DirectCollector` — **the only collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. |
+| `direct.js` | `DirectCollector` — **the only collector.** Authenticates to Gather and opens its own game socket in *observer* mode, so it needs no debug port and no running desktop client. Also `describeClose()`, and the deaf-socket watchdog: `close` drives every reconnect, and a half-open TCP connection never fires one, so `_flush` reconnects after `SILENCE_LIMIT_MS` of total silence. Both exist because of one measurement — see **Reconnects are normal** below. |
 | `gather-auth.js` | Gather's own auth: adopts the desktop client's Firebase session out of IndexedDB, refreshes ID tokens, and does authenticated REST calls. |
 | `fcm.js` | `FcmSender` — Firebase Cloud Messaging HTTP v1, hand-rolled: RS256 service-account JWT → OAuth2 access token → `messages:send`. Also `readServiceAccount()`. |
-| `push.js` | `PushNotifier` (which events deserve waking a locked phone) and `PushRegistry` (the registered devices, persisted in the config file). `describe()` holds the policy and is pure. |
+| `push.js` | `PushNotifier` (which events deserve waking a locked phone) and `PushRegistry` (the registered devices, persisted in the config file). `describe()` holds the policy and is pure. Devices are keyed on the app's **`installId`**, not on the FCM token: a reinstall mints a new token, so token-keying left the previous install's dead token in the list absorbing every push while FCM answered `200`. Registering something unchanged is **not logged** — the app re-registers on every resume, and a line each buried the one that mattered — but a successful *send* is, because its absence is exactly why a fortnight of undelivered pushes went unnoticed. `prune()` is a last resort with a 60-day default: `registeredAt` only refreshes on the LAN, so anyone remote for a month has a live token that never re-registers. |
 | `game-protocol.js` | `GameProtocolReader` — interprets Gather's model-patch protocol into a `SpaceUser` roster, reads the space name off the `Space` row, resolves which row is *me*, and drains `DeltaState.events[]` (Gather's event bus: waves, chat). Also `MeetingWatch`, which turns `MeetingParticipant` and `MeetingJoinRequest` rows into invites and knocks. |
 | `msgpack.js` | Hand-written MessagePack. **Decoder** covers Gather's five extension types; **encoder** covers only what we send (plain maps/strings/numbers) and throws on anything else. |
 | `desktop-notifications.js` | `DesktopNotificationReader` — the last scraper, and down to two signals (`meeting invite`, `event reminder`). One line shape (`IPC Event: SHOW_NOTIFICATION`) in the `(main)` scope, plus `parseInspect()` for `util.inspect` bodies. **`wave` is deliberately ignored**: waves come off the game socket's `DeltaState.events[]` bus, with a sender, whether or not the desktop app is running. |
@@ -109,6 +109,22 @@ platform plumbing — launchd installation, paths, pairing codes.
 - **`direct.js` distinguishes "connected" from "holding state".** `hasState`
   gates health, because an empty roster reported confidently lets the app render
   "nobody is following you" out of nothing.
+- **Reconnects are normal, and were once mistaken for a fault.** Measured over
+  2026-08-07→13: **387** socket drops, every connection ending in one, median
+  lifetime 10 minutes. Two causes, both benign and both correctly handled by the
+  backoff — Gather's gateway recycling connections (**1012**), and the Mac
+  suspending (**1006**, with **63%** of drops landing within two minutes of a macOS
+  sleep or wake against a 6% baseline). Do not "fix" the reconnecting.
+  - What *was* broken is that all 387 logged the bare line `direct: game socket
+    error` while the close code went to `_setHealth` and `_lastClose` and never
+    reached the log. Nothing is logged from the `error` handler now; `close` carries
+    the code and `describeClose()` puts it in words. Keep it that way.
+  - And a socket can go deaf **without** `close` ever firing — half-open TCP after a
+    suspend, no FIN. `_frames` is cumulative and reset only per connect, so the
+    healthy branch of `_flush` reported `98 space users (observer)` indefinitely
+    while receiving nothing. `_isSilent()` guards that branch; it must stay *first*
+    in `_flush`, and the teardown must call `_scheduleRetry()` itself because
+    `_closeSocket()` nulls `_ws` and the `close` handler guards on identity.
 - **Keep counters out of the health `detail` string.** `_setHealth` publishes an
   event whenever the detail changes, and a frame counter changes on every 250ms
   flush — that fills the 500-event history the phone replays on reconnect with

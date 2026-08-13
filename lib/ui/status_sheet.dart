@@ -6,15 +6,21 @@
 /// it from a distance, and the app already has one sheet (`type_code_dialog.dart`)
 /// whose recipe this follows exactly.
 ///
-/// ## The two halves are not the same kind of fact
+/// ## Both halves are read back, and neither is an echo
 ///
-/// Availability is read back off the roster, so the picker shows what Gather
-/// actually holds and reflects the desktop client changing it. The status line is
-/// not: `SpaceUserStatus` is one of the forty-three models
-/// `GameProtocolReader` discards, so there is nowhere to read it from and what is
-/// shown is an echo of what this phone last sent. That is why it goes away on a
-/// restart rather than persisting a guess — an echo presented as the truth would
-/// be a status line that says something you cleared from your Mac an hour ago.
+/// Availability comes off the roster, and so does the status line. That second
+/// one was an echo of whatever this phone last sent for a while, because
+/// `SpaceUserStatus` was one of the models the reader discarded — so it survived
+/// no restart and knew nothing about a status set from the Mac. It is tracked
+/// now. The join runs from the status row's own `spaceUserId` rather than from
+/// `SpaceUser.activeCustomStatusId`, because that field, and
+/// `activeUserGeneratedStatusId` beside it, were never set on anybody: measured
+/// across 98 rows, including people whose status was on screen at the time.
+///
+/// One consequence worth knowing: what comes back may be a status **Gather
+/// wrote**, not one you typed. A connected calendar produces `CalendarInferred`
+/// rows — "Lunch 🥗" — and this sheet will happily show you one and let you
+/// replace it.
 library;
 
 import 'package:flutter/material.dart';
@@ -116,7 +122,7 @@ class _StatusSheetState extends State<_StatusSheet> {
                 child: Container(
                   width: 38,
                   height: 4,
-                  margin: const EdgeInsets.only(bottom: 18),
+                  margin: const EdgeInsets.only(bottom: 16),
                   decoration: BoxDecoration(
                     color: t.ring,
                     borderRadius: BorderRadius.circular(2),
@@ -132,7 +138,7 @@ class _StatusSheetState extends State<_StatusSheet> {
                 availabilityLabel(current ?? 'Active'),
                 style: TextStyle(fontSize: 13, color: t.mutedForeground),
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: 16),
               Row(
                 children: [
                   for (final availability in settableAvailabilities) ...[
@@ -151,7 +157,7 @@ class _StatusSheetState extends State<_StatusSheet> {
                   ],
                 ],
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 16),
               TextField(
                 controller: _text,
                 textInputAction: TextInputAction.done,
@@ -231,7 +237,7 @@ class _Choice extends StatelessWidget {
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
-            padding: const EdgeInsets.symmetric(vertical: 13),
+            padding: const EdgeInsets.symmetric(vertical: 12),
             decoration: BoxDecoration(
               color: selected ? colour.withValues(alpha: 0.12) : t.secondary,
               borderRadius: BorderRadius.circular(t.radius),
@@ -247,7 +253,7 @@ class _Choice extends StatelessWidget {
                   height: 8,
                   decoration: BoxDecoration(color: colour, shape: BoxShape.circle),
                 ),
-                const SizedBox(width: 7),
+                const SizedBox(width: 8),
                 Flexible(
                   child: Text(
                     availabilityLabel(availability),

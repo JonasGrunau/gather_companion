@@ -150,7 +150,7 @@ class _Header extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('Pair with your computer', style: Theme.of(context).textTheme.titleLarge),
-                const SizedBox(height: 3),
+                const SizedBox(height: 4),
                 Text(
                   'Point the camera at the square in your terminal',
                   style: TextStyle(fontSize: 12.5, color: t.mutedForeground),
@@ -361,7 +361,7 @@ class _Hint extends StatelessWidget {
           if (error != null) ...[
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               decoration: BoxDecoration(
                 color: t.danger.withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(t.radius),
@@ -372,7 +372,7 @@ class _Hint extends StatelessWidget {
                 style: TextStyle(fontSize: 13, height: 1.4, color: t.danger),
               ),
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 16),
           ],
           Text(
             'No square on screen yet?',
@@ -415,7 +415,9 @@ class _Command extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: t.secondary,
-        borderRadius: BorderRadius.circular(8),
+        // The step-down radius everything nested-scale uses, rather than its
+        // own third size.
+        borderRadius: BorderRadius.circular(t.radius - 2),
         border: Border.all(color: t.border),
       ),
       child: Text(

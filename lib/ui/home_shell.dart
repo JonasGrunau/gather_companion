@@ -20,9 +20,8 @@
 /// That has two costs, and both are paid here rather than left to leak:
 ///
 ///  * **Tickers keep running when nothing is on screen.** `MapMotion` drives the
-///    walk at 60fps and `_PartyCard`'s gradient spins on a five-second loop, and
-///    neither knows it is behind another tab. Each tab is wrapped in a
-///    `TickerMode` so the ones you are not looking at are muted.
+///    walk at 60fps and does not know it is behind another tab. Each tab is
+///    wrapped in a `TickerMode` so the ones you are not looking at are muted.
 ///  * **`AppState.positions` ticks at 4Hz.** That listenable exists precisely so
 ///    that footsteps repaint the map without waking the rest of the tree, so
 ///    merging it in unconditionally would hand the map four rebuilds a second
@@ -206,11 +205,17 @@ class _Inset extends StatelessWidget {
 /// ## Why the whole dock is one width
 ///
 /// [IntrinsicWidth] over a stretched column: the column takes the width of its
-/// widest row, which is the controls, and every other row is stretched to match.
-/// So the navigation is exactly as wide as the controls above it, its three
-/// destinations spread across that width by the same `spaceEvenly` the controls
-/// use. Left to themselves the two rows would be different widths and the join
-/// would have a visible step in it.
+/// widest row, and every other row is stretched to match. So the navigation is
+/// exactly as wide as the controls above it, its three destinations dividing
+/// that width between them as equal segments. Left to themselves the two rows
+/// would be different widths and the join would have a visible step in it.
+///
+/// The widest row is usually neither of them: [kRailMinWidth] puts a floor
+/// under the island. Without it the nav row alone measured 180 points — a pill
+/// lost at the bottom of the screen — and the island lurched sideways every
+/// time the control row came or went. With it, both rows spread across the same
+/// steady width, and only a control row that genuinely outgrows the floor (the
+/// camera flip and the leave door together) widens the island past it.
 ///
 /// ## Why it grows and shrinks rather than sliding
 ///
@@ -218,9 +223,8 @@ class _Inset extends StatelessWidget {
 /// the rail on the way out. Attached, there is nothing to slide behind: the honest
 /// motion for a section of one object leaving is for the object to close up over
 /// it. [AnimatedSize] anchored at the bottom does that, so the dock settles onto
-/// the navigation row and lifts back off it — including sideways, since losing the
-/// controls narrows the whole island. Same for the reaction tray, which is a third
-/// row and pushes the dock upwards rather than floating over it.
+/// the navigation row and lifts back off it. Same for the reaction tray, which is
+/// a third row and pushes the dock upwards rather than floating over it.
 ///
 /// The controls cannot live *inside* the map tab, which is where they belong
 /// conceptually: an `IndexedStack` stops painting a tab the moment it is not
@@ -268,35 +272,55 @@ class _Dock extends StatelessWidget {
               curve: Curves.easeOutCubic,
               alignment: Alignment.bottomCenter,
               child: IntrinsicWidth(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    if (showingControls)
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          border: Border(bottom: BorderSide(color: t.border)),
+                // The floor under the island's width — see [kRailMinWidth].
+                // Inside the IntrinsicWidth, so a control row that genuinely
+                // outgrows the floor can still widen the whole dock.
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: kRailMinWidth),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (showingControls)
+                        DecoratedBox(
+                          decoration: BoxDecoration(
+                            border: Border(bottom: BorderSide(color: t.border)),
+                          ),
+                          child: ListenableBuilder(
+                            // Outside the `IndexedStack`, so it has no listener of
+                            // its own — the mute button has to redraw when the call
+                            // state changes and when a roster moves us in or out of
+                            // a conversation.
+                            listenable: state,
+                            builder: (context, _) => ControlBar(state: state),
+                          ),
                         ),
-                        child: ListenableBuilder(
-                          // Outside the `IndexedStack`, so it has no listener of
-                          // its own — the mute button has to redraw when the call
-                          // state changes and when a roster moves us in or out of
-                          // a conversation.
-                          listenable: state,
-                          builder: (context, _) => ControlBar(state: state),
+                      SizedBox(
+                        height: kRailHeight,
+                        // Equal thirds rather than `spaceEvenly`: three fixed-width
+                        // plates spread across the widened island floated in it as
+                        // three loose pills, with the bar's fill showing as dead
+                        // space around each one. Segments own the width instead.
+                        child: Padding(
+                          // The one breathing distance: 6 between a plate and the
+                          // island's edge, and 6 between neighbouring plates — the
+                          // gaps below, not per-item padding, so the edges do not
+                          // end up wider than the seams.
+                          padding: const EdgeInsets.all(6),
+                          child: Row(
+                            children: [
+                              for (final tab in _Tab.values) ...[
+                                if (tab != _Tab.values.first) const SizedBox(width: 6),
+                                Expanded(
+                                  child: _NavItem(tab: tab, selected: selected, onSelect: onSelect),
+                                ),
+                              ],
+                            ],
+                          ),
                         ),
                       ),
-                    SizedBox(
-                      height: kRailHeight,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          for (final tab in _Tab.values)
-                            _NavItem(tab: tab, selected: selected, onSelect: onSelect),
-                        ],
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -307,14 +331,19 @@ class _Dock extends StatelessWidget {
   }
 }
 
-/// One destination: an icon on a plate that fills in when it is the one you are
-/// on.
+/// One destination: an icon with its name under it, on a plate that fills in
+/// when it is the one you are on.
+///
+/// The name is not optional decoration. Bare glyphs at a fixed 60 points were
+/// tried first and they floated in the widened bar as three loose pills —
+/// unlabelled, they read as ornaments rather than as places to go, and a map
+/// glyph does not say "The office" to anybody new. Each item now owns a third
+/// of the bar, so the plates meet the width instead of swimming in it.
 ///
 /// The D-pad's rule — pressed is a step of opacity, not a colour — is about a
 /// control being *pushed*, and does not apply to a control that is *in a state*.
 /// This is the second kind, so it follows the media check's toggles instead and
-/// uses the brand for on. The plate is what stops three loose glyphs reading as
-/// decoration on a floating bar.
+/// uses the brand for on.
 class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.tab,
@@ -330,9 +359,11 @@ class _NavItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final on = tab == selected;
-    // The nested-inside-a-card radius: the plate sits within a rail that is
-    // already rounded, so it takes a step down rather than matching it.
-    final radius = BorderRadius.circular(t.radius - 2);
+    // Concentric with the island: the dock's corner is `t.radius + 10` and the
+    // plate sits 6 points inside it, so its corner is the dock's minus that
+    // inset. Any other number and the two curves visibly disagree at the
+    // corners of the bar.
+    final radius = BorderRadius.circular(t.radius + 4);
 
     return Semantics(
       button: true,
@@ -348,8 +379,6 @@ class _NavItem extends StatelessWidget {
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOutCubic,
-              width: 60,
-              height: 44,
               decoration: BoxDecoration(
                 // A wash of the accent rather than `t.secondary`. The plain
                 // surface was the first try and it all but vanished: `#20242F`
@@ -360,11 +389,32 @@ class _NavItem extends StatelessWidget {
                 color: on ? t.brand.withValues(alpha: 0.18) : Colors.transparent,
                 borderRadius: radius,
               ),
-              child: TweenAnimationBuilder<Color?>(
-                duration: const Duration(milliseconds: 220),
-                curve: Curves.easeOutCubic,
-                tween: ColorTween(end: on ? t.brand : t.mutedForeground),
-                builder: (context, colour, _) => Icon(tab.icon, size: 22, color: colour),
+              // The outer `Semantics` already says the name; without this the
+              // visible label would make a screen reader say it twice.
+              child: ExcludeSemantics(
+                child: TweenAnimationBuilder<Color?>(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutCubic,
+                  tween: ColorTween(end: on ? t.brand : t.mutedForeground),
+                  builder: (context, colour, _) => Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(tab.icon, size: 22, color: colour),
+                      const SizedBox(height: 3),
+                      Text(
+                        tab.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.1,
+                          color: colour,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
           ),

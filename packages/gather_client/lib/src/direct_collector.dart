@@ -69,6 +69,23 @@ const _heartbeatInterval = Duration(seconds: 10);
 /// retract it.
 const _handshakeGrace = Duration(seconds: 5);
 
+/// How long a total silence has to last before we stop believing the socket.
+///
+/// Nothing else notices a socket that has gone deaf. `onDone` is what drives every
+/// reconnect here, and a half-open TCP connection never fires one: the peer sent no
+/// FIN, so the send side keeps accepting heartbeats and the read side simply never
+/// delivers anything again. That is the ordinary outcome of a device losing its
+/// network without a clean teardown — a phone changing cell, wifi dropping, a laptop
+/// suspending — and without this the collector reports full health and a live roster
+/// for as long as the process runs while receiving nothing.
+///
+/// Gather's server heartbeats every 3–9s, so silence is unambiguous well before
+/// this. Generous anyway: being wrong costs a reconnect and a fresh state dump, but
+/// reconnecting a *working* socket every 45s would be its own bug.
+///
+/// Mirrors `SILENCE_LIMIT_MS` in `bridge/lib/direct.js`; the two must not drift.
+const _silenceLimit = Duration(seconds: 45);
+
 const _maxBackoff = Duration(seconds: 30);
 
 /// What we tell Gather we are. Mirrors the desktop client.
@@ -97,6 +114,10 @@ class DirectCollector {
     String socketUrl = _gameSocket,
     Future<WebSocket> Function(String url)? connect,
     void Function(String)? log,
+    // Injected for the same reason as `connect`: the honest test of the deaf-socket
+    // watchdog is to let a connection actually fall silent, and a suite that waited
+    // [_silenceLimit] to find out would add 45 seconds to every run.
+    this.silenceLimit = _silenceLimit,
         // A named parameter cannot be a private initializing formal, so these are
         // assigned the long way round — same as `BridgeClient` and `AppState`.
         // ignore: prefer_initializing_formals
@@ -109,6 +130,10 @@ class DirectCollector {
         _log = log ?? _noop;
 
   static void _noop(String _) {}
+
+  /// How long a silence has to last before the socket is torn down. See
+  /// [_silenceLimit] for why this exists and why it is as long as it is.
+  final Duration silenceLimit;
 
   final GatherAuth _auth;
   final String _socketUrl;
@@ -138,6 +163,9 @@ class DirectCollector {
   /// Whether `enterSpace` has gone out on the current socket. Reset per connect.
   bool _entered = false;
   DateTime? _handshakeAt;
+
+  /// When a frame last arrived. The watchdog's whole state — see [_silenceLimit].
+  DateTime? _lastFrameAt;
 
   final _rosters = StreamController<Roster>.broadcast();
   final _interactions = StreamController<BusEvent>.broadcast();
@@ -510,6 +538,7 @@ class DirectCollector {
     // so carrying rows over would only keep ghosts of people who have since left.
     reader = GameProtocolReader(log: _log)..authUserId = authUserId;
     _frames = 0;
+    _lastFrameAt = null;
 
     final url = '$_socketUrl?spaceId=${Uri.encodeQueryComponent(resolvedSpace)}'
         '&authUserId=${Uri.encodeQueryComponent(authUserId ?? '')}';
@@ -548,6 +577,11 @@ class DirectCollector {
     }
 
     _handshakeAt = DateTime.now();
+    // The clock starts at the handshake, not at the first frame: a server that
+    // accepts the socket and then says nothing at all is exactly the case worth
+    // reconnecting out of, and leaving this null until something arrived would make
+    // that the one case the watchdog could not see.
+    _lastFrameAt = _handshakeAt;
     _setHealth(false, 'handshake sent; waiting for state');
 
     _publishTimer = Timer.periodic(_publishInterval, (_) => _flush());
@@ -559,8 +593,12 @@ class DirectCollector {
         _onFrame(data);
       },
       onError: (Object _) {
-        // `onDone` always follows and carries the code; retry from there.
-        if (_ws == ws) _log('direct: game socket error');
+        // Deliberately silent. This used to log `direct: game socket error` and
+        // nothing else. On the bridge, whose copy of this logged the same line, that
+        // produced 387 identical entries over six days carrying no information at
+        // all — the close code, the only diagnostic fact available, went to
+        // `_setHealth` and never reached the log. `onDone` always follows an error
+        // and carries the code, so it is the only place worth logging from.
       },
       onDone: () {
         if (_ws != ws) return;
@@ -573,6 +611,7 @@ class DirectCollector {
         // changed and is worth saying out loud.
         final suffix = code == 4031 ? ' — duplicate connection rejected' : '';
         _setHealth(false, 'game socket closed ($code)$suffix');
+        _log('direct: ${describeClose(code, ws.closeReason)}; reconnecting');
         _scheduleRetry();
       },
       cancelOnError: false,
@@ -667,6 +706,26 @@ class DirectCollector {
     }
   }
 
+  /// Tears the socket down if nothing has arrived for [silenceLimit].
+  ///
+  /// Returns true when it acted. The teardown is explicit rather than left to
+  /// `onDone`, because [_closeSocket] nulls `_ws` first and the `onDone` handler
+  /// guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
+  bool _isSilent() {
+    final last = _lastFrameAt;
+    if (last == null) return false;
+    final since = DateTime.now().difference(last);
+    if (since < silenceLimit) return false;
+
+    final secs = since.inSeconds;
+    _clearTimers();
+    unawaited(_closeSocket());
+    _setHealth(false, 'no frames for ${secs}s — the socket went deaf; reconnecting');
+    _log('direct: nothing from Gather for ${secs}s — the socket went deaf; reconnecting');
+    _scheduleRetry();
+    return true;
+  }
+
   void _heartbeat() {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) return;
@@ -692,6 +751,10 @@ class DirectCollector {
     }
     if (frame is! Map<String, Object?>) return;
     _frames++;
+    // Every frame counts as liveness, heartbeats included — the question the
+    // watchdog asks is whether the socket still carries anything at all, not whether
+    // anything interesting happened.
+    _lastFrameAt = DateTime.now();
     if (reader.ingest(frame)) _dirty = true;
 
     // The state dump is what names us, so this is the first moment the late path
@@ -708,6 +771,13 @@ class DirectCollector {
   }
 
   void _flush() {
+    // First, because the block below is what was lying. `_frames` is cumulative and
+    // reset only on connect, so once it had ever been above zero this reported full
+    // health on every tick for as long as the process ran — whether or not a single
+    // frame had arrived since. Asking here rather than on the heartbeat also means
+    // the answer is never more than one publish interval stale.
+    if (_isSilent()) return;
+
     if (_frames > 0) {
       if (hasState) {
         // Deliberately *not* the frame count. A status whose detail changes four
@@ -746,4 +816,31 @@ String _txnId() {
   final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}'
       '-${hex.substring(16, 20)}-${hex.substring(20)}';
+}
+
+/// What a close code means, in words, for the log.
+///
+/// Exported because it is the whole point of the change that produced it: the
+/// bridge's copy of this collector logged 387 undifferentiated `game socket error`
+/// lines over six days, and every one of them was one of the first two cases below —
+/// Gather recycling the connection, or a device losing its network. Neither is a
+/// fault. Saying which is what makes the third case, an actual fault, visible.
+///
+/// Mirrors `describeClose` in `bridge/lib/direct.js`; the two must not drift.
+String describeClose(int code, [String? reason]) {
+  final said = (reason == null || reason.isEmpty) ? '' : ' — "$reason"';
+  return switch (code) {
+    // RFC 6455 1012. Gather's gateway closing us on purpose as it recycles or
+    // redeploys. Routine, frequent, and nothing to act on.
+    1012 => 'Gather recycled the connection (1012)$said',
+    // 1006 is synthesised by the client when the peer vanished without a close
+    // frame: a suspended laptop, a phone changing cell, a NAT rebinding.
+    1006 => 'the connection dropped without a close frame (1006)$said',
+    1001 => 'Gather is going away (1001)$said',
+    1000 => 'Gather closed the connection normally (1000)$said',
+    // Long believed to be the duplicate-connection code. Neither an observer nor an
+    // entered connection has ever triggered it, so this means Gather's rules changed.
+    4031 => 'duplicate connection rejected (4031)$said',
+    _ => 'the game socket closed ($code)$said',
+  };
 }

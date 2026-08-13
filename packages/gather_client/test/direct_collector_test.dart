@@ -41,7 +41,11 @@ void main() {
     await gather.close();
   });
 
-  DirectCollector build({String? spaceId = 'space-1'}) {
+  DirectCollector build({
+    String? spaceId = 'space-1',
+    Duration? silenceLimit,
+    void Function(String)? log,
+  }) {
     final auth = GatherAuth(
       credentials: const GatherCredentials(refreshToken: 'refresh-1'),
       http: http,
@@ -50,6 +54,8 @@ void main() {
       auth: auth,
       spaceId: spaceId,
       socketUrl: gather.url,
+      log: log,
+      silenceLimit: silenceLimit ?? const Duration(seconds: 45),
     );
   }
 
@@ -460,5 +466,69 @@ void main() {
 
     expect(gather.connections, hasLength(2));
     expect(c.stats()['connects'], 2);
+  });
+
+  group('the deaf socket', () {
+    // The failure this exists for. Every reconnect in this collector is driven by
+    // `onDone`, and a half-open TCP connection never fires one — the peer sent no
+    // FIN, so sends keep succeeding and reads simply never deliver anything again.
+    // On a phone that is routine: iOS suspends the app, the radio changes cell, wifi
+    // drops. Before the watchdog the collector reported full health and a live
+    // roster for as long as the process ran while receiving nothing at all.
+    //
+    // The fake server sends its dump and then nothing, so the silence is real rather
+    // than simulated; only the limit is shortened.
+
+    test('a socket that goes silent is torn down and reconnected', () async {
+      final lines = <String>[];
+      final c = build(silenceLimit: const Duration(milliseconds: 400), log: lines.add)..start();
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the first dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      expect(c.healthy, isTrue, reason: 'healthy once the dump has landed');
+
+      await firstWhere(gather.onDumped, (_) => true, reason: 'a reconnect')
+          .timeout(const Duration(seconds: 5));
+
+      expect(gather.connections.length, greaterThanOrEqualTo(2));
+      expect(
+        lines.any((l) => l.contains('the socket went deaf')),
+        isTrue,
+        reason: 'expected the watchdog to say so, got $lines',
+      );
+    });
+
+    test('a socket still carrying heartbeats is left alone', () async {
+      // The other half, and the one that matters more: reconnecting a working socket
+      // every few seconds would be worse than the bug being fixed. Nothing here is
+      // interesting — only heartbeats — which is exactly what must count as alive.
+      final c = build(silenceLimit: const Duration(milliseconds: 400))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      final beat = Timer.periodic(
+        const Duration(milliseconds: 100),
+        (_) => conn.send({'type': 'Heartbeat', 'timestamp': 2, 'origin': 'Server'}),
+      );
+      addTearDown(beat.cancel);
+      await Future<void>.delayed(const Duration(seconds: 2));
+
+      expect(gather.connections, hasLength(1), reason: 'a live socket must not be reconnected');
+      expect(c.healthy, isTrue);
+    });
+  });
+
+  group('close codes', () {
+    // 387 lines of `direct: game socket error` over six days on the bridge, all of
+    // them one of the first two cases, neither of them a fault. The code was
+    // captured into health detail and never reached the log.
+    test('a close code is described in words, so a log of them means something', () {
+      expect(describeClose(1012), contains('Gather recycled the connection (1012)'));
+      expect(describeClose(1006), contains('dropped without a close frame (1006)'));
+      expect(describeClose(4031), contains('duplicate connection rejected'));
+      expect(describeClose(1000), contains('closed the connection normally'));
+      expect(describeClose(4999), contains('the game socket closed (4999)'));
+      expect(describeClose(1006, 'bye'), contains('(1006) — "bye"'));
+      expect(describeClose(1006, ''), isNot(contains('—')));
+    });
   });
 }

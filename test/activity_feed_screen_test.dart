@@ -89,20 +89,22 @@ void main() {
 
   testWidgets('only what can be marked read offers to be', (tester) async {
     // A wave is unread-able: its read state is a chat cursor, not a subscription.
+    // The offer is the double-check icon; the words live in its tooltip.
     await tester.pumpWidget(wrap(stateWith([wave()])));
     await tester.pump();
-    expect(find.text('Mark all read'), findsNothing);
+    expect(find.byIcon(Icons.done_all_rounded), findsNothing);
 
     await tester.pumpWidget(wrap(stateWith([memo()])));
     await tester.pump();
-    expect(find.text('Mark all read'), findsOneWidget);
+    expect(find.byIcon(Icons.done_all_rounded), findsOneWidget);
+    expect(find.byTooltip('Mark all read'), findsOneWidget);
   });
 
   testWidgets('an already-read item offers nothing to clear', (tester) async {
     await tester.pumpWidget(wrap(stateWith([memo(isRead: true)])));
     await tester.pump();
 
-    expect(find.text('Mark all read'), findsNothing);
+    expect(find.byIcon(Icons.done_all_rounded), findsNothing);
   });
 
   testWidgets('the badge counts what is unread', (tester) async {

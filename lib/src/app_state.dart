@@ -42,6 +42,7 @@ class AppState extends ChangeNotifier {
     Notifier? notifier,
     PushRegistrar? push,
     GatherCredentialStore? credentials,
+    BridgeSettingsStore? bridge,
     // Test seam: lets a suite drive a fake Gather without a network.
     DirectCollector Function(GatherAuth auth, String? spaceId)? buildCollector,
     ActivityFeed Function(GatherAuth auth)? buildActivityFeed,
@@ -49,17 +50,17 @@ class AppState extends ChangeNotifier {
     // a [Call] is a microphone, a camera and an SFU, none of which a test runner
     // has. `main.dart` supplies the real one.
     Call Function(GatherAuth auth, String spaceId, String srcId)? buildCall,
-  })  : _notifier = notifier ?? Notifier(),
-        // ignore: prefer_initializing_formals
-        _push = push,
-        _credentialStore = credentials ?? GatherCredentialStore(),
-        _buildCollector = buildCollector ?? _realCollector,
-        _buildActivityFeed = buildActivityFeed ?? _realActivityFeed,
-        // ignore: prefer_initializing_formals
-        _buildCall = buildCall;
+  }) : _notifier = notifier ?? Notifier(),
+       // ignore: prefer_initializing_formals
+       _push = push,
+       _credentialStore = credentials ?? GatherCredentialStore(),
+       _bridgeStore = bridge ?? BridgeSettingsStore(),
+       _buildCollector = buildCollector ?? _realCollector,
+       _buildActivityFeed = buildActivityFeed ?? _realActivityFeed,
+       // ignore: prefer_initializing_formals
+       _buildCall = buildCall;
 
-  static DirectCollector _realCollector(GatherAuth auth, String? spaceId) =>
-      DirectCollector(auth: auth, spaceId: spaceId);
+  static DirectCollector _realCollector(GatherAuth auth, String? spaceId) => DirectCollector(auth: auth, spaceId: spaceId);
 
   static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
@@ -67,6 +68,7 @@ class AppState extends ChangeNotifier {
   Notifier get notifier => _notifier;
 
   final GatherCredentialStore _credentialStore;
+  final BridgeSettingsStore _bridgeStore;
   final DirectCollector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
 
@@ -102,8 +104,11 @@ class AppState extends ChangeNotifier {
   final PresenceTracker _tracker = PresenceTracker();
   final _subs = <StreamSubscription<dynamic>>[];
 
-  /// Where the bridge is, for push registration only. Nothing renders from it.
+  /// Where the bridge is, for push registration only. Nothing renders from it —
+  /// [_pushReach] is what the settings card reads, because that one has been tested
+  /// against the actual computer.
   BridgeSettings _settings = BridgeSettings.empty;
+  PushRegistration _pushReach = PushRegistration.unknown;
   GatherCredentials _credentials = GatherCredentials.empty;
   String? _spaceId;
 
@@ -126,11 +131,20 @@ class AppState extends ChangeNotifier {
   /// that can never answer anything.
   bool get isConfigured => _credentials.isComplete;
 
-  /// Whether the bridge can wake this phone while the app is closed.
+  /// How close the bridge is to being able to wake this phone while the app is closed.
   ///
   /// Independent of [isConfigured] on purpose: presence works without it, and losing
   /// push is a degradation rather than a failure.
-  bool get canBeWoken => _settings.isComplete;
+  ///
+  /// This is the *result of the last attempt*, not an inference from what is stored.
+  /// It used to be `_settings.isComplete` — "do we know a host and a token" — which
+  /// meant the settings screen claimed a computer was unreachable without anything
+  /// ever having tried to reach it, and claimed it was reachable forever once it had
+  /// been paired. Both were wrong in the direction that hides a real fault.
+  /// There is deliberately no `canBeWoken` boolean beside this. Collapsing these six
+  /// answers back to one is what produced a card that sent people to check a computer
+  /// that was fine; ask [PushRegistration.isArmed] if that really is the question.
+  PushRegistration get pushReach => _pushReach;
 
   /// Who is following me — the only thing this app claims to know about anyone.
   ///
@@ -138,8 +152,7 @@ class AppState extends ChangeNotifier {
   /// Gather's own map iteration and shuffles for reasons that have nothing to do with
   /// people, which reads as flicker.
   List<PlayerRef> get followers {
-    final list = _snapshot.players.where((p) => p.isFollowingMe).toList()
-      ..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
+    final list = _snapshot.players.where((p) => p.isFollowingMe).toList()..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return list;
   }
 
@@ -274,17 +287,19 @@ class AppState extends ChangeNotifier {
       final x = row.x, y = row.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
       if (row.floorId != null && floorId != null && row.floorId != floorId) continue;
-      out.add(MapPerson(
-        id: row.id,
-        label: row.name ?? row.id.substring(0, row.id.length.clamp(0, 6)),
-        x: x.toDouble(),
-        y: y.toDouble(),
-        isFollowingMe: followers.contains(row.id),
-        speaking: speaking.contains(row.id),
-        avatarUrl: _collector?.avatarUrlFor(row.id),
-        direction: row.direction,
-        availability: row.availability,
-      ));
+      out.add(
+        MapPerson(
+          id: row.id,
+          label: row.name ?? row.id.substring(0, row.id.length.clamp(0, 6)),
+          x: x.toDouble(),
+          y: y.toDouble(),
+          isFollowingMe: followers.contains(row.id),
+          speaking: speaking.contains(row.id),
+          avatarUrl: _collector?.avatarUrlFor(row.id),
+          direction: row.direction,
+          availability: row.availability,
+        ),
+      );
     }
     // Roster order is Gather's own map iteration and shuffles between snapshots.
     // The painter decides whether to repaint by comparing this list position by
@@ -308,19 +323,15 @@ class AppState extends ChangeNotifier {
   static const _devPair = String.fromEnvironment('GATHER_PAIR');
 
   Future<void> boot() async {
-    _settings = await BridgeSettings.load();
-    _bridgeName = await BridgeSettings.loadName();
+    _settings = await _bridgeStore.load();
+    _bridgeName = await _bridgeStore.loadName();
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
 
     if (!_credentials.isComplete && _devPair.isNotEmpty) {
       final parts = _devPair.split(':');
       if (parts.length >= 4) {
-        _settings = BridgeSettings(
-          host: parts[0],
-          port: int.tryParse(parts[1]) ?? BridgeSettings.defaultPort,
-          token: parts[2],
-        );
+        _settings = BridgeSettings(host: parts[0], port: int.tryParse(parts[1]) ?? BridgeSettings.defaultPort, token: parts[2]);
         _credentials = GatherCredentials(refreshToken: parts[3]);
         _bridgeName = 'dev · ${parts[0]}';
       }
@@ -344,8 +355,8 @@ class AppState extends ChangeNotifier {
       case PairSuccess(:final settings, :final name, :final gather, :final spaceId):
         _settings = settings;
         _bridgeName = name;
-        await settings.save();
-        await BridgeSettings.saveName(name);
+        await _bridgeStore.save(settings);
+        await _bridgeStore.saveName(name);
 
         if (!gather.isComplete) {
           // Pairing worked; the bridge simply has no Gather session to give. Say so
@@ -369,12 +380,13 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> unpair() async {
-    await BridgeSettings.clear();
+    await _bridgeStore.clear();
     await _credentialStore.clear();
     _settings = BridgeSettings.empty;
     _credentials = GatherCredentials.empty;
     _spaceId = null;
     _bridgeName = null;
+    _pushReach = PushRegistration.unknown;
     _snapshot = PresenceSnapshot.empty;
     await _detach();
     _link = const LinkStatus(LinkState.idle);
@@ -391,7 +403,7 @@ class AppState extends ChangeNotifier {
     if (party == null) return 'Not connected to Gather.';
 
     if (!on) {
-      _onPartyChanged(party.stop('switched off'));
+      _onPartyChanged(party.stop());
       return null;
     }
     final result = party.start();
@@ -418,9 +430,7 @@ class AppState extends ChangeNotifier {
   /// What makes "leave the conversation" a control that is only offered when
   /// there is one to leave, the same rule the D-pad follows: a button that cannot
   /// do anything is indistinguishable from a broken one.
-  List<String> get huddle =>
-      debugHuddle ??
-      [for (final row in _roster?.myCluster ?? const []) row.name ?? 'Someone'];
+  List<String> get huddle => debugHuddle ?? [for (final row in _roster?.myCluster ?? const []) row.name ?? 'Someone'];
 
   bool get inHuddle => huddle.isNotEmpty;
 
@@ -429,20 +439,66 @@ class AppState extends ChangeNotifier {
   @visibleForTesting
   List<String>? debugHuddle;
 
-  /// The status line I last set from this phone.
+  /// The line under my name, as Gather holds it.
   ///
-  /// Local, and deliberately not read back: `SpaceUserStatus` is one of the 43
-  /// models [GameProtocolReader] discards, so there is nowhere to read it from.
-  /// It is an echo of what this app did rather than a claim about what Gather
-  /// holds, which is why it goes away on a restart instead of persisting a
-  /// guess.
-  ({String text, String? emoji})? get customStatus => _customStatus;
-  ({String text, String? emoji})? _customStatus;
+  /// Read back off the roster rather than remembered, so it survives a restart
+  /// and reflects the desktop client setting or clearing it. `SpaceUserStatus`
+  /// used to be one of the models the reader discarded, which is why this was an
+  /// echo of what this phone last sent; it is tracked now, and the join runs from
+  /// the status row's own `spaceUserId` because the two pointer fields on
+  /// `SpaceUser` are never set.
+  ///
+  /// Includes the ones Gather writes from a calendar, not only typed ones — a
+  /// status is a status to whoever is reading it.
+  PersonStatus? get customStatus => _myRow()?.status;
 
-  /// Whether my hand is up. Local for the same reason as [customStatus] —
-  /// `handRaisedAt` is on the model and not in the tracked field set.
+  /// Whether my hand is up.
+  ///
+  /// Local, unlike [customStatus]: `handRaisedAt` is on the model but not in the
+  /// tracked field set, so there is nothing to read it back from yet.
   bool get handRaised => _handRaised;
   bool _handRaised = false;
+
+  // ---- faces -------------------------------------------------------------------
+
+  ProfilePhotos? _photos;
+
+  /// Somebody's profile picture, if we already have a URL for it.
+  ///
+  /// Synchronous and self-healing, which is the shape the widget tree wants: it
+  /// answers null the first time, starts the lookup, and calls listeners when the
+  /// URL lands so the same `build` runs again and gets it. A `FutureBuilder` per
+  /// face would flash a placeholder on every rebuild, and the map rebuilds four
+  /// times a second.
+  ///
+  /// Null for the roughly half of a space who have not set a picture — on the
+  /// reference space, 45 of 98 had one — which is a fallback avatar, not a
+  /// failure.
+  String? photoUrlFor(String spaceUserId) {
+    final photos = _photos;
+    final spaceId = _spaceIdForCall;
+    final fileId = _rowFor(spaceUserId)?.profilePictureId;
+    if (photos == null || spaceId == null || fileId == null) return null;
+
+    final known = photos.cached(fileId);
+    if (known != null || photos.isResolved(fileId)) return known;
+
+    // Not yet asked. The `then` lands after this frame, so notifying from it is
+    // safe, and `isResolved` above is what stops the rebuild asking again.
+    unawaited(
+      photos.urlFor(spaceId: spaceId, fileId: fileId).then((url) {
+        if (url != null && _photos == photos) notifyListeners();
+      }),
+    );
+    return null;
+  }
+
+  RosterRow? _rowFor(String id) {
+    for (final row in _roster?.rows ?? const <RosterRow>[]) {
+      if (row.id == id) return row;
+    }
+    return null;
+  }
 
   /// Turns a collector answer into the sentence-or-null contract the UI expects.
   String? _sent(({bool ok, String? detail}) result, String whatFailed) {
@@ -463,38 +519,23 @@ class AppState extends ChangeNotifier {
   }
 
   /// Sets the line of text under my name.
-  Future<String?> setCustomStatus({
-    required String text,
-    String? emoji,
-    DateTime? clearAt,
-  }) async {
+  Future<String?> setCustomStatus({required String text, String? emoji, DateTime? clearAt}) async {
     final collector = _collector;
     if (collector == null) return 'Not connected to Gather.';
 
     final trimmed = text.trim();
     if (trimmed.isEmpty) return clearCustomStatus();
 
-    final failed = _sent(
-      collector.setCustomStatus(text: trimmed, emoji: emoji, clearAt: clearAt),
-      'Could not set your status.',
-    );
-    if (failed == null) {
-      _customStatus = (text: trimmed, emoji: emoji);
-      notifyListeners();
-    }
-    return failed;
+    // No optimistic echo. The status row comes back on the socket as an
+    // `addmodel` within a beat, and [customStatus] reads it from there — so
+    // holding a local copy would only create a second answer to disagree with.
+    return _sent(collector.setCustomStatus(text: trimmed, emoji: emoji, clearAt: clearAt), 'Could not set your status.');
   }
 
   Future<String?> clearCustomStatus() async {
     final collector = _collector;
     if (collector == null) return 'Not connected to Gather.';
-
-    final failed = _sent(collector.clearCustomStatus(), 'Could not clear your status.');
-    if (failed == null) {
-      _customStatus = null;
-      notifyListeners();
-    }
-    return failed;
+    return _sent(collector.clearCustomStatus(), 'Could not clear your status.');
   }
 
   /// Throws an emoji over the room.
@@ -508,10 +549,7 @@ class AppState extends ChangeNotifier {
     final collector = _collector;
     if (collector == null) return 'Not connected to Gather.';
 
-    final failed = _sent(
-      collector.setHandRaised(raised),
-      raised ? 'Could not raise your hand.' : 'Could not lower your hand.',
-    );
+    final failed = _sent(collector.setHandRaised(raised), raised ? 'Could not raise your hand.' : 'Could not lower your hand.');
     if (failed == null) {
       _handRaised = raised;
       notifyListeners();
@@ -537,11 +575,7 @@ class AppState extends ChangeNotifier {
   /// The media plane keys on `UserAccount` while the game plane keys on
   /// `SpaceUser`, so this needs a *different* id from everything else here — and
   /// it arrives with the state dump rather than at connect.
-  bool get canCall =>
-      debugCanCall ??
-      (_buildCall != null &&
-          _collector?.selfAccountId != null &&
-          _spaceIdForCall != null);
+  bool get canCall => debugCanCall ?? (_buildCall != null && _collector?.selfAccountId != null && _spaceIdForCall != null);
 
   /// Test seam, as [debugCanWalk].
   @visibleForTesting
@@ -608,7 +642,95 @@ class AppState extends ChangeNotifier {
   /// [Walk] repeats the step at Gather's own walking pace until [stopWalking].
   void walk(String direction) => _walk?.press(direction);
 
-  void stopWalking() => _walk?.release();
+  void stopWalking() {
+    _walk?.release();
+    notifyListeners();
+  }
+
+  /// Whether a tapped destination is being walked to right now.
+  ///
+  /// Notified rather than polled, which is why [stopWalking] and [goTo] both wake the
+  /// tree: the map's *Go to* pill turns into a *Stop* while this is true, and a pill
+  /// that only changed on the next roster would sit there saying the wrong word for
+  /// up to a quarter of a second at each end of the walk.
+  bool get onRoute => debugOnRoute ?? (_walk?.onRoute ?? false);
+
+  /// Test seam, as [debugCanWalk].
+  @visibleForTesting
+  bool? debugOnRoute;
+
+  /// Walk to a tile, the way a double-click on the floor does on the desktop.
+  ///
+  /// Answers the way everything else the user can press answers — null when it worked,
+  /// a sentence when it did not — because the alternative is a tap that silently does
+  /// nothing. Not a `Future` in substance: the route is planned and the first step is
+  /// on the wire before this returns. It is one so the map can hand it to the same
+  /// `_run` helper the control bar uses.
+  Future<String?> goTo(int x, int y) async {
+    final walk = _walk;
+    final map = this.map;
+    if (map == null) return 'Still reading the floor plan.';
+    if (walk == null || _collector == null) return 'Not connected to Gather.';
+
+    final at = walk.at;
+    if (at == null) return 'Still working out where you are.';
+
+    final route = map.routeTo(fromX: at.x, fromY: at.y, toX: x, toY: y, avoid: _occupied());
+    if (route == null) return 'There is no way to walk there.';
+
+    walk.follow(route);
+    notifyListeners();
+    return null;
+  }
+
+  /// Walk into a room, landing on a seat if it has a free one.
+  ///
+  /// [toward] is the tile that was actually tapped; it only breaks ties between
+  /// equally good landing tiles. `getAbsoluteTilesClosestToPrioritizedBySeats` hands
+  /// back every tile in the room, best first, and the client keeps the also-rans as
+  /// `altMoveGoals` so a seat taken while you were walking falls through to the next
+  /// one. [SpaceMap.routeTo] is cheap enough to do that by simply trying them in turn.
+  Future<String?> goToRoom(SpaceRoom room, {required ({int x, int y}) toward}) async {
+    final walk = _walk;
+    final map = this.map;
+    if (map == null) return 'Still reading the floor plan.';
+    if (walk == null || _collector == null) return 'Not connected to Gather.';
+
+    final at = walk.at;
+    if (at == null) return 'Still working out where you are.';
+
+    final occupied = _occupied();
+    final taken = {for (final tile in occupied) tile.y * map.width + tile.x};
+    for (final tile in map.tilesClosestTo(room, toward).take(_landingTries)) {
+      if (taken.contains(tile.y * map.width + tile.x)) continue;
+      final route = map.routeTo(fromX: at.x, fromY: at.y, toX: tile.x, toY: tile.y, avoid: occupied);
+      if (route == null) continue;
+      walk.follow(route);
+      notifyListeners();
+      return null;
+    }
+    return 'There is no way to walk into ${room.name ?? 'there'}.';
+  }
+
+  /// How many of a room's tiles to try before giving up on it.
+  ///
+  /// A room is up to a few dozen tiles and each attempt is a fresh search, so this is
+  /// a bound on the work rather than a real limit: the tiles are sorted best-first, so
+  /// anything past the eighth is a tile nobody would have wanted anyway.
+  static const _landingTries = 8;
+
+  /// Tiles other people are standing on, for a route to go round.
+  ///
+  /// The client is stricter — its `GoalBlocked` refuses a goal outright when somebody
+  /// is standing within one tile of it — and that rule is deliberately not copied. It
+  /// is written for a mouse pointer that can see exactly which square it is over; on a
+  /// phone you tap a place, and refusing every tap that lands beside a colleague would
+  /// refuse most taps in a busy office. Routing *around* people is the part worth
+  /// keeping, and arriving is allowed to be a scramble.
+  /// Read off [peopleOnMap] rather than the roster directly, so "somebody is standing
+  /// there" means the same thing here as it does on the screen: present rather than
+  /// merely connected, on this floor, and never me.
+  List<({int x, int y})> _occupied() => [for (final person in peopleOnMap) (x: person.x.round(), y: person.y.round())];
 
   /// Confirms the connection is really up, and reconnects only if it is not.
   ///
@@ -621,6 +743,17 @@ class AppState extends ChangeNotifier {
     if (collector.healthy && collector.hasState) return;
     await collector.resync();
   }
+
+  /// Re-checks whether the computer can still wake this phone.
+  ///
+  /// Also what iOS resume calls, and separate from [verifyLink] because the two
+  /// answers have nothing to do with each other: the Gather socket works on cellular
+  /// with the Mac shut, and the Mac can be sitting there ready while Gather is down.
+  ///
+  /// This *is* the probe. `POST /push/register` is idempotent by design and its reply
+  /// says whether the bridge can send, so re-posting it beats pinging `/health` and
+  /// inferring the rest — and it refreshes our entry on the bridge while it is at it.
+  Future<void> refreshPushReach() => _registerForPush();
 
   /// Reconnects, and resolves only once there is something to show for it.
   ///
@@ -665,14 +798,20 @@ class AppState extends ChangeNotifier {
 
   /// What a badge shows. Live waves are unread by definition — they arrived while
   /// you were looking elsewhere.
-  int get unreadActivityCount =>
-      _live.length + _fetched.where((item) => !item.isRead).length;
+  int get unreadActivityCount => _live.length + _fetched.where((item) => !item.isRead).length;
 
   bool get isLoadingActivity => _loadingActivity;
 
   /// The last failure, or null. Kept so the screen can say what went wrong instead
   /// of showing an empty list, which would read as "nothing ever happened".
   Object? get activityError => _activityError;
+
+  /// Whether the feed has been read for the space we are in. False across the
+  /// whole launch window — before Gather has even named a space, and while the
+  /// first fetch is in flight — which is when the screen shows a skeleton
+  /// rather than claiming "nothing yet". An empty *answer* counts as fetched:
+  /// that claim has been checked.
+  bool get activityFetched => _fetchedFor != null && _fetchedFor == _activitySpaceId;
 
   /// The space the feed belongs to, once Gather has told us which one that is.
   String? get _activitySpaceId => _snapshot.self.spaceId ?? _spaceId;
@@ -715,9 +854,7 @@ class AppState extends ChangeNotifier {
 
     final before = _fetched;
     final ids = markable.map((item) => item.id).toSet();
-    _fetched = [
-      for (final item in _fetched) ids.contains(item.id) ? item.markedRead() : item,
-    ];
+    _fetched = [for (final item in _fetched) ids.contains(item.id) ? item.markedRead() : item];
     notifyListeners();
 
     try {
@@ -768,34 +905,47 @@ class AppState extends ChangeNotifier {
     );
 
     // Same credential as the socket, different transport: the feed is REST, and
-    // the phone mints its own ID tokens for both.
+    // the phone mints its own ID tokens for both. So are the faces.
     _activityFeed = _buildActivityFeed(auth);
+    _photos = ProfilePhotos(auth: auth);
 
     final collector = _collector = _buildCollector(auth, _spaceId);
     final party = _party = PartyMode(collector: () => _collector);
-    final walk = _walk = Walk(collector: () => _collector, map: () => map);
+    final walk = _walk = Walk(
+      collector: () => _collector,
+      map: () => map,
+      // A route ends by itself, and the map's *Go to* pill is a `Stop` for as long as
+      // one is running. Waking the tree here rather than waiting for the roster that
+      // follows: the two are up to a quarter of a second apart, which is a quarter of
+      // a second of a button offering to cancel a walk that already finished.
+      onRouteEnded: notifyListeners,
+    );
 
     _subs
-      ..add(collector.rosters.listen((roster) {
-        // Party mode first, so a hop fired from this same roster is judged against the
-        // freshest positions we hold rather than the previous ones.
-        party.noteRoster(roster);
-        _roster = roster;
-        // After `_roster`, so the floor plan `walk` looks up per step is the one for
-        // the floor this roster puts us on — `map` reads `_myRow()` to find it.
-        walk.noteRoster(roster);
-        // The collector already coalesces and only publishes when something in the
-        // state actually moved, so this is "the map changed", not a clock.
-        _positions.tick();
-        final out = _tracker.applyRoster(roster);
-        _onFold(out);
-      }))
-      ..add(collector.interactions.listen((event) {
-        // Before the fold, so a wave is on the list by the time the notification
-        // it produces wakes the screen that shows it.
-        _noteActivity(event);
-        _onFold(_tracker.applyInteraction(event));
-      }))
+      ..add(
+        collector.rosters.listen((roster) {
+          // Party mode first, so a hop fired from this same roster is judged against the
+          // freshest positions we hold rather than the previous ones.
+          party.noteRoster(roster);
+          _roster = roster;
+          // After `_roster`, so the floor plan `walk` looks up per step is the one for
+          // the floor this roster puts us on — `map` reads `_myRow()` to find it.
+          walk.noteRoster(roster);
+          // The collector already coalesces and only publishes when something in the
+          // state actually moved, so this is "the map changed", not a clock.
+          _positions.tick();
+          final out = _tracker.applyRoster(roster);
+          _onFold(out);
+        }),
+      )
+      ..add(
+        collector.interactions.listen((event) {
+          // Before the fold, so a wave is on the list by the time the notification
+          // it produces wakes the screen that shows it.
+          _noteActivity(event);
+          _onFold(_tracker.applyInteraction(event));
+        }),
+      )
       ..add(collector.statuses.listen(_onCollectorStatus))
       ..add(party.changes.listen(_onPartyChanged))
       ..add(party.progress.listen(_onPartyProgress))
@@ -817,11 +967,15 @@ class AppState extends ChangeNotifier {
     _walk = null;
     _call = null;
     _auth = null;
-    // The status line and the raised hand are echoes of what this connection did.
-    // Carried across a reconnect they would be claims about a socket that no
-    // longer exists, and after an unpair they would be somebody else's.
-    _customStatus = null;
+    // The raised hand is an echo of what this connection did. Carried across a
+    // reconnect it would be a claim about a socket that no longer exists, and
+    // after an unpair it would be somebody else's. The status line needs no such
+    // care — it is read off the roster, so it arrives and leaves with one.
     _handRaised = false;
+    // Faces are signed per space and per person. Pairing again as somebody else
+    // must not serve them the previous account's cache.
+    _photos?.clear();
+    _photos = null;
     // The feed belongs to a credential and a space. Unpairing and pairing again as
     // somebody else must not leave the previous person's waves on the screen.
     _activityFeed = null;
@@ -845,23 +999,35 @@ class AppState extends ChangeNotifier {
     await collector?.dispose();
   }
 
-  /// Hands this phone's push token to the bridge, if it happens to be reachable.
+  /// Hands this phone's push token to the bridge, and records whether it landed.
   ///
-  /// Opportunistic on purpose, and the only thing that still needs the computer at
-  /// all. FCM tokens rotate — a reinstall, a restore from backup, Firebase's own
-  /// schedule — so registering once at pairing would let push die silently months
-  /// later. Registering on every attach is idempotent and costs one request.
+  /// The only thing that still needs the computer at all. FCM tokens rotate — a
+  /// reinstall, a restore from backup, Firebase's own schedule — so registering once
+  /// at pairing would let push die silently months later. Registering on every attach
+  /// and every resume is idempotent and costs one request.
   ///
-  /// A failure is not reported: the phone is frequently on a different network from
-  /// the computer, and that is a normal state, not a fault.
+  /// A failure is still not *complained* about — the phone is frequently on a
+  /// different network from the computer, and that is a normal state, not a fault —
+  /// but it is no longer thrown away. [pushReach] is the difference between "we never
+  /// looked" and "we looked and it is fine", which is what the settings card needs to
+  /// stop guessing.
   Future<void> _registerForPush() async {
-    if (!_settings.isComplete) return;
+    if (!_settings.isComplete) return _setPushReach(const PushRegistration(PushReach.unpaired));
     final registrar = _pushRegistrar();
-    if (registrar == null) return;
-    await registrar.register(_settings);
+    // No registrar means no Firebase in this build, so nothing can wake the app.
+    if (registrar == null) return _setPushReach(const PushRegistration(PushReach.noToken));
+
+    _setPushReach(await registrar.register(_settings, installId: await _bridgeStore.installId()));
     _pushRefresh ??= registrar.tokenRefreshes.listen((_) {
-      unawaited(registrar.register(_settings));
+      registrar.forgetToken();
+      unawaited(_registerForPush());
     });
+  }
+
+  void _setPushReach(PushRegistration next) {
+    if (next == _pushReach) return;
+    _pushReach = next;
+    notifyListeners();
   }
 
   void _onFold(FoldResult out) {
@@ -890,17 +1056,18 @@ class AppState extends ChangeNotifier {
   }
 
   void _onCollectorStatus(CollectorStatus status) {
-    _tracker.setHealth(CollectorHealth(
-      gather: status.healthy,
-      // `cdp` is a compatibility alias, not a second collector: `hasRichData` reads
-      // `gather || cdp`, and mirroring keeps a build that predates the rename honest.
-      cdp: status.healthy,
-      detail: status.detail,
-    ));
+    _tracker.setHealth(
+      CollectorHealth(
+        gather: status.healthy,
+        // `cdp` is a compatibility alias, not a second collector: `hasRichData` reads
+        // `gather || cdp`, and mirroring keeps a build that predates the rename honest.
+        cdp: status.healthy,
+        detail: status.detail,
+      ),
+    );
 
     _link = switch (status) {
-      CollectorStatus(needsPairing: true) =>
-        LinkStatus(LinkState.idle, status.detail, true),
+      CollectorStatus(needsPairing: true) => LinkStatus(LinkState.idle, status.detail, true),
       CollectorStatus(healthy: true) => LinkStatus(LinkState.live, status.detail),
       _ => LinkStatus(LinkState.retrying, status.detail),
     };
@@ -952,12 +1119,7 @@ class AppState extends ChangeNotifier {
     // Party mode cannot start without knowing which avatar is ours, so this is
     // belt and braces rather than a real case.
     if (id == null) return;
-    _lastTeleport = (
-      id: id,
-      x: tile.x.toDouble(),
-      y: tile.y.toDouble(),
-      seq: ++_teleportSeq,
-    );
+    _lastTeleport = (id: id, x: tile.x.toDouble(), y: tile.y.toDouble(), seq: ++_teleportSeq);
     _positions.tick();
   }
 
@@ -1013,14 +1175,23 @@ class AppState extends ChangeNotifier {
 
   /// Test seam for a single event. Notifications no-op until [Notifier.init].
   @visibleForTesting
-  void debugApplyEvent(GatherEvent event) =>
-      _onFold(FoldResult(emit: [event], stateChanged: false));
+  void debugApplyEvent(GatherEvent event) => _onFold(FoldResult(emit: [event], stateChanged: false));
 
   /// Test seam for the link state, which changes what an empty feed means: with no
   /// connection the screen says so rather than claiming all is quiet.
   @visibleForTesting
   void debugApplyLink(LinkStatus status) {
     _link = status;
+    notifyListeners();
+  }
+
+  /// Test seam for push reachability, which is otherwise only reachable by having a
+  /// real bridge on the LAN answer a real POST — the reason this state went wrong
+  /// unnoticed in the first place.
+  @visibleForTesting
+  void debugApplyPushReach(PushRegistration reach, {String? bridgeName}) {
+    _pushReach = reach;
+    if (bridgeName != null) _bridgeName = bridgeName;
     notifyListeners();
   }
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { DirectCollector } from '../lib/direct.js';
+import { DirectCollector, describeClose } from '../lib/direct.js';
 import { decode, encode } from '../lib/msgpack.js';
 import { fakeGameServer, fakeJwt } from './fake-gather.js';
 
@@ -12,7 +12,12 @@ import { fakeGameServer, fakeJwt } from './fake-gather.js';
  * `getToken` is the seam, and `spaceId` is passed explicitly so no API lookup
  * happens either.
  */
-async function startCollector({ requireAuth = true, token = fakeJwt() } = {}) {
+async function startCollector({
+  requireAuth = true,
+  token = fakeJwt(),
+  silenceLimitMs,
+  log = () => {},
+} = {}) {
   const fake = fakeGameServer({ requireAuth });
   servers.push(fake);
   const socketUrl = await fake.listen();
@@ -21,7 +26,8 @@ async function startCollector({ requireAuth = true, token = fakeJwt() } = {}) {
     socketUrl,
     spaceId: 'space-1',
     getToken: async () => token,
-    log: () => {},
+    log,
+    ...(silenceLimitMs === undefined ? {} : { silenceLimitMs }),
   });
   collectors.push(collector);
   return { fake, collector };
@@ -179,4 +185,93 @@ test('the collector reports unhealthy while it holds no state', () => {
   assert.equal(collector.healthy, false);
   assert.equal(collector.hasState, false, 'an empty roster must never read as healthy');
   assert.equal(collector.stats().entered, false, 'stats must state that we did not enter');
+});
+
+// ---- the deaf socket --------------------------------------------------------
+
+test('a socket that goes silent is torn down and reconnected', async () => {
+  // The failure this exists for. Every reconnect in this collector is driven by
+  // `close`, and a half-open TCP connection never fires one — the peer sent no FIN,
+  // so sends keep succeeding into a kernel buffer and reads simply never deliver
+  // anything again. That is the ordinary outcome of a laptop suspending, measured at
+  // 63% of this collector's drops landing within two minutes of a macOS sleep or
+  // wake. Before the watchdog, the collector reported full health and a live roster
+  // for as long as the daemon ran while receiving nothing and pushing nothing.
+  //
+  // The fake server sends its dump and then nothing at all, so the silence is real
+  // rather than simulated; only the limit is shortened.
+  const lines = [];
+  const { fake, collector } = await startCollector({
+    silenceLimitMs: 400,
+    log: (line) => lines.push(line),
+  });
+
+  await collector.start();
+  await firstRoster(collector);
+  assert.equal(collector.healthy, true, 'healthy once the dump has landed');
+
+  // Long enough for the limit to pass and a reconnect to be scheduled and taken.
+  await wait(2500);
+
+  assert.ok(
+    fake.connections.length >= 2,
+    `expected a reconnect, saw ${fake.connections.length} connection(s)`,
+  );
+  assert.ok(
+    lines.some((l) => /nothing from Gather for \d+s — the socket went deaf/.test(l)),
+    `expected the watchdog to say so, got ${JSON.stringify(lines)}`,
+  );
+});
+
+test('a socket still carrying heartbeats is left alone', async () => {
+  // The other half, and the one that matters more: reconnecting a working socket
+  // every few seconds would be a worse bug than the one being fixed. Nothing here
+  // is interesting — only heartbeats — which is exactly the case the watchdog must
+  // treat as alive.
+  const { fake, collector } = await startCollector({ silenceLimitMs: 400 });
+  await collector.start();
+  await firstRoster(collector);
+
+  const conn = fake.latest;
+  const beat = setInterval(() => conn.send({ type: 'Heartbeat', timestamp: 2, origin: 'Server' }), 100);
+  try {
+    await wait(2000);
+    assert.equal(fake.connections.length, 1, 'a live socket must not be reconnected');
+    assert.equal(collector.healthy, true);
+  } finally {
+    clearInterval(beat);
+  }
+});
+
+test('the silence clock starts at the handshake, not at the first frame', async () => {
+  // A server that accepts the socket and then says nothing at all is the case most
+  // worth reconnecting out of. Leaving the clock at zero until something arrived
+  // would make it the one case the watchdog could not see, so `requireAuth` here
+  // produces a server that stays deliberately silent — as Gather does when it
+  // rejects a handshake.
+  const { fake, collector } = await startCollector({
+    requireAuth: true,
+    token: '',
+    silenceLimitMs: 400,
+  });
+  await collector.start();
+  await wait(2500);
+
+  assert.ok(
+    fake.connections.length >= 2,
+    `a silent handshake must still be retried, saw ${fake.connections.length}`,
+  );
+  assert.equal(collector.healthy, false);
+});
+
+test('a close code is logged as words, so six days of them mean something', () => {
+  // 387 lines of `direct: game socket error` over six days, all of them one of the
+  // first two cases, neither of them a fault. The code was captured into
+  // `_lastClose` and health detail and never reached the log.
+  assert.match(describeClose(1012), /Gather recycled the connection \(1012\)/);
+  assert.match(describeClose(1006), /dropped without a close frame \(1006\)/);
+  assert.match(describeClose(4031), /duplicate connection rejected/);
+  assert.match(describeClose(1000), /closed the connection normally/);
+  assert.match(describeClose(4999), /the game socket closed \(4999\)/);
+  assert.match(describeClose(1006, 'bye'), /\(1006\) — "bye"/);
 });

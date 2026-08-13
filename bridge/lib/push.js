@@ -40,6 +40,19 @@ export const PUSH_DEFAULTS = Object.freeze({
 });
 
 /**
+ * How long a device may go without re-registering before it is dropped.
+ *
+ * A last resort, and generous on purpose. `registeredAt` only refreshes when the
+ * phone can reach this daemon over the LAN, so somebody working remotely for a
+ * month has a perfectly live token that never re-registers — ageing them out
+ * aggressively would break push for exactly the people who need it. The real
+ * defence against a stale token is `installId` below, which replaces rather than
+ * accumulates, and `UNREGISTERED` from FCM. Overridable via
+ * `push.staleAfterDays`.
+ */
+export const STALE_AFTER_DAYS = 60;
+
+/**
  * The phones that have asked to be told.
  *
  * Persisted in the same config file as the pairing token, because a bridge that
@@ -64,17 +77,78 @@ export class PushRegistry {
     return Array.isArray(devices) ? devices.filter((d) => d && typeof d.token === 'string') : [];
   }
 
-  /** Adds or refreshes one device. Returns the resulting device count. */
-  register({ token, platform = 'ios' }) {
+  /**
+   * Adds or refreshes one device. Returns the resulting device count.
+   *
+   * Keyed on `installId` when the app sends one, falling back to the token. The
+   * difference matters: a reinstalled app gets a *new* FCM token, so keying on the
+   * token alone left the previous install's dead token in the list, absorbing every
+   * push while FCM answered 200 and nothing arrived. Keying on the install replaces
+   * it. The fallback keeps older app builds registering.
+   */
+  register({ token, platform = 'ios', installId = null }) {
     if (typeof token !== 'string' || token.length < 32) {
       throw new Error('that does not look like a push token');
     }
     const config = this._read();
-    const devices = this.list().filter((d) => d.token !== token);
-    devices.push({ token, platform, registeredAt: new Date().toISOString() });
+    const previous = this.list();
+    const id = typeof installId === 'string' && installId ? installId : null;
+    const devices = previous.filter((d) =>
+      id ? d.installId !== id && d.token !== token : d.token !== token,
+    );
+    const replaced = previous.find((d) => (id ? d.installId === id : d.token === token));
+    devices.push({
+      token,
+      platform,
+      ...(id ? { installId: id } : {}),
+      registeredAt: new Date().toISOString(),
+      // Carried across a re-registration so ageing sees the whole history, not just
+      // the most recent handshake.
+      ...(replaced?.lastSentAt ? { lastSentAt: replaced.lastSentAt } : {}),
+    });
     this._write({ ...config, push: { ...config.push, devices } });
-    this.log(`push: registered a ${platform} device (${devices.length} total)`);
+
+    // Quiet when nothing changed. The app re-registers on every resume, and a line
+    // per resume buried the one registration that mattered under thirty that did
+    // not.
+    if (!replaced) this.log(`push: registered a ${platform} device (${devices.length} total)`);
+    else if (replaced.token !== token) this.log(`push: a ${platform} device rotated its token`);
     return devices.length;
+  }
+
+  /** Records that a push actually went to this device. */
+  sent(token) {
+    const config = this._read();
+    const devices = this.list().map((d) =>
+      d.token === token ? { ...d, lastSentAt: new Date().toISOString() } : d,
+    );
+    this._write({ ...config, push: { ...config.push, devices } });
+  }
+
+  /**
+   * Drops devices that have neither re-registered nor been pushed to in a long
+   * while. Returns how many went.
+   */
+  prune({ staleAfterDays = this.staleAfterDays(), now = Date.now() } = {}) {
+    const cutoff = now - staleAfterDays * 86_400_000;
+    const devices = this.list();
+    const kept = devices.filter((d) => {
+      const seen = Date.parse(d.lastSentAt ?? d.registeredAt ?? '');
+      // An entry with no readable date is kept: it predates this field, and
+      // guessing it is stale would unregister a working phone.
+      return Number.isNaN(seen) || seen >= cutoff;
+    });
+    if (kept.length === devices.length) return 0;
+    const config = this._read();
+    this._write({ ...config, push: { ...config.push, devices: kept } });
+    const dropped = devices.length - kept.length;
+    this.log(`push: dropped ${dropped} device(s) not seen in ${staleAfterDays} days`);
+    return dropped;
+  }
+
+  staleAfterDays() {
+    const configured = this._read().push?.staleAfterDays;
+    return typeof configured === 'number' && configured > 0 ? configured : STALE_AFTER_DAYS;
   }
 
   /** Forgets a token FCM told us is dead. */
@@ -120,9 +194,16 @@ export class PushNotifier {
     if (!note) return null;
     if (!this.registry.kinds()[note.kind]) return null;
 
+    this.registry.prune();
     const devices = this.registry.list();
-    if (devices.length === 0) return null;
+    if (devices.length === 0) {
+      // Worth saying. This is the shape of "push is set up and doing nothing",
+      // which otherwise looks identical to no events happening.
+      this.log(`push: nothing to send "${note.title}" to — no device has registered`);
+      return null;
+    }
 
+    let sent = 0;
     for (const device of devices) {
       try {
         const result = await this.sender.send({
@@ -132,14 +213,23 @@ export class PushNotifier {
           data: { type: event.type, kind: note.kind },
           collapseId: note.collapseId,
         });
-        if (!result.ok && result.drop) this.registry.forget(device.token);
-        else if (!result.ok) this.log(`push failed: ${result.detail}`);
+        if (result.ok) {
+          sent++;
+          this.registry.sent(device.token);
+        } else if (result.drop) this.registry.forget(device.token);
+        else this.log(`push failed: ${result.detail}`);
       } catch (error) {
         // Never let a push failure break the event pipeline — the phone that is
         // actually connected must keep receiving over the socket regardless.
         this.log(`push failed: ${error.message}`);
       }
     }
+
+    // Logged on success as well as failure, and this is not noise. FCM answers 200
+    // for a token whose app has been reinstalled, so "accepted" and "arrived" are
+    // different claims — without this line there was no evidence a push was ever
+    // attempted, and a fortnight of them went nowhere unnoticed.
+    if (sent > 0) this.log(`push: sent "${note.title}" to ${sent} device(s)`);
     return note;
   }
 }

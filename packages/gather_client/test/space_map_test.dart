@@ -748,6 +748,219 @@ void main() {
     });
   });
 
+  group('routing', () {
+    /// A room, walled unless told otherwise, with doorways given relative to it.
+    void area(
+      SpaceMapBuilder b, {
+      required String id,
+      required String type,
+      required int x,
+      required int y,
+      int width = 4,
+      int height = 4,
+      String? name,
+      String walls = 'PlainWhite',
+      List<(int, int, String)> doorways = const [],
+    }) {
+      b.apply('MapArea', _add({
+        'id': id,
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': x,
+        'relativeY': y,
+        'dimensionsInTiles': _dims(width, height),
+        'mapAreaType': type,
+        'name': ?name,
+        'wallsTexture': walls,
+        'doorways': {
+          'locations': [
+            for (final (dx, dy, orientation) in doorways)
+              {
+                'origin': {'x': dx, 'y': dy},
+                'orientation': orientation,
+              },
+          ],
+        },
+      }));
+    }
+
+    /// How many times a route changes direction. One turn is an L; seven is a
+    /// staircase, which is what the −0.001 exists to prevent.
+    int turns(List<({int x, int y})> route) {
+      var count = 0;
+      for (var i = 2; i < route.length; i++) {
+        final was = (route[i - 1].x - route[i - 2].x, route[i - 1].y - route[i - 2].y);
+        final now = (route[i].x - route[i - 1].x, route[i].y - route[i - 1].y);
+        if (was != now) count++;
+      }
+      return count;
+    }
+
+    test('an open floor is crossed in a straight line', () {
+      final map = _base().forFloor('floor-1')!;
+      final route = map.routeTo(fromX: 2, fromY: 5, toX: 8, toY: 5)!;
+
+      expect(route.first, (x: 2, y: 5), reason: 'the start is included');
+      expect(route.last, (x: 8, y: 5));
+      expect(route.length, 7, reason: 'six steps, seven tiles');
+      expect(route.every((t) => t.y == 5), isTrue);
+    });
+
+    test('a route turns once rather than climbing a staircase', () {
+      // The −0.001 bonus for continuing in the same direction. Every step costs 1,
+      // so on an open floor an L and a staircase are exactly the same length and
+      // nothing but this tiebreak chooses between them.
+      final map = _base().forFloor('floor-1')!;
+      final route = map.routeTo(fromX: 2, fromY: 2, toX: 7, toY: 7)!;
+
+      expect(route.length, 11, reason: 'still a shortest route');
+      expect(turns(route), 1, reason: 'an L, not a staircase');
+    });
+
+    test('a wall is not crossed even though both of its sides are walkable', () {
+      // The bug this geometry invites, and the reason `canPassThrough` exists: a
+      // wall is a line between two tiles, and both of those tiles are perfectly good
+      // floor. A route that asked only `isWalkable` would step straight through it.
+      final b = _base();
+      area(b, id: 'room', type: 'MeetingRoom', x: 2, y: 2, name: 'Boardroom');
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.isWalkable(3, 1), isTrue);
+      expect(map.isWalkable(3, 2), isTrue, reason: 'the wall tile is standable');
+      expect(map.canPassThrough(3, 1, 3, 2), isFalse, reason: 'but the line is not');
+      expect(map.routeTo(fromX: 3, fromY: 1, toX: 3, toY: 3), isNull);
+    });
+
+    test('a room with a doorway is entered through it', () {
+      final b = _base();
+      area(b, id: 'room', type: 'MeetingRoom', x: 2, y: 2, name: 'Boardroom',
+          doorways: [(1, 0, 'Horizontal')]);
+      final map = b.forFloor('floor-1')!;
+
+      final route = map.routeTo(fromX: 8, fromY: 1, toX: 3, toY: 4)!;
+      expect(route.last, (x: 3, y: 4));
+      // `doorwayPositionHashes` is two tiles wide: the origin and the one beside it.
+      expect(
+        route,
+        anyOf(contains((x: 3, y: 2)), contains((x: 4, y: 2))),
+        reason: 'it came in through the door',
+      );
+    });
+
+    test('a room with no doorway cannot be walked into at all', () {
+      // Which is the honest answer rather than a failure: `teleport` ignores walls
+      // and walking does not, so there is genuinely no way to walk there.
+      final b = _base();
+      area(b, id: 'room', type: 'MeetingRoom', x: 2, y: 2, name: 'Sealed');
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.routeTo(fromX: 8, fromY: 1, toX: 3, toY: 3), isNull);
+    });
+
+    test('a route will not cut through somebody else\'s desk', () {
+      // `isPublicWalkway`: Common, MeetingRoom and Desk are false, and every area
+      // that answers false is impassable unless the route starts or ends in it.
+      // Desks are usually unwalled, so nothing else would stop this.
+      final b = _base();
+      area(b, id: 'desk', type: 'Desk', x: 10, y: 0, width: 2, height: 10,
+          walls: 'NewStyleNoWall');
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.isWalkable(10, 5), isTrue, reason: 'physically fine to stand on');
+      expect(map.routeTo(fromX: 5, fromY: 5, toX: 15, toY: 5), isNull);
+      // Ending there is exactly what "go to that desk" is, so the goal's own area is
+      // always exempt.
+      expect(map.routeTo(fromX: 5, fromY: 5, toX: 10, toY: 5), isNotNull);
+    });
+
+    test('a team zone is a walkway and may be crossed', () {
+      // The same fixture, one word changed. Public, Lobby and Team answer true.
+      final b = _base();
+      area(b, id: 'team', type: 'Team', x: 10, y: 0, width: 2, height: 10,
+          name: 'Frontend', walls: 'NewStyleNoWall');
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.routeTo(fromX: 5, fromY: 5, toX: 15, toY: 5), isNotNull);
+    });
+
+    test('a tile somebody is standing on is routed around', () {
+      final map = _base().forFloor('floor-1')!;
+      final route = map.routeTo(
+        fromX: 2,
+        fromY: 5,
+        toX: 8,
+        toY: 5,
+        avoid: [(x: 5, y: 5)],
+      )!;
+
+      expect(route.last, (x: 8, y: 5));
+      expect(route, isNot(contains((x: 5, y: 5))));
+    });
+
+    test('the goal itself is never avoided', () {
+      // Otherwise walking up to somebody would be impossible, and the client's own
+      // arrival rules — `havePriorityToStayOnTile`, `getNearestFreeTile` — are about
+      // what happens when you get there, not about refusing to set off.
+      final map = _base().forFloor('floor-1')!;
+      expect(
+        map.routeTo(fromX: 2, fromY: 5, toX: 8, toY: 5, avoid: [(x: 8, y: 5)]),
+        isNotNull,
+      );
+    });
+
+    test('a search that runs out of budget gives up rather than grinding', () {
+      final map = _base().forFloor('floor-1')!;
+      expect(map.routeTo(fromX: 0, fromY: 0, toX: 19, toY: 9, budget: 4), isNull);
+      expect(map.routeTo(fromX: 0, fromY: 0, toX: 19, toY: 9), isNotNull);
+    });
+
+    test('standing where you already are is a route of one tile', () {
+      final map = _base().forFloor('floor-1')!;
+      expect(map.routeTo(fromX: 4, fromY: 4, toX: 4, toY: 4), [(x: 4, y: 4)]);
+    });
+
+    test('a room offers its seats first, then its nearest floor', () {
+      // `getAbsoluteTilesClosestToPrioritizedBySeats`. A meeting room you walk into
+      // should sit you down, and the tile you tapped only breaks ties.
+      final b = _base();
+      area(b, id: 'room', type: 'MeetingRoom', x: 2, y: 2, name: 'Boardroom',
+          doorways: [(1, 0, 'Horizontal')]);
+      _variant(b, 'v1', const [], family: 'Chair', sittable: [
+        [0, 0],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'chair',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 5,
+        'relativeY': 5,
+        'catalogItemVariantId': 'v1',
+      }));
+      final map = b.forFloor('floor-1')!;
+      final room = map.rooms.firstWhere((r) => r.id == 'room');
+
+      // The chair is in the far corner from the tapped tile and still comes first.
+      final tiles = map.tilesClosestTo(room, (x: 2, y: 2));
+      expect(tiles.first, (x: 5, y: 5), reason: 'the seat outranks proximity');
+      expect(tiles[1], (x: 2, y: 2), reason: 'then the nearest standing tile');
+      expect(tiles.length, 16, reason: 'the whole 4x4 room is walkable');
+    });
+
+    test('areaAt sees the desks that roomAt is built to skip', () {
+      // Two questions that look alike: roomAt labels a position for a human and so
+      // wants a name, areaAt decides what a route may cross and so must count the 62
+      // unnamed desks.
+      final b = _base();
+      area(b, id: 'desk', type: 'Desk', x: 2, y: 2, width: 2, height: 2,
+          walls: 'NewStyleNoWall');
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.roomAt(2, 2), isNull, reason: 'a desk has no name');
+      expect(map.areaAt(2, 2)?.id, 'desk');
+      expect(map.areaAt(9, 9)?.id, 'base', reason: 'the base area still contains it');
+    });
+  });
+
   test('a single floor answers even when the floor is not named', () {
     // The roster can carry a null floorId, and a one-floor space has only one
     // possible answer. Guessing is only wrong when there is a choice.

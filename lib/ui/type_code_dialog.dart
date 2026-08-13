@@ -101,7 +101,7 @@ class _TypeCodeSheetState extends State<_TypeCodeSheet> {
                   child: Container(
                     width: 38,
                     height: 4,
-                    margin: const EdgeInsets.only(bottom: 18),
+                    margin: const EdgeInsets.only(bottom: 16),
                     decoration: BoxDecoration(
                       color: t.ring,
                       borderRadius: BorderRadius.circular(2),
@@ -114,7 +114,7 @@ class _TypeCodeSheetState extends State<_TypeCodeSheet> {
                   'Both are printed under the square.',
                   style: TextStyle(fontSize: 12.5, color: t.mutedForeground),
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 16),
                 TextFormField(
                   controller: _code,
                   autofocus: true,

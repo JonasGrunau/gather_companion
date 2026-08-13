@@ -184,17 +184,24 @@ const double kTextGutter = 20;
 /// too — the shell adds it to their `MediaQuery` padding, and a screen placing
 /// something over the rail by hand has to be able to ask how tall it is. Reading
 /// it from the shell would mean each tab importing the thing that builds it.
-const double kRailHeight = 56;
+/// Tall enough for an icon with its name under it. The destinations were bare
+/// glyphs at 56 and read as decoration floating in the bar; the label is what
+/// makes each one look like somewhere you can go.
+const double kRailHeight = 64;
 const double kRailGap = 8;
 const double kRailInset = kRailHeight + kRailGap + 8;
 
-const kMonoFallback = <String>[
-  'SF Mono',
-  'ui-monospace',
-  'Menlo',
-  'Monaco',
-  'Courier New',
-];
+/// The dock never gets narrower than this, however few controls it is holding.
+///
+/// Left to its intrinsic width the nav row is three 60-point plates — a 180-point
+/// sliver that reads as a pill lost at the bottom of the screen, and the island
+/// visibly lurched sideways every time the office's control row came or went.
+/// A floor of 320 spreads the three destinations with real air between them,
+/// keeps the island's width steady across tabs, and still leaves the floor
+/// showing on either side on the narrowest phones the app targets.
+const double kRailMinWidth = 320;
+
+const kMonoFallback = <String>['SF Mono', 'ui-monospace', 'Menlo', 'Monaco', 'Courier New'];
 
 /// Gather sets its own interface in Inter; asking for it by name picks it up on
 /// devices that have it and falls through to the platform face otherwise.
@@ -206,25 +213,12 @@ ThemeData buildGatherTheme() {
 
   final base = ThemeData.dark(useMaterial3: true);
   final textTheme = base.textTheme
-      .apply(
-        bodyColor: t.foreground,
-        displayColor: t.foreground,
-        fontFamily: kSans,
-        fontFamilyFallback: kSansFallback,
-      )
+      .apply(bodyColor: t.foreground, displayColor: t.foreground, fontFamily: kSans, fontFamilyFallback: kSansFallback)
       // Tighter tracking on headings: Inter at display sizes is loose by default
       // and reads as unset type rather than as a title.
       .copyWith(
-        titleLarge: base.textTheme.titleLarge?.copyWith(
-          fontWeight: FontWeight.w700,
-          letterSpacing: -0.5,
-          color: t.foreground,
-        ),
-        titleMedium: base.textTheme.titleMedium?.copyWith(
-          fontWeight: FontWeight.w600,
-          letterSpacing: -0.2,
-          color: t.foreground,
-        ),
+        titleLarge: base.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.5, color: t.foreground),
+        titleMedium: base.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600, letterSpacing: -0.2, color: t.foreground),
       );
 
   return base.copyWith(
@@ -233,15 +227,7 @@ ThemeData buildGatherTheme() {
     colorScheme: ColorScheme.fromSeed(
       seedColor: t.brand,
       brightness: Brightness.dark,
-    ).copyWith(
-      surface: t.background,
-      onSurface: t.foreground,
-      primary: t.brand,
-      onPrimary: t.primaryForeground,
-      secondary: t.secondary,
-      error: t.danger,
-      outline: t.border,
-    ),
+    ).copyWith(surface: t.background, onSurface: t.foreground, primary: t.brand, onPrimary: t.primaryForeground, secondary: t.secondary, error: t.danger, outline: t.border),
     textTheme: textTheme,
     appBarTheme: AppBarTheme(
       backgroundColor: t.background,
@@ -257,12 +243,7 @@ ThemeData buildGatherTheme() {
         backgroundColor: t.brand,
         foregroundColor: t.primaryForeground,
         minimumSize: const Size.fromHeight(50),
-        textStyle: const TextStyle(
-          fontFamily: kSans,
-          fontFamilyFallback: kSansFallback,
-          fontSize: 15,
-          fontWeight: FontWeight.w600,
-        ),
+        textStyle: const TextStyle(fontFamily: kSans, fontFamilyFallback: kSansFallback, fontSize: 15, fontWeight: FontWeight.w600),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(t.radius)),
       ),
     ),
@@ -306,21 +287,21 @@ ThemeData buildGatherTheme() {
 /// nothing offline is ever drawn, so reaching the fallback means the field was
 /// absent, not that the person is away.
 Color availabilityColor(GatherTokens t, String? availability) => switch (availability) {
-      'Busy' => t.danger,
-      'Focused' || 'FocusedCoworking' => t.warn,
-      'Away' => t.faint,
-      _ => t.ok,
-    };
+  'Busy' => t.danger,
+  'Focused' || 'FocusedCoworking' => t.warn,
+  'Away' => t.faint,
+  _ => t.ok,
+};
 
 /// What the picker calls each one. Gather's own wording, which is worth keeping:
 /// somebody who has seen the desktop client should not have to learn a second
 /// vocabulary for the same three states.
 String availabilityLabel(String availability) => switch (availability) {
-      'Busy' => 'Busy',
-      'Away' => 'Away',
-      'Focused' || 'FocusedCoworking' => 'Focused',
-      _ => 'Active',
-    };
+  'Busy' => 'Busy',
+  'Away' => 'Away',
+  'Focused' || 'FocusedCoworking' => 'Focused',
+  _ => 'Active',
+};
 
 /// A stable colour per person, so the same face keeps the same dot across
 /// sessions without the bridge having to send one.
@@ -328,16 +309,7 @@ String availabilityLabel(String availability) => switch (availability) {
 /// Picked from the accent ramp and its neighbours rather than from the whole
 /// wheel: a feed of arbitrary hues looks like a chart, not like a room.
 Color avatarColor(String id) {
-  const palette = [
-    Color(0xFF4257DA),
-    Color(0xFF6886F2),
-    Color(0xFF5F4DC5),
-    Color(0xFF00786F),
-    Color(0xFF3FBF87),
-    Color(0xFFE0A22F),
-    Color(0xFFD33EF7),
-    Color(0xFF2C86C4),
-  ];
+  const palette = [Color(0xFF4257DA), Color(0xFF6886F2), Color(0xFF5F4DC5), Color(0xFF00786F), Color(0xFF3FBF87), Color(0xFFE0A22F), Color(0xFFD33EF7), Color(0xFF2C86C4)];
   var hash = 0;
   for (final unit in id.codeUnits) {
     hash = (hash * 31 + unit) & 0x7fffffff;

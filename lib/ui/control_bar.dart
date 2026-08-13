@@ -42,6 +42,7 @@ import 'package:flutter/services.dart';
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
+import 'person_avatar.dart';
 import 'status_sheet.dart';
 
 /// The eight, in Gather's own order.
@@ -53,7 +54,9 @@ import 'status_sheet.dart';
 /// else's screen rather than the red one they expected.
 const _emotes = ['👋', '❤️', '🎉', '👍️', '🤣', '👏', '💯', '🔥'];
 
-/// Matches the rail below it, so two islands read as one system.
+/// The controls' row. The nav row below is taller — it carries labels under its
+/// icons — but both are rows of the same island, which is what keeps them one
+/// system.
 const double _barHeight = 56;
 
 /// How much taller the dock is while the office is carrying these.
@@ -124,9 +127,9 @@ class _ControlBarState extends State<ControlBar> {
         SizedBox(
           height: _barHeight,
           child: Row(
-            // Spread across the dock's width rather than bunched at the left: the
-            // nav row underneath is the same width and does the same, so the two
-            // rows' plates line up as a grid instead of drifting apart.
+            // Spread across the dock's width rather than bunched at the left, so
+            // the row reads as the island's contents and not as a strip taped to
+            // one end of it.
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               _SelfButton(state: state, onTap: () => showStatusSheet(context, state)),
@@ -180,14 +183,14 @@ class _ControlBarState extends State<ControlBar> {
   }
 }
 
-/// You: a coloured disc with your initial and the dot that says how available you
-/// are, which is the same dot the map draws over your head.
+/// You: your own profile picture, with the dot that says how available you are —
+/// the same dot the map draws over your head.
 ///
-/// Gather shows your camera here. This does not, and the reason is not laziness:
-/// the preview would have to reach past [Call] for a `MediaStream` and drag the
-/// WebRTC plugin into the widget layer, and the tile is 40 points across — at
-/// which size a face is a smudge and the thing worth showing is whether you are
-/// marked busy.
+/// Gather shows your live camera here instead. This does not, and the reason is
+/// not laziness: the preview would have to reach past [Call] for a `MediaStream`
+/// and drag the WebRTC plugin into the widget layer. The picture you set is the
+/// better thing to show anyway, because it is there before the camera is on and
+/// stays there after it goes off.
 class _SelfButton extends StatelessWidget {
   const _SelfButton({required this.state, required this.onTap});
 
@@ -211,53 +214,20 @@ class _SelfButton extends StatelessWidget {
           color: Colors.transparent,
           child: InkWell(
             onTap: onTap,
-            borderRadius: BorderRadius.circular(t.radius - 2),
+            borderRadius: BorderRadius.circular(t.radius + 4),
             child: SizedBox(
               width: 48,
               height: 44,
               child: Center(
-                child: SizedBox(
-                  width: 34,
-                  height: 34,
-                  // The dot hangs off the disc's corner, so it needs to be able to
-                  // paint outside it.
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      Container(
-                        width: 34,
-                        height: 34,
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: avatarColor(id),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Text(
-                          label.trim().isEmpty ? '?' : label.trim()[0].toUpperCase(),
-                          style: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        right: -1,
-                        bottom: -1,
-                        child: Container(
-                          width: 12,
-                          height: 12,
-                          decoration: BoxDecoration(
-                            color: availabilityColor(t, state.myAvailability),
-                            shape: BoxShape.circle,
-                            // Ringed in the bar's own fill, so the dot reads as
-                            // sitting on top of the disc rather than cut into it.
-                            border: Border.all(color: t.card, width: 2),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                child: PersonAvatar(
+                  id: id,
+                  label: label,
+                  photoUrl: state.photoUrlFor(id),
+                  size: 34,
+                  availability: state.myAvailability ?? 'Active',
+                  // Ringed in the dock's own fill, so the dot reads as sitting on
+                  // the picture rather than cut into it.
+                  dotRing: t.card,
                 ),
               ),
             ),
@@ -296,7 +266,9 @@ class _BarButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final radius = BorderRadius.circular(t.radius - 2);
+    // Concentric with the island, like the nav plates below: the dock's corner
+    // minus the inset to here. See `_NavItem` in home_shell.dart.
+    final radius = BorderRadius.circular(t.radius + 4);
 
     return Semantics(
       button: true,
@@ -375,7 +347,7 @@ class _Tray extends StatelessWidget {
                 color: Colors.transparent,
                 child: InkWell(
                   onTap: () => onPick(emote),
-                  borderRadius: BorderRadius.circular(t.radius - 2),
+                  borderRadius: BorderRadius.circular(t.radius + 4),
                   child: SizedBox(
                     width: 40,
                     height: 40,

@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart';
 
 import '../src/app_state.dart';
@@ -60,7 +61,11 @@ class _MapScreenState extends State<MapScreen> {
   void _wantArt(SpaceArt? art) {
     if (identical(art, _art)) return;
     _art = art;
-    if (art != null) _cache.prefetch(art.urls);
+    // Asked for as the office's whole request rather than as more URLs, so that a
+    // set built mid-dump — before the `CatalogItem` rows that put a `?t=` on every
+    // furniture URL had landed — stops being fetched the moment the real one
+    // arrives. See [ArtRequest].
+    if (art != null) _cache.prefetch(art.urls, group: ArtRequest.office);
   }
 
   @override
@@ -72,8 +77,7 @@ class _MapScreenState extends State<MapScreen> {
     // Everybody in the room, me included: "here" is a count of the office, and the
     // reader is standing in it. `peopleOnMap` deliberately excludes me, because
     // every other screen is asking about other people.
-    final present =
-        widget.state.peopleOnMap.length + (widget.state.mePerson == null ? 0 : 1);
+    final present = widget.state.peopleOnMap.length + (widget.state.mePerson == null ? 0 : 1);
 
     return Scaffold(
       backgroundColor: t.background,
@@ -82,18 +86,21 @@ class _MapScreenState extends State<MapScreen> {
       // of a phone.
       appBar: AppBar(
         backgroundColor: t.background,
-        titleSpacing: 0,
+        // Default title spacing, like the other two tabs: the three app bars sit
+        // in one shell, and a title that shifts sideways as you change tab reads
+        // as a layout bug rather than a choice.
         title: _Where(space: widget.state.spaceName),
         actions: [
+          // The follower count leads and the head count anchors the corner, so
+          // the pill that is always there never moves when the other arrives.
+          if (widget.state.followers.isNotEmpty) ...[_Followers(count: widget.state.followers.length), const SizedBox(width: 8)],
           if (map != null) _HeadCount(present: present),
-          const SizedBox(width: 12),
+          const SizedBox(width: kGutter),
         ],
       ),
       // Deliberately not wrapped in SafeArea: the floor runs under the home
       // indicator, which is what "fullscreen" has to mean for something you pan.
-      body: map == null
-          ? _Waiting(connected: widget.state.link.isLive)
-          : _Plan(state: widget.state, map: map, art: _art, cache: _cache),
+      body: map == null ? _Waiting(connected: widget.state.link.isLive) : _Plan(state: widget.state, map: map, art: _art, cache: _cache),
     );
   }
 }
@@ -114,19 +121,65 @@ class _Where extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final t = context.tokens;
+    // `titleLarge`, written out the way the other two tabs write it. This was
+    // 17pt for a while — and then styleless, trusting the app bar's default to
+    // be the same style, which it visibly was not — and the title shrank every
+    // time you arrived on the office. Explicit is what the sibling bars do, so
+    // explicit is what matches them.
+    return Text(space ?? 'The office', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge);
+  }
+}
 
-    return Padding(
-      padding: const EdgeInsets.only(left: 4),
-      child: Text(
-        space ?? 'The office',
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          fontSize: 17,
-          fontWeight: FontWeight.w600,
-          letterSpacing: -0.2,
-          color: t.foreground,
+/// Who is following you, as the head count's sibling: the same pill, tinted the
+/// accent instead of neutral, saying only the number.
+///
+/// This was a card at the top of the activity tab — the app's one saturated
+/// surface — but a card of live presence pinned over a history was stale a
+/// minute later and in the way of what that screen is for. The office is the
+/// live screen, so the live answer lives here now. Absent rather than reading
+/// "0": zero followers is the permanent normal state, and a pill saying so all
+/// day is furniture.
+class _Followers extends StatelessWidget {
+  const _Followers({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    // The link strip's tint recipe on the head count's geometry, with the
+    // lighter step of the accent so the number stays readable on dark.
+    final tint = t.brandSoft;
+    return Semantics(
+      label: count == 1 ? 'One person is following you' : '$count people are following you',
+      // The outer label is the sentence; without this a screen reader would
+      // append the bare number to it.
+      child: ExcludeSemantics(
+        child: Tooltip(
+          message: 'Following you',
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: tint.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(t.radius),
+              border: Border.all(color: tint.withValues(alpha: 0.3)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration: BoxDecoration(color: tint, shape: BoxShape.circle),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  '$count',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: tint),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -143,7 +196,7 @@ class _HeadCount extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
         color: t.muted,
         borderRadius: BorderRadius.circular(t.radius),
@@ -155,19 +208,12 @@ class _HeadCount extends StatelessWidget {
           Container(
             width: 6,
             height: 6,
-            decoration: BoxDecoration(
-              color: present > 0 ? t.ok : t.faint,
-              shape: BoxShape.circle,
-            ),
+            decoration: BoxDecoration(color: present > 0 ? t.ok : t.faint, shape: BoxShape.circle),
           ),
           const SizedBox(width: 6),
           Text(
             '$present here',
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              color: present > 0 ? t.foreground : t.mutedForeground,
-            ),
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: present > 0 ? t.foreground : t.mutedForeground),
           ),
         ],
       ),
@@ -190,7 +236,7 @@ class _Waiting extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(Icons.map_outlined, size: 30, color: t.faint),
-            const SizedBox(height: 14),
+            const SizedBox(height: 12),
             Text(
               connected ? 'Reading the floor plan' : 'Not connected',
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.mutedForeground),
@@ -201,7 +247,7 @@ class _Waiting extends StatelessWidget {
                   // True rather than reassuring: the map is ~1700 rows inside a dump
                   // of about 5000, so it lands a moment after the roster does.
                   ? 'Gather sends the map with everything else, so it arrives a '
-                      'moment after the people do.'
+                        'moment after the people do.'
                   : 'The map comes from Gather, so this needs the connection back.',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 12.5, height: 1.5, color: t.faint),
@@ -227,19 +273,10 @@ class _Waiting extends StatelessWidget {
 /// enforce it for a transform set from outside — which is every transform this
 /// screen sets itself.
 @visibleForTesting
-Matrix4 framedOn({
-  required Offset at,
-  required Size viewport,
-  required Size child,
-  required double zoom,
-}) {
+Matrix4 framedOn({required Offset at, required Size viewport, required Size child, required double zoom}) {
   final scale = zoom.clamp(kMinZoom, kMaxZoom);
-  final dx = (viewport.width / 2 - scale * at.dx)
-      .clamp(math.min(0.0, viewport.width - child.width * scale), 0.0)
-      .toDouble();
-  final dy = (viewport.height / 2 - scale * at.dy)
-      .clamp(math.min(0.0, viewport.height - child.height * scale), 0.0)
-      .toDouble();
+  final dx = (viewport.width / 2 - scale * at.dx).clamp(math.min(0.0, viewport.width - child.width * scale), 0.0).toDouble();
+  final dy = (viewport.height / 2 - scale * at.dy).clamp(math.min(0.0, viewport.height - child.height * scale), 0.0).toDouble();
   return Matrix4.identity()
     ..translateByDouble(dx, dy, 0, 1)
     ..scaleByDouble(scale, scale, scale, 1);
@@ -254,12 +291,7 @@ const double kMinZoom = 1;
 const double kMaxZoom = 20;
 
 class _Plan extends StatefulWidget {
-  const _Plan({
-    required this.state,
-    required this.map,
-    required this.art,
-    required this.cache,
-  });
+  const _Plan({required this.state, required this.map, required this.art, required this.cache});
 
   final AppState state;
   final SpaceMap map;
@@ -279,14 +311,152 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// the painter listens to it rather than the widget tree rebuilding for footsteps.
   late final MapMotion _motion = MapMotion(vsync: this);
 
-  late final AnimationController _zoom = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 220),
-  );
+  late final AnimationController _zoom = AnimationController(vsync: this, duration: const Duration(milliseconds: 220));
   Animation<Matrix4>? _zoomTo;
 
   /// Where the last double tap landed, in the viewer's own coordinates.
   Offset _tapped = Offset.zero;
+
+  /// The tile a tap picked out, and the room it stands for when it stands for one.
+  ///
+  /// Held here rather than on [AppState] because it is not presence: nothing outside
+  /// this screen has any use for it, and it should not survive the screen. `setState`
+  /// rather than the painter's own [Listenable] — the map repaints off `Listenable`s
+  /// so that a footstep never rebuilds the tree, and this is not a footstep: the pill
+  /// appears and disappears with it, which is a rebuild by definition.
+  ({int x, int y, SpaceRoom? room})? _selected;
+
+  /// Which tile a point on the glass is over, or null when it is off the floor.
+  ///
+  /// The same inverse the double tap takes, one step further: [_onDoubleTap] wants the
+  /// point in the child's pixels and this wants the tile under it.
+  ({int x, int y})? _tileAt(Offset point, double base) {
+    final inverse = Matrix4.tryInvert(_view.value);
+    if (inverse == null) return null;
+    final mapPx = MatrixUtils.transformPoint(inverse, point) / base;
+    final x = (mapPx.dx / artTileSize).floor();
+    final y = (mapPx.dy / artTileSize).floor();
+    final map = widget.map;
+    if (x < 0 || y < 0 || x >= map.width || y >= map.height) return null;
+    return (x: x, y: y);
+  }
+
+  /// A tap picks somewhere to go, or picks nothing.
+  ///
+  /// The desktop client does this on *hover*, which is a thing a phone does not have,
+  /// and moves on the double click. Splitting it into a tap and a button is the touch
+  /// version of the same two beats: the reticle says what you are pointing at before
+  /// anything happens to your avatar.
+  void _onTap(Offset point, double base) {
+    final map = widget.map;
+    final at = _tileAt(point, base);
+    if (at == null) {
+      setState(() => _selected = null);
+      return;
+    }
+
+    final target = _target(map, at, base);
+    if (target == null) {
+      // A tap on a desk, a wall, or the void outside the office. Not an error and not
+      // worth a sentence — you tapped some furniture.
+      setState(() => _selected = null);
+      return;
+    }
+    // A shut door is worth a sentence, because it is the one refusal here that is
+    // about somebody else rather than about the floor. Gather refuses this too —
+    // `AttemptToMoveToLockedArea` — and has to, since neither `move` nor `teleport`
+    // is checked server-side.
+    final locked = target.room;
+    if (locked != null && locked.locked) {
+      setState(() => _selected = null);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('${locked.name ?? 'That room'} is locked.'),
+        ));
+      return;
+    }
+    if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
+        target.room == null) {
+      setState(() => _selected = null);
+      return;
+    }
+
+    HapticFeedback.selectionClick();
+    setState(() => _selected = target);
+  }
+
+  /// What a tap on [at] actually means, or null when it means nothing.
+  ///
+  /// `shouldNavigateToTile` decides the first half: the main floor, the lobby and a
+  /// team's corner are places you point at a *tile* in, and a meeting room, a desk or a
+  /// coworking area is a place you point at as a whole. `isSelectableViaMap` is why a
+  /// `Public` area never becomes a room target however large it is.
+  ({int x, int y, SpaceRoom? room})? _target(
+    SpaceMap map,
+    ({int x, int y}) at,
+    double base,
+  ) {
+    final area = map.areaAt(at.x, at.y);
+    if (area != null && !navigatesToTile(area) && area.name != null) {
+      return (x: at.x, y: at.y, room: area);
+    }
+    final tile = _walkableNear(map, at, base);
+    return tile == null ? null : (x: tile.x, y: tile.y, room: null);
+  }
+
+  /// The tile that was aimed at, which at a distance is not the one that was hit.
+  ///
+  /// Zoomed all the way out a tile is about three logical pixels on a 124-tile floor,
+  /// so the raw answer is noise. The search widens with the zoom on the same reasoning
+  /// the labels use — what matters is the size of the thing on the *glass*, not on the
+  /// map — and collapses to nothing once a tile is bigger than a fingertip.
+  ({int x, int y})? _walkableNear(SpaceMap map, ({int x, int y}) at, double base) {
+    if (map.isWalkable(at.x, at.y)) return at;
+    final onGlass = artTileSize * base * _view.value.getMaxScaleOnAxis();
+    final radius = (_thumb / onGlass).ceil().clamp(0, _maxSnap);
+    for (var ring = 1; ring <= radius; ring++) {
+      ({int x, int y})? best;
+      for (var dy = -ring; dy <= ring; dy++) {
+        for (var dx = -ring; dx <= ring; dx++) {
+          if (dx.abs() != ring && dy.abs() != ring) continue;
+          final x = at.x + dx, y = at.y + dy;
+          if (!map.isWalkable(x, y)) continue;
+          best ??= (x: x, y: y);
+        }
+      }
+      if (best != null) return best;
+    }
+    return null;
+  }
+
+  /// Set off, or call off the walk that is already running.
+  ///
+  /// The selection is dropped the moment it is acted on: the reticle is a thing you
+  /// are pointing at, not a thing you have. Leaving it up through a fourteen-second
+  /// walk would leave a bracket sitting on a tile the avatar is already halfway to.
+  Future<String?> _go() async {
+    final state = widget.state;
+    if (state.onRoute) {
+      state.stopWalking();
+      return null;
+    }
+    final target = _selected;
+    if (target == null) return null;
+
+    setState(() => _selected = null);
+    final room = target.room;
+    return room == null
+        ? state.goTo(target.x, target.y)
+        : state.goToRoom(room, toward: (x: target.x, y: target.y));
+  }
+
+  /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
+  /// this is a radius and that is a diameter.
+  static const _thumb = 22.0;
+
+  /// However far out the map is, a tap does not mean a tile three rooms away.
+  static const _maxSnap = 3;
 
   @override
   void initState() {
@@ -322,12 +492,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _view.value = framedOn(
-        at: Offset((me.x + 0.5) * artTileSize * base, (me.y + 0.5) * artTileSize * base),
-        viewport: viewport,
-        child: child,
-        zoom: _openingZoom,
-      );
+      _view.value = framedOn(at: Offset((me.x + 0.5) * artTileSize * base, (me.y + 0.5) * artTileSize * base), viewport: viewport, child: child, zoom: _openingZoom);
     });
   }
 
@@ -345,16 +510,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     final target = framedOn(
       // The tap is in viewport coordinates; the point under it is wherever the
       // current transform says it is.
-      at: MatrixUtils.transformPoint(
-        Matrix4.tryInvert(_view.value) ?? Matrix4.identity(),
-        _tapped,
-      ),
+      at: MatrixUtils.transformPoint(Matrix4.tryInvert(_view.value) ?? Matrix4.identity(), _tapped),
       viewport: viewport,
       child: child,
       zoom: current > 2.5 ? 1 : 4,
     );
-    _zoomTo = Matrix4Tween(begin: _view.value, end: target)
-        .animate(CurvedAnimation(parent: _zoom, curve: Curves.easeOutCubic));
+    _zoomTo = Matrix4Tween(begin: _view.value, end: target).animate(CurvedAnimation(parent: _zoom, curve: Curves.easeOutCubic));
     _zoom.forward(from: 0);
   }
 
@@ -369,7 +530,9 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
     // Avatars are fetched exactly like the furniture is, through the same cache, so
     // asking for them is a set difference on every build and a no-op once they land.
-    cache.prefetch([for (final person in people) ?person.avatarUrl]);
+    // Their own request, so that superseding the office's does not disturb them and
+    // somebody walking off the floor stops being fetched.
+    cache.prefetch([for (final person in people) ?person.avatarUrl], group: ArtRequest.avatars);
 
     // Somebody who has asked the system to stop moving things gets the tiles the
     // wire reports, with no walk between them — which is what the desktop client
@@ -393,14 +556,8 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               // other dimension is exact. Letterboxing would waste the dimension a
               // phone has least of, and — with the boundary below — a map smaller than
               // the screen in either direction is a map you can drag the void into.
-              final base = math.max(
-                viewport.height / (map.height * artTileSize),
-                viewport.width / (map.width * artTileSize),
-              );
-              final child = Size(
-                map.width * artTileSize * base,
-                map.height * artTileSize * base,
-              );
+              final base = math.max(viewport.height / (map.height * artTileSize), viewport.width / (map.width * artTileSize));
+              final child = Size(map.width * artTileSize * base, map.height * artTileSize * base);
               _centreOnMe(viewport, child, base, people);
 
               // The whole floor at once, pinchable and pannable. A map you cannot get
@@ -408,6 +565,11 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               return GestureDetector(
                 onDoubleTapDown: (details) => _tapped = details.localPosition,
                 onDoubleTap: () => _onDoubleTap(viewport, child),
+                // Flutter holds a single tap until the double-tap window closes, so
+                // the reticle lands a beat after the finger. That is the price of
+                // keeping double-tap-to-zoom, and on a select-then-confirm gesture it
+                // is a price worth paying: nothing has happened to the avatar yet.
+                onTapUp: (details) => _onTap(details.localPosition, base),
                 child: InteractiveViewer(
                   transformationController: _view,
                   // Sized here, so the viewer must not stretch it back to the
@@ -434,6 +596,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                           view: _view,
                           viewport: viewport,
                           motion: _motion,
+                          selection: _selected,
                         ),
                         child: const SizedBox.expand(),
                       ),
@@ -447,15 +610,18 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         // Floating over the map rather than taking a strip from it, and only while
         // it has something to say.
         Positioned(
-          left: 12,
-          right: 12,
+          left: kGutter,
+          right: kGutter,
           bottom: 12,
-          child: SafeArea(top: false, child: _Legend(cache: cache, art: art)),
+          child: SafeArea(
+            top: false,
+            child: _Legend(cache: cache, art: art),
+          ),
         ),
         // Centred across the bottom, so it is the same reach from either hand. High
         // enough off the edge to sit above the home indicator rather than fight it for
         // the same gesture, and above the legend rather than over it.
-        if (state.canWalk)
+        if (kShowDPad && state.canWalk)
           Positioned(
             left: 0,
             right: 0,
@@ -467,7 +633,153 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               ),
             ),
           ),
+        // Present only when there is somewhere to go or a walk to call off — a
+        // control that cannot do anything is absent, not dimmed.
+        //
+        // Closer to the dock than the D-pad's 64: the pad needed room underneath it
+        // because a thumb rolls around a disc and would have caught the rail, and a
+        // pill is tapped once. Sitting just above the island reads as the same
+        // control surface rather than as something adrift over the floor.
+        if (state.onRoute || (_selected != null && state.canWalk))
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(
+                child: _GoTo(
+                  room: _selected?.room,
+                  walking: state.onRoute,
+                  onGo: _go,
+                  onClear: () => setState(() => _selected = null),
+                ),
+              ),
+            ),
+          ),
       ],
+    );
+  }
+}
+
+/// Somewhere to go, and the way to call it off again.
+///
+/// One control with two states rather than two controls: while a walk is running the
+/// only thing anybody wants from this corner of the screen is to stop it, and the
+/// desktop client says the same thing the same way — no confirmation before the walk,
+/// a persistent toast with a Cancel on it during.
+///
+/// The words are Gather's own. `areaActionGotoProperties` labels the button over an
+/// area "Go to", and a bare tile is the same verb with nowhere to name.
+class _GoTo extends StatefulWidget {
+  const _GoTo({
+    required this.room,
+    required this.walking,
+    required this.onGo,
+    required this.onClear,
+  });
+
+  /// The room being pointed at, or null when the target is a bare tile.
+  final SpaceRoom? room;
+  final bool walking;
+  final Future<String?> Function() onGo;
+  final VoidCallback onClear;
+
+  @override
+  State<_GoTo> createState() => _GoToState();
+}
+
+class _GoToState extends State<_GoTo> {
+  /// The control bar's helper, because a tap that silently does nothing is the one
+  /// outcome this app does not allow.
+  Future<void> _run() async {
+    final failed = await widget.onGo();
+    if (!mounted || failed == null) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(failed)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final walking = widget.walking;
+    final name = widget.room?.name;
+    final label = walking ? 'Stop' : (name == null ? 'Go here' : 'Go to $name');
+
+    return Material(
+      color: Colors.transparent,
+      // Concentric with the dock below it, the same way the control bar's own
+      // buttons are.
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(t.radius + 4),
+        child: Container(
+          color: walking ? t.card : t.brand,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+                  InkWell(
+                    onTap: _run,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            walking ? Icons.close_rounded : Icons.turn_right_rounded,
+                            size: 18,
+                            color: walking ? t.foreground : t.primaryForeground,
+                          ),
+                          const SizedBox(width: 8),
+                          // A room name can be long and the floor is only so wide.
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 200),
+                            child: Text(
+                              label,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: walking ? t.foreground : t.primaryForeground,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  // Only while there is a selection to drop. Mid-walk the whole pill
+                  // is already the way out, and a second dismiss beside it would be
+                  // two buttons for one thought.
+                  if (!walking) ...[
+                    SizedBox(
+                      height: 24,
+                      child: VerticalDivider(
+                        width: 1,
+                        thickness: 1,
+                        color: t.primaryForeground.withValues(alpha: 0.24),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: widget.onClear,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                        child: Semantics(
+                          label: 'Clear the selection',
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: t.primaryForeground,
+                          ),
+                        ),
+                      ),
+                    ),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -485,10 +797,22 @@ class _Legend extends StatelessWidget {
     return AnimatedBuilder(
       animation: cache,
       builder: (context, _) {
+        final art = this.art;
         // Once the art is down there is nothing left worth covering the floor with:
         // the bodies are avatars now, and a key explaining that a person is a person
         // was answering a question the map stopped asking.
-        if (art == null || cache.settled) return const SizedBox.shrink();
+        if (art == null || (art.awaiting == 0 && cache.settled)) {
+          return const SizedBox.shrink();
+        }
+        // Two different waits, and saying "drawing" for both of them was the bug
+        // this screen was reported for. An office whose catalog rows have not landed
+        // has fetched every picture it knows about, so the cache is *settled* and
+        // the line used to disappear — leaving a fully drawn, fully furnished-looking
+        // office with no furniture in it, and nothing to say it was still arriving.
+        final waiting = art.awaiting > 0
+            ? 'The furniture is still arriving — ${art.awaiting} '
+                  '${art.awaiting == 1 ? 'piece' : 'pieces'}'
+            : 'Drawing the office — ${cache.loaded} of ${cache.wanted}';
         return Align(
           alignment: Alignment.bottomLeft,
           child: Container(
@@ -501,16 +825,9 @@ class _Legend extends StatelessWidget {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                SizedBox(
-                  width: 11,
-                  height: 11,
-                  child: CircularProgressIndicator(strokeWidth: 1.6, color: t.faint),
-                ),
+                SizedBox(width: 11, height: 11, child: CircularProgressIndicator(strokeWidth: 1.6, color: t.faint)),
                 const SizedBox(width: 8),
-                Text(
-                  'Drawing the office — ${cache.loaded} of ${cache.wanted}',
-                  style: TextStyle(fontSize: 11.5, color: t.mutedForeground),
-                ),
+                Text(waiting, style: TextStyle(fontSize: 11.5, color: t.mutedForeground)),
               ],
             ),
           ),
@@ -536,18 +853,8 @@ CustomPainter officePainter({
   TransformationController? view,
   Size? viewport,
   MapMotion? motion,
-}) =>
-    _OfficePainter(
-      map: map,
-      art: art,
-      cache: cache,
-      people: people,
-      partyActive: partyActive,
-      tokens: tokens,
-      view: view,
-      viewport: viewport,
-      motion: motion,
-    );
+  ({int x, int y, SpaceRoom? room})? selection,
+}) => _OfficePainter(map: map, art: art, cache: cache, people: people, partyActive: partyActive, tokens: tokens, view: view, viewport: viewport, motion: motion, selection: selection);
 
 class _OfficePainter extends CustomPainter {
   _OfficePainter({
@@ -560,9 +867,8 @@ class _OfficePainter extends CustomPainter {
     this.view,
     this.viewport,
     this.motion,
-  }) : super(
-          repaint: Listenable.merge([cache, ?view, ?motion]),
-        );
+    this.selection,
+  }) : super(repaint: Listenable.merge([cache, ?view, ?motion]));
 
   final SpaceMap map;
   final SpaceArt? art;
@@ -591,6 +897,9 @@ class _OfficePainter extends CustomPainter {
   /// tiles, standing still", which is what a still test render wants.
   final MapMotion? motion;
 
+  /// Where the reticle is, or null when nothing has been tapped.
+  final ({int x, int y, SpaceRoom? room})? selection;
+
   /// Pixels per tile in Gather's own coordinates. Everything in [SpaceArt] is in
   /// these, and the canvas is scaled once to fit them on screen.
   static const _tile = artTileSize;
@@ -607,24 +916,14 @@ class _OfficePainter extends CustomPainter {
     // whole map is laid out and only a slice is visible; at two thousand draws a
     // frame that slice is worth knowing about.
     final inverse = Matrix4.tryInvert(matrix);
-    final shown = inverse == null
-        ? Offset.zero & size
-        : MatrixUtils.transformRect(inverse, Offset.zero & (viewport ?? size));
-    final visible = Rect.fromLTWH(
-      shown.left / base,
-      shown.top / base,
-      shown.width / base,
-      shown.height / base,
-    ).inflate(_tile.toDouble() * 2);
+    final shown = inverse == null ? Offset.zero & size : MatrixUtils.transformRect(inverse, Offset.zero & (viewport ?? size));
+    final visible = Rect.fromLTWH(shown.left / base, shown.top / base, shown.width / base, shown.height / base).inflate(_tile.toDouble() * 2);
 
     // One clock reading for the whole frame, and one position per body taken from
     // it. Sampling the walk twice inside a single paint would let a body's name plate
     // disagree with its feet by however long the paint took.
     final now = motion?.now ?? Duration.zero;
-    final where = {
-      for (final person in people)
-        person.id: motion?.positionOf(person, now) ?? Offset(person.x, person.y),
-    };
+    final where = {for (final person in people) person.id: motion?.positionOf(person, now) ?? Offset(person.x, person.y)};
 
     canvas.save();
     canvas.scale(base);
@@ -640,6 +939,9 @@ class _OfficePainter extends CustomPainter {
     _paintProps(canvas, art, paint, visible, where, now);
     // Names and room labels last: they are the one thing that must never end up
     // behind a pot plant.
+    // Over the floor and the furniture, under the name plates: the reticle marks a
+    // place, and a place is a thing people stand in front of.
+    _paintSelection(canvas, base * zoom);
     _paintLabels(canvas, visible, base * zoom, where, now);
 
     canvas.restore();
@@ -656,16 +958,10 @@ class _OfficePainter extends CustomPainter {
     final height = map.height * _tile.toDouble();
     canvas.drawRect(Rect.fromLTWH(0, 0, width, height), Paint()..color = tokens.card);
 
-    final rooms = [...map.rooms.where((r) => r.name != null)]
-      ..sort((a, b) => (b.width * b.height).compareTo(a.width * a.height));
+    final rooms = [...map.rooms.where((r) => r.name != null)]..sort((a, b) => (b.width * b.height).compareTo(a.width * a.height));
     for (final room in rooms) {
       canvas.drawRect(
-        Rect.fromLTWH(
-          room.x * _tile.toDouble(),
-          room.y * _tile.toDouble(),
-          room.width * _tile.toDouble(),
-          room.height * _tile.toDouble(),
-        ),
+        Rect.fromLTWH(room.x * _tile.toDouble(), room.y * _tile.toDouble(), room.width * _tile.toDouble(), room.height * _tile.toDouble()),
         Paint()..color = tokens.brand.withValues(alpha: room.walled ? 0.10 : 0.05),
       );
     }
@@ -677,9 +973,7 @@ class _OfficePainter extends CustomPainter {
       for (var y = 0; y < map.height; y++) {
         for (var x = 0; x < map.width; x++) {
           if (map.isWalkable(x, y)) continue;
-          blocked.addRect(
-            Rect.fromLTWH(x * _tile.toDouble(), y * _tile.toDouble(), _tile.toDouble(), _tile.toDouble()),
-          );
+          blocked.addRect(Rect.fromLTWH(x * _tile.toDouble(), y * _tile.toDouble(), _tile.toDouble(), _tile.toDouble()));
         }
       }
       canvas.drawPath(blocked, Paint()..color = tokens.border);
@@ -717,12 +1011,7 @@ class _OfficePainter extends CustomPainter {
               ),
           );
         case ArtWall():
-          canvas.drawImageRect(
-            image,
-            Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-            rect,
-            paint,
-          );
+          canvas.drawImageRect(image, Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()), rect, paint);
       }
     }
   }
@@ -745,14 +1034,7 @@ class _OfficePainter extends CustomPainter {
   /// depth is the line it stands on — the bottom of its tile — the same measure
   /// `updateDepth` uses for a sprite's fold. The near half of an object is a separate
   /// `foregroundRenderable` for exactly this reason, and goes on last.
-  void _paintProps(
-    Canvas canvas,
-    SpaceArt? art,
-    Paint paint,
-    Rect visible,
-    Map<String, Offset> where,
-    Duration now,
-  ) {
+  void _paintProps(Canvas canvas, SpaceArt? art, Paint paint, Rect visible, Map<String, Offset> where, Duration now) {
     // A body's depth is the line it stands on: the bottom of its own tile — and the
     // tile it is drawn on rather than the one the wire last named, or somebody walking
     // out from behind a desk pops in front of it a quarter of a second early.
@@ -763,19 +1045,9 @@ class _OfficePainter extends CustomPainter {
     final bodies = <({MapPerson person, Offset at, double alpha, double scale})>[];
     for (final person in people) {
       final flash = motion?.flashOf(person, now);
-      bodies.add((
-        person: person,
-        at: where[person.id]!,
-        alpha: flash?.alpha ?? 1,
-        scale: flash?.scale ?? 1,
-      ));
+      bodies.add((person: person, at: where[person.id]!, alpha: flash?.alpha ?? 1, scale: flash?.scale ?? 1));
       if (flash != null) {
-        bodies.add((
-          person: person,
-          at: flash.ghostAt,
-          alpha: flash.ghostAlpha,
-          scale: 1,
-        ));
+        bodies.add((person: person, at: flash.ghostAt, alpha: flash.ghostAlpha, scale: 1));
       }
     }
     bodies.sort((a, b) => a.at.dy.compareTo(b.at.dy));
@@ -784,15 +1056,7 @@ class _OfficePainter extends CustomPainter {
     // too, so this walks both once.
     final props = art?.props ?? const <ArtSprite>[];
     var next = 0;
-    void body(int i) => _paintPerson(
-          canvas,
-          bodies[i].person,
-          paint,
-          bodies[i].at,
-          now,
-          alpha: bodies[i].alpha,
-          scale: bodies[i].scale,
-        );
+    void body(int i) => _paintPerson(canvas, bodies[i].person, paint, bodies[i].at, now, alpha: bodies[i].alpha, scale: bodies[i].scale);
 
     for (final prop in props) {
       if (prop.foreground) continue;
@@ -826,15 +1090,7 @@ class _OfficePainter extends CustomPainter {
   /// [alpha] and [scale] are the teleport, and are 1 for everybody standing still.
   /// A body arriving fades and grows into place; the one it left behind dissolves at
   /// full size. See `../src/map_motion.dart`.
-  void _paintPerson(
-    Canvas canvas,
-    MapPerson person,
-    Paint paint,
-    Offset at,
-    Duration now, {
-    double alpha = 1,
-    double scale = 1,
-  }) {
+  void _paintPerson(Canvas canvas, MapPerson person, Paint paint, Offset at, Duration now, {double alpha = 1, double scale = 1}) {
     final sheet = person.avatarUrl == null ? null : cache[person.avatarUrl!];
 
     if (sheet == null) {
@@ -844,18 +1100,16 @@ class _OfficePainter extends CustomPainter {
       final colour = person.isMe
           ? tokens.brand
           : person.isFollowingMe
-              ? tokens.ok
-              : tokens.mutedForeground;
+          ? tokens.ok
+          : tokens.mutedForeground;
       final radius = _tile * 0.42 * scale;
-      canvas.drawCircle(
-          middle, radius + 3, Paint()..color = tokens.background.withValues(alpha: 0.55 * alpha));
+      canvas.drawCircle(middle, radius + 3, Paint()..color = tokens.background.withValues(alpha: 0.55 * alpha));
       canvas.drawCircle(middle, radius, Paint()..color = colour.withValues(alpha: alpha));
       return;
     }
 
     final posture = _posture(person, now);
-    final frame = avatarAnimation(facing: posture.facing, pose: posture.pose)
-        .frameAt(motion?.phaseOf(person, now) ?? Duration.zero);
+    final frame = avatarAnimation(facing: posture.facing, pose: posture.pose).frameAt(motion?.phaseOf(person, now) ?? Duration.zero);
 
     // Grown about the feet rather than the middle: a sprite scaled around its centre
     // sinks into the floor on the way in, and the tile somebody stands on is the one
@@ -865,27 +1119,17 @@ class _OfficePainter extends CustomPainter {
     final floor = at.dy * _tile + avatarOffsetY + avatarFrameHeight;
     canvas.drawImageRect(
       sheet,
-      Rect.fromLTWH(
-        (frame * avatarFrameWidth).toDouble(),
-        0,
-        avatarFrameWidth.toDouble(),
-        avatarFrameHeight.toDouble(),
-      ),
-      Rect.fromLTWH(
-        at.dx * _tile + (avatarFrameWidth - width) / 2,
-        floor - height,
-        width,
-        height,
-      ),
+      Rect.fromLTWH((frame * avatarFrameWidth).toDouble(), 0, avatarFrameWidth.toDouble(), avatarFrameHeight.toDouble()),
+      Rect.fromLTWH(at.dx * _tile + (avatarFrameWidth - width) / 2, floor - height, width, height),
       // The shared paint carries the pixel-art settings and is reused for everybody
       // at full opacity; a fading body needs its own, since the alpha that fades it
       // is the paint's own colour.
       alpha >= 1
           ? paint
           : (Paint()
-            ..isAntiAlias = false
-            ..filterQuality = FilterQuality.none
-            ..color = const Color(0xFFFFFFFF).withValues(alpha: alpha.clamp(0.0, 1.0))),
+              ..isAntiAlias = false
+              ..filterQuality = FilterQuality.none
+              ..color = const Color(0xFFFFFFFF).withValues(alpha: alpha.clamp(0.0, 1.0))),
     );
   }
 
@@ -914,13 +1158,132 @@ class _OfficePainter extends CustomPainter {
     final y = person.y.round();
     if (map.isSeat(x, y)) {
       final chair = map.seatFacing(x, y);
-      return (
-        pose: person.speaking ? Pose.talkingSitting : Pose.sitting,
-        facing: chair == null ? facing : Facing.of(chair),
-      );
+      return (pose: person.speaking ? Pose.talkingSitting : Pose.sitting, facing: chair == null ? facing : Facing.of(chair));
     }
     return (pose: person.speaking ? Pose.talking : Pose.standing, facing: facing);
   }
+
+  /// The reticle: four corner brackets around whatever a tap picked out.
+  ///
+  /// Gather's own shape — `immersive-tile-highlighter-tl.png` and its three mirrors,
+  /// drawn on a `TileHighlight` layer of their own — and its own rule about areas:
+  /// hovering one snaps the highlighter to the whole bounding box with five pixels of
+  /// padding rather than to the tile under the pointer.
+  ///
+  /// Brackets rather than a filled square because the tile you are pointing at is
+  /// usually the interesting one: a chair, a desk, somebody's avatar. A fill would
+  /// hide the thing that made you tap there.
+  ///
+  /// **Deliberately static.** The client's reticle lerps between tiles and fades
+  /// itself out after three seconds, and neither is copied: `MapMotion`'s ticker stops
+  /// itself when nobody is moving and an office standing still has to cost no frames,
+  /// and a selection that faded out from under the button still waiting on it would be
+  /// incoherent. Gather's is a hover affordance. This one is a pending action.
+  void _paintSelection(Canvas canvas, double onGlass) {
+    final selection = this.selection;
+    if (selection == null) return;
+
+    // Map pixels per screen pixel — everything below is a size on the *glass*, undone
+    // into map space, the same way the labels are laid out.
+    final scale = 1 / onGlass;
+    final room = selection.room;
+
+    final rect = room == null
+        ? Rect.fromLTWH(
+            selection.x * _tile.toDouble(),
+            selection.y * _tile.toDouble(),
+            _tile.toDouble(),
+            _tile.toDouble(),
+          )
+        : Rect.fromLTWH(
+            room.x * _tile.toDouble(),
+            room.y * _tile.toDouble(),
+            room.width * _tile.toDouble(),
+            room.height * _tile.toDouble(),
+          ).inflate(_areaPadding);
+
+    // **The mark is the tile, at every zoom.** An earlier version held the reticle to
+    // a minimum size on the glass, on the theory that a tile zoomed all the way out
+    // is too small to carry a bracket. Measured on a real phone it is 8 to 10 points
+    // rather than the three that theory assumed — perfectly drawable — and the floor
+    // was inflating it to 2.1x the tile on an iPhone 15 and 2.7x on an SE, so the
+    // crosshair visibly came unstuck from the square it was marking. Everything below
+    // is a proportion of [rect] instead, and the only things pinned to the glass are
+    // pinned as *ceilings*.
+    final shorter = math.min(rect.width, rect.height);
+
+    // Two points on the glass, unless that is heavy against the tile itself: on an
+    // 8-point tile a 2-point line is a quarter of the square.
+    final width = math.min(_reticleStroke * scale, shorter / 8);
+
+    // A stroke is centred on its path, so a path laid along the tile's edge puts half
+    // its width on the neighbour. Zoomed in that is a pixel nobody notices; zoomed out
+    // the stroke is a fifth of the tile and it lands squarely on the square next door.
+    final inner = rect.deflate(width / 2);
+
+    // A quarter of the shorter side, so a bracket never grows past the corner it
+    // belongs to; at nine points on the glass it stops growing with the zoom. Zoomed
+    // right out the four brackets nearly meet and the mark reads as a small square,
+    // which is the right thing for it to degrade into.
+    final arm = math.min(_reticleArm * scale, math.min(inner.width, inner.height) / 4);
+
+    // Its own Paint: the shared one runs with antialiasing off for the pixel art, and
+    // a diagonal-free shape still needs it for the stroke's ends and corners.
+    //
+    // Black rather than the brand blue. The office's own artwork is saturated and
+    // full of blue — the rugs, the sofas, half the desks — and a brand-coloured mark
+    // on top of it reads as one more piece of furniture. Black is the one colour
+    // Gather's floor never uses, so it reads as an annotation instead of as part of
+    // the room. `background` rather than a literal, because colours come from tokens.
+    final stroke = Paint()
+      ..isAntiAlias = true
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = width
+      ..color = tokens.background;
+
+    final path = Path();
+    for (final (corner, dx, dy) in [
+      (inner.topLeft, 1.0, 1.0),
+      (inner.topRight, -1.0, 1.0),
+      (inner.bottomRight, -1.0, -1.0),
+      (inner.bottomLeft, 1.0, -1.0),
+    ]) {
+      path
+        ..moveTo(corner.dx + dx * arm, corner.dy)
+        ..lineTo(corner.dx, corner.dy)
+        ..lineTo(corner.dx, corner.dy + dy * arm);
+    }
+
+    canvas.drawPath(path, stroke);
+
+    // The floor names the ten team zones and deliberately never names the fourteen
+    // meeting rooms, on the grounds that the one you are standing in is already in the
+    // app bar. The one you are pointing at is not, and naming it is the whole point of
+    // having selected it.
+    final name = room?.name;
+    if (name != null) {
+      // The zone labels' recipe, opaque rather than at 0.62: those are ambient and
+      // this one is the thing being pointed at. Matches the brackets, so the name and
+      // the mark read as one annotation rather than two.
+      final label = _text(name, tokens.foreground);
+      _plate(
+        canvas,
+        Offset(rect.center.dx, rect.top - (_plateHeight(label) / 2 + _zoneGap) * scale),
+        label,
+        scale,
+        fill: tokens.background,
+      );
+    }
+  }
+
+  /// The five pixels the client pads an area's bounding box by, in map pixels.
+  static const _areaPadding = 5.0;
+
+  /// Bracket thickness and arm length, in logical pixels on the glass. Ceilings
+  /// rather than sizes: a small tile gets a proportionate mark instead of this one.
+  static const _reticleStroke = 2.0;
+  static const _reticleArm = 9.0;
 
   /// Team-area names and name plates, laid out on the glass and scaled into the map.
   ///
@@ -930,13 +1293,7 @@ class _OfficePainter extends CustomPainter {
   /// on the glass at every zoom, which is what a label is for; and because the font
   /// size never changes, a name's [TextPainter] is laid out once and kept, instead of
   /// every person on the map being re-laid-out on every frame of a pinch.
-  void _paintLabels(
-    Canvas canvas,
-    Rect visible,
-    double onGlass,
-    Map<String, Offset> where,
-    Duration now,
-  ) {
+  void _paintLabels(Canvas canvas, Rect visible, double onGlass, Map<String, Offset> where, Duration now) {
     // Map pixels per screen pixel — the factor that undoes the zoom.
     final scale = 1 / onGlass;
 
@@ -952,12 +1309,7 @@ class _OfficePainter extends CustomPainter {
       for (final area in map.rooms) {
         final name = area.name;
         if (name == null || area.type != _sectionType) continue;
-        final rect = Rect.fromLTWH(
-          area.x * _tile.toDouble(),
-          area.y * _tile.toDouble(),
-          area.width * _tile.toDouble(),
-          area.height * _tile.toDouble(),
-        );
+        final rect = Rect.fromLTWH(area.x * _tile.toDouble(), area.y * _tile.toDouble(), area.width * _tile.toDouble(), area.height * _tile.toDouble());
         if (!rect.overlaps(visible)) continue;
         // White, and only two-thirds of it: a zone name is a thing you read when you
         // are looking for it, not a thing that should compete with the people.
@@ -965,13 +1317,7 @@ class _OfficePainter extends CustomPainter {
         if (_plateWidth(label) * scale > rect.width) continue;
         // Floating above the zone rather than lying on it: a team area is full of the
         // desks it exists to group, and a label inside it covers one of them.
-        _plate(
-          canvas,
-          Offset(rect.center.dx, rect.top - (_plateHeight(label) / 2 + _zoneGap) * scale),
-          label,
-          scale,
-          fill: tokens.background.withValues(alpha: 0.62),
-        );
+        _plate(canvas, Offset(rect.center.dx, rect.top - (_plateHeight(label) / 2 + _zoneGap) * scale), label, scale, fill: tokens.background.withValues(alpha: 0.62));
       }
     }
 
@@ -985,10 +1331,7 @@ class _OfficePainter extends CustomPainter {
       // frame is 64 tall and hung 32 above its tile, and across the sheets sampled the
       // highest hat still starts 14 pixels below that tile's top edge.
       final body = where[person.id] ?? Offset(person.x, person.y);
-      final at = Offset(
-        (body.dx + 0.5) * _tile,
-        body.dy * _tile - _tile * 0.5 - _plateHeight(label) / 2 * scale,
-      );
+      final at = Offset((body.dx + 0.5) * _tile, body.dy * _tile - _tile * 0.5 - _plateHeight(label) / 2 * scale);
       if (!visible.contains(at)) continue;
       // A plate arrives with the body it names. Faded through a layer rather than by
       // tinting the text: a colour is part of a [TextPainter]'s cache key, so fading
@@ -996,11 +1339,7 @@ class _OfficePainter extends CustomPainter {
       final arriving = motion?.flashOf(person, now)?.alpha ?? 1;
       if (arriving < 1) {
         canvas.saveLayer(
-          Rect.fromCenter(
-            center: at,
-            width: (_plateWidth(label, dot: true) + 2) * scale,
-            height: (_plateHeight(label) + 2) * scale,
-          ),
+          Rect.fromCenter(center: at, width: (_plateWidth(label, dot: true) + 2) * scale, height: (_plateHeight(label) + 2) * scale),
           Paint()..color = const Color(0xFFFFFFFF).withValues(alpha: arriving.clamp(0.0, 1.0)),
         );
       }
@@ -1039,8 +1378,7 @@ class _OfficePainter extends CustomPainter {
   /// The gap between a zone's top edge and the bottom of its label.
   static const _zoneGap = _size * 0.5;
 
-  double _plateWidth(TextPainter label, {bool dot = false}) =>
-      label.width + _padX * 2 + (dot ? _dotRadius * 2 + _dotGap : 0);
+  double _plateWidth(TextPainter label, {bool dot = false}) => label.width + _padX * 2 + (dot ? _dotRadius * 2 + _dotGap : 0);
 
   double _plateHeight(TextPainter label) => label.height + _padY * 2;
 
@@ -1050,14 +1388,7 @@ class _OfficePainter extends CustomPainter {
   /// [centre] is the middle of the plate in *map* pixels, so callers position it by
   /// whichever edge they actually care about; [scale] is map pixels per screen pixel,
   /// and everything inside is drawn on the glass.
-  void _plate(
-    Canvas canvas,
-    Offset centre,
-    TextPainter label,
-    double scale, {
-    required Color fill,
-    Color? dot,
-  }) {
+  void _plate(Canvas canvas, Offset centre, TextPainter label, double scale, {required Color fill, Color? dot}) {
     canvas.save();
     canvas.translate(centre.dx, centre.dy);
     canvas.scale(scale);
@@ -1068,16 +1399,9 @@ class _OfficePainter extends CustomPainter {
       width: _plateWidth(label, dot: dot != null),
       height: _plateHeight(label),
     );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(box, Radius.circular(box.height / 2)),
-      Paint()..color = fill,
-    );
+    canvas.drawRRect(RRect.fromRectAndRadius(box, Radius.circular(box.height / 2)), Paint()..color = fill);
     if (dot != null) {
-      canvas.drawCircle(
-        Offset(box.left + _padX + _dotRadius, 0),
-        _dotRadius,
-        Paint()..color = dot,
-      );
+      canvas.drawCircle(Offset(box.left + _padX + _dotRadius, 0), _dotRadius, Paint()..color = dot);
     }
     label.paint(canvas, Offset(box.left + _padX + lead, -label.height / 2));
 
@@ -1102,12 +1426,7 @@ class _OfficePainter extends CustomPainter {
     final painter = TextPainter(
       text: TextSpan(
         text: value,
-        style: TextStyle(
-          fontSize: _size,
-          height: 1.1,
-          color: colour,
-          fontWeight: FontWeight.w600,
-        ),
+        style: TextStyle(fontSize: _size, height: 1.1, color: colour, fontWeight: FontWeight.w600),
       ),
       textDirection: TextDirection.ltr,
       maxLines: 1,
@@ -1121,6 +1440,7 @@ class _OfficePainter extends CustomPainter {
       old.map != map ||
       old.art != art ||
       old.partyActive != partyActive ||
+      old.selection != selection ||
       old.people.length != people.length ||
       // Positions change without the count changing, which is most of the time.
       !_samePlaces(old.people, people);

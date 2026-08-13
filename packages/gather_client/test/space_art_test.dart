@@ -472,4 +472,51 @@ void main() {
       expect(_sprites(b.artFor('floor-1')!).single.left, 9 * 32);
     });
   });
+
+  /// The dump is four chunks, and the rows that make a floor drawable are a
+  /// hundredth the size of the rows that say what is standing on it. So there is a
+  /// window — seconds on a good connection, most of a minute on a phone — where the
+  /// office draws in full colour with none of its furniture. The screen has no way
+  /// to tell that from an empty office unless the art says so.
+  group('furniture that has not arrived', () {
+    test('an object whose variant is still coming is counted, not silently dropped', () {
+      final b = _base();
+      // The wire order this is about: the `MapObject` rows land, the
+      // `CatalogItemVariant` rows have not.
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 4,
+        'relativeY': 5,
+        'catalogItemVariantId': 'v-later',
+      }));
+      final waiting = b.artFor('floor-1')!;
+
+      expect(_sprites(waiting), isEmpty, reason: 'nothing to draw it with yet');
+      expect(waiting.awaiting, 1, reason: 'but the screen must know it is coming');
+    });
+
+    test('and stops being counted the moment its variant lands', () {
+      final b = _base();
+      _object(b, id: 'o1', variantId: 'v1', x: 4, y: 5);
+      final art = b.artFor('floor-1')!;
+
+      expect(_sprites(art), hasLength(1));
+      expect(art.awaiting, 0, reason: 'a drawable office is not still arriving');
+    });
+
+    test('an object naming no variant at all is not something to wait for', () {
+      final b = _base();
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 4,
+        'relativeY': 5,
+      }));
+
+      expect(b.artFor('floor-1')!.awaiting, 0);
+    });
+  });
 }

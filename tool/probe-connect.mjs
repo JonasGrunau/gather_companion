@@ -686,18 +686,31 @@ async function map(args) {
   }
 
   // --- route 2: what the state dump already hands us ----------------------
-  const WANTED = new Set([
-    'MapArea',
-    'MapObject',
-    'CatalogItemVariant',
-    'FloorMap',
-    'MapEntityIdentifier',
-    // Not map geometry: the two models an avatar is assembled from. `hashOutfit`
-    // joins an outfit's wearable ids and appends the newest `lastSyncAuthoredAt`
-    // among them, so neither model answers on its own.
-    'SpaceUserOutfit',
-    'Wearable',
-  ]);
+  // `--models A,B,C` asks the same question about any other model instead. The
+  // state dump carries about 45 of them and this command already does the whole
+  // job of getting one — connect, collect `addmodel`, write it out — so anything
+  // hardcoded here would only be an arbitrary limit on which of the 45 you can
+  // look at. `--models SpaceUser,UserFile` is how the profile-picture route was
+  // settled.
+  const WANTED = new Set(
+    args.models
+      ? String(args.models)
+          .split(',')
+          .map((m) => m.trim())
+          .filter(Boolean)
+      : [
+          'MapArea',
+          'MapObject',
+          'CatalogItemVariant',
+          'FloorMap',
+          'MapEntityIdentifier',
+          // Not map geometry: the two models an avatar is assembled from.
+          // `hashOutfit` joins an outfit's wearable ids and appends the newest
+          // `lastSyncAuthoredAt` among them, so neither model answers on its own.
+          'SpaceUserOutfit',
+          'Wearable',
+        ],
+  );
   const rows = new Map([...WANTED].map((m) => [m, []]));
 
   const url = `${GAME_SOCKET}?spaceId=${encodeURIComponent(spaceId)}&authUserId=${encodeURIComponent(authUserId)}`;

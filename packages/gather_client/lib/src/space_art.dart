@@ -217,6 +217,7 @@ class SpaceArt {
     required this.height,
     required this.ground,
     required this.props,
+    this.awaiting = 0,
   });
 
   /// The grid, in map pixels.
@@ -232,6 +233,22 @@ class SpaceArt {
   /// belong in this same order by their own feet; [ArtSprite.foreground] pieces go
   /// over all of it.
   final List<ArtSprite> props;
+
+  /// Furniture on this floor that cannot be drawn yet, because the
+  /// `CatalogItemVariant` naming its picture has not arrived.
+  ///
+  /// Non-zero for the first seconds of every connection, and sometimes for a good
+  /// deal longer. The dump is four `FullStateChunk`s and ~5400 patches, and the 93
+  /// `MapArea` rows that make a floor drawable are two orders of magnitude cheaper
+  /// to send than the 477 `CatalogItemVariant` rows that say what the 1140
+  /// `MapObject`s look like — so the office becomes drawable, in full colour, with
+  /// none of its furniture in it. There is nothing to draw in its place either: an
+  /// object's collision tiles come off the same variant, so the schematic that used
+  /// to stand in for missing artwork is empty for exactly as long as this is not.
+  ///
+  /// Which makes this the difference between an office that is still arriving and
+  /// an office with no desks in it, and the screen has no other way to tell.
+  final int awaiting;
 
   /// Every distinct image this floor needs, which is exactly what to prefetch.
   Set<String> get urls => {

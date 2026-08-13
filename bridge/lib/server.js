@@ -289,14 +289,16 @@ export class BridgeServer {
 
     if (!this._authorised(url)) return json(401, { error: 'bad or missing token' });
 
-    // The phone hands over its FCM token after pairing, and again whenever
-    // Firebase rotates it. Idempotent by token, so re-registering is free.
+    // The phone hands over its FCM token after pairing, whenever Firebase rotates
+    // it, and on every resume. Idempotent, so re-registering is free — and the app
+    // uses the reply as its reachability check, which is why `sending` is in it.
     if (url.pathname === '/push/register') {
       readJsonBody(req)
         .then((body) => {
           const count = this.push.registry.register({
             token: body?.token,
             platform: body?.platform ?? 'ios',
+            installId: body?.installId,
           });
           json(200, { ok: true, devices: count, sending: this.push.enabled });
         })

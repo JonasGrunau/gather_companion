@@ -13,6 +13,7 @@ export 'src/game_protocol.dart';
 export 'src/gather_auth.dart';
 export 'src/msgpack.dart';
 export 'src/party.dart';
+export 'src/profile_photos.dart';
 export 'src/presence_tracker.dart';
 export 'src/sfu_signalling.dart';
 export 'src/space_art.dart';

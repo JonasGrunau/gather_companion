@@ -9,6 +9,7 @@
 /// No network: [ArtCache] takes the fetch as a seam, and these hand it colours.
 library;
 
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -216,6 +217,7 @@ Future<ui.Image> _paint(
   TransformationController? view,
   SpaceMap? map,
   MapMotion? motion,
+  ({int x, int y, SpaceRoom? room})? selection,
 }) async {
   map ??= _map();
   final size = Size(map.width * artTileSize.toDouble(), map.height * artTileSize.toDouble());
@@ -230,6 +232,7 @@ Future<ui.Image> _paint(
     view: view,
     viewport: size,
     motion: motion,
+    selection: selection,
   ).paint(Canvas(recorder, Offset.zero & size), size);
   return recorder.endRecording().toImage(size.width.round(), size.height.round());
 }
@@ -254,9 +257,12 @@ const _avatarUrl = 'https://sprite.v2.gather.town/v2/sprite/avatar-x.png';
 
 extension on ByteData {
   /// The colour at a tile's centre, given the image is [width] pixels across.
-  Color at(int width, double tileX, double tileY) {
-    final x = ((tileX + 0.5) * artTileSize).round();
-    final y = ((tileY + 0.5) * artTileSize).round();
+  Color at(int width, double tileX, double tileY) =>
+      pixel(width, ((tileX + 0.5) * artTileSize).round(), ((tileY + 0.5) * artTileSize).round());
+
+  /// The colour at one map pixel. What [at] is built on, and what anything drawn at
+  /// a tile's *edge* rather than its middle has to be read with.
+  Color pixel(int width, int x, int y) {
     final offset = (y * width + x) * 4;
     return Color.fromARGB(
       getUint8(offset + 3),
@@ -341,6 +347,149 @@ void main() {
 
     expect(pixels.at(image.width, 1, 1).a, 1.0);
     expect(pixels.at(image.width, 1, 1), isNot(_grass));
+  });
+
+  group('the reticle', () {
+    /// The map pixel at a tile's top-left corner, where a bracket's elbow sits.
+    (int, int) corner(int tileX, int tileY) => (tileX * artTileSize, tileY * artTileSize);
+
+    Future<ByteData> painted({
+      required ({int x, int y, SpaceRoom? room})? selection,
+      TransformationController? view,
+    }) async {
+      final image = await _paint(
+        null,
+        ArtCache(fetch: (_) async => null),
+        selection: selection,
+        view: view,
+      );
+      return (await image.toByteData())!;
+    }
+
+    test('a selected tile is bracketed at its corners', () async {
+      final pixels = await painted(selection: (x: 4, y: 2, room: null));
+      final (cx, cy) = corner(4, 2);
+      final floor = pixels.at(320, 7, 6);
+
+      // Measured as "not the floor" rather than against a colour. The mark is black
+      // over a light halo, so which of the two a given pixel lands on depends on
+      // where in the stroke it falls — but neither of them is the floor.
+      expect(pixels.pixel(320, cx + 3, cy), isNot(floor),
+          reason: 'the top arm of the top-left bracket');
+      expect(pixels.pixel(320, cx, cy + 3), isNot(floor),
+          reason: 'and its side arm');
+    });
+
+    test('the brackets are black, and nothing else', () async {
+      // Black rather than the brand blue: the office's own artwork is full of blue —
+      // the rugs, the sofas, half the desks — and a brand-coloured mark on top of it
+      // reads as one more piece of furniture. Drawn as one pass, with no outline
+      // under it: a light halo made the crosshair look like a sticker.
+      final pixels = await painted(selection: (x: 4, y: 2, room: null));
+      final (cx, cy) = corner(4, 2);
+
+      final along = [for (var d = -2; d <= 2; d++) pixels.pixel(320, cx + 3, cy + d)];
+      expect(along.map((c) => c.r).reduce((a, b) => a < b ? a : b), lessThan(0.15),
+          reason: 'the stroke itself is black');
+      expect(
+        along.every((c) => c.r <= pixels.at(320, 7, 6).r + 0.01),
+        isTrue,
+        reason: 'and nothing beside it is lighter than the floor',
+      );
+    });
+
+    test('the brackets leave the middle of the tile alone', () async {
+      // The whole reason for this shape over a filled square: the tile you tapped
+      // usually has the thing you tapped it for on it — a chair, a desk, somebody's
+      // avatar — and a fill would hide it.
+      final pixels = await painted(selection: (x: 4, y: 2, room: null));
+
+      expect(pixels.at(320, 4, 2), pixels.at(320, 7, 6),
+          reason: 'the middle is exactly the floor it was before');
+    });
+
+    test('an unselected floor is drawn without any of it', () async {
+      final pixels = await painted(selection: null);
+      final (cx, cy) = corner(4, 2);
+
+      expect(pixels.pixel(320, cx + 3, cy), pixels.pixel(320, cx + 3, cy + 8));
+    });
+
+    test('the brackets keep their size on the glass, not on the map', () async {
+      // The same rule the labels follow, and the reason it is not optional: left in
+      // map pixels a 2-pixel stroke is a 40-pixel slab at 20x and a smear at 1x.
+      //
+      // Measured as reach rather than as brightness. At 8x every length this draws is
+      // an eighth of what it is at 1x *in map pixels*, which is the same length on the
+      // glass — and at that point the stroke is a quarter of a map pixel, so what a
+      // pixel reads is a fraction of the colour rather than the colour.
+      final (cx, cy) = corner(4, 2);
+      final far = await painted(selection: (x: 4, y: 2, room: null));
+      final floor = far.at(320, 7, 6);
+
+      expect(far.pixel(320, cx + 6, cy), isNot(floor),
+          reason: 'at 1x the arm is 8 map pixels long');
+
+      final close = await painted(
+        selection: (x: 4, y: 2, room: null),
+        view: TransformationController()
+          ..value = Matrix4.identity().scaledByDouble(8, 8, 8, 1),
+      );
+
+      expect(close.pixel(320, cx, cy), isNot(floor), reason: 'still drawn');
+      expect(close.pixel(320, cx + 6, cy), floor,
+          reason: 'but the arm no longer reaches a fifth of the way across the tile');
+    });
+
+    test('zoomed right out the mark is still exactly the tile', () async {
+      // The bug this replaced: the reticle used to be held to a minimum size on the
+      // glass, which zoomed all the way out inflated it to over twice the tile — so
+      // the crosshair came visibly unstuck from the square it was marking. Every
+      // length is a proportion of the tile now, with the on-glass figures acting only
+      // as ceilings.
+      final pixels = await painted(
+        selection: (x: 4, y: 2, room: null),
+        view: TransformationController()
+          ..value = Matrix4.identity().scaledByDouble(0.1, 0.1, 0.1, 1),
+      );
+      final floor = pixels.at(320, 7, 6);
+      final (cx, cy) = corner(4, 2);
+
+      expect(pixels.pixel(320, cx + 1, cy + 1), isNot(floor), reason: 'drawn');
+
+      // Nothing at all outside the tile it belongs to.
+      for (var d = 0; d < artTileSize; d++) {
+        expect(pixels.pixel(320, cx + d, cy - 2), floor, reason: 'above the tile');
+        expect(pixels.pixel(320, cx - 2, cy + d), floor, reason: 'left of the tile');
+        expect(pixels.pixel(320, cx + d, cy + artTileSize + 1), floor,
+            reason: 'below the tile');
+        expect(pixels.pixel(320, cx + artTileSize + 1, cy + d), floor,
+            reason: 'right of the tile');
+      }
+    });
+
+    test('a room target is bracketed around the whole room', () async {
+      // `onPointerMove` snaps the highlighter to an area's bounding box rather than
+      // to the tile under the pointer, with five pixels of padding.
+      final room = SpaceRoom(
+        id: 'r1',
+        name: 'Boardroom',
+        type: 'MeetingRoom',
+        x: 2,
+        y: 2,
+        width: 4,
+        height: 4,
+        walled: true,
+      );
+      final pixels = await painted(selection: (x: 3, y: 3, room: room));
+      final floor = pixels.at(320, 7, 6);
+
+      // The room's own corner, five pixels out — not the tapped tile's.
+      expect(pixels.pixel(320, 2 * artTileSize - 5 + 3, 2 * artTileSize - 5),
+          isNot(floor));
+      expect(pixels.at(320, 3, 3), floor,
+          reason: 'and the tapped tile inside it is untouched');
+    });
   });
 
   group('people', () {
@@ -605,5 +754,153 @@ void main() {
     final image = await _paint(art, cache);
     // The floor under the missing desk is still there.
     expect((await image.toByteData())!.at(image.width, 3, 3), _wood);
+  });
+
+  /// The office is asked for in one burst the moment the map lands, which on a
+  /// phone is the moment the radio may still be coming up. What that burst does
+  /// when it goes wrong is the difference between an office that draws a second
+  /// late and one that is a schematic until you force-quit.
+  group('fetching', () {
+    /// Real delays, because [ArtCache] runs on real timers and real futures — a
+    /// backoff is a `Timer` and a decode is a `Future`, and neither is something a
+    /// fake clock can reach through.
+    ///
+    /// The ceiling is generous rather than tight. It is only reached when a test is
+    /// about to fail anyway, and a suite sharing a machine with another one takes
+    /// far longer per poll than the delay asks for — which is how the first version
+    /// of these flaked.
+    Future<void> until(bool Function() done) async {
+      for (var i = 0; i < 2000 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    }
+
+    test('an outage delays the office rather than losing it', () async {
+      final art = _art();
+      var offline = true;
+      var attempts = 0;
+      final cache = ArtCache(
+        // Long enough that the office cannot spend all eight of its goes while this
+        // test is still noticing the first round failed, short enough that the
+        // recovery below is one wait rather than a pause in the suite.
+        backoff: const Duration(milliseconds: 50),
+        fetch: (url) async {
+          attempts++;
+          if (offline) throw const SocketException('the radio was still coming up');
+          return _colours(url);
+        },
+      );
+
+      addTearDown(cache.dispose);
+
+      cache.prefetch(art.urls);
+      await until(() => attempts >= art.urls.length);
+      expect(cache.loaded, 0);
+      // The one signal that anything is wrong. While a failure was permanent this
+      // was true the moment the burst finished, so the legend went away and the
+      // office looked finished rather than broken.
+      expect(cache.settled, isFalse, reason: 'a cache waiting out a backoff is not settled');
+
+      offline = false;
+      await until(() => cache.settled);
+
+      expect(cache.loaded, art.urls.length);
+      expect(cache.failed, 0);
+      // And it is the artwork, not the schematic underneath it.
+      final image = await _paint(art, cache);
+      expect((await image.toByteData())!.at(image.width, 3, 3), _sprite);
+    });
+
+    test('an outage that never ends is eventually called a hole', () async {
+      var attempts = 0;
+      final cache = ArtCache(
+        backoff: const Duration(milliseconds: 5),
+        fetch: (_) async {
+          attempts++;
+          throw const SocketException('there is no network');
+        },
+      );
+
+      addTearDown(cache.dispose);
+
+      cache.prefetch({'https://static.gather.town/a.png'});
+      await until(() => cache.settled);
+
+      expect(cache.failed, 1, reason: 'patience is bounded');
+      expect(attempts, 8, reason: 'eight goes, and no more');
+    });
+
+    test('an answer is not argued with', () async {
+      var attempts = 0;
+      final cache = ArtCache(
+        backoff: const Duration(milliseconds: 5),
+        fetch: (_) async {
+          attempts++;
+          return null; // A 404, or a body that is not a picture.
+        },
+      );
+
+      addTearDown(cache.dispose);
+
+      cache.prefetch({'https://static.gather.town/gone.png'});
+      await until(() => cache.settled);
+      // Long enough that a backoff would have fired if one had been set.
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+
+      expect(attempts, 1, reason: 'a missing file costs one request, not eight');
+      expect(cache.failed, 1);
+    });
+
+    test('a superseded office stops being fetched', () async {
+      final asked = <String>[];
+      final cache = ArtCache(fetch: (url) async {
+        asked.add(url);
+        return _png(_sprite, 32, 32);
+      });
+
+      addTearDown(cache.dispose);
+
+      // Twenty pictures as the office looked before the `CatalogItem` rows landed,
+      // and then as it looks once they have: the same art, a different spelling.
+      Set<String> office({required bool stamped}) => {
+            for (var i = 0; i < 20; i++)
+              'https://static.gather.town/$i.png${stamped ? '?t=2026-08-04' : ''}',
+          };
+
+      cache.prefetch(office(stamped: false));
+      cache.prefetch(office(stamped: true));
+      await until(() => cache.settled);
+
+      expect(cache.wanted, 20);
+      expect(cache.loaded, 20);
+      expect(asked.where((url) => url.contains('?t=')), hasLength(20));
+      // Only what was already on the wire when the office was superseded. The rest
+      // left the queue instead of being fetched ahead of the art that is drawn.
+      expect(
+        asked.where((url) => !url.contains('?t=')),
+        hasLength(lessThanOrEqualTo(8)),
+        reason: 'no more than one round of concurrency was wasted',
+      );
+    });
+
+    test('replacing the office leaves the avatars alone', () async {
+      var attempts = 0;
+      final cache = ArtCache(fetch: (_) async {
+        attempts++;
+        return _png(_sprite, 32, 32);
+      });
+
+      addTearDown(cache.dispose);
+
+      cache.prefetch({'https://gather/avatar.png'}, group: ArtRequest.avatars);
+      await until(() => cache.settled);
+      expect(cache.loaded, 1);
+
+      cache.prefetch({'https://gather/floor.png'}, group: ArtRequest.office);
+      await until(() => cache.wanted == 2 && cache.settled);
+
+      expect(cache['https://gather/avatar.png'], isNotNull, reason: 'not evicted');
+      expect(attempts, 2, reason: 'and not fetched again');
+    });
   });
 }

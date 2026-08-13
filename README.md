@@ -236,6 +236,47 @@ No double-ups: iOS does not display a push while the app is frontmost unless the
 app asks it to, and this one does not. So the local notification is what you see
 when the app is open, and the push is the only one when it is not.
 
+### The computer has to be running
+
+Worth saying outright, because the diagram above implies it and the prose used to
+leave it to be inferred: **the bridge is the thing that sends the push.** There is
+no cloud service in this project. FCM removed the need for the phone to hold a
+live socket, not the need for the computer — something has to be awake to notice
+the wave, and that something is the daemon on your Mac.
+
+What it does *not* need is the phone and the computer being on the same network at
+the time. The push goes bridge → FCM → APNs → phone, so the phone can be anywhere.
+The LAN is needed once, to hand the token over.
+
+The settings screen says which of those is true, and it now says it from the result
+of an actual attempt. It used to render "is a host and token stored", printed under
+the word *Unreachable* — so it called a sleeping Mac reachable forever, and called a
+phone that had no bridge address at all unreachable, which sends you to inspect a
+computer that is fine. Six states, because six different things go wrong in six
+different places:
+
+| the card says | what is actually wrong | where to fix it |
+|---|---|---|
+| Can wake this app | nothing | — |
+| Can't reach it right now | the Mac is asleep, off, or elsewhere | nothing to do; pushes resume |
+| No push credentials yet | the daemon has no FCM service account | `gather-app-bridge push setup` |
+| No computer paired | the phone has no bridge address — **an app reinstall does this** | pair again |
+| iOS has not issued a push token | a simulator, or a build without the entitlement | run on a device, check `aps-environment` |
+| Notifications turned off | permission refused | iOS Settings |
+
+> [!WARNING]
+> **A reinstall used to break push silently, and that is the failure to know about.**
+> iOS wipes an app's preferences on reinstall but leaves its keychain alone. The
+> Gather session lived in the keychain and the bridge address did not, so a reinstall
+> left the phone connected to Gather — presence, map and feed all working — with no
+> bridge address, and registration bails without one. The phone stopped handing over
+> its token, the bridge went on pushing to the token from the *previous* install, FCM
+> answered `200`, and nothing arrived. Both halves now live in the keychain and move
+> together, and the daemon keys its device list on a stable install id rather than on
+> the token, so a reinstalled app replaces its old entry instead of leaving it there
+> absorbing pushes. A device that has neither re-registered nor been reached in 60
+> days is dropped — `push.staleAfterDays` in `~/.gather-app-bridge.json` to change it.
+
 ### Setting it up
 
 Push is optional. Everything else works without it; you simply do not get woken
@@ -518,15 +559,34 @@ dump for free — while the notification tailer re-stats the log file, because i
 polls rather than trusting `fs.watch`, which stops delivering events after a
 suspend without erroring.
 
+**Reconnects in the log are normal.** Measured 2026-08-07→13: 387 drops, every
+connection ending in one, median lifetime 10 minutes. Two causes, neither a fault:
+Gather's gateway recycling connections (close **1012**), and this Mac suspending
+(**1006** — 63% of drops landed within two minutes of a sleep or wake, against a 6%
+baseline). Each one now names its cause in the log instead of repeating an
+undifferentiated `game socket error`, which is what those 387 lines used to say.
+
+The case that *was* worth fixing is the drop that never announces itself. A
+suspend can leave a half-open TCP connection with no `close` frame ever arriving,
+and since `close` is what drives every reconnect, the collector sat there reporting
+a live roster while receiving nothing at all — the shape of "presence looks fine and
+no notification ever comes". Both collectors now reconnect after 45 seconds of total
+silence; Gather heartbeats every 3–9 seconds, so nothing that quiet is alive.
+
+What no watchdog can fix is that a sleeping Mac sends no pushes, because nothing is
+awake to notice the wave. That is inherent to a laptop being the sender.
+
 ---
 
 ## 📡 HTTP / WebSocket API
 
 Everything except `/health` and `/pair/claim` needs `?token=<token>`.
 
-The app uses exactly one of these — `POST /push/register` — and only
-opportunistically, whenever it happens to be able to reach the computer. The rest
-are the operator surface that `gather-bridge watch`, `replay`, `resync` and
+The app uses exactly one of these — `POST /push/register` — on attach, on resume,
+and whenever Firebase rotates its token. That one call is also how the app knows
+whether the computer is reachable and able to send: it is idempotent by design and
+its reply carries `sending`, so there is nothing to poll and no separate probe. The
+rest are the operator surface that `gather-bridge watch`, `replay`, `resync` and
 `doctor` are built on; they go dormant when nothing is attached.
 
 | endpoint | what |
@@ -538,7 +598,7 @@ are the operator surface that `gather-bridge watch`, `replay`, `resync` and
 | `WS /ws?since=<seq>` | snapshot frame, then live events |
 | `WS /ws?raw=1` | additionally the unfiltered firehose, as `kind: "raw"` frames |
 | `GET /resync` | force a full state resync (reconnects the game socket) |
-| `POST /push/register` | phone hands over its FCM token (idempotent) |
+| `POST /push/register` | phone hands over `{token, platform, installId}` (idempotent, keyed on `installId`); replies `{ok, devices, sending}` |
 | `GET /pair/offer` | mint a pairing code (used by `pair`) |
 | `GET /pair/claim?code=` | **no token** — trade a code for the bridge token *and your Gather session*, once |
 

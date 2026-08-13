@@ -835,7 +835,7 @@ Captured off the real client, or confirmed by probe:
 | `startSpeaking` / `stopSpeaking` | `['SpaceUser', id]` | **two args.** Voice activity, not mute |
 | `leaveCluster` | `['SpaceUser', id]` | **two args.** Leaves the conversation, stays put |
 | `broadcastEmote` | `['SpaceUser', id, {emote, count, ambientlyConnectedUserIds}]` | see below |
-| `updateTargetMeetingArea` | `['SpaceUser', id, {}]` | seen with an empty payload only |
+| `updateTargetMeetingArea` | `['SpaceUser', id, {meetingAreaId, shouldBeInClusterWithOthersWithSameTargetMeetingArea?}]` | read out of the bundle, not off the wire — `MeetingFrontendRepo.joinMeeting` sends it after `getOrSetMeetingArea` assigns a room. This row said "seen with an empty payload only" until the client was read directly; the capture that produced that was of a join that carried no area. Both fields line up with `SpaceUser.currentTargetMeetingAreaId` and `shouldBeInClusterWithOthersWithSameTargetMeetingArea` in the state dump. |
 | `markContextualOnboardingPOICompleted` | `['SpaceUserOnboarding', id, 'Profile']` | **not `SpaceUser`** — the model is per-action |
 
 Probed and confirmed **not** to exist on `SpaceUser`: `moveTo`, `setPosition`,
@@ -876,6 +876,67 @@ because both carry `targetUserIds` and so still route correctly.
 All of the above except `startSpeaking`/`stopSpeaking`/`updateTargetMeetingArea`
 are implemented in `packages/gather_client/lib/src/direct_collector.dart` and
 asserted frame-for-frame in its test.
+
+### Profile pictures: the id is not a URL, and the row does not carry one either
+
+`SpaceUser.profilePictureId` is a `UserFile` id. Measured 2026-08-13 on a live
+98-row space: **45 people had one**, and the other 53 had the field *absent*
+rather than empty — bots and `Anonymous` rows share a single placeholder that the
+API rejects as `Invalid UUID`, so "no picture" has to be read as a missing field
+and not as something worth requesting.
+
+The `UserFile` rows are in the state dump (60 of them, every one `type: Profile`)
+and they are **not** enough:
+
+```jsonc
+{"id":"…","path":"<spaceId>/<uuid>.jpg","type":"Profile","mimeType":"image/jpeg",
+ "originalWidth":512,"originalHeight":512,
+ "originalFileUrl":undefined,"imageThumbnailUrl":undefined,"downloadFileUrl":undefined}
+```
+
+All three URL fields came across msgpack-undefined on all sixty rows, and the
+bucket answers `403` to an unsigned request built from `path`. There is exactly
+one route:
+
+```http
+GET /spaces/:spaceId/files/:fileId
+→ 200 {"url":"https://profile-photos.gather.town/<path>?Expires=…&Key-Pair-Id=…&Signature=…"}
+```
+
+A CloudFront signature, **24 hours** out, and it needs **no authorization
+header** — so the URL can go straight to an image loader that knows nothing about
+Gather. `packages/gather_client/lib/src/profile_photos.dart` caches it, failures
+included, because a busy office is a hundred faces on a screen that repaints four
+times a second.
+
+### The status line hangs off the status row, not off the person
+
+`SpaceUserStatus` carries `spaceUserId`, and that is the only usable link.
+`SpaceUser` has two fields that look like the pointer — `activeCustomStatusId`
+and `activeUserGeneratedStatusId` — and on 98 rows **neither was ever set**,
+including on people whose status was on screen at the time. Read from that side
+and every status in the space is invisible.
+
+```jsonc
+{"op":"addmodel","model":"SpaceUserStatus","data":{
+  "id":"…","spaceUserId":"…","text":"Test","emoji":"❤️",
+  "clearCondition":"DateTime","clearAt":<ext-1 DateTime>,
+  "type":"Custom","calendarEventVirtualId":null}}
+```
+
+Three things about it:
+
+- **`clearCondition` is asymmetric.** `setCustomStatus` sends it as an object,
+  `{type:'DateTime', clearAt:…}`; it comes back as the bare string `"DateTime"`.
+- **`type` is `Custom` or `CalendarInferred`.** The second is written by Gather
+  from a connected calendar — "Lunch 🥗" — and on the reference space 8 of 14
+  statuses were that kind. Dropping them leaves most of an office blank. A person
+  can hold both at once, and the typed one is the one to show.
+- **The row outlives the status.** An expired one stays on the wire unchanged,
+  with `clearAt` in the past — one set at 16:33 to clear at 17:03 was still there
+  at 20:20. Gather's own client evidently filters on read, so a client that does
+  not shows people at lunch all evening. Clearing a status is a `deletemodel` on
+  this row; nothing on the `SpaceUser` side moves.
 
 ### An observer can move. Entering is not a prerequisite for writing
 
@@ -990,6 +1051,25 @@ Electron shell with no game code in it (`app.asar` has no `dimensionsInTiles`, n
 lazy chunks. The collision engine is in `bundle.fcbc27cfb33c44ea.js` — class
 `Collisions`, plus getters on `MapObject` and `MapArea`. Constants live in `main.js`:
 `TILE_SIZE = 32`, `MAX_HIERARCHY_DEPTH = 20`.
+
+#### Where to find the bundle again
+
+Worth writing down, because it is not where anyone looks first and finding it took
+longer than reading it. The installed app is **`GatherV2.app`**, not `Gather.app`, and
+its `app.asar` is 7798 files of which only 84 are Gather's own — all shell, no game.
+The engine is in the Electron HTTP cache, uncompressed:
+
+```
+~/Library/Application Support/GatherV2/Cache/Cache_Data/
+```
+
+Chromium's simple-cache format puts a header in front of the body: skip
+`20 + readUInt32LE(offset 12)` bytes and the rest is plain JavaScript. The key string
+sits at offset 20, so a directory of entries can be grepped for the one you want.
+At the time of writing that was `bundle.c2029c930c00996`, 10.3 MB, containing
+`webpackChunkgather_browser` — the pathfinder (module 22795, `Hh`), the tile
+highlighter, `moveSpaceUserToMapArea`, and the `MapArea` getters. Bundle hashes change
+on every release; the cache layout does not.
 
 **Absolute position** — `MapEntity#absolutePosition`. The plain sum of
 `relativeX`/`relativeY` up the parent chain, no rounding anywhere, depth-capped at 20:
@@ -1715,7 +1795,7 @@ deleted mic/camera flags; the other three are still unused.
 | `coreRole` | no |
 | `spaceId` | no |
 | `floorId` | **yes** |
-| `profilePictureId` | no |
+| `profilePictureId` | **yes** — a `UserFile` id, resolved to a signed URL over REST |
 | `followTargetId` | **yes** |
 | `userAccountId` | **yes** |
 | `clusterId` | no — was Gather's own "standing together" signal; dropped with proximity |

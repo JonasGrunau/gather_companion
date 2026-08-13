@@ -19,8 +19,9 @@ rules that decide which events are worth a person's attention.
 | `link_status.dart` | `LinkState` / `LinkStatus` — how good our connection to **Gather** is. Carries `needsPairing`, the one state that asks the user to act rather than wait. |
 | `credentials.dart` | `GatherCredentialStore` — the Gather refresh token, in the platform keychain. Not `SharedPreferences`: this is the user's whole Gather identity and backups include plists. |
 | `pairing.dart` | `PairPayload` parsing (`HOST:PORT:CODE`), `normaliseCode()`, `parseAddress()`, and `claimPairing()` — the one unauthenticated call in the API. |
-| `settings.dart` | `BridgeSettings` — host, port, token in `SharedPreferences`, plus `wsUri()` / `httpUri()` construction and the bridge's friendly name. |
+| `settings.dart` | `BridgeSettings` — host, port, token, plus `httpUri()` construction; and `BridgeSettingsStore`, which keeps them **in the keychain beside the Gather session**, with a one-shot migration out of `SharedPreferences`. Moved there for *durability*, not secrecy: iOS wipes a preferences plist on reinstall and leaves keychain items alone, so the old split left phones with a working Gather session and no bridge address — push registration bails without one, so the phone silently stopped handing over its FCM token while the bridge went on pushing to the previous install's dead token, which FCM accepts with a 200. Do not move it back without reading that header. Also mints the stable `installId` the bridge keys its device list on. |
 | `notifications.dart` | `Notifier` — local notifications for the two events worth interrupting someone for, with permission requested *after* pairing rather than at launch. |
+| `push.dart` | `PushRegistrar`, `PushReach`, `PushRegistration` — the other half of notifications, and the **only** thing the app still asks the computer for. Fetches the APNs token *before* the FCM one, because `getToken()` is meaningless until APNs has answered. `register()` returns a six-state outcome rather than `void`: it used to discard everything, which is why a fortnight of pushes went nowhere with no error anywhere. The `POST /push/register` **is** the reachability probe — idempotent by design, and its reply says whether the bridge can actually send — so there is no `/health` ping and nothing polls. Re-posted on attach, on resume, and on token rotation. |
 | `media/media_engine.dart` | `MediaEngine`, `LocalMediaState`, `MediaFailure` — the seam between call logic and hardware. **Imports no `flutter_webrtc`**, which is what lets the call logic be tested on a machine with no camera. Talks in state and track ids, never native objects. |
 | `media/webrtc_media_engine.dart` | `WebrtcMediaEngine` — the only file in the app that imports `flutter_webrtc`. `getUserMedia`, camera switching, teardown. Exposes `localStream` concretely for the renderer, deliberately off the interface. Mute goes to the **audio device** (`Helper.setMicrophoneMuted` in `voiceProcessing` mode), not to `track.enabled`: disabling the track stops the frames while the capture session runs on, leaving iOS's orange microphone indicator lit for the whole mute. The file's header explains the trade in full, including the platform mute tone it accepts to get muted-talker detection. |
 | `media/mediasoup_ice.dart` | Three lines that re-export `RTCIceServer` / `RTCIceTransportPolicy` / `RTCIceCredentialType` from `mediasfu_mediasoup_client`'s unexported `src/handlers/`. The **only** `implementation_imports` ignore in the app, deliberately kept to one file: those types are the declared parameters of every API that accepts TURN servers, so the real choice is this or no TURN. Read the header before touching it. |
@@ -90,7 +91,7 @@ layer stays free of widgets entirely.
 
 ### External
 
-`shared_preferences`, `web_socket_channel` (`IOWebSocketChannel`),
-`flutter_local_notifications`, `dart:io` (`HttpClient`).
+`flutter_secure_storage`, `shared_preferences` (the migration path only),
+`firebase_messaging`, `flutter_local_notifications`, `dart:io` (`HttpClient`).
 
 <!-- MANUAL: -->

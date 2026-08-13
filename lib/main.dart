@@ -78,7 +78,14 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
     // the socket, and reconnecting unconditionally threw away a working
     // connection every time — a second of "Reconnecting" for nothing, which is
     // most of what made the link look unreliable.
-    if (lifecycle == AppLifecycleState.resumed) unawaited(_state.verifyLink());
+    if (lifecycle == AppLifecycleState.resumed) {
+      unawaited(_state.verifyLink());
+      // A separate question with a separate answer: the computer may have gone to
+      // sleep, come back, or had its push credentials set up while we were away.
+      // Nothing else re-asks, so a stale "can wake this app" would sit there for the
+      // rest of the session.
+      unawaited(_state.refreshPushReach());
+    }
   }
 
   @override

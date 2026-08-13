@@ -1,15 +1,23 @@
 /// Where the Gather refresh token lives on the phone.
 ///
-/// Split from [BridgeSettings] deliberately, because the two are not comparable.
-/// The bridge token is scoped to one daemon on one LAN; losing it means somebody
-/// can read your presence while on your wifi. The Gather refresh token *is* your
-/// Gather account — it mints ID tokens for as long as it stays valid, from
-/// anywhere. So it goes in the platform keychain, and nothing else does.
+/// A separate store from `BridgeSettingsStore`, because the two are not comparable
+/// in what they cost to lose. The bridge token is scoped to one daemon on one LAN;
+/// losing it means somebody can read your presence while on your wifi. The Gather
+/// refresh token *is* your Gather account — it mints ID tokens for as long as it
+/// stays valid, from anywhere. That is why *this* one is in the keychain.
 ///
 /// `SharedPreferences` would have been one less dependency and one less code path.
 /// It is also an unencrypted plist that iCloud and iTunes backups include, which
 /// would put the user's Gather identity in every backup of the device until they
 /// next changed their password.
+///
+/// This used to end "and nothing else does". `BridgeSettingsStore` is in the
+/// keychain too now, and for an unrelated reason: iOS wipes a preferences plist on
+/// reinstall but leaves keychain items alone, so the two halves of one pairing did
+/// not survive equally, and a reinstalled app was left connected to Gather with no
+/// idea where its bridge was. Read that class's header before moving either back.
+/// The reasoning above is still why *this* record could never have lived anywhere
+/// else; it is no longer the only record here.
 library;
 
 import 'dart:convert';

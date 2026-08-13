@@ -84,6 +84,24 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
  */
 const HANDSHAKE_GRACE_MS = 5000;
 
+/**
+ * How long a total silence has to last before we stop believing the socket.
+ *
+ * Nothing else notices a socket that has gone deaf. `close` is what drives every
+ * reconnect here, and a half-open TCP connection never fires one: the peer sent no
+ * FIN, so the send side keeps accepting heartbeats into a kernel buffer and the read
+ * side simply never delivers anything again. That is the ordinary outcome of a
+ * laptop suspending — measured 2026-08-13, 63% of this collector's drops landed
+ * within two minutes of a macOS sleep or wake, against a 6% baseline — and when it
+ * happens without a FIN the collector reports `98 space users (observer)` and full
+ * health for as long as the daemon runs, while receiving nothing and pushing nothing.
+ *
+ * Gather's server heartbeats every 3–9s, so silence is unambiguous well before this.
+ * Generous anyway: the cost of being wrong is a reconnect and a fresh state dump,
+ * but reconnecting a *working* socket every 45s would be its own bug.
+ */
+const SILENCE_LIMIT_MS = 45_000;
+
 /** What we tell Gather we are. Mirrors the desktop client — see docs/gather-api.md. */
 const CONNECTION_TARGET = 'OfficeView';
 const CLIENT_PLATFORM = 'Desktop';
@@ -96,9 +114,14 @@ export class DirectCollector extends EventEmitter {
     // Gather or the developer's real session. Production always uses the default.
     getToken = getIdToken,
     log = () => {},
+    // Injected for the same reason as `socketUrl`: the honest test of the deaf-socket
+    // watchdog is to let a connection actually fall silent, and a suite that waited
+    // [SILENCE_LIMIT_MS] to find out would add 45 seconds to every run.
+    silenceLimitMs = SILENCE_LIMIT_MS,
   } = {}) {
     super();
     this.log = log;
+    this.silenceLimitMs = silenceLimitMs;
     /** Overridable so tests can point at a fake game server instead of Gather. */
     this.socketUrl = socketUrl;
     this._getToken = getToken;
@@ -120,6 +143,8 @@ export class DirectCollector extends EventEmitter {
     this._connects = 0;
     this._lastClose = null;
     this._handshakeAt = 0;
+    /** When a frame last arrived. The watchdog's whole state — see [SILENCE_LIMIT_MS]. */
+    this._lastFrameAt = 0;
   }
 
   get healthy() {
@@ -322,6 +347,7 @@ export class DirectCollector extends EventEmitter {
     this.reader = new GameProtocolReader({ log: this.log });
     this.reader.authUserId = authUserId;
     this._frames = 0;
+    this._lastFrameAt = 0;
 
     const url =
       `${this.socketUrl}?spaceId=${encodeURIComponent(spaceId)}` +
@@ -355,6 +381,11 @@ export class DirectCollector extends EventEmitter {
         return;
       }
       this._handshakeAt = Date.now();
+      // The clock starts at the handshake, not at the first frame: a server that
+      // accepts the socket and then says nothing at all is exactly the case worth
+      // reconnecting out of, and leaving this at 0 until something arrived would
+      // make that the one case the watchdog could not see.
+      this._lastFrameAt = this._handshakeAt;
       this._setHealth(false, 'handshake sent; waiting for state');
 
       this._publishTimer = setInterval(() => this._flush(), PUBLISH_INTERVAL_MS);
@@ -378,13 +409,21 @@ export class DirectCollector extends EventEmitter {
       // something about Gather's rules changed and is worth saying out loud.
       const suffix = event.code === 4031 ? ' — duplicate connection rejected' : '';
       this._setHealth(false, `game socket closed (${event.code})${suffix}`);
+      this.log(`direct: ${describeClose(event.code, event.reason)}; reconnecting`);
       this._scheduleRetry();
     });
 
     ws.addEventListener('error', () => {
       if (this._ws !== ws) return;
-      // `close` always follows, and it carries the code; retry from there.
-      this.log('direct: game socket error');
+      // Deliberately silent. This used to log `direct: game socket error` and
+      // nothing else, which produced 387 identical lines carrying no information
+      // whatsoever — the close code, the only diagnostic fact available, went to
+      // `_setHealth` and `_lastClose` and never reached the log at all. So six days
+      // of "Gather recycled the connection" and "the laptop slept" were
+      // indistinguishable from a real fault, and read as 387 real faults.
+      //
+      // `close` always follows an `error` and carries the code, so it is the only
+      // place worth logging from. Nothing is lost by saying nothing here.
     });
   }
 
@@ -422,6 +461,27 @@ export class DirectCollector extends EventEmitter {
     }
   }
 
+  /**
+   * Tears the socket down if nothing has arrived for [silenceLimitMs].
+   *
+   * Returns true when it acted. The teardown is explicit rather than left to the
+   * `close` event, because [_closeSocket] nulls `_ws` first and the close handler
+   * guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
+   */
+  _isSilent() {
+    const since = Date.now() - this._lastFrameAt;
+    if (this._lastFrameAt === 0 || since < this.silenceLimitMs) return false;
+
+    const secs = Math.round(since / 1000);
+    this._clearTimers();
+    this._closeSocket();
+    this._lastClose = { code: null, reason: 'silent' };
+    this._setHealth(false, `no frames for ${secs}s — the socket went deaf; reconnecting`);
+    this.log(`direct: nothing from Gather for ${secs}s — the socket went deaf; reconnecting`);
+    this._scheduleRetry();
+    return true;
+  }
+
   _onFrame(data) {
     let frame;
     try {
@@ -433,6 +493,10 @@ export class DirectCollector extends EventEmitter {
     }
     if (frame == null || typeof frame !== 'object') return;
     this._frames++;
+    // Every frame counts as liveness, heartbeats included — the question the
+    // watchdog asks is whether the socket still carries anything at all, not
+    // whether anything interesting happened.
+    this._lastFrameAt = Date.now();
     if (this.reader.ingest(frame)) this._dirty = true;
 
     // Interactions go out at once rather than waiting for [PUBLISH_INTERVAL_MS].
@@ -443,6 +507,13 @@ export class DirectCollector extends EventEmitter {
   }
 
   _flush() {
+    // First, because the block below is what was lying. `_frames` is cumulative and
+    // reset only on connect, so once it had ever been above zero this reported full
+    // health on every tick for as long as the daemon ran — whether or not a single
+    // frame had arrived since. Asking here rather than on the heartbeat also means
+    // the answer is never more than one publish interval stale.
+    if (this._isSilent()) return;
+
     if (this._frames > 0) {
       const stats = this.reader.stats();
       if (this.hasState) {
@@ -470,5 +541,42 @@ export class DirectCollector extends EventEmitter {
     if (!this._dirty) return;
     this._dirty = false;
     this.emit('roster', this.reader.roster());
+  }
+}
+
+/**
+ * What a close code means, in words, for the log.
+ *
+ * Exported because it is the whole point of the change that produced it: this
+ * collector logged 387 undifferentiated `game socket error` lines over six days, and
+ * every one of them was one of the first two cases below — Gather recycling the
+ * connection, or a laptop suspending. Neither is a fault. Saying which is what makes
+ * the third case, an actual fault, visible at all.
+ *
+ * @param {number|null} code
+ * @param {string} [reason] Gather has never sent one; included because the frame
+ *   allows it and inventing a sentence over a real one would be worse.
+ */
+export function describeClose(code, reason = '') {
+  const said = reason ? ` — "${reason}"` : '';
+  switch (code) {
+    // RFC 6455 1012. Gather's gateway closing us on purpose as it recycles or
+    // redeploys. Routine, frequent, and nothing to act on.
+    case 1012:
+      return `Gather recycled the connection (1012)${said}`;
+    // 1006 is synthesised by the client when the peer vanished without a close
+    // frame: a suspended laptop, a dropped wifi association, a NAT rebinding.
+    case 1006:
+      return `the connection dropped without a close frame (1006)${said}`;
+    case 1001:
+      return `Gather is going away (1001)${said}`;
+    case 1000:
+      return `Gather closed the connection normally (1000)${said}`;
+    // Long believed to be the duplicate-connection code. An observer has never
+    // triggered it, so this arriving means Gather's rules changed.
+    case 4031:
+      return `duplicate connection rejected (4031)${said}`;
+    default:
+      return `the game socket closed (${code})${said}`;
   }
 }

@@ -30,7 +30,10 @@ void main() {
       players: const [],
       health: const CollectorHealth(logTail: true, cdp: true),
       at: DateTime(2026, 8, 4, 12, 30),
-    ));
+    ))
+    // Fetched-and-empty, so the activity tab shows its empty-state sentence —
+    // the marker these tests key on — rather than the first-read skeleton.
+    ..debugApplyActivity(const []);
 
   Widget wrap(AppState state, {VoidCallback? onUnpair}) => MaterialApp(
         theme: buildGatherTheme(),
@@ -44,7 +47,7 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(find.text('Nobody is following you'), findsOneWidget);
+    expect(find.textContaining('Waves and meeting notes'), findsOneWidget);
     // The other two are in the tree but not on screen, which is the whole point.
     expect(find.textContaining('Reading the floor plan'), findsNothing);
     expect(find.byType(MapScreen, skipOffstage: false), findsOneWidget);
@@ -84,7 +87,7 @@ void main() {
     await tester.tap(find.byTooltip('The office'));
     await tester.pump();
     expect(find.textContaining('Reading the floor plan'), findsOneWidget);
-    expect(find.text('Nobody is following you'), findsNothing);
+    expect(find.textContaining('Waves and meeting notes'), findsNothing);
 
     await tester.tap(find.byTooltip('Settings'));
     await tester.pump();
@@ -93,7 +96,7 @@ void main() {
 
     await tester.tap(find.byTooltip('Activity'));
     await tester.pump();
-    expect(find.text('Nobody is following you'), findsOneWidget);
+    expect(find.textContaining('Waves and meeting notes'), findsOneWidget);
   });
 
   testWidgets('leaving the office and coming back returns to it rather than rebuilding it', (tester) async {
@@ -194,6 +197,9 @@ void main() {
     await tester.pump();
     expect(find.byType(SettingsScreen), findsOneWidget);
 
+    // Bottom of the settings list now that it has a section of its own — off
+    // the edge of the test viewport until scrolled to.
+    await tester.ensureVisible(find.text('Forget this computer'));
     await tester.tap(find.text('Forget this computer'));
     await tester.pump();
 

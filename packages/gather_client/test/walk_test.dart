@@ -347,4 +347,179 @@ void main() {
       expect(w.walking, isFalse);
     });
   });
+
+  group('walking a route', () {
+    /// The route [SpaceMap.routeTo] would hand back for a straight line east.
+    List<({int x, int y})> east(int fromX, int y, int toX) =>
+        [for (var x = fromX; x <= toX; x++) (x: x, y: y)];
+
+    test('a route steps itself to the end and then stops', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 7));
+
+      // The first step goes immediately, like a press: the pill was already the
+      // confirmation, so waiting out a tick reads as the tap having missed.
+      expect(collector.steps, ['Right']);
+      expect(w.onRoute, isTrue);
+
+      w.step();
+      w.step();
+      expect(collector.steps, ['Right', 'Right', 'Right']);
+      expect(w.at, (x: 7, y: 4));
+      expect(w.onRoute, isFalse, reason: 'arrived');
+      expect(w.walking, isFalse, reason: 'and stopped its own timer');
+
+      // Nothing further, however often it is asked.
+      expect(w.step().ok, isFalse);
+      expect(collector.steps.length, 3);
+    });
+
+    test('the direction is derived from the tiles, not carried alongside them', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow([(x: 4, y: 4), (x: 4, y: 3), (x: 5, y: 3), (x: 5, y: 4)]);
+      w.step();
+      w.step();
+
+      expect(collector.steps, ['Up', 'Right', 'Down']);
+    });
+
+    test('a tap while already walking replaces the old route', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 9));
+      w.follow([(x: 5, y: 4), (x: 5, y: 5)]);
+
+      // One step east from the first route, then the second route takes over — and
+      // it is walked from where that step left us rather than from the tile the tap
+      // was made on.
+      expect(collector.steps, ['Right', 'Down']);
+      expect(w.at, (x: 5, y: 5));
+      expect(w.onRoute, isFalse);
+    });
+
+    test('reaching for the D-pad cancels the route', () {
+      // Manual input beats autopilot. Two things stepping one avatar would fight,
+      // and the person holding the phone is the one who changed their mind.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 9));
+      expect(w.onRoute, isTrue);
+
+      w.press('Up');
+      expect(w.onRoute, isFalse);
+      expect(collector.steps, ['Right', 'Up']);
+
+      w.step();
+      expect(collector.steps, ['Right', 'Up', 'Up'], reason: 'the pad has it now');
+    });
+
+    test('a chair moved into the route abandons the rest of it', () {
+      // The desktop client re-runs its pathfinder every tick and would walk around.
+      // This stops instead, because a route walked from a floor plan that has since
+      // changed is a route to somewhere nobody asked for. Tapping again re-plans.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 8));
+      expect(collector.steps, ['Right']);
+
+      map = _obstructed(); // a wall now stands on the west side of column 9
+      w.noteRoster(_at(8, 4));
+
+      expect(w.step().ok, isFalse);
+      expect(w.onRoute, isFalse);
+      expect(w.walking, isFalse);
+      expect(collector.steps, ['Right'], reason: 'nothing more went out');
+    });
+
+    test('a roster that puts us off the route stops the walk', () {
+      // The desktop client moved this same avatar, or a step was dropped. Either way
+      // the remaining tiles are relative to a tile we are not standing on, and
+      // walking them would take somebody somewhere they never asked to go.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 9));
+
+      w.noteRoster(_at(12, 17));
+      expect(w.step(), (ok: false, detail: 'lost the way there'));
+      expect(w.onRoute, isFalse);
+      expect(collector.steps, ['Right']);
+    });
+
+    test('a roster that has merely not caught up does not stop the walk', () {
+      // The ordinary case, and the one the previous test must not swallow: the
+      // roster is coalesced at 250ms and a route runs at seven tiles a second, so it
+      // is always describing a tile we left. `_pending` already knows that.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 8));
+      w.step();
+      w.step();
+      expect(w.at, (x: 7, y: 4));
+
+      w.noteRoster(_at(5, 4)); // two steps behind
+      expect(w.at, (x: 7, y: 4), reason: 'a tile we claimed is not a correction');
+      expect(w.step().ok, isTrue);
+      expect(collector.steps, ['Right', 'Right', 'Right', 'Right']);
+      expect(w.onRoute, isFalse);
+    });
+
+    test('a route is not dropped for outlasting the hold limit', () {
+      // A finite list ends itself. The limit is there for a pointer that never
+      // lifted, and the longest route this floor can produce is within a tile or two
+      // of thirty seconds' walking.
+      var now = DateTime(2026, 8, 13, 9);
+      final w = walk = Walk(
+        collector: () => collector,
+        map: () => map,
+        interval: const Duration(hours: 1),
+        holdLimit: const Duration(seconds: 30),
+        now: () => now,
+      )..noteRoster(_at(4, 4));
+
+      w.follow(east(4, 4, 7));
+      now = now.add(const Duration(minutes: 5));
+
+      expect(w.step().ok, isTrue);
+      expect(w.onRoute, isTrue);
+    });
+
+    test('the end of a route is announced, so a screen can stop saying "Stop"', () {
+      // The roster that follows the last step is up to a quarter of a second behind
+      // it, and the map's pill offers to cancel the walk for exactly as long as one
+      // is running.
+      var ended = 0;
+      final w = walk = Walk(
+        collector: () => collector,
+        map: () => map,
+        interval: const Duration(hours: 1),
+        onRouteEnded: () => ended++,
+      )..noteRoster(_at(4, 4));
+
+      w.follow(east(4, 4, 6));
+      expect(ended, 0, reason: 'still walking');
+
+      w.step();
+      expect(w.onRoute, isFalse);
+      expect(ended, 1, reason: 'arrived');
+
+      // Not on a held direction being let go — nothing was routed.
+      w.press('Up');
+      w.release();
+      expect(ended, 1);
+    });
+
+    test('a route that only names the tile we are on is not a walk', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow([(x: 4, y: 4)]);
+
+      expect(collector.steps, isEmpty);
+      expect(w.onRoute, isFalse);
+      expect(w.walking, isFalse);
+    });
+
+    test('a step the socket refuses ends the route rather than walking on', () {
+      final w = build()..noteRoster(_at(4, 4));
+      collector.refuse = true;
+      w.follow(east(4, 4, 8));
+
+      expect(collector.steps, isEmpty);
+      expect(w.onRoute, isFalse);
+      expect(w.at, (x: 4, y: 4), reason: 'and nothing was believed');
+    });
+  });
 }

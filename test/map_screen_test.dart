@@ -16,6 +16,7 @@ import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/dpad.dart';
 import 'package:gather_companion/ui/map_screen.dart';
+import 'package:gather_events/gather_events.dart';
 
 SpaceMap _map({Set<int> blocked = const {}, List<SpaceRoom> rooms = const []}) => SpaceMap(
       floorId: 'f1',
@@ -55,6 +56,23 @@ CustomPainter _officePainter(WidgetTester tester) => tester
     .whereType<CustomPainter>()
     .firstWhere((painter) => painter.runtimeType.toString().contains('OfficePainter'));
 
+/// One area covering the whole test floor.
+///
+/// Which tile a tap lands on depends on the viewport, the cover-the-screen factor and
+/// the opening shot, and pinning all three would be a test of arithmetic rather than
+/// of behaviour. An area the size of the floor means any tap inside the map is inside
+/// *it*, so what is asserted is the rule — tile or room — and not the coordinate.
+SpaceRoom _everywhere({required String type, String? name}) => SpaceRoom(
+      id: 'area-1',
+      name: name,
+      type: type,
+      x: 0,
+      y: 0,
+      width: 20,
+      height: 10,
+      walled: false,
+    );
+
 void main() {
   // The same pair of listenables the app opens this screen with. `state` alone is
   // not enough: walking is not a presence event, so a roster where everybody moved
@@ -66,6 +84,16 @@ void main() {
           builder: (context, _) => MapScreen(state: state),
         ),
       );
+
+  /// A tap on the middle of the floor, waited out.
+  ///
+  /// The map carries `onDoubleTap` for the one-handed zoom, so Flutter holds a single
+  /// tap until the double-tap window closes before delivering it. A test that pumped
+  /// one frame would see nothing and conclude the tap was ignored.
+  Future<void> tapFloor(WidgetTester tester) async {
+    await tester.tapAt(const Offset(400, 300));
+    await tester.pump(const Duration(milliseconds: 400));
+  }
 
   testWidgets('a connected app with no map yet says it is still reading one', (tester) async {
     final state = AppState()..debugApplyLink(const LinkStatus(LinkState.live));
@@ -101,6 +129,40 @@ void main() {
     expect(find.text('3 here'), findsOneWidget, reason: 'me and two others; the parked one does not count');
   });
 
+  testWidgets('being followed is a counter beside the head count, and absent when nobody is',
+      (tester) async {
+    // The follower card moved here from the activity tab: live presence on the
+    // live screen. Same pill as the head count, the accent instead of neutral,
+    // and only a number — absent rather than "0", because zero is the permanent
+    // normal state and a pill saying so all day is furniture.
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+    expect(find.text('1'), findsNothing, reason: 'nobody following, no badge');
+
+    state.debugApplySnapshot(PresenceSnapshot(
+      self: const SelfState(spaceId: 'space-1'),
+      players: const [
+        PlayerRef(id: 'a', name: 'Ada', isFollowingMe: true),
+        // In the space but not following: must not count.
+        PlayerRef(id: 'c', name: 'Cleo'),
+      ],
+      health: const CollectorHealth(logTail: true, cdp: true),
+      at: DateTime(2026, 8, 4, 12, 30),
+    ));
+    await tester.pump();
+
+    expect(find.text('1'), findsOneWidget);
+    expect(
+      tester.getSemantics(find.text('1')),
+      isSemantics(label: 'One person is following you'),
+    );
+  });
+
   testWidgets('the pad appears only once there is something for it to drive',
       (tester) async {
     // Both halves are needed and neither is optional: the socket to send the step on,
@@ -119,6 +181,15 @@ void main() {
       ..debugCanWalk = true
       ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
     await tester.pump();
+
+    if (!kShowDPad) {
+      // The pad is shelved — see `kShowDPad` in dpad.dart. This branch pins the
+      // shelving itself: even with everything live behind it, no pad. The layout
+      // assertions below wait, live, for the flag to flip back.
+      expect(find.byType(DPad), findsNothing,
+          reason: 'the pad is shelved while kShowDPad is false');
+      return;
+    }
 
     expect(find.byType(DPad), findsOneWidget);
     // Centred across the bottom, so it is the same reach from either hand.
@@ -190,6 +261,180 @@ void main() {
       isTrue,
       reason: 'a roster carrying only movement still has to reach the floor',
     );
+  });
+
+  group('going somewhere', () {
+    /// A live-enough app to tap on: a floor, a roster, and something behind the pill.
+    ///
+    /// Deliberately without a row for *us*. `_centreOnMe` fires the opening shot at
+    /// 3x on our own avatar as soon as there is one, which puts our own tile under
+    /// the middle of the screen — so every tap in the middle would land on the one
+    /// tile that means "clear the selection". The rule is worth having and worth
+    /// testing; it is just not worth every other test having to know about it.
+    AppState ready({List<SpaceRoom> rooms = const [], Set<int> blocked = const {}}) =>
+        AppState()
+          ..debugApplyLink(const LinkStatus(LinkState.live))
+          ..debugCanWalk = true
+          ..debugMap = _map(rooms: rooms, blocked: blocked)
+          ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('ada', 8, 4, name: 'Ada')]));
+
+    testWidgets('nothing is offered until something is tapped', (tester) async {
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+
+      expect(find.text('Go here'), findsNothing);
+      expect(find.textContaining('Go to'), findsNothing);
+    });
+
+    testWidgets('a tap on open floor offers to go to that tile', (tester) async {
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
+    });
+
+    testWidgets('a tap inside a meeting room offers the room by name', (tester) async {
+      // `shouldNavigateToTile` is false for MeetingRoom, Common and Desk: you meant
+      // "go to the Boardroom", not "stand on that particular square of it". And the
+      // floor never writes a meeting room's name on itself, so the pill is the only
+      // place the name appears.
+      await tester.pumpWidget(wrap(
+        ready(rooms: [_everywhere(type: 'MeetingRoom', name: 'Boardroom')]),
+      ));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go to Boardroom'), findsOneWidget);
+    });
+
+    testWidgets('a tap on the main floor picks the tile, not the area', (tester) async {
+      // The same fixture with one word changed. `Public`, `Lobby` and `Team` answer
+      // true, and the measured office's main room is a single 44x34 Public area — an
+      // area target there would mean "go to the office", which is where you are.
+      await tester.pumpWidget(wrap(
+        ready(rooms: [_everywhere(type: 'Public', name: 'Main floor')]),
+      ));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
+      expect(find.text('Go to Main floor'), findsNothing);
+    });
+
+    testWidgets('a tap on nothing but furniture selects nothing', (tester) async {
+      // Not an error and not a sentence — you tapped a desk. The snap that forgives a
+      // near miss only widens as far as [_maxSnap], and a floor that is furniture all
+      // the way out has nothing to offer.
+      await tester.pumpWidget(wrap(
+        ready(blocked: {for (var tile = 0; tile < 20 * 10; tile++) tile}),
+      ));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsNothing);
+    });
+
+    testWidgets('the pill is absent when there is no live Gather behind it', (tester) async {
+      // The D-pad's rule, and the same reason: a control that cannot do anything is
+      // absent rather than dimmed.
+      final state = ready()..debugCanWalk = false;
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsNothing);
+    });
+
+    testWidgets('the cross puts the selection back', (tester) async {
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+      await tapFloor(tester);
+      expect(find.text('Go here'), findsOneWidget);
+
+      await tester.tap(find.byIcon(Icons.close_rounded));
+      await tester.pump();
+
+      expect(find.text('Go here'), findsNothing);
+    });
+
+    testWidgets('a walk under way offers to stop instead', (tester) async {
+      // One control with two states. The desktop client does the same thing with a
+      // persistent toast: no confirmation before the walk, a Cancel during it.
+      final state = ready()..debugOnRoute = true;
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      expect(find.text('Stop'), findsOneWidget,
+          reason: 'and without anything having been selected');
+      expect(find.text('Go here'), findsNothing);
+    });
+
+    testWidgets('a tap the app cannot act on says so', (tester) async {
+      // Every action answers. There is no collector behind this state, so going
+      // anywhere is refused — and the refusal is a sentence, not silence.
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+      await tapFloor(tester);
+
+      await tester.tap(find.text('Go here'));
+      await tester.pump();
+
+      expect(find.text('Not connected to Gather.'), findsOneWidget);
+    });
+
+    testWidgets('a locked room is refused, and says why', (tester) async {
+      // The one refusal here that is about a person rather than about the floor, so
+      // the one that earns a sentence. `isLocked` lives on `MapEntityIdentifier`
+      // rather than on the area, and nothing server-side enforces it.
+      await tester.pumpWidget(wrap(ready(rooms: [
+        SpaceRoom(
+          id: 'area-1',
+          name: 'Boardroom',
+          type: 'MeetingRoom',
+          x: 0,
+          y: 0,
+          width: 20,
+          height: 10,
+          walled: true,
+          locked: true,
+        ),
+      ])));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go to Boardroom'), findsNothing);
+      expect(find.text('Boardroom is locked.'), findsOneWidget);
+    });
+
+    testWidgets('tapping where you are already standing clears the selection', (tester) async {
+      // The opening shot centres on our own avatar at 3x, so the middle of the screen
+      // is us — which makes this both the rule and the reason every other test here
+      // is built without a row for us.
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugCanWalk = true
+        ..debugMap = _map()
+        ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsNothing,
+          reason: 'there is nowhere to go to from where you are');
+    });
+
+    testWidgets('the painter is told what is selected, and repaints for it', (tester) async {
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+      final before = _officePainter(tester);
+
+      await tapFloor(tester);
+
+      expect(_officePainter(tester).shouldRepaint(before), isTrue,
+          reason: 'the reticle has to be drawn');
+    });
   });
 
   group('framing', () {
@@ -297,5 +542,49 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.text('1 here'), findsOneWidget, reason: 'one person, however many bodies');
+  });
+
+  /// Reported as "sometimes only the floor, the walls and the users render", and
+  /// then it fixes itself after half a minute. It is not a fetch that failed: the
+  /// dump is four chunks, and the 93 `MapArea` rows that make the floor drawable
+  /// land well before the 477 `CatalogItemVariant` rows that say what the 1140
+  /// pieces of furniture look like. So the office paints in full colour with no
+  /// desks in it — and because the cache has fetched every picture that office
+  /// asked for, it was *settled*, the legend hid itself, and nothing on screen
+  /// said the office was still arriving.
+  group('an office that is still arriving', () {
+    SpaceArt art({required int awaiting}) => SpaceArt(
+          width: 20 * artTileSize.toDouble(),
+          height: 10 * artTileSize.toDouble(),
+          ground: const [],
+          props: const [],
+          awaiting: awaiting,
+        );
+
+    testWidgets('says so, even though there is nothing left to fetch', (tester) async {
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugMap = _map()
+        ..debugArt = art(awaiting: 12);
+
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      expect(find.textContaining('furniture is still arriving'), findsOneWidget);
+      expect(find.textContaining('12'), findsOneWidget);
+    });
+
+    testWidgets('and goes quiet once the catalog has landed', (tester) async {
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugMap = _map()
+        ..debugArt = art(awaiting: 0);
+
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      expect(find.textContaining('still arriving'), findsNothing);
+      expect(find.textContaining('Drawing the office'), findsNothing);
+    });
   });
 }
