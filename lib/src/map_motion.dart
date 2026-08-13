@@ -283,14 +283,23 @@ class MapMotion extends ChangeNotifier {
   /// between the bursts — a limp rather than a walk. The gap is what actually
   /// elapsed, so pacing over it is what joins the bursts back up.
   Duration _leg(double distance, {required Duration gap, required bool continuing}) {
-    final pace = walkStep * distance;
-    if (!continuing && gap > stillAfter) return pace;
-    // Never quicker than Gather walks, and never slower than [_slowestLeg] — except
-    // where a burst of three tiles or more already takes longer than that at walking
-    // pace, in which case walking pace is the slower of the two and wins.
-    final longest = pace > _slowestLeg ? pace : _slowestLeg;
+    if (!continuing && gap > stillAfter) return walkStep * distance;
+
+    // The gap, and never longer than it. This used to insist a leg took at least
+    // walking pace, and that is the bug it was: a burst of three tiles takes 429ms at
+    // walking pace while the next roster lands in 250ms, so the drawn body finished
+    // 1.75 tiles behind and started the next leg from there. Over a run of bursts the
+    // lag compounds — measured on the arithmetic: four rosters into a body moving
+    // three tiles at a time, the wire says 12 and the map draws 5.25 — and what that
+    // looks like is a body gliding slowly towards somewhere it arrived seconds ago.
+    // Movement measured over 110 seconds of a real space arrives one tile per patch,
+    // so how far somebody got in a window is a *fact*, and drawing it slower than it
+    // happened is not caution, it is a body that never catches up.
+    //
+    // [_slowestLeg] still caps it, for a gap that was a pause rather than a stride.
     return Duration(
-      microseconds: gap.inMicroseconds.clamp(pace.inMicroseconds, longest.inMicroseconds),
+      microseconds:
+          gap.inMicroseconds.clamp(walkStep.inMicroseconds, _slowestLeg.inMicroseconds),
     );
   }
 

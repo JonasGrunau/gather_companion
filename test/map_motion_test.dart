@@ -94,6 +94,26 @@ void main() {
     expect(motion.walking(_at(2, 2), now), isFalse);
   });
 
+  test('somebody moving quicker than a walk is not left gliding behind the wire', () {
+    // The slow flight. Measured off a real space: movement arrives one tile per
+    // patch at a median of 144ms — `MOVEMENT_DURATION` exactly — but in bursts that
+    // run to 18.8 tiles a second, nearly three times that. A leg held to walking
+    // pace then outlasts the roster behind it: three tiles takes 429ms while the
+    // next roster lands in 250ms, so the body finished 1.75 tiles short and set off
+    // again from there. Four rosters in, the wire said 12 and the map drew 5.25 —
+    // a body gliding slowly towards somewhere it had already arrived.
+    motion.update([_at(0, 2)]);
+    for (var i = 1; i <= 4; i++) {
+      now += const Duration(milliseconds: 250);
+      motion.update([_at(i * 3.0, 2)]);
+    }
+
+    // One burst behind, which is what interpolating between reported tiles *is*.
+    expect(motion.positionOf(_at(12, 2), now).dx, 9);
+    now += const Duration(milliseconds: 250);
+    expect(motion.positionOf(_at(12, 2), now).dx, 12, reason: 'caught up, not creeping');
+  });
+
   test('a step that starts a walk is paced at Gather\'s own speed instead', () {
     // The other half of the rule: somebody who has been sitting still for a minute
     // and takes one step should take 143ms over it, not stretch it to fill however
