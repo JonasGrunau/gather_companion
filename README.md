@@ -39,7 +39,7 @@ push them.
                     │   Gather's own servers  │
                     └────┬───────────────┬────┘
       authenticated      │               │      authenticated
-      observer socket    ▼               ▼    observer socket
+      game socket        ▼               ▼    observer socket
        ┌─────────────────────────┐   ┌─────────────────────────┐
        │    Gather Companion     │   │    gather-app-bridge    │
        │       ← your phone      │   │      ← your computer    │
@@ -57,8 +57,12 @@ push them.
 
 The two connections do not fight: `Connection` is per-connection but `SpaceUser`
 is per-person-per-space, so your phone, the bridge and the desktop client all
-observe the same avatar without disturbing each other. Neither observer ever
-sends `enterSpace`, so neither appears in the room.
+drive the same avatar without disturbing each other — measured, not assumed.
+
+They differ in what they do once connected. **The bridge only ever reads**: it
+never sends `enterSpace`, so it never appears in the room. **The app enters**,
+because it is on its way to carrying a real call, and something that publishes
+audio and video is present whether or not it admits it.
 
 ---
 
@@ -123,13 +127,18 @@ long-lived, so this is a one-time read: afterwards the bridge mints its own ID
 tokens and never touches the desktop client again.
 
 It then opens its own game socket in **observer mode**, and hands the same session
-to your phone at pairing so the app can open one too. The distinction that makes
-this safe is that Gather splits joining a space into two actions: `loadSpaceUser`
-starts the state dump, and `enterSpace` puts an avatar in the room. Both observers
-send the first and never the second, so each receives the entire roster — names,
-`followTargetId`, live voice activity, and tile coordinates for party mode —
-while remaining invisible to everyone in the space, with
-`Connection.entered: false`.
+to your phone at pairing so the app can open one too. Gather splits joining a
+space into two actions: `loadSpaceUser` starts the state dump, and `enterSpace`
+puts an avatar in the room. Sending only the first is enough to receive the entire
+roster — names, `followTargetId`, live voice activity, `clusterId`, and tile
+coordinates for party mode.
+
+**The bridge stops there** and stays invisible, with `Connection.entered: false`.
+**The app goes on to send `enterSpace`**, and follows it with `reportActivity` so
+it does not sit in the room looking idle. That is the honest position for a client
+heading towards two-way audio and video: you cannot be in a call and not be in the
+room. It costs one thing worth knowing — `numTimesEnteredSpace` is a permanent
+counter on your own profile and increments once per entering connection.
 
 None of these connections disturbs the others, which was the long-standing fear:
 Gather's gateway was believed to evict a duplicate `spaceId` + `authUserId` with
@@ -355,9 +364,11 @@ bridge-side version did not: that one would happily keep hopping for the rest of
 the quarter-hour after your phone went flat.
 
 Entering the space is **not** required to move — `SpaceUser` is
-per-person-per-space, so an observer connection drives the same avatar the
-desktop client draws. That is what keeps this free: `numTimesEnteredSpace`, the
-one counter that cannot be undone, is never touched. See
+per-person-per-space, so even an observer connection drives the same avatar the
+desktop client draws. Party mode was built on that and does not depend on the
+app now entering. What entering does cost is `numTimesEnteredSpace`, the one
+counter that cannot be undone; it goes up once per entering connection, which is
+why the app declines to reconnect a socket that is already healthy. See
 [`docs/gather-api.md`](docs/gather-api.md).
 
 ---
@@ -623,19 +634,51 @@ misread code would be worse than asking someone to look again.
 
 ### 🗺️ The map
 
-The map icon in the header opens the office as a floor plan: rooms tinted and
-named, walls and furniture blocked out, everyone who is actually connected drawn
-where they are, and you in Gather blue. Pinch to zoom, drag to pan. Switch party
-mode on and your own marker picks up a ring, which is the one time the screen is
-worth watching rather than glancing at.
+The map icon in the header opens the office **in Gather's own artwork**: floors,
+walls, doorways, every piece of furniture, and everybody in it drawn as their own
+avatar, facing the way they are facing and sitting down when they are sitting down.
+Pinch to zoom, double-tap to jump in and out, drag to pan — though never far enough
+to drag the background in beside the office: zoomed out, the floor covers the screen,
+and that is the floor.
 
-It is deliberately not a game view. At 124 tiles across a phone there are roughly
-three pixels a tile, so anything more detailed than a block of colour is a smudge.
-The questions it answers are *where are the rooms*, *where is everyone*, and *where
-am I*.
+Labels are Gather's own: a dark capsule above each head carrying the name and an
+availability dot, yours in the accent colour, and the **team zones** named above
+themselves. Nothing is drawn around a body — no ring, no halo. The meeting rooms are
+deliberately not written across the floor: the office names twenty-eight areas and
+writing all of them turned it into a contents page, while the one you are actually
+standing in is already in the app bar. Zone names come off once they no longer fit;
+names never do, because "where is everybody" is the question the screen is for.
 
-Offline avatars are not drawn. Their coordinates are wherever somebody logged off,
-and a map full of people who went home is worse than a map with nobody on it.
+**People walk.** Gather's positions are whole tiles — measured, all 98 rows of a live
+dump carry integer coordinates — and the roster this app reads is coalesced at a
+quarter of a second, so drawn literally the office is a room full of people
+teleporting. So they are walked between the tiles instead, at Gather's own seven
+tiles a second, linearly, and with its own rule that a jump of more than eight tiles
+is a teleport rather than a sprint — which is what keeps a party-mode hop reading as a
+hop. The legs move while they walk, they sit down on chairs, and their mouth moves
+while they are speaking, all off the client's own animation table. Turn animations off
+in your system settings and everybody stands on their tile, which is exactly what the
+desktop client does with that setting.
+
+**None of that art is bundled, and Gather ships no tileset.** The client resolves one
+image per floor texture, per wall piece and per furniture variant and fetches each on
+its own; so does this. On the space it was built against that is **573 images
+totalling 222 KB** — pixel art at 32×32 is a few hundred bytes a file — which is why
+downloading the whole office on a phone is a reasonable thing to do rather than an
+extravagance. They are cached on disk, so the second visit costs nothing. Avatars
+come from Gather's sprite service, which composites an outfit into one 72-frame
+spritesheet; `docs/gather-api.md` has the URL rules, including the "hash" that is not
+a hash.
+
+The schematic it used to be is still underneath, and still does the work while the
+art is in flight or when the network is not there at all.
+
+**Who is drawn is a separate question from who is connected**, and getting it wrong
+was visible: `SpaceUser.connected` goes stale when a socket dies without saying
+goodbye. Measured against a real space, twelve rows claimed it and nine of them were
+people who had gone home — so the map drew eleven bodies into an office holding
+three. Presence is the pair: connected *and* `userSetAvailability` not `Offline`.
+Availability alone is no better, because people close the app without touching it.
 
 ### 📋 What the main screen shows
 
@@ -786,12 +829,16 @@ re-run gets a fresh build number, so neither half objects to going twice.
   process. If Gather changes it, `npx gather-app-bridge replay` on a log you know
   contained a wave will report zero and say so. Presence is unaffected — it comes
   from the protocol, not the log.
-- ✍️ **The bridge does write to the socket** — this used to say "read-only", and
-  that is no longer the whole truth. `DirectCollector` sends five frame shapes and
-  nothing else: `Authenticate`, `ConnectToSpace`, `Subscribe`, one
-  `Action{loadSpaceUser}`, and a heartbeat every ten seconds. It mutates no game
-  state: it does not move, chat, follow, or change any setting, and it never sends
-  `enterSpace`, so no avatar appears. The desktop client itself is still never
+- ✍️ **The bridge writes to the socket; the app writes more.** This used to say
+  "read-only", and then "the bridge does write", and both are now too simple.
+  *The bridge* sends five frame shapes and nothing else: `Authenticate`,
+  `ConnectToSpace`, `Subscribe`, one `Action{loadSpaceUser}`, and a heartbeat every
+  ten seconds. It mutates no game state — no move, chat, follow or setting — and it
+  never sends `enterSpace`, so no avatar appears.
+  *The app* additionally sends `enterSpace` and `reportActivity`, so it **is**
+  present in the room, and it can move your avatar for party mode. What it still
+  never does is speak for anyone but you: same account, same `SpaceUser`, your own
+  credential, no fabricated second identity. The desktop client itself is never
   modified — `app.asar` integrity validation is enabled, so patching it is not
   possible anyway.
 - 🔑 **The bridge stores a Gather credential.** `adopt` copies a Firebase refresh

@@ -568,11 +568,23 @@ Three things this corrects, each of which silently breaks a client that guesses:
    `token`/`idToken`/`authToken` field is not an error — the server simply never
    replies, keeps heartbeating, and drops you later. Measured: a wrong-shaped
    `Authenticate` yields 4 heartbeats and nothing else.
-2. **`Subscribe` takes no arguments at all.** The earlier reading of this document
-   was wrong: you cannot narrow the stream by model key from the client.
-   `ModelSubscription` (`{connectionId, modelIds, modelKey, subscriptionType, …}`)
-   is server-side bookkeeping, not a client-supplied filter. You get everything
-   and filter locally, exactly as `bridge/lib/game-protocol.js:47` already does.
+2. **`Subscribe` takes no arguments at all** — but that is not the same as being
+   unable to narrow the stream, and this document said so twice before getting it
+   right. `Subscribe` is the blanket "send me everything". Narrowing is a separate
+   *action*, captured off the real client 2026-08-13:
+
+   ```jsonc
+   Action{createSubscription, args:['ModelSubscription', null,
+     {modelKey:'BaseCombinedCalendarEvent', subscriptionType:'Include', modelIds:[…]}]}
+   Action{updateSubscription, args:['ModelSubscription', '<id>', {modelIds:[…]}]}
+   ```
+
+   So `ModelSubscription` is a client-supplied filter after all, addressed by
+   `modelKey` with an explicit row list. The desktop client uses it for calendar
+   events rather than for presence. Nothing here needs it — we take everything and
+   filter locally, as `bridge/lib/game-protocol.js:47` does — but "you cannot" was
+   false, and the reason it survived is that nobody watched the client's *own*
+   outbound frames for long enough to see it.
 3. **State arrives because of an `Action`, not because you connected.**
    `loadSpaceUser` is what materialises your `SpaceUser` and triggers the dump.
 
@@ -704,6 +716,8 @@ Captured off the real client, or confirmed by probe:
 | `enterSpace` | `['SpaceUser', '<spaceUserId>']` | puts your avatar *in* the space; see its cost below |
 | `reportActivity` | `['Connection', null, {isActive:boolean}]` | idle reporting |
 | `getAuthenticationData` | `['SpotifyOAuthUserSecret', null]` | integration secrets |
+| `createSubscription` | `['ModelSubscription', null, {modelKey, subscriptionType:'Include', modelIds[]}]` | narrows a model to specific rows — see below |
+| `updateSubscription` | `['ModelSubscription', '<id>', {modelIds[]}]` | replaces that subscription's id list |
 | `move` | `['SpaceUser', id, {direction:'Up'\|'Down'\|'Left'\|'Right'}]` | **one tile per call** |
 | `teleport` | `['SpaceUser', id, {x, y, direction}]` | flat `x`/`y`; `floorId` optional |
 
@@ -893,6 +907,129 @@ Result on the measured space: **463 blocked of 10168 tiles, 9705 walkable.**
 are kept as a regression check (nobody may stand on a blocked tile) rather than as
 the source of truth.
 
+### The art is fetched one file at a time, and there is no tileset
+
+Measured 2026-08-13, against the same space. `packages/gather_client/lib/src/space_art.dart`
+is the transcription, `lib/src/art_cache.dart` the fetching.
+
+**There is no per-space art bundle.** The client resolves one image per floor
+texture, per wall piece and per furniture variant, fetches each on its own, and packs
+them into a texture atlas in a web worker at runtime (`Atlas Manager`, class `Aq`).
+Two of the three kinds of image live on the app origin and one on the catalog CDN:
+
+| what | where | size |
+|---|---|---|
+| floor tiles | `app.v2.gather.town/images/studio/new-assets/walls-and-floors/floors/…` | 32×32, tiled |
+| wall pieces | `…/walls/<Style>/thin wall <n\|ne\|e\|…>.png` | 32×64 top and bottom, 32×32 sides |
+| furniture | `static.gather.town` + `CatalogItemVariant.mainRenderable.imageUrl` | the variant's `dimensionsInPixels` |
+| avatars | `sprite.v2.gather.town/v2/sprite/avatar-<hash>.png` | 2304×64 — 72 frames of 32×64 |
+
+**All of it is public.** Fetched with no cookies and no `Authorization`, every one
+answers 200. The whole office measured here is **573 images totalling 222 KB**,
+because pixel art at 32×32 is a few hundred bytes a file — which is why a phone can
+simply download the lot.
+
+**A floor's filename is composed, not stored.** `MapArea` carries `floorTexture` and
+`floorColor`; the client joins them:
+
+```js
+function d(A,e,g){                          // texture, colour, isDark
+  const t=o[A]; if(!t) return undefined;    // WoodSlats -> Wood_Slats
+  const I=r[A]; if(I&&!I.includes(e)) return undefined;   // NewStyleGrass: Green only
+  return `${t}_${E[e]}${g?"_Dark":""}.png`; // -> Wood_Slats_Wood_Dark.png
+}
+```
+
+Falling back, when that yields nothing, to a flat per-theme table keyed by texture
+alone. Dark is a **different set of files**, not a suffix: the wood floors are a
+later re-cut (`Redux_Wood_Slats_Dark_v2.png`).
+
+**The ground is layered, and the layers are a lookup rather than a coordinate.**
+This is the part that looks like a bug when it is got wrong. `updateFloorsDepth`
+starts from `getBaseDepthForSimplifiedAreaFloor`:
+
+```js
+if (A.isBaseArea) return YZ.BaseAreaGround;                           // 0
+if (A.mapAreaType === MapAreaType.Public) return YZ.PublicAreaGround;  // 2
+return YZ.AreaGround;                                                  // 4
+```
+
+and only then adds `AD(bottomEdge)/9999 + depth/1000`, both under a thousandth of the
+gap between layers. Sorted by position instead, the base area — the whole grid, so
+the lowest bottom edge on the map — paints over every room inside it, and the office
+renders as bare ground.
+
+**Walls belong to their area's ground band.** An area is one Phaser container whose
+depth is its floor's, so every wall sits under every piece of furniture: an object in
+front of a wall covers it. Occlusion the other way is what `foregroundRenderable` is
+for — 61 of 477 variants carry a second image that draws over whoever is standing
+behind it.
+
+**Furniture sorts by its fold, not its row.** `updateDepth` is
+`topLeftAbsolutePosition.y * 32 + renderable.fold`, where `fold` (0…137 here) is the
+pixel line inside the sprite that meets the floor. Anything nested inside another
+object takes its parent's depth with its own tucked in behind the decimal point, so a
+lamp travels with the desk it stands on.
+
+### Avatars are composited by the server, and the hash is not a hash
+
+`SpriteService.hashOutfit` reads like a digest and is not one. It is the outfit's
+wearable ids joined with `SPRITESHEET_DELIMITER` — which is `"."` — followed by the
+newest `lastSyncAuthoredAt` among those wearables, formatted `yyyyMMdd'T'HHmmss'Z'`:
+
+```
+avatar-<skin>.<hair>.<top>.…20260804T081737Z.png
+```
+
+Three things are load-bearing and all three were checked against the live service,
+because getting any of them wrong is a 404 rather than an odd-looking person:
+
+- the delimiter is a dot, so a hash is a run of UUIDs and the timestamp is one more
+  field;
+- the order is `toOutfit()`'s pick order (`skin`, `hair`, `facialHair`, `top`,
+  `bottom`, `shoes`, `hat`, `glasses`, `other`, `costume`, `mobility`, `jacket`), not
+  the wire's;
+- the timestamp is Luxon's format string to the second, not an ISO-8601 round trip.
+
+Two models are needed and neither answers alone: `SpaceUserOutfit` (66 rows here, for
+111 people — an outfit is not guaranteed) and `Wearable` (144–157). The sheet that
+comes back is 72 frames of 32×64 in one row, and the frame to draw is in the client's
+own animation table: `idle-s` 0, `idle-w` 9, `idle-n` 18, `idle-e` 23; `walk-s`
+32–35, `walk-w` 40–43, `walk-n` 48–51, `walk-e` 56–59; `run-s` 36–39, `run-w` 44–47,
+`run-n` 52–55, `run-e` 60–63 (chosen on `speed.modifier > 1`, which was 1 on all 98
+rows measured); `dance` 12–15; the sitting poses at 5, 14, 21, 28. Frame rates come
+with the table: the walk and the run at **7fps**, the talking loops at 4, a blink at
+10, and a still pose declared as one frame at 60. The talking loops are the idle frame
+with the mouth-open frame — always idle + 1 — laid over it by a hand-authored mask,
+three variants per direction picked at random so a table of people is not chewing in
+unison. Sprites hang one tile above the body's own tile (`defaultAvatarOffsetY =
+-32`), which is what puts the feet on the floor.
+
+**`direction` is a value object, not a string.** It arrives as `{$type: 'Direction',
+value: 'Right'}` — the same shape as `userSetAvailability` — and a field patch on it
+comes through as `/direction/value`. Read as a bare string it is null for everybody,
+and since anything unrecognised means south, the symptom is a whole office facing the
+camera rather than an obviously missing field.
+
+**Movement is not on the wire either.** Positions are whole tiles, so a client that
+draws them literally shows people teleporting. `PlayerEntityV2.preUpdate` interpolates
+linearly between the old and new position over `MOVEMENT_DURATION = 1e3/7` ms per
+tile — the same seven the walk cycle runs at, so a body advances one frame per tile —
+and `setTargetPosition` snaps instead of sliding when the distance exceeds
+`TILE_SIZE * 8` or when the user prefers reduced motion. Separately,
+`SpaceUser.isMoving` is `!doneMoving`, an observable threshold that stays true for
+**250 ms** after the last change to `position.x`/`y`.
+
+**Sitting is not on the wire.** `PlayerEntity.isSitting` reads `playerState`, which
+is the client's own field and is never published — so a second client cannot be told
+who is sitting and has to derive it the way Gather does: you are sitting when you are
+standing on a chair's `sittable` tile. Those tiles are placed exactly like collision
+tiles (`activeSittableAbsoluteTiles`: origin backed out, rounded, gated on
+`isSpecialEffectActive`), and unlike collision tiles they stay walkable — a chair you
+could not stand on would be a chair nobody could sit in. The seated frame then uses
+the person's own `direction`, which the server does publish and does update when they
+sit down.
+
 ### Entering costs something
 
 `enterSpace` increments **`numTimesEnteredSpace`** on your own `SpaceUser`, once per
@@ -986,28 +1123,222 @@ Three things to take from this table:
 ## Media — the SFU
 
 Separate from the game socket, and **standard mediasoup**, not a bespoke protocol.
-`wss://router.v2.gather.town` (bundle module `15683`, under the key `routerURLs`).
-The client bundles mediasoup-client and signals with `sendWithResponse(method, args)`:
+Re-read from the bundle 2026-08-13; this section used to be a partial grep for
+`sendWithResponse(` literals and listed seven methods, which is not enough to build
+a client — transport creation was missing entirely.
 
-| Method | Payload |
+### The strategy is not configurable
+
+The A/V strategy map is hardcoded to two entries and only one is implemented:
+
+```js
+const rW = { base: () => undefined, gather: (e,t) => new rG(e,t) };
+```
+
+The interface declares `base | gather | livekit | livekitselfhost`, but the LiveKit
+variants are **never provided**, and the server-side gate returns `"gather"` on both
+branches. **LiveKit is meeting *recording* only** (`/hooks/livekit/recording/…`,
+`LivekitRecordingObjectKey`). Agora survives only as dead v1 telemetry columns
+(`agoraVideoId`, `agoraScreenId`) with no SDK present.
+
+### Authentication — this was Unverified #4, and it is solved
+
+**Captured on the wire 2026-08-13** with `tool/probe-sfu.mjs reload`, not inferred.
+Both signalling sockets are **Socket.IO v4** (`EIO=4&transport=websocket`, path
+`/socket.io/`), and they authenticate in the Socket.IO `CONNECT` packet rather than
+in a first application frame:
+
+```jsonc
+// client → server, engine "message", socket CONNECT
+{ "spaceId": "584d27b3-…", "token": "<a 1037-byte Firebase ID token>" }
+// server → client
+{ "sid": "_GmgZxNrlDzXVsQOAukF" }
+```
+
+Identical on the router socket and on the SFU node socket. **The same Firebase ID
+token the game socket uses** — no separate video token, no REST token-fetch, which is
+consistent with the 217-endpoint sweep finding nothing media-shaped. Nothing rides in
+the URL or in a cookie; the upgrade carries twelve ordinary headers and `Origin:
+https://app.v2.gather.town`.
+
+**The correlation key is the Socket.IO ack id.** `sendWithResponse` is not a bespoke
+mechanism — it is `socket.emit(name, args, callback)`, so a request goes out as
+`42<ackId>["name",{…}]` and the reply comes back as `43<ackId>[{…}]`. A Dart client
+gets this for free from any Socket.IO v4 library.
+
+The `{wsSequenceNumber, …}` envelope is real but **not universal**, and the exemption
+list in the bundle is accurate. Measured: `get-rtp-capabilities` sent
+`{"wsSequenceNumber":1}`, while `get-addr` sent `{"srcId":…,"srcStreamId":…}` with no
+sequence number at all.
+
+### `srcId` is the UserAccount id, not the SpaceUser id
+
+The single most expensive thing to get wrong here, and it is not guessable — the two
+planes are keyed on different identities:
+
+| Wire field | What it actually holds | Where else it appears |
+|---|---|---|
+| `srcId` | **`UserAccount.id`** | `UserAccount{id, firebaseAuthId, email}` in the dump |
+| `srcStreamId` | the **space id** | the game socket's `?spaceId=` query |
+
+Measured against the same capture: the client asked the router for
+`srcId: 88551ba4-…`, which is the `UserAccount` row whose `firebaseAuthId` matches our
+own token — while `enterSpace` in the same session addressed
+`SpaceUser 752f6182-…`. A client that assumed `srcId == spaceUserId` would ask the
+router about a stream that does not exist and get a silent nothing back, which is
+Gather's usual failure mode.
+
+`UserAccount.id` is already in the state dump, and `GameProtocolReader` already finds
+that row: it is `_myUserAccountId`, the fallback identity route.
+
+### Two sockets, then a pool
+
+| Purpose | URL |
 |---|---|
-| `get-rtp-capabilities` | → `{routerRtpCapabilities}` |
-| `produce` | `{transportId, tag, kind, rtpParameters, highQualityScreenShare}` |
-| `consume` | `{transportId, srcId, srcStreamId, tag, rtpCapabilities, spatialLayer}` |
-| `pause` / `resume` / `Reconnect` / `RefreshTURNCredentials` | — |
+| Router — SFU *assignment* | `wss://router.v2.gather.town/socket.io/?EIO=4&transport=websocket` |
+| SFU media node | `<sfuAddr>/socket.io/?sessionId=<uuid>&EIO=4&transport=websocket` |
+| SFU health | `https://<sfu-host>/healthCheck` |
+| TURN | `cf.turn.gather.town` (Cloudflare) |
 
-Codecs: **VP8** for camera, **H264** for screen share, Opus with DTX/NACK/FEC for
-audio. Three simulcast layers toggled via `scaleResolutionDownBy` and per-layer
-`active` flags. TURN credentials are refreshed on a timer, and SFU assignment is
-dynamic — `sfuAddr`, `retainSFUAssignment`, and cordoning via `onCordonSFU`.
+The measured exchange, in full:
 
-**Feasibility of sending media from a custom client:** the protocol is a known
-quantity and Dart has `flutter_webrtc` + `mediasoup_client_flutter`, so it is not
-blocked on protocol secrecy. What stands in the way is that the signalling socket's
-auth is unmapped, SFU assignment is operational machinery with no compatibility
-promise, and Gather's own roadmap lists **"2.0 Mobile App (iOS & Android) — In
-Progress"** with "join meetings and use Gather chat on the go". Building this means
-racing the vendor on the churniest part of their stack.
+```jsonc
+→ get-addr  #0  {"srcId":"<UserAccount.id>", "srcStreamId":"<spaceId>"}
+← addrs         {"srcId":"<UserAccount.id>",
+                 "sfuAddr":"wss://sfu-v2.eu-central-1-a.prod.aws.gather.town:443/ip-10-206-193-211",
+                 "distance":0.522}
+← ACK       #0  [{"addrFound":true}]
+```
+
+Three corrections to what the bundle implied. The host prefix is **`sfu-v2.`**, not
+`sfu.`; the `ip-…` is a **path segment** naming the node's private address, not a
+subdomain; and `sfuAddr` arrives with an explicit `:443`. The region is the
+account's, not a constant — this capture is `eu-central-1-a`, while the telemetry
+hosts in the bundle read `us-east-1-a`. `addrs` also carries an undocumented
+**`distance`** (0.522 here), presumably the assignment score.
+
+The client appends `/socket.io/?sessionId=<uuid>&…` to `sfuAddr`. That `sessionId` is
+**not** in the `addrs` reply, so it is generated client-side or held from elsewhere —
+unconfirmed, and it matters, because a wrong one may be how the SFU rejects you.
+
+Router vocabulary also includes `unsubscribe`, `reassign`, `debug-router`,
+`remote-log`, and a server-pushed `cordon-sfu {sfuAddr}` draining a node.
+
+### Both sockets open at space join, before any call
+
+Worth knowing before designing a lifecycle around it: the capture above involved **no
+call at all**. On entering the space the client immediately asked the router for its
+own address, connected to the assigned node, and pulled `get-rtp-capabilities`. So
+assignment and capability negotiation are startup work, and only produce/consume wait
+for somebody to stand next to you. A client that defers opening the SFU socket until a
+cluster forms is doing something the real client does not.
+
+### What the router actually offers
+
+The measured `routerRtpCapabilities`, which is what `Device.load()` consumes:
+
+| Kind | Codec | PT | Parameters | Feedback |
+|---|---|---|---|---|
+| audio | `audio/opus` 48000 ×2 | 100 | `useinbandfec:1`, `usedtx:1` | `nack`, `transport-cc` |
+| video | `video/VP8` 90000 | 102 | — | `nack`, `nack/pli`, `ccm/fir`, `goog-remb`, `transport-cc` |
+
+Plus 18 header extensions, including `urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id`
+and `…repaired-rtp-stream-id` (simulcast, `recvonly`), `ssrc-audio-level`,
+`abs-capture-time`, and mediasoup's own `urn:mediasoup:params:rtp-hdrext:packet-id`.
+
+Two absences that contradict the bundle reading and matter for planning:
+
+- **No H264.** The bundle suggested H264 for screen share; this router advertises
+  VP8 only. Either screen share is VP8 too, or H264 is offered by a different router.
+- **No RTX.** mediasoup usually offers a retransmission codec alongside video; this
+  router does not, so there is no `apt` mapping to reconcile.
+
+SFU, request/response: `get-rtp-capabilities`, `transport-create {direction,
+iceTransportRequestOptions}`, `transport-connect`, `produce {transportId, tag, kind,
+rtpParameters, highQualityScreenShare}`, `consume`, `consume-created`,
+`consume-request {srcId, srcStreamId, requested}`, `consume-set-priority`,
+`consume-set-spatial`, `restart-ice`, `get-player-data`,
+`set-player-conversation-metadata`. Fire-and-forget: `consume-allow {dstId, allowed}`,
+`produce-close/pause/resume/migrate`, `transport-close`. Server→client:
+`consume-close/connected/not-allowed/try`, `disable-video`, `double-connected`,
+`move-off`, `producer-paused/resumed`, `set-max-spatial-layer`, `client-ip-info`,
+`server-info`.
+
+Codecs: **VP8** camera, **H264** screen share, Opus with DTX/NACK/FEC. Three simulcast
+layers via `scaleResolutionDownBy` and per-layer `active`. **TURN credentials rotate
+through `restart-ice`**, which returns fresh `iceServers` → `updateIceServers()` +
+`restartIce()`; there is no REST TURN endpoint. `TURN_CREDENTIAL_EXPIRY_S = 86400`,
+`TURN_REFRESH_INTERVAL_S = 14400`.
+
+Peers can be spread across **several SFU nodes at once** — `getSFUsByPlayerId`,
+`getPrimarySFUByPlayerId`, `moveSFU`, `migratingParticipants`. One media connection is
+not a valid model.
+
+### Proximity is computed client-side
+
+There is no server "call started" event. The client keeps `playerMediaMags`
+(`playerId → {video, audio, screen, stronglyConnected}`), recomputed on
+`position.x`, `position.y`, `clusterId`, `availability`, `cluster.isLocked`,
+`speaking`:
+
+```
+DIST_THRESHOLD = 12
+inRange = a.floorId == b.floorId && a.position.euclideanDistanceSqr(b.position) < 12*12
+
+calculatePerceptionMag(d):        // normal ambient range
+  d <= 5 : video = 1 - d/15                      ; audio = 1 - d/10
+  else   : video = max((1-5/15)/1.5**(d-5), 0.1) ; audio = max((1-5/10)/1.485**(d-5), 0.1)
+```
+
+Twelve pipeline stages run in order, each able to raise or zero the magnitudes:
+`connectToNearbyPlayer`, `connectToPlayerInSameTeamArea`,
+`connectToNearbyClusterMembers`, `disconnectFromPlayersInDifferingPrivateAreas`,
+`connectStronglyToPlayersInSameCluster`,
+`disconnectFromPlayersInDifferentLockedCluster`, `disconnectFromHeadphoneUsers`,
+`disconnectFromAllAudioIfMuteForPlayback`,
+`disconnectFromAmbientAudioIfFocusedCoworking`, `enforceAmbientAudioSetting`,
+`disconnectFromRecordingClients`, `disconnectFromUsersNotInOffice`,
+`boundMyPlayerAudio`.
+
+**The half that matters most for a custom client:** only
+`connectStronglyToPlayersInSameCluster` reads `clusterId`, and that is the "we are in
+a bubble together" relation Gather computes server-side and publishes in state. The
+*distance* math is for ambient audio from people merely nearby. So a client can join
+and leave calls on `clusterId` alone and skip this pipeline entirely; it needs the
+arithmetic only for ambient volume. `packages/gather_client` now tracks `clusterId`
+and exposes `Roster.myCluster` on exactly that basis.
+
+Subscribe flow: nonzero mags → `subscribe(playerId, tags)` with tags ⊆ `{audio, video,
+sound, screen}` → if the SFU is unknown, router `get-addr` → `addrs` → connect or reuse
+that node → `consume-request {requested:true}`. Leaving range → debounced
+`consume-request {requested:false}` + router `unsubscribe`. `consume-allow {dstId,
+allowed}` is the reciprocal grant controlling who may consume *our* streams.
+
+### Feasibility of sending media from a custom client
+
+The protocol is a known quantity and the auth is now mapped, so this is not blocked on
+secrecy. Two corrections to what this section used to say:
+
+- **`mediasoup_client_flutter` is abandoned** — last release 2023-06-08, SDK
+  `>=2.12.0 <3.0.0`, so it cannot resolve against Dart 3 at all. The maintained
+  Dart-3 fork is `mediasfu_mediasoup_client` (0.1.4, 2026-07-12), on
+  `flutter_webrtc ^1.5.2`. Pin `flutter_webrtc` to **`^1.6.0`** yourself: 1.6.0 is the
+  release that added Swift Package Manager support, and resolving to 1.5.x silently
+  drags the project back onto CocoaPods.
+- **Gather has shipped their mobile app.** The roadmap line quoted here as "2.0 Mobile
+  App (iOS & Android) — In Progress" is out of date: "Gather Meetings" v1.0.43 by
+  Gather Presence, Inc. has been on the iOS App Store since 2026-07-06. That cuts both
+  ways — the vendor is ahead of where this document assumed, but a shipped first-party
+  mobile client also means the mediasoup path is now exercised from phones by Gather
+  themselves.
+
+What remains genuinely unpromised is SFU assignment, which is operational machinery
+with no compatibility guarantee.
+
+**Not a shortcut:** every chunk ends with a live `sourceMappingURL` pointing at
+`sourcemaps.us-east-1-a.prod.aws.gather.town`, which looks like it would make all of
+this trivial. That host resolves to RFC1918 addresses (10.202.1.40, 10.202.0.144)
+behind an internal ELB and does not answer from outside. Internal-only.
 
 ## Negative results
 
@@ -1325,7 +1656,11 @@ positions, and `Authenticate` frames contain a live JWT.
 3. **Whether other clients render anything** when a second connection enters, and
    whether the desktop client's mic/camera are disturbed by it. The socket was
    untouched, but AV state was never instrumented.
-4. **The SFU signalling socket's authentication.** Mapped for the game socket only.
+4. ~~**The SFU signalling socket's authentication.**~~ **Resolved 2026-08-13** — a
+   Socket.IO v4 `CONNECT` payload of `{spaceId, token}`, the same Firebase ID token
+   the game socket carries. See "Media — the SFU". What remains open there is
+   narrower: where the `sessionId` in the SFU socket's URL comes from, and how a
+   client learns that a *remote* producer exists.
 5. **Token lifetime in practice.** Refresh works (~60 min ID tokens), but nothing has
    run long enough to see whether a refresh token survives the desktop client
    signing out.

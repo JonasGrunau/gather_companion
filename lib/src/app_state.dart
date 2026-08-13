@@ -146,8 +146,24 @@ class AppState extends ChangeNotifier {
   Listenable get positions => _positions;
   final _positions = _Ticker();
 
+  /// The space's own name, as Gather has it — "SafeNow", not "The office".
+  ///
+  /// From the single `Space` row in the state dump, carried through the snapshot.
+  String? get spaceName => _snapshot.self.spaceName;
+
   /// The floor plan, or null until enough of it has arrived.
   SpaceMap? get map => debugMap ?? _collector?.mapFor(_myRow()?.floorId);
+
+  /// The same floor's artwork — what to draw, and the images to fetch for it.
+  ///
+  /// Dark, because the app is: the client keeps a second set of files for its dark
+  /// appearance and picking the light ones would put a white office inside a black
+  /// phone.
+  SpaceArt? get art => debugArt ?? _collector?.artFor(_myRow()?.floorId, dark: true);
+
+  /// Test seam, as [debugMap].
+  @visibleForTesting
+  SpaceArt? debugArt;
 
   /// Test seam. The real map is assembled from ~1700 patches inside a live state
   /// dump, which is not a thing a widget test can arrange.
@@ -163,7 +179,8 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  /// Where I am, in tiles, or null before the first roster.
+  /// Where I am, in tiles, or null before the first roster. Rounded, because its
+  /// callers ask questions about tiles — which room am I in — rather than drawing.
   ({int x, int y})? get myTile {
     final me = _myRow();
     final x = me?.x, y = me?.y;
@@ -171,10 +188,35 @@ class AppState extends ChangeNotifier {
     return (x: x.round(), y: y.round());
   }
 
+  /// Me, in the same shape as everybody else, for the map to draw.
+  ///
+  /// Separate from [peopleOnMap], which deliberately excludes me: every other screen
+  /// wants "other people", and only this one wants the whole room including myself.
+  MapPerson? get mePerson {
+    final me = _myRow();
+    final x = me?.x, y = me?.y;
+    if (me == null || x == null || y == null || !x.isFinite || !y.isFinite) return null;
+    return MapPerson(
+      id: me.id,
+      label: me.name ?? 'You',
+      x: x.toDouble(),
+      y: y.toDouble(),
+      isFollowingMe: false,
+      speaking: _snapshot.players.any((p) => p.id == me.id && p.speaking),
+      avatarUrl: _collector?.avatarUrlFor(me.id),
+      direction: me.direction,
+      availability: me.availability,
+      isMe: true,
+    );
+  }
+
   /// Everyone else who is actually here, with somewhere to draw them.
   ///
   /// Offline rows are excluded: their coordinates are wherever somebody logged off,
   /// so drawing them would populate the map with people who are not in the building.
+  /// That test is [RosterRow.isPresent] and not `connected`, because `connected`
+  /// goes stale — measured against a real space, eleven of the twelve rows claiming
+  /// it were people who had gone home, and the map drew all of them.
   List<MapPerson> get peopleOnMap {
     final roster = _roster;
     if (roster == null) return const [];
@@ -190,17 +232,20 @@ class AppState extends ChangeNotifier {
     final out = <MapPerson>[];
     for (final row in roster.rows) {
       if (row.id == roster.selfId) continue;
-      if (row.connected == false) continue;
+      if (!row.isPresent) continue;
       final x = row.x, y = row.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
       if (row.floorId != null && floorId != null && row.floorId != floorId) continue;
       out.add(MapPerson(
         id: row.id,
         label: row.name ?? row.id.substring(0, row.id.length.clamp(0, 6)),
-        x: x.round(),
-        y: y.round(),
+        x: x.toDouble(),
+        y: y.toDouble(),
         isFollowingMe: followers.contains(row.id),
         speaking: speaking.contains(row.id),
+        avatarUrl: _collector?.avatarUrlFor(row.id),
+        direction: row.direction,
+        availability: row.availability,
       ));
     }
     // Roster order is Gather's own map iteration and shuffles between snapshots.

@@ -24,8 +24,23 @@ SpaceMap _map({Set<int> blocked = const {}, List<SpaceRoom> rooms = const []}) =
       rooms: rooms,
     );
 
-RosterRow _row(String id, num x, num y, {bool connected = true, String? name}) =>
-    RosterRow(id: id, name: name, x: x, y: y, floorId: 'f1', connected: connected);
+RosterRow _row(
+  String id,
+  num x,
+  num y, {
+  bool connected = true,
+  String? name,
+  String? availability,
+}) =>
+    RosterRow(
+      id: id,
+      name: name,
+      x: x,
+      y: y,
+      floorId: 'f1',
+      connected: connected,
+      availability: availability,
+    );
 
 void main() {
   // The same pair of listenables the app opens this screen with. `state` alone is
@@ -70,8 +85,30 @@ void main() {
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    expect(find.text('2 here'), findsOneWidget, reason: 'me and the parked one do not count');
-    expect(find.text('You'), findsOneWidget, reason: 'the key is drawn');
+    expect(find.text('3 here'), findsOneWidget, reason: 'me and two others; the parked one does not count');
+  });
+
+  testWidgets('somebody still marked connected but away is not here', (tester) async {
+    // The bug this rule exists for. Measured against a real space: twelve rows said
+    // `connected: true` and nine of them were people who had gone home hours before,
+    // so the map drew eleven bodies into an office holding three. A socket that dies
+    // without saying goodbye leaves `connected` behind it; availability is what
+    // moves when somebody actually leaves.
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [
+        _row('me', 5, 5),
+        _row('ada', 8, 4, name: 'Ada', availability: 'Active'),
+        _row('busy', 9, 6, name: 'Bram', availability: 'Busy'),
+        _row('ghost', 2, 2, name: 'Ghost', availability: 'Offline'),
+      ]));
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // Busy is still in the building; Offline is not, however connected it claims.
+    expect(find.text('3 here'), findsOneWidget, reason: 'Ada, Bram and me');
   });
 
   testWidgets('the room you are standing in is named', (tester) async {
@@ -134,6 +171,48 @@ void main() {
     await tester.pump();
 
     expect(find.text('Green Park'), findsOneWidget, reason: 'I walked into the park');
+  });
+
+  group('framing', () {
+    // A phone, and the office as it is laid out on one: 124×82 tiles covering the
+    // height exactly and overflowing sideways.
+    const viewport = Size(390, 780);
+    const child = Size(1178.78, 780);
+
+    test('there is never anything on screen that is not map', () {
+      // Aiming past the right-hand edge stops with the edge on the edge, rather than
+      // centring the point and letting the background in beside it.
+      final past = framedOn(
+        at: const Offset(1178.78, 400),
+        viewport: viewport,
+        child: child,
+        zoom: 1,
+      );
+      expect(past.getTranslation().x, closeTo(viewport.width - child.width, 0.01));
+      expect(past.getTranslation().y, closeTo(0, 0.01));
+
+      // And the other corner, which clamps the other way.
+      final origin = framedOn(at: Offset.zero, viewport: viewport, child: child, zoom: 1);
+      expect(origin.getTranslation().x, closeTo(0, 0.01));
+      expect(origin.getTranslation().y, closeTo(0, 0.01));
+    });
+
+    test('a point with room around it is simply centred', () {
+      final centred = framedOn(
+        at: const Offset(400, 300),
+        viewport: viewport,
+        child: child,
+        zoom: 3,
+      );
+      expect(centred.getMaxScaleOnAxis(), 3);
+      expect(centred.getTranslation().x, closeTo(390 / 2 - 3 * 400, 0.01));
+      expect(centred.getTranslation().y, closeTo(780 / 2 - 3 * 300, 0.01));
+    });
+
+    test('and the zoom itself cannot go below covering the screen', () {
+      final out = framedOn(at: const Offset(400, 300), viewport: viewport, child: child, zoom: 0.2);
+      expect(out.getMaxScaleOnAxis(), kMinZoom);
+    });
   });
 
   testWidgets('outside every room it falls back to the size of the floor', (tester) async {

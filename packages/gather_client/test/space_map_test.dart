@@ -554,6 +554,60 @@ void main() {
     });
   });
 
+  group('seats', () {
+    test('a chair marks the tile you sit on, placed like a collision tile', () {
+      // `activeSittableAbsoluteTiles` is `sittablePositions` through the same
+      // origin-and-round placement as collision. Nothing else on the wire says who
+      // is sitting: `playerState` never leaves the client that owns it.
+      final b = _base();
+      _variant(b, 'v1', const [], family: 'Chair', sittable: [
+        [0, 0],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'chair',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 6,
+        'relativeY': 4,
+        'catalogItemVariantId': 'v1',
+      }));
+
+      final map = b.forFloor('floor-1')!;
+      expect(map.isSeat(6, 4), isTrue);
+      expect(map.isSeat(6, 5), isFalse);
+      // A seat is not furniture: you stand on it, so it must stay walkable.
+      expect(map.isWalkable(6, 4), isTrue);
+      expect(map.seatCount, 1);
+    });
+
+    test('a chair standing on something else seats nobody', () {
+      // The `isSpecialEffectActive` gate collision uses, applied to the same tiles:
+      // a chair on a table is scenery.
+      final b = _base();
+      _variant(b, 'v1', const [], family: 'Chair', sittable: [
+        [0, 0],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'table',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 6,
+        'relativeY': 4,
+        'catalogItemVariantId': 'v1',
+      }));
+      b.apply('MapObject', _add({
+        'id': 'chair',
+        'mapId': 'map-1',
+        'parentObjectId': 'table',
+        'relativeX': 0,
+        'relativeY': 0,
+        'catalogItemVariantId': 'v1',
+      }));
+
+      expect(b.forFloor('floor-1')!.seatCount, 1);
+    });
+  });
+
   test('a single floor answers even when the floor is not named', () {
     // The roster can carry a null floorId, and a one-floor space has only one
     // possible answer. Guessing is only wrong when there is a choice.

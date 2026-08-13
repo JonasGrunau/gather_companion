@@ -4,23 +4,31 @@
 /// this opens the same one from the app, which is what lets the app stop depending
 /// on the bridge being reachable at all.
 ///
-/// ## Observer mode, and why this is safe
+/// ## Entering, and what it costs
 ///
 /// `loadSpaceUser` materialises our SpaceUser and starts the state dump.
 /// `enterSpace` is a *separate* action, and it is what actually puts an avatar in
-/// the room. **We never send it.** The result is a connection with
-/// `Connection.entered: false` that receives the complete roster while being
-/// invisible to everyone in the space.
+/// the room. **This collector sends it**, because the app is no longer only
+/// watching: a phone that publishes audio and video is a participant, and a
+/// participant is present. `Connection.entered` goes true, and `reportActivity`
+/// follows so we do not sit there looking idle to colleagues.
+///
+/// The bridge's copy of this collector (`bridge/lib/direct.js`) does **not** enter
+/// and must never start. It exists to wake a sleeping phone and has no reason to
+/// be in a room. That divergence is deliberate — see `AGENTS.md` — and is the one
+/// place these two implementations of the same wire format are allowed to differ.
 ///
 /// Two connections of your own do not fight: `Connection` is per-connection but
-/// `SpaceUser` is per-person-per-space, so the bridge's observer, the desktop
-/// client and this one all drive the same avatar. Measured 2026-08-06: neither an
-/// observer connection nor an entered one disturbed the desktop client's socket.
+/// `SpaceUser` is per-person-per-space, so the desktop client and this one drive
+/// the same avatar. Measured 2026-08-06: neither an observer connection nor an
+/// entered one disturbed the desktop client's socket, `enterSpace` returned
+/// `{type:'Success'}`, and our position was unchanged either side of it.
 ///
-/// `enterSpace` is omitted because it is **unnecessary and not free**, not because
-/// it is dangerous: entering increments `numTimesEnteredSpace` on every reconnect
-/// and marks the user present for idle and availability purposes. A collector that
-/// only reads should touch neither.
+/// What entering costs is real and worth knowing: **`numTimesEnteredSpace`
+/// increments per entering connection**, and it is a permanent counter on the
+/// user's own profile. That makes reconnect frequency a thing with a price, which
+/// is why `AppState.verifyLink()` does not reconnect a socket that is already
+/// healthy. Do not "simplify" that into an unconditional resync.
 ///
 /// ## No resync
 ///
@@ -39,6 +47,7 @@ import 'dart:typed_data';
 import 'game_protocol.dart';
 import 'gather_auth.dart';
 import 'msgpack.dart';
+import 'space_art.dart';
 import 'space_map.dart';
 
 const _gameSocket = 'wss://game-router.v2.gather.town/gather-game-v2';
@@ -125,6 +134,9 @@ class DirectCollector {
   bool _dirty = false;
   int _frames = 0;
   int _connects = 0;
+
+  /// Whether `enterSpace` has gone out on the current socket. Reset per connect.
+  bool _entered = false;
   DateTime? _handshakeAt;
 
   final _rosters = StreamController<Roster>.broadcast();
@@ -156,13 +168,21 @@ class DirectCollector {
   /// it starts returning a map the moment one can be built.
   SpaceMap? mapFor(String? floorId) => reader.mapBuilder.forFloor(floorId);
 
+  /// The same floor, drawn: floor tiles, wall pieces and furniture sprites, with the
+  /// URLs to fetch them from. Read through for the same reason as [mapFor].
+  SpaceArt? artFor(String? floorId, {bool dark = true}) =>
+      reader.mapBuilder.artFor(floorId, dark: dark);
+
+  /// Somebody's avatar spritesheet, or null when their outfit is not known.
+  String? avatarUrlFor(String spaceUserId) => reader.avatarUrlFor(spaceUserId);
+
   Map<String, Object?> stats() => {
         ...reader.stats(),
         'frames': _frames,
         'connects': _connects,
         'spaceId': spaceId,
         'authUserId': reader.authUserId,
-        'entered': false,
+        'entered': _entered,
       };
 
   void start() {
@@ -288,18 +308,25 @@ class DirectCollector {
     });
   }
 
-  /// Which space to watch.
+  /// Which space to join, and who we are in it.
   ///
   /// Prefers configuration — the id handed over at pairing — then asks the API.
   /// The bridge can also read the space the desktop client last opened off disk;
   /// the phone has no such shortcut, so the REST call is the fallback rather than
   /// the last resort.
-  Future<String?> _resolveSpaceId() async {
+  ///
+  /// `/users/me/recent-spaces` hands over `spaceUserId` as well, which is what
+  /// `enterSpace` addresses. Getting it here means entering in the same breath as
+  /// the rest of the handshake rather than waiting for the `Connection` row to
+  /// come back and name us. A configured space id carries no such hint, so that
+  /// path enters late instead — see [_maybeEnter].
+  Future<({String id, String? spaceUserId})?> _resolveSpace() async {
     if (_configuredSpaceId != null && _configuredSpaceId.isNotEmpty) {
-      return _configuredSpaceId;
+      return (id: _configuredSpaceId, spaceUserId: null);
     }
     final spaces = await _auth.recentSpaces();
-    return spaces.isEmpty ? null : spaces.first.id;
+    if (spaces.isEmpty) return null;
+    return (id: spaces.first.id, spaceUserId: spaces.first.spaceUserId);
   }
 
   void _connectNow() {
@@ -313,10 +340,10 @@ class DirectCollector {
     if (_stopped) return;
 
     final String token;
-    final String? resolvedSpace;
+    final ({String id, String? spaceUserId})? resolved;
     try {
       token = await _auth.idToken();
-      resolvedSpace = await _resolveSpaceId();
+      resolved = await _resolveSpace();
     } on GatherAuthException catch (error) {
       // The one failure the user has to act on, kept distinct from every other:
       // a dead refresh token cannot be retried into working.
@@ -331,11 +358,12 @@ class DirectCollector {
     }
     if (_stopped) return;
 
-    if (resolvedSpace == null) {
-      _setHealth(false, 'no space to watch — open a space in Gather once');
+    if (resolved == null) {
+      _setHealth(false, 'no space to join — open a space in Gather once');
       _scheduleRetry();
       return;
     }
+    final resolvedSpace = resolved.id;
     spaceId = resolvedSpace;
 
     // The token is the identity; a stored uid is only a cache of it. Reading the
@@ -369,12 +397,14 @@ class DirectCollector {
     _ws = ws;
     _connects++;
     _backoff = const Duration(seconds: 1);
-    _log('direct: connected to space $resolvedSpace as observer');
+    _entered = false;
+    _log('direct: connected to space $resolvedSpace');
 
     try {
-      for (final frame in _handshake(token, resolvedSpace)) {
+      for (final frame in _handshake(token, resolvedSpace, resolved.spaceUserId)) {
         ws.add(msgpackEncode(frame));
       }
+      if (resolved.spaceUserId != null) _entered = true;
     } on Object catch (error) {
       // The encoder refuses rather than sending something Gather would ignore.
       _setHealth(false, 'handshake encode failed: $error');
@@ -404,8 +434,9 @@ class DirectCollector {
         _ws = null;
         final code = ws.closeCode ?? 0;
         // 4031 is the duplicate-connection code the gateway was long believed to
-        // use. Observer connections do not trigger it, so seeing it here would mean
-        // Gather's rules changed and is worth saying out loud.
+        // use. Neither an observer connection nor an entered one triggers it —
+        // both were measured — so seeing it here would mean Gather's rules
+        // changed and is worth saying out loud.
         final suffix = code == 4031 ? ' — duplicate connection rejected' : '';
         _setHealth(false, 'game socket closed ($code)$suffix');
         _scheduleRetry();
@@ -414,16 +445,23 @@ class DirectCollector {
     );
   }
 
-  /// The frames that get us subscribed as an observer.
+  /// The frames that get us subscribed, and then into the room.
   ///
-  /// Deliberately does not include `enterSpace`. That is the line between watching
-  /// a space and being in it, and this collector only ever watches.
+  /// The first four are the subscription. `enterSpace` is the fifth and is what
+  /// makes us present; it needs our own `SpaceUser` id, so it is only included
+  /// when [spaceUserId] is already known. Otherwise [_maybeEnter] sends it once
+  /// the `Connection` row names us.
   ///
   /// A wrong-shaped `Authenticate` is the trap: Gather does not reject it, it simply
   /// never replies and keeps heartbeating, so the failure looks like a network
   /// problem rather than an auth one. These shapes were captured off the desktop
   /// client's own outbound frames, and `msgpack_test.dart` pins the bytes.
-  List<Map<String, Object?>> _handshake(String token, String space) => [
+  List<Map<String, Object?>> _handshake(
+    String token,
+    String space,
+    String? spaceUserId,
+  ) =>
+      [
         {
           'type': 'Authenticate',
           'credential': {'type': 'JWT', 'jwt': token},
@@ -440,7 +478,60 @@ class DirectCollector {
             {'connectionTarget': _connectionTarget, 'clientPlatform': _clientPlatform},
           ],
         },
+        if (spaceUserId != null) ..._enterFrames(spaceUserId),
       ];
+
+  /// Entering, and saying we are awake while we are here.
+  ///
+  /// `reportActivity` earns its place only now: an observer had no business
+  /// claiming to be active, but a participant that never reports goes idle and
+  /// stops looking present to the people it is talking to.
+  List<Map<String, Object?>> _enterFrames(String spaceUserId) => [
+        {
+          'type': 'Action',
+          'txnId': _txnId(),
+          'action': 'enterSpace',
+          'args': ['SpaceUser', spaceUserId],
+        },
+        {
+          'type': 'Action',
+          'txnId': _txnId(),
+          'action': 'reportActivity',
+          'args': [
+            'Connection',
+            null,
+            {'isActive': true},
+          ],
+        },
+      ];
+
+  /// Enters late, when the handshake could not.
+  ///
+  /// A configured space id carries no `spaceUserId`, so on that path the first
+  /// thing that can tell us who we are is the `Connection` row inside the state
+  /// dump. Sent once per connection — `_entered` is reset on every connect, and
+  /// entering twice on one socket would increment `numTimesEnteredSpace` twice
+  /// for no benefit.
+  void _maybeEnter() {
+    if (_entered) return;
+    final self = reader.selfId;
+    if (self == null) return;
+    final ws = _ws;
+    if (ws == null || ws.readyState != WebSocket.open) return;
+
+    _entered = true;
+    try {
+      for (final frame in _enterFrames(self)) {
+        ws.add(msgpackEncode(frame));
+      }
+      _log('direct: entered space as $self');
+    } on Object catch (error) {
+      // Not fatal: we are subscribed and reading either way, and the next
+      // connection gets another go.
+      _entered = false;
+      _log('direct: could not enter the space: $error');
+    }
+  }
 
   void _heartbeat() {
     final ws = _ws;
@@ -469,6 +560,10 @@ class DirectCollector {
     _frames++;
     if (reader.ingest(frame)) _dirty = true;
 
+    // The state dump is what names us, so this is the first moment the late path
+    // can enter. Cheap to ask: it returns immediately once done.
+    _maybeEnter();
+
     // Interactions go out at once rather than waiting for the publish window.
     // Coalescing exists because nobody needs every intermediate position; a wave is
     // a single deliberate act and there is nothing to coalesce it with.
@@ -484,7 +579,7 @@ class DirectCollector {
         // Deliberately *not* the frame count. A status whose detail changes four
         // times a second would fill the UI's own history with noise; the user count
         // changes rarely and means something.
-        _setHealth(true, '${reader.userCount} space users (observer)');
+        _setHealth(true, '${reader.userCount} space users');
       } else if (_handshakeAt != null &&
           DateTime.now().difference(_handshakeAt!) >= _handshakeGrace) {
         // Frames arriving but still no state means the handshake was not accepted —

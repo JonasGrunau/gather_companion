@@ -13,10 +13,12 @@ you change something here, look at the JS twin named in the table.
 | `msgpack.dart` | `bridge/lib/msgpack.js` | Decoder for everything Gather sends, incl. 5 ext types. Shallow encoder for the 5 frames we send. |
 | `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, plus `MeetingWatch` for invites and knocks. |
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
-| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — observer handshake, heartbeat, 250ms roster coalescing, `teleport`, backoff. |
+| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, backoff. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
 | `party.dart` | *(deleted from the bridge)* | `PartyMode`. Lives only here now — the app holds the socket, and two parties driving one avatar would fight. Draws its tiles from `space_map.dart`. |
-| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas) and "what is this room called". |
+| `space_art.dart` | *(no counterpart)* | `SpaceArt` / `ArtGround` / `ArtFloor` / `ArtWall` / `ArtSprite`, and the URL rules for Gather's floor, wall and furniture art. **Transcribed from the client bundle.** Gather ships no tileset: this is the list of images to fetch and where each one goes, 573 of them totalling 222 KB on the measured space. Note the two depths a wall can have — the sides are `ArtWall` in `ground`, while the north and south bands are `ArtSprite`s in `props`, because `ensureImmersiveWalls` gives them depths of their own. |
+| `avatar.dart` | *(no counterpart)* | `hashOutfit` / `avatarSpriteUrl` / `avatarAnimation` / `AvatarAnimation` / `avatarFrame` / `Facing` / `Pose`. The sprite service composites an outfit into one 72-frame sheet; the "hash" is the wearable ids joined with dots plus a timestamp, and getting its order or format wrong is a 404 rather than a wrong-looking person. The animation table is `Ae` from the client, transcribed with its frame rates: walking at 7fps, talking at 4, a still pose declared as one frame at 60. |
+| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas), "what is this room called" and "is somebody standing here sitting down" (`isSeat` — `playerState` never reaches the wire, so it is derived from the chair). `artFor()` builds the drawable scene from the same rows. |
 
 ## Things that will bite you
 
@@ -32,8 +34,16 @@ you change something here, look at the JS twin named in the table.
   undefined, and *absent* `followTargetId` (nobody is followed) differs from *null*
   (explicitly cleared). `RosterRow.followTargetKnown` carries the distinction; without
   it the app renders a confident "nobody is following you" out of missing data.
-- **`enterSpace` is never sent.** It is what puts an avatar in the room, and it
-  permanently increments `numTimesEnteredSpace`. Reading needs only `loadSpaceUser`.
+  `clusterId` is the second such column and `clusterIdKnown` is its flag — the
+  stakes there are opening a call with nobody in it, or never opening one.
+- **`enterSpace` is sent here, and only here.** It puts an avatar in the room and
+  permanently increments `numTimesEnteredSpace`, so it is not free — but the app
+  publishes media, and a thing that publishes is present. `DirectCollector` sends
+  it in the handshake when `/users/me/recent-spaces` supplied our `spaceUserId`,
+  and otherwise as soon as the `Connection` row names us (`_maybeEnter`), once per
+  connection. **The JS twin `bridge/lib/direct.js` must never grow these frames** —
+  that divergence is the one exception to the never-drift rule, and
+  `bridge/test/direct.test.js` guards it.
 - **`GatherAuthException.permanent` is load-bearing.** A revoked refresh token must
   stop retrying and ask for pairing; a 503 must retry silently. Confusing the two
   either strands the user at a spinner or sends them to the pairing screen over a

@@ -53,21 +53,61 @@ void main() {
     );
   }
 
-  test('the handshake is sent in order, and stops short of enterSpace', () async {
+  test('the handshake is sent in order, then enters once the dump names us', () async {
     final c = build()..start();
     final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
 
     expect(
-      conn.received.map((f) => f['type']),
+      conn.received.take(4).map((f) => f['type']),
       ['Authenticate', 'ConnectToSpace', 'Subscribe', 'Action'],
     );
-    expect(conn.received.last['action'], 'loadSpaceUser');
+    expect(conn.received[3]['action'], 'loadSpaceUser');
+
+    // A configured space id carries no spaceUserId, so entering waits for the
+    // `Connection` row inside the dump to say which avatar is ours.
+    await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+    await pumpEventQueue();
+
     expect(
-      conn.received.any((f) => f['action'] == 'enterSpace'),
-      isFalse,
-      reason: 'entering is the one action with a permanent cost',
+      conn.received.map((f) => f['action']),
+      containsAllInOrder(['loadSpaceUser', 'enterSpace', 'reportActivity']),
     );
-    expect(c.stats()['entered'], isFalse);
+    expect(
+      conn.received.firstWhere((f) => f['action'] == 'enterSpace')['args'],
+      ['SpaceUser', 'me-1'],
+    );
+    expect(c.stats()['entered'], isTrue);
+  });
+
+  test('a space resolved from REST enters in the handshake itself', () async {
+    // `/users/me/recent-spaces` hands over spaceUserId, so this path does not have
+    // to wait for the dump to say who we are.
+    http.spaces = {
+      'space-1': {'id': 'space-1', 'name': 'Test Space', 'spaceUserId': 'me-1'},
+    };
+    build(spaceId: null).start();
+    final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+
+    expect(
+      conn.received.map((f) => f['action']).whereType<String>(),
+      ['loadSpaceUser', 'enterSpace', 'reportActivity'],
+      reason: 'entering rides along with the handshake, before any frame arrives',
+    );
+  });
+
+  test('entering happens once per connection, not once per frame', () async {
+    // `numTimesEnteredSpace` is a permanent counter on the user's own profile, so
+    // a second enterSpace on the same socket costs something and buys nothing.
+    final c = build()..start();
+    final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+    await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+    conn.delta([
+      {'op': 'replace', 'model': 'SpaceUser', 'id': 'them-1', 'path': '/position/x', 'data': 9},
+    ]);
+    await pumpEventQueue();
+
+    expect(conn.received.where((f) => f['action'] == 'enterSpace'), hasLength(1));
   });
 
   test('the socket url carries the space and our firebase uid', () async {

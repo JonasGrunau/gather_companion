@@ -484,8 +484,10 @@ async function spaces() {
  *   - `Authenticate` wraps the token: `credential: {type:'JWT', jwt}`. A flat
  *     `token` field is ignored — the server does not answer, it just keeps
  *     heartbeating and eventually drops you.
- *   - `Subscribe` takes **no arguments at all**. You cannot narrow the stream by
- *     model from the client; `ModelSubscription` is server-side bookkeeping.
+ *   - `Subscribe` takes **no arguments at all** — it means "send me everything".
+ *     Narrowing is possible, but through a separate `createSubscription` /
+ *     `updateSubscription` action rather than through `Subscribe`; see
+ *     `docs/gather-api.md`. We deliberately do not narrow.
  *   - State is loaded by an `Action`, not by connecting. `loadSpaceUser` is what
  *     materialises your SpaceUser and starts the state dump.
  *
@@ -690,6 +692,11 @@ async function map(args) {
     'CatalogItemVariant',
     'FloorMap',
     'MapEntityIdentifier',
+    // Not map geometry: the two models an avatar is assembled from. `hashOutfit`
+    // joins an outfit's wearable ids and appends the newest `lastSyncAuthoredAt`
+    // among them, so neither model answers on its own.
+    'SpaceUserOutfit',
+    'Wearable',
   ]);
   const rows = new Map([...WANTED].map((m) => [m, []]));
 
@@ -727,6 +734,17 @@ async function map(args) {
 
   console.log('\nmap models in the state dump:');
   for (const [model, list] of rows) console.log(`  ${model.padEnd(22)} ${list.length}`);
+
+  // `--dump <file>` writes the collected rows out so the next question about the
+  // map costs a file read rather than another connection. msgpack ext values carry
+  // Symbol keys and decode `undefined` to a Symbol outright, so they are stringified
+  // through the same replacer the console output uses.
+  if (args.dump) {
+    const replacer = (k, v) =>
+      typeof v === 'symbol' ? String(v) : typeof v === 'bigint' ? String(v) : v;
+    writeFileSync(args.dump, JSON.stringify(Object.fromEntries(rows), replacer, 1));
+    console.log(`  wrote ${args.dump}`);
+  }
 
   // msgpack ext values decode to objects carrying Symbol keys, and `undefined`
   // (ext-4) comes back as a Symbol outright, so nothing here may assume a value
@@ -775,6 +793,44 @@ async function map(args) {
   console.log(
     `  points-per-variant: ${[...counts].sort((a, b) => a[0] - b[0]).map(([n, c]) => `${n === -1 ? 'none' : n}×${c}`).join(' ')}`,
   );
+
+  // What the map *looks* like, as opposed to what it blocks. `mainRenderable` and
+  // `foregroundRenderable` carry the sprite; `MapArea` carries floor and wall
+  // texture keys. The client turns a renderable's `imageUrl` into
+  // `https://static.gather.town<path>?t=<catalogItem.lastSyncAuthoredAt>` unless it
+  // already starts with `http` — so the shape of these paths decides whether a
+  // second client can fetch the art at all.
+  const art = variants
+    .map((v) => v?.mainRenderable?.imageUrl)
+    .filter((u) => typeof u === 'string');
+  const prefixes = new Map();
+  for (const url of art) {
+    const key = url.startsWith('http') ? new URL(url).origin : url.split('/').slice(0, 3).join('/');
+    prefixes.set(key, (prefixes.get(key) ?? 0) + 1);
+  }
+  console.log(`\nart (${art.length} of ${variants.length} variants carry a mainRenderable.imageUrl):`);
+  for (const [prefix, n] of [...prefixes].sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${String(n).padStart(4)} ${prefix}`);
+  }
+  for (const v of variants.slice(0, 4)) {
+    console.log(`  main ${show(v?.mainRenderable)}`);
+    console.log(
+      `     fg ${show(v?.foregroundRenderable)}  dims ${show(v?.dimensionsInPixels)}  offset ${show(v?.offsetInPixels)}`,
+    );
+  }
+
+  const areas = rows.get('MapArea');
+  const tally = (field) => {
+    const counts = new Map();
+    for (const a of areas) {
+      const value = typeof a?.[field] === 'string' ? a[field] : String(kind(a?.[field]));
+      counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    return [...counts].sort((a, b) => b[1] - a[1]).map(([v, n]) => `${v}×${n}`).join(' ');
+  };
+  for (const field of ['floorTexture', 'wallsTexture', 'floorColor', 'mapAreaType']) {
+    console.log(`  ${field.padEnd(14)} ${tally(field)}`);
+  }
 
   for (const model of ['FloorMap', 'MapArea', 'MapObject']) {
     const list = rows.get(model);

@@ -54,3 +54,11 @@ app.*.map.json
 # is named `<project>-firebase-adminsdk-<hash>-<id>.json`.
 *-firebase-adminsdk-*.json
 service-account*.json
+
+# Unredacted SFU captures from `tool/probe-sfu.mjs --raw`. These carry a live
+# Firebase ID token, TURN credentials, DTLS fingerprints and ICE candidates
+# naming your LAN and public IPs. The probe writes a redacted transcript by
+# default and only produces this when explicitly asked; committing one would
+# publish a working credential.
+*.raw.jsonl
+sfu-capture.raw*

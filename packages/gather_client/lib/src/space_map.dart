@@ -100,6 +100,8 @@
 /// and 94 of the 112 people were standing in that set.
 library;
 
+import 'space_art.dart';
+
 /// Pixels per tile. `const l=32` in the bundle, exported as `TILE_SIZE`.
 const _tileSize = 32;
 
@@ -165,9 +167,11 @@ class SpaceMap {
     required this.rooms,
     Set<int>? private,
     Set<int>? inside,
+    Set<int>? seats,
   })  : _blocked = blocked,
         _private = private ?? const {},
         _inside = inside ?? const {},
+        _seats = seats ?? const {},
         walkable = _select(width * height, (t) => !blocked.contains(t)),
         open = _select(width * height, (t) {
           if (blocked.contains(t)) return false;
@@ -194,6 +198,15 @@ class SpaceMap {
   /// is. Empty for a space that defines no other areas — see the constructor.
   final Set<int> _inside;
 
+  /// Tiles you sit down on: a chair's `sittable` points, placed the same way its
+  /// collision points are.
+  ///
+  /// Not a physical fact like [walkable] and not manners like [open] — it is what
+  /// somebody standing here *looks* like. The client keeps `playerState` for this
+  /// and never sends it, so a second client has to work it out the way Gather does:
+  /// you are sitting when you are standing on a seat.
+  final Set<int> _seats;
+
   final List<SpaceRoom> rooms;
 
   /// Every tile a body physically fits on, as `y * width + x`. Furniture removed;
@@ -213,6 +226,11 @@ class SpaceMap {
 
   /// Inside a closed room: standable, but not somewhere to teleport for fun.
   bool isPrivate(int x, int y) => _private.contains(y * width + x);
+
+  /// Whether somebody standing here is sitting down. See [_seats].
+  bool isSeat(int x, int y) => _seats.contains(y * width + x);
+
+  int get seatCount => _seats.length;
 
   /// Inside the office rather than the emptiness around it.
   bool isInside(int x, int y) =>
@@ -253,6 +271,10 @@ class SpaceMapBuilder {
   bool _dirty = true;
   Map<String, SpaceMap> _maps = const {};
 
+  /// `'<floorId>/<dark>'` -> artwork. Thrown away whenever a patch lands, on the
+  /// same reasoning as [_dirty]: a moved chair changes where it is drawn.
+  final Map<String, SpaceArt> _art = {};
+
   /// Whether anything has arrived at all. False means "no map yet", which is a
   /// different thing from "a map with nothing in it".
   bool get hasData => _floors.isNotEmpty && _areas.isNotEmpty;
@@ -275,6 +297,18 @@ class SpaceMapBuilder {
     // handing it over would place walls that are not there.
     if (floorId == null) return all.length == 1 ? all.values.first : null;
     return all[floorId];
+  }
+
+  /// The same floor, drawn rather than measured: see `space_art.dart`.
+  ///
+  /// Separate from [forFloor] because the two answer different questions and change
+  /// at different rates — walkability is consumed four times a second by party mode,
+  /// artwork once per screen. Cached per floor *and* per theme, since a space that
+  /// switches appearance re-resolves every filename.
+  SpaceArt? artFor(String? floorId, {bool dark = true}) {
+    final map = forFloor(floorId);
+    if (map == null) return null;
+    return _art.putIfAbsent('${map.floorId}/$dark', () => _buildArt(map, dark: dark));
   }
 
   Map<String, Map<String, Object?>>? _storeFor(String model) => switch (model) {
@@ -324,6 +358,7 @@ class SpaceMapBuilder {
     }
 
     _dirty = true;
+    _art.clear();
     return true;
   }
 
@@ -418,6 +453,265 @@ class SpaceMapBuilder {
     return !snapped;
   }
 
+  // ---- artwork -------------------------------------------------------------------
+
+  /// How deep in the parent chain a row sits. `MapEntity#depth`, which only breaks
+  /// ties between floors that end on the same row.
+  int _nesting(Map<String, Object?> row, [int depth = 0]) {
+    if (depth >= _maxHierarchyDepth) return depth;
+    final parentId = _str(row['parentObjectId']) ?? _str(row['parentAreaId']);
+    final parent = parentId == null ? null : (_objects[parentId] ?? _areas[parentId]);
+    return parent == null ? depth : _nesting(parent, depth + 1);
+  }
+
+  /// `MapArea#doorwayPositionHashes`, in tiles relative to the area.
+  ///
+  /// Each location is two tiles — right for `Horizontal`, down for `Vertical` — and
+  /// a wall piece is simply not drawn on either of them, which is what makes a door
+  /// a gap rather than a picture of a door.
+  Set<int> _doorways(Map<String, Object?> area, int width) {
+    final doorways = area['doorways'];
+    final locations = doorways is Map<String, Object?> ? doorways['locations'] : null;
+    if (locations is! List) return const {};
+
+    final tiles = <int>{};
+    for (final location in locations) {
+      if (location is! Map<String, Object?>) continue;
+      final origin = location['origin'];
+      if (origin is! Map<String, Object?>) continue;
+      final x = _num(origin['x'])?.toInt();
+      final y = _num(origin['y'])?.toInt();
+      if (x == null || y == null) continue;
+      final horizontal = _str(location['orientation']) == 'Horizontal';
+      tiles.add(y * width + x);
+      tiles.add(horizontal ? y * width + x + 1 : (y + 1) * width + x);
+    }
+    return tiles;
+  }
+
+  /// `updateDepth`: the sprite's fold line, or its parent's with the child's own
+  /// tucked in behind the decimal point so a lamp travels with the desk it stands on.
+  /// One level deep, exactly as the client does it.
+  double _propDepth(Map<String, Object?> object, double topY, num fold) {
+    final own = topY * _tileSize + fold;
+
+    final parent = _objects[_str(object['parentObjectId']) ?? ''];
+    if (parent == null) return own;
+    final parentVariant = _variants[_str(parent['catalogItemVariantId']) ?? ''];
+    if (parentVariant == null) return own;
+    final parentTopLeft = _topLeft(parent, parentVariant);
+    if (parentTopLeft == null) return own;
+
+    final renderable = parentVariant['mainRenderable'];
+    final parentFold =
+        renderable is Map<String, Object?> ? (_num(renderable['fold']) ?? 0) : 0;
+    return parentTopLeft.y * _tileSize + parentFold + own / 1e6;
+  }
+
+  SpaceArt _buildArt(SpaceMap map, {required bool dark}) {
+    Map<String, Object?>? floor;
+    for (final row in _floors.values) {
+      if (_live(row) && row['floorId'] == map.floorId) {
+        floor = row;
+        break;
+      }
+    }
+    final mapId = floor?['id'];
+    if (mapId is! String) {
+      return SpaceArt(
+        width: (map.width * _tileSize).toDouble(),
+        height: (map.height * _tileSize).toDouble(),
+        ground: const [],
+        props: const [],
+      );
+    }
+    final baseId = _str(floor?['baseAreaId']);
+
+    final ground = <ArtGround>[];
+    final props = <ArtSprite>[];
+
+    // Paint order for the ground, which is a lookup and not a coordinate: the base
+    // area first, then `Public` zones, then rooms and desks. Within a layer, nesting
+    // and then the bottom edge — `updateFloorsDepth`'s two tiebreaks, in its order.
+    final areas = [
+      for (final area in _areas.values)
+        if (area['mapId'] == mapId && _live(area)) area,
+    ];
+    int layerOf(Map<String, Object?> area) => area['id'] == baseId
+        ? 0
+        : _str(area['mapAreaType']) == 'Public'
+            ? 2
+            : 4;
+    double bottomOf(Map<String, Object?> area) {
+      final dims = area['dimensionsInTiles'];
+      final at = _absolute(area);
+      if (dims is! Map<String, Object?> || at == null) return 0;
+      return (at.y + (_num(dims['height']) ?? 0)) * _tileSize;
+    }
+
+    areas.sort((a, b) {
+      final layer = layerOf(a).compareTo(layerOf(b));
+      if (layer != 0) return layer;
+      final nesting = _nesting(a).compareTo(_nesting(b));
+      if (nesting != 0) return nesting;
+      return bottomOf(a).compareTo(bottomOf(b));
+    });
+
+    for (final area in areas) {
+      final dims = area['dimensionsInTiles'];
+      if (dims is! Map<String, Object?>) continue;
+      final at = _absolute(area);
+      if (at == null) continue;
+
+      final tilesWide = _num(dims['width'])?.toInt() ?? 0;
+      final tilesHigh = _num(dims['height'])?.toInt() ?? 0;
+      if (tilesWide <= 0 || tilesHigh <= 0) continue;
+
+      final left = at.x * _tileSize;
+      final top = at.y * _tileSize;
+      final width = (tilesWide * _tileSize).toDouble();
+      final height = (tilesHigh * _tileSize).toDouble();
+
+      final url = floorImageUrl(
+        _str(area['floorTexture']),
+        _str(area['floorColor']),
+        dark: dark,
+      );
+      if (url != null) {
+        ground.add(ArtFloor(
+          url: url,
+          left: left,
+          top: top,
+          width: width,
+          height: height,
+        ));
+      }
+
+      // The base area is the grid, and grids have no walls; `wallsTexture` on it is
+      // `NewStyleNoWall` anyway, but saying so here means one less thing to be
+      // surprised by.
+      final style = _str(area['wallsTexture']);
+      if (area['id'] == baseId || style == null || style == _noWall) continue;
+
+      final doorways = _doorways(area, tilesWide);
+      // North and south bands are two tiles tall and own the corners; the sides run
+      // between them, which is why they stop at `tilesHigh - 3`.
+      const bandHeight = _tileSize * 2;
+      for (var x = 0; x < tilesWide; x++) {
+        final north = x == 0
+            ? WallPiece.northWest
+            : x == tilesWide - 1
+                ? WallPiece.northEast
+                : WallPiece.north;
+        final south = x == 0
+            ? WallPiece.southWest
+            : x == tilesWide - 1
+                ? WallPiece.southEast
+                : WallPiece.south;
+
+        if (!doorways.contains(x)) {
+          final url = wallImageUrl(style, north, dark: dark);
+          if (url != null) {
+            props.add(ArtSprite(
+              url: url,
+              left: left + x * _tileSize,
+              // Above the area's first row: `northEdge.setPosition(0, -nw)`.
+              top: top - bandHeight,
+              width: _tileSize.toDouble(),
+              height: bandHeight.toDouble(),
+              // `QS(container.y + .1)` — the area's own top line, so the band covers
+              // whatever stands north of the room and nothing inside it.
+              depth: top + 0.1,
+            ));
+          }
+        }
+        if (!doorways.contains((tilesHigh - 1) * tilesWide + x)) {
+          final url = wallImageUrl(style, south, dark: dark);
+          if (url != null) {
+            props.add(ArtSprite(
+              url: url,
+              left: left + x * _tileSize,
+              top: top + height - bandHeight,
+              width: _tileSize.toDouble(),
+              height: bandHeight.toDouble(),
+              // `QS(container.y + height * TILE_SIZE)` — the area's bottom line. The
+              // band is two tiles tall and its bottom sits on that line, so it hangs
+              // over the room's last two rows and is drawn over what stands in them.
+              depth: top + height,
+            ));
+          }
+        }
+      }
+
+      for (var y = 0; y < tilesHigh - 2; y++) {
+        for (final (piece, column) in [
+          (WallPiece.west, 0),
+          (WallPiece.east, tilesWide - 1),
+        ]) {
+          if (tilesWide == 1 && piece == WallPiece.east) continue;
+          if (doorways.contains(y * tilesWide + column)) continue;
+          final url = wallImageUrl(style, piece, dark: dark);
+          if (url == null) continue;
+          ground.add(ArtWall(
+            url: url,
+            left: left + column * _tileSize,
+            top: top + y * _tileSize,
+            width: _tileSize.toDouble(),
+            height: _tileSize.toDouble(),
+          ));
+        }
+      }
+    }
+
+    for (final object in _objects.values) {
+      if (object['mapId'] != mapId || !_live(object)) continue;
+      final variant = _variants[_str(object['catalogItemVariantId']) ?? ''];
+      if (variant == null) continue;
+      final topLeft = _topLeft(object, variant);
+      if (topLeft == null) continue;
+
+      final dims = variant['dimensionsInPixels'];
+      final width =
+          dims is Map<String, Object?> ? (_num(dims['width']) ?? 0).toDouble() : 0.0;
+      final height =
+          dims is Map<String, Object?> ? (_num(dims['height']) ?? 0).toDouble() : 0.0;
+
+      final item = _items[_str(variant['catalogItemId']) ?? ''];
+      final authoredAt = _str(item?['lastSyncAuthoredAt']);
+
+      for (final (field, foreground) in [
+        ('mainRenderable', false),
+        ('foregroundRenderable', true),
+      ]) {
+        final renderable = variant[field];
+        if (renderable is! Map<String, Object?>) continue;
+        final url = catalogImageUrl(_str(renderable['imageUrl']), authoredAt: authoredAt);
+        if (url == null) continue;
+
+        props.add(ArtSprite(
+          url: url,
+          left: topLeft.x * _tileSize,
+          top: topLeft.y * _tileSize,
+          width: width,
+          height: height,
+          depth: _propDepth(object, topLeft.y, _num(renderable['fold']) ?? 0),
+          foreground: foreground,
+        ));
+      }
+    }
+
+    // The ground is already in order — it was built area by area in it. Only the
+    // furniture needs sorting, and it sorts by its fold line.
+    props.sort((a, b) => a.depth.compareTo(b.depth));
+
+    return SpaceArt(
+      width: (map.width * _tileSize).toDouble(),
+      height: (map.height * _tileSize).toDouble(),
+      ground: List.unmodifiable(ground),
+      props: List.unmodifiable(props),
+    );
+  }
+
   // ---- building ----------------------------------------------------------------
 
   Map<String, SpaceMap> _build() {
@@ -440,6 +734,7 @@ class SpaceMapBuilder {
       final blocked = <int>{};
       final private = <int>{};
       final inside = <int>{};
+      final seats = <int>{};
       final rooms = <SpaceRoom>[];
 
       // Furniture, and only furniture. Walls are directions, not tiles — see the
@@ -452,6 +747,13 @@ class SpaceMapBuilder {
         for (final tile in _pointsOf(object, variant, 'collision')) {
           if (tile.x < 0 || tile.y < 0 || tile.x >= width || tile.y >= height) continue;
           blocked.add(tile.y * width + tile.x);
+        }
+        // `activeSittableAbsoluteTiles` — the same placement and the same
+        // `isSpecialEffectActive` gate the collision tiles get, which is why this
+        // shares the loop rather than repeating it.
+        for (final tile in _pointsOf(object, variant, 'sittable')) {
+          if (tile.x < 0 || tile.y < 0 || tile.x >= width || tile.y >= height) continue;
+          seats.add(tile.y * width + tile.x);
         }
       }
 
@@ -506,6 +808,7 @@ class SpaceMapBuilder {
         blocked: blocked,
         private: private,
         inside: inside,
+        seats: seats,
         rooms: rooms,
       );
     }

@@ -5,8 +5,9 @@
 
 ## Purpose
 
-Two developer scripts: the one that draws the app icon, and the one that ships a
-build to TestFlight. Neither is part of the app or the npm package.
+Developer scripts: three probes that ask Gather questions, the one that draws the
+app icon, and the one that ships a build to TestFlight. None is part of the app
+or the npm package.
 
 ## Key Files
 
@@ -14,6 +15,7 @@ build to TestFlight. Neither is part of the app or the npm package.
 |------|-------------|
 | `probe-connect.mjs` | The direct-connection spike, still the fastest way to ask Gather a question. `adopt` reuses the desktop session; `spaces` lists ids; `connect` opens a read-only game socket. **`map`** dumps the shape of the map models and tries the REST routes (all 404 — the map is only ever on the socket). **`walkable`** builds the collision grid and scores it against the live roster, which is how the rounding rule in `space_map.dart` was settled. `--dump <file>` writes the raw rows so hypotheses can be swept offline instead of over somebody's workspace. |
 | `probe-events.mjs` | The instrument that found Gather's event bus. Prints the full model census, dumps the interaction-shaped models whole, then watches **every** delta patch and bus event unfiltered — which is what `probe-connect.mjs` structurally could not do, since it pipes frames through the four-model reader. Read-only observer; never sends `enterSpace`. |
+| `probe-sfu.mjs` | The media-plane capture. Attaches to a running desktop client over CDP and records **every** WebSocket it owns — the upgrade request and its headers, both frame directions, and the close — then prints a grammar summary: where the credential lives, what the correlation key is, and the full ordered method vocabulary per socket. Decodes msgpack (the game socket) and Engine.IO/Socket.IO (the router and SFU sockets). Sends nothing to Gather. |
 | `make_icons.mjs` | Draws the icon from constants and writes all fifteen asset-catalogue sizes, the launch mark on alpha, and the squircled `docs/icon.png`. Zero dependencies — the PNG encoder is `node:zlib` plus a CRC table. |
 | `upload-testflight.sh` | Uploads `build/ios/ipa/gather_companion.ipa` via `xcrun altool`. **CI runs this exact script**, so the human path and the automated path cannot drift. |
 | `icon-preview.png` | Output of `--preview`, committed for review. |
@@ -21,6 +23,33 @@ build to TestFlight. Neither is part of the app or the npm package.
 ## For AI Agents
 
 ### Working In This Directory
+
+**`probe-sfu.mjs`**
+
+- **Attach at the *browser* endpoint** (`/json/version` → `webSocketDebuggerUrl`),
+  never at a page endpoint. Gather hosts the app in a `BrowserView` alongside tray
+  and accessory renderers, so picking one `type:"page"` target out of `/json`
+  misses whichever one owns the socket. The structure came from
+  `bridge/lib/cdp.js`, deleted in `80a2ab8`; recover it with
+  `git show 80a2ab8^:bridge/lib/cdp.js` if more of it is ever wanted.
+- **`Network.enable` only reports frames from that moment on.** A socket opened
+  before the attach produces no `webSocketCreated` event and so has no URL — which
+  is why `classify()` tolerates `unknown` and why `reload` exists.
+- **Capture every socket, not just the SFU's.** If the media credential were
+  minted by an unmapped game-socket action, a probe filtered to the SFU host would
+  record a token it could not explain.
+- **`--raw` writes live credentials.** A capture carries a Firebase ID token, TURN
+  credentials, DTLS fingerprints, and ICE candidates naming your LAN and public
+  IPs. `.gitignore` covers `*.raw.jsonl`; the redacted transcript is the one to
+  read, quote and commit.
+- Sends nothing to Gather, but `reload` restarts the renderer — about two seconds,
+  the same interruption `resync` used to cost.
+
+```sh
+open -a GatherV2 --args --remote-debugging-port=9222
+node tool/probe-sfu.mjs watch          # then walk into a call
+node tool/probe-sfu.mjs reload         # catch the router socket at startup
+```
 
 **`make_icons.mjs`**
 

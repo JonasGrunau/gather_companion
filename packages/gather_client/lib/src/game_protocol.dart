@@ -3,8 +3,9 @@
 /// A port of `bridge/lib/game-protocol.js`. One binary WebSocket to
 /// `wss://game-router.v2.gather.town/gather-game-v2?spaceId=<uuid>&authUserId=<firebaseUid>`
 /// carrying msgpack frames. [DirectCollector] opens it and authenticates as the
-/// user, then stops at `loadSpaceUser` — it never sends `enterSpace`, so it reads
-/// the whole space without showing up as a presence in it.
+/// user. Reading the whole space needs only `loadSpaceUser`; the app goes on to
+/// send `enterSpace` as well, because it is heading towards carrying a call, but
+/// nothing in this file depends on that — every field below arrives either way.
 ///
 /// ## Wire format
 ///
@@ -47,6 +48,7 @@
 /// plus `SpaceUser.userAccountId` gives a second, slower route.
 library;
 
+import 'avatar.dart';
 import 'space_map.dart';
 
 /// Only these models matter; a full state dump is mostly calendars and catalogs.
@@ -68,6 +70,11 @@ const _models = {
   // state rather than sent over the event bus. See [_MeetingWatch].
   'MeetingParticipant',
   'MeetingJoinRequest',
+  // What people look like. Neither model answers on its own: `hashOutfit` joins an
+  // outfit's wearable ids and appends the newest `lastSyncAuthoredAt` among them,
+  // so the sprite URL needs both. See `avatar.dart`.
+  'SpaceUserOutfit',
+  'Wearable',
 };
 
 /// The map models, routed to [SpaceMapBuilder] rather than to the roster.
@@ -84,6 +91,13 @@ const _mapModels = {
 /// `speaking` earns its place: measured over three minutes on a 111-person space
 /// it was the most frequent delta of any kind. It is live voice activity — who is
 /// actually talking.
+///
+/// `clusterId` is the conversation. Gather's client computes proximity itself, but
+/// it does not compute *this*: the server groups people who are talking together
+/// and publishes the grouping, and the desktop client's own A/V pipeline reads it
+/// in `connectStronglyToPlayersInSameCluster`. Sharing a non-null `clusterId` with
+/// somebody is what the video bubble means. Without this entry the `replace` patch
+/// on `/clusterId` is dropped and a bubble forming looks like nothing happening.
 const _trackedFields = {
   'followTargetId',
   'position',
@@ -92,7 +106,15 @@ const _trackedFields = {
   'connected',
   'isIdle',
   'speaking',
+  'clusterId',
   'userAccountId',
+  // Which way somebody is facing. Only the map cares, and only since it started
+  // drawing bodies rather than dots: an avatar sheet has a frame per direction and
+  // without this everybody stands facing the camera while walking north.
+  'direction',
+  // Whether they are actually there. `connected` alone is not that — see
+  // [RosterRow.availability].
+  'userSetAvailability',
 };
 
 /// One interaction off `DeltaState.events[]`.
@@ -142,6 +164,10 @@ class RosterRow {
     this.speaking,
     this.followTargetKnown = false,
     this.followTargetId,
+    this.clusterIdKnown = false,
+    this.clusterId,
+    this.direction,
+    this.availability,
   });
 
   final String id;
@@ -161,6 +187,44 @@ class RosterRow {
   /// would render a confident empty state out of missing data.
   final bool followTargetKnown;
   final String? followTargetId;
+
+  /// Whether `clusterId` was present on the row at all.
+  ///
+  /// The same absent-versus-null distinction [followTargetKnown] draws, and it
+  /// matters more here because something acts on it: standing alone is
+  /// `clusterId: null`, while not-yet-known is the key being missing. Treating
+  /// them alike means either opening a call with nobody in it or never opening
+  /// one at all.
+  final bool clusterIdKnown;
+
+  /// The conversation this person is in, if any. Two people sharing a non-null
+  /// value are in the same bubble.
+  final String? clusterId;
+
+  /// `Up`, `Down`, `Left` or `Right` — which way the body is facing.
+  ///
+  /// `direction.value`, not `direction`: the wire carries a value object,
+  /// `{$type: 'Direction', value: 'Right'}`, exactly as `userSetAvailability` does.
+  /// Null before it has ever been sent, which the map reads as facing south, exactly
+  /// as the client does — which is why reading this field wrongly does not look like
+  /// a parsing bug, it looks like an office where everybody stares at the floor.
+  final String? direction;
+
+  /// `Active`, `Busy` or `Offline` — `userSetAvailability.value`, and the only field
+  /// that answers "are they actually there".
+  ///
+  /// **`connected` does not.** Measured 2026-08-13 against a 98-row space: twelve
+  /// rows carried `connected: true` and nine of those were `Offline`, some of them
+  /// for a day. A socket that goes away without saying goodbye leaves `connected`
+  /// true behind it, so a client trusting that field alone draws bodies where the
+  /// desktop app shows nobody and reports eleven people in an office holding three.
+  /// Neither field is sufficient on its own — availability alone counted 31, because
+  /// people leave it on `Active` when they close the app — so presence is the pair:
+  /// connected *and* not `Offline`.
+  final String? availability;
+
+  /// Connected, and not away. See [availability].
+  bool get isPresent => connected == true && availability != 'Offline';
 }
 
 /// A whole roster, as [PresenceTracker] consumes it.
@@ -170,6 +234,33 @@ class Roster {
   final String? selfId;
   final List<RosterRow> rows;
   final String? spaceName;
+
+  /// The people in the same conversation as us, excluding ourselves.
+  ///
+  /// Empty when we are standing alone, when we do not yet know who we are, or
+  /// when the dump has not carried our `clusterId` — all three are honestly "no
+  /// call", and none of them is worth distinguishing to a caller deciding whether
+  /// to open one.
+  ///
+  /// Disconnected rows are dropped: a cluster outlives the moment somebody's
+  /// socket dies, so without this a call would keep a tile for someone who has
+  /// already gone.
+  List<RosterRow> get myCluster {
+    final me = selfId;
+    if (me == null) return const [];
+    String? mine;
+    for (final row in rows) {
+      if (row.id == me) {
+        mine = row.clusterId;
+        break;
+      }
+    }
+    if (mine == null) return const [];
+    return [
+      for (final row in rows)
+        if (row.id != me && row.clusterId == mine && row.connected != false) row,
+    ];
+  }
 }
 
 /// Mutable accumulator for one SpaceUser as patches arrive.
@@ -189,6 +280,10 @@ class _Row {
   String? userAccountId;
   bool followTargetKnown = false;
   String? followTargetId;
+  bool clusterIdKnown = false;
+  String? clusterId;
+  String? direction;
+  String? availability;
   bool gone = false;
 }
 
@@ -321,6 +416,15 @@ class GameProtocolReader {
     if (model is! String || !_models.contains(model)) return false;
     _patchCount++;
 
+    if (model == 'SpaceUserOutfit' || model == 'Wearable') {
+      _applyAvatarModel(model, patch);
+      // Never "the roster changed": what somebody is wearing does not move them, and
+      // the map reads outfits through [avatarUrlFor] when it paints. 66 outfits and
+      // 157 wearables arrive in the dump, which would otherwise be 223 republished
+      // rosters for a screen that has not opened yet.
+      return false;
+    }
+
     if (_mapModels.contains(model)) {
       // Never "the roster changed": a map edit is not somebody moving, and
       // republishing an 80-row roster because a plant was dragged is exactly the
@@ -347,6 +451,56 @@ class GameProtocolReader {
         return _replaceField(model, patch);
       default:
         return false;
+    }
+  }
+
+  /// SpaceUser id -> the wearable ids they have on.
+  final Map<String, Map<String, Object?>> _outfits = {};
+
+  /// Wearable id -> when it was last authored, which is half of the sprite URL.
+  final Map<String, DateTime> _wearableAuthoredAt = {};
+
+  /// The avatar spritesheet for somebody, or null if we cannot name their outfit.
+  ///
+  /// Null is normal rather than exceptional: only 66 of 111 people in the measured
+  /// dump had a `SpaceUserOutfit` row at all, and somebody with no outfit has no
+  /// sprite to ask for. The map falls back to a dot.
+  String? avatarUrlFor(String spaceUserId) {
+    final outfit = _outfits[spaceUserId];
+    if (outfit == null) return null;
+    final hash = hashOutfit(outfit, (id) => _wearableAuthoredAt[id]);
+    return hash == null ? null : avatarSpriteUrl(hash);
+  }
+
+  void _applyAvatarModel(String model, Map<String, Object?> patch) {
+    final data = patch['data'];
+    switch (patch['op']) {
+      case 'addmodel':
+        if (data is! Map<String, Object?>) return;
+        if (model == 'Wearable') {
+          final id = data['id'];
+          final at = data['lastSyncAuthoredAt'];
+          if (id is String && at is DateTime) _wearableAuthoredAt[id] = at;
+          return;
+        }
+        final spaceUserId = data['spaceUserId'];
+        if (spaceUserId is String) _outfits[spaceUserId] = {...data};
+      case 'replace':
+        // A changed hat arrives as `/hat`, not as a fresh row.
+        if (model != 'SpaceUserOutfit') return;
+        final id = patch['id'];
+        if (id is! String) return;
+        final field =
+            (patch['path'] as String? ?? '').split('/').where((s) => s.isNotEmpty).firstOrNull;
+        if (field == null) return;
+        for (final outfit in _outfits.values) {
+          if (outfit['id'] != id) continue;
+          outfit[field] = data;
+          return;
+        }
+      case 'deletemodel':
+        if (model != 'SpaceUserOutfit') return;
+        _outfits.removeWhere((_, outfit) => outfit['id'] == patch['id']);
     }
   }
 
@@ -426,6 +580,18 @@ class GameProtocolReader {
       return _merge(row, {'position__${sub.first}': value});
     }
 
+    // Going away is a patch on the value object's own field, and dropping it would
+    // leave somebody who has gone home standing in the office until they reconnect.
+    if (field == 'userSetAvailability' && sub.first == 'value') {
+      return _merge(row, {'userSetAvailability__value': patch['data']});
+    }
+
+    // Turning around is the same shape, and it arrives on its own: you can face a new
+    // way without moving, and every step sends it before the position.
+    if (field == 'direction' && sub.first == 'value') {
+      return _merge(row, {'direction__value': patch['data']});
+    }
+
     return false;
   }
 
@@ -469,6 +635,38 @@ class GameProtocolReader {
     if (data.containsKey('type')) {
       set(row.kind, _nullableString(data['type']), (v) => row.kind = v);
     }
+    // A value object, like [availability] below and not like a plain string. Read as
+    // one, every row's direction came back null and the whole office faced south:
+    // `Facing.of(null)` is south, so the bug looked like a rendering default rather
+    // than like a field that was never parsed.
+    if (data.containsKey('direction')) {
+      final value = data['direction'];
+      set(
+        row.direction,
+        value is Map<String, Object?> ? _nullableString(value['value']) : _nullableString(value),
+        (v) => row.direction = v,
+      );
+    }
+    if (data.containsKey('direction__value')) {
+      set(row.direction, _nullableString(data['direction__value']),
+          (v) => row.direction = v);
+    }
+
+    // A value object: ext-0 decodes to `{$type: 'SpaceUserAvailability', value: …}`,
+    // and a field patch on it arrives as `/userSetAvailability/value`, flattened by
+    // [_replaceField] the way a position is.
+    if (data.containsKey('userSetAvailability')) {
+      final value = data['userSetAvailability'];
+      set(
+        row.availability,
+        value is Map<String, Object?> ? _nullableString(value['value']) : null,
+        (v) => row.availability = v,
+      );
+    }
+    if (data.containsKey('userSetAvailability__value')) {
+      set(row.availability, _nullableString(data['userSetAvailability__value']),
+          (v) => row.availability = v);
+    }
 
     // An optional column: only touch it when the key is actually present, and
     // remember that it *was* present. `PresenceTracker` tells absent from null to
@@ -480,6 +678,15 @@ class GameProtocolReader {
       });
       set(row.followTargetId, _nullableString(data['followTargetId']),
           (v) => row.followTargetId = v);
+    }
+
+    // The other optional column, read the same way and for the same reason.
+    if (data.containsKey('clusterId')) {
+      setIf(!row.clusterIdKnown, () {
+        row.clusterIdKnown = true;
+        changed = true;
+      });
+      set(row.clusterId, _nullableString(data['clusterId']), (v) => row.clusterId = v);
     }
 
     // Position arrives as a value object: {'$type': 'Position', 'x': …, 'y': …}.
@@ -526,6 +733,10 @@ class GameProtocolReader {
         speaking: row.speaking,
         followTargetKnown: row.followTargetKnown,
         followTargetId: row.followTargetId,
+        clusterIdKnown: row.clusterIdKnown,
+        clusterId: row.clusterId,
+        direction: row.direction,
+        availability: row.availability,
       ));
     }
     return Roster(selfId: selfId, rows: rows, spaceName: spaceName);
