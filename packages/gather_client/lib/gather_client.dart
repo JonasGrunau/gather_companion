@@ -6,6 +6,7 @@
 /// pushes while the app is asleep.
 library;
 
+export 'src/activity_feed.dart';
 export 'src/avatar.dart';
 export 'src/direct_collector.dart';
 export 'src/game_protocol.dart';

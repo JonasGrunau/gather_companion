@@ -712,13 +712,24 @@ Who is following you, which of them is talking, and whether the party is on. Tha
 is the whole screen, and all of it is *now* — read from the live Gather socket, not
 from history.
 
-There used to be a scrolling activity feed underneath. It was worth having when the
-bridge kept a 500-event ring on a computer that was awake all day and replayed it on
-connect. Once the app talked to Gather itself, the log could only record what
-happened while the app was open — the one window in which you were already looking
-at the screen — so it was empty exactly when it would have been useful. Everything
-worth interrupting you for arrives as a **push notification** instead, which works
-whether the app is running or not.
+There used to be a scrolling activity feed underneath, kept by the app itself. It was
+worth having when the bridge kept a 500-event ring on a computer that was awake all
+day and replayed it on connect. Once the app talked to Gather itself, the log could
+only record what happened while the app was open — the one window in which you were
+already looking at the screen — so it was empty exactly when it would have been
+useful. Everything worth interrupting you for arrives as a **push notification**
+instead, which works whether the app is running or not.
+
+What is underneath now is **Gather's** activity feed, which is not the same thing.
+That one is recorded server-side, so it was there while the phone was asleep: waves,
+mentions, reactions, thread replies, and "your meeting notes are ready". It is read
+over REST (`GET /spaces/:id/chat/activity-feed`, which answers msgpack like
+everything else here) and topped up by `WaveEvent` off the socket the app already
+holds, so nothing polls. Meeting notes and onboarding nudges can be marked read from
+the phone and the desktop badge clears with them; a wave cannot, because its read
+state is a chat cursor rather than a subscription — so waves show no unread dot
+instead of one the app could not clear. See
+[`docs/gather-api.md`](docs/gather-api.md#the-activity-feed) for the decoded shape.
 
 ### 🎨 Palette and icon
 

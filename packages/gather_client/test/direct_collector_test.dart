@@ -217,6 +217,121 @@ void main() {
     });
   });
 
+  /// The shapes here are transcribed from a capture of the desktop client taken on
+  /// 2026-08-13, not inferred. They are asserted literally because the server
+  /// rejects a whole action on a schema mismatch — a bare `true` sent as
+  /// `{raised: true}` fails, and it fails silently enough to be worth a test.
+  group('being a person in the room', () {
+    /// Connects, waits until our own row is known, and hands back the socket the
+    /// fake saw — everything below needs a `selfId` before it can address anything.
+    Future<(DirectCollector, FakeConnection)> connected() async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      return (c, conn);
+    }
+
+    /// The last frame the fake received for [action], once it has had time to land.
+    Future<Map<Object?, Object?>> lastFrame(
+      FakeConnection conn,
+      String action,
+    ) async {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      return conn.received.lastWhere((f) => f['action'] == action);
+    }
+
+    test('setAvailability names the state, and refuses one Gather cannot be set to',
+        () async {
+      final (c, conn) = await connected();
+
+      expect(c.setAvailability('Busy').ok, isTrue);
+      expect((await lastFrame(conn, 'setAvailability'))['args'],
+          ['SpaceUser', 'me-1', {'availability': 'Busy'}]);
+
+      // Written by the server when a socket goes away. Claiming it while holding an
+      // open one asserts something the connection carrying it contradicts.
+      expect(c.setAvailability('Offline').ok, isFalse);
+      expect(c.setAvailability('Focused').ok, isFalse);
+    });
+
+    test('setCustomStatus carries text, emoji and an expiry as an ext-1 DateTime',
+        () async {
+      final (c, conn) = await connected();
+      final until = DateTime.utc(2026, 8, 13, 18, 33, 7);
+
+      expect(c.setCustomStatus(text: 'Heads down', emoji: '🎧', clearAt: until).ok,
+          isTrue);
+
+      final args = (await lastFrame(conn, 'setCustomStatus'))['args'] as List<Object?>;
+      expect(args[2], {
+        'text': 'Heads down',
+        'emoji': '🎧',
+        // Survives the encoder's ext 1 and comes back as a DateTime, which is the
+        // whole reason `msgpack.dart` learned to write one.
+        'clearCondition': {'type': 'DateTime', 'clearAt': until},
+      });
+    });
+
+    test('setCustomStatus with no expiry omits clearCondition rather than nulling it',
+        () async {
+      final (c, conn) = await connected();
+
+      expect(c.setCustomStatus(text: 'Back at three').ok, isTrue);
+
+      final args = (await lastFrame(conn, 'setCustomStatus'))['args'] as List<Object?>;
+      expect(args[2], {'text': 'Back at three'});
+    });
+
+    test('clearCustomStatus and leaveCluster send two arguments, not three', () async {
+      final (c, conn) = await connected();
+
+      expect(c.clearCustomStatus().ok, isTrue);
+      expect((await lastFrame(conn, 'clearCustomStatus'))['args'],
+          ['SpaceUser', 'me-1']);
+
+      expect(c.leaveCluster().ok, isTrue);
+      expect((await lastFrame(conn, 'leaveCluster'))['args'], ['SpaceUser', 'me-1']);
+    });
+
+    test('setHandRaised sends a bare bool and faceDirection a bare string', () async {
+      final (c, conn) = await connected();
+
+      expect(c.setHandRaised(true).ok, isTrue);
+      expect((await lastFrame(conn, 'setHandRaised'))['args'],
+          ['SpaceUser', 'me-1', true]);
+
+      expect(c.faceDirection('Left').ok, isTrue);
+      expect((await lastFrame(conn, 'faceDirection'))['args'],
+          ['SpaceUser', 'me-1', 'Left']);
+
+      expect(c.faceDirection('Sideways').ok, isFalse);
+    });
+
+    test('broadcastEmote sends the emoji, a count and an empty fan-out list',
+        () async {
+      final (c, conn) = await connected();
+
+      expect(c.broadcastEmote('👋').ok, isTrue);
+      expect((await lastFrame(conn, 'broadcastEmote'))['args'], [
+        'SpaceUser',
+        'me-1',
+        {'emote': '👋', 'count': 1, 'ambientlyConnectedUserIds': <String>[]},
+      ]);
+
+      expect(c.broadcastEmote('').ok, isFalse);
+    });
+
+    test('every one of them refuses before it knows which avatar is ours', () {
+      final c = build();
+      expect(c.setAvailability('Busy').ok, isFalse);
+      expect(c.setCustomStatus(text: 'x').ok, isFalse);
+      expect(c.clearCustomStatus().ok, isFalse);
+      expect(c.broadcastEmote('👋').ok, isFalse);
+      expect(c.setHandRaised(true).ok, isFalse);
+      expect(c.leaveCluster().ok, isFalse);
+    });
+  });
+
   group('a dead credential is told apart from a bad network', () {
     test('a revoked refresh token asks for pairing and stops retrying', () async {
       http

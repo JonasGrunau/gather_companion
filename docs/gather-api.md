@@ -49,6 +49,8 @@ This document maps the API. It does not describe how the bridge works today — 
   - [Email OTP does not currently complete for an existing account](#email-otp-does-not-currently-complete-for-an-existing-account)
   - [What does work: reuse the desktop client's session](#what-does-work-reuse-the-desktop-clients-session)
 - [REST surface — 217 endpoints](#rest-surface-217-endpoints)
+- [The activity feed](#the-activity-feed)
+  - [Marking activity read](#marking-activity-read)
 - [The game socket](#the-game-socket)
   - [Frame types and envelopes](#frame-types-and-envelopes)
   - [Confirmed live, 2026-08-06](#confirmed-live-2026-08-06)
@@ -481,6 +483,111 @@ result in this document.
 | `BrowserExtensionConfig` | `/browser-extension/config` |
 
 
+## The activity feed
+
+`GET /spaces/:spaceId/chat/activity-feed` — what the desktop client shows behind
+`gather-chat-activity-feed-nav`, and the only durable history Gather keeps for you.
+Measured 2026-08-13 against a real space: `200`, **75,407 bytes**,
+`content-type: application/x.gather.msgpack`. REST speaks msgpack too, so the same
+decoder the socket uses reads it; a JSON parse destroys the body.
+
+The payload is normalised exactly like a state dump — id lists plus a model store:
+
+```jsonc
+{ "activityFeed": {
+    "chatMessageIdsForActivityFeedWaveItems":       [ "<ChatMessage id>", … ], // 100
+    "chatMentionIdsForActivityFeedMentionItems":    [ … ],                     //   0
+    "chatMessageIdsForActivityFeedReactionItems":   [ … ],                     //   0
+    "threadParentIdsForActivityFeedReplyItems":     [ … ],                     //   0
+    "activityEventSubscriptionIds":                 [ "<sub id>", … ] },       //  16
+  "serializedModels": {
+    "ChatMessage":               [ … ],  // 100, all type:'System' with an empty body
+    "ChatMessageMetadata":       [ … ],  // 100, all {type:'Waved', …}
+    "ChatChannel":               [ … ],  //   7 DirectMessage channels
+    "ActivityEvent":             [ … ],  //  16
+    "ActivityEventSubscription": [ … ] } //  16
+}
+```
+
+**A wave's sender is on the metadata, not the message.** The `ChatMessage` row is a
+`System` row in a DM channel and its `spaceUserId` is the channel's author, not the
+waver. `ChatMessageMetadata.metadata` is where it actually lives:
+
+```jsonc
+{ "type": "Waved", "waveRecipientId": "<me>", "actorSpaceUserId": "<them>" }
+```
+
+**`ActivityEvent.metadata` is discriminated by `type`.** Observed, 16 rows:
+
+| `type` | Count | Payload |
+|---|---|---|
+| `MeetingArtifactReady` | 14 | `meetingId` `meetingTitle` `meetingAreaId` `hasMeetingMemo` `hasVideoRecording` `meetingArtifactId` `meetingParticipantCount` `artifactContentStartTimestamp` `artifactContentEndTimestamp` |
+| `OnboardingChat` | 1 | none — `isGlobal: true` |
+| `OnboardingDesk` | 1 | none — `isGlobal: true` |
+
+**Read state is on the subscription, not the event.** `ActivityEventSubscription` is
+`{id, spaceUserId, activityEventId, readAt, …}` and `readAt: null` means unread — 11
+of 16 in the measured space.
+
+### Marking activity read
+
+`POST /spaces/:spaceId/chat/activity-feed/toggle-read-status`, captured off the
+desktop client 2026-08-13 and then exercised from our own code against the live
+account:
+
+```http
+Content-Type: application/json
+
+{"activityEventId": "3aba2ff3-fc2d-5c48-9c05-e50f0945c50d"}
+```
+
+→ `200`, and a **msgpack** body holding the row that changed:
+
+```jsonc
+{ "ActivityEventSubscription": [
+    { "id": "5eabaa25-…", "spaceUserId": "…", "activityEventId": "3aba2ff3-…",
+      "readAt": "2026-08-13T17:52:15.417Z", "createdAt": "…", "updatedAt": "…" }]}
+```
+
+Four things here are the opposite of the obvious guess, and every one of them was
+guessed wrong before it was measured:
+
+- **The request is JSON while the response is msgpack.** The API is not symmetric.
+  Beware of confirming otherwise by accident: a JSON body starts with `{`, which is
+  `0x7b`, which is a valid msgpack fixint — so a msgpack decoder "succeeds" on the
+  first byte of a JSON body and returns `123`. Try JSON first.
+- **It names the *event*, not the subscription.** `readAt` lives on the
+  subscription, which makes the subscription id look like the handle. It is not.
+- **One event per request.** The client sends a separate call per item; no batch
+  form was observed, and no plural field exists to invent.
+- **It is a toggle, and there is no `read: true`.** The server flips whatever it
+  finds and stamps its own timestamp, so sending an already-read id marks it
+  *unread*. Anything offering "mark all read" must filter to the unread ones first
+  or it will un-read most of the list. Verified by round trip: unread 6 → 5 → 6.
+
+**Waves are not here at all.** They have no subscription row; their read state is a
+`ChatReadCursor`, posted per channel to
+`POST /spaces/:spaceId/chat/channels/:channelId/read-cursors` (also JSON), and read
+back as `cursors: {previousCursorId, nextCursorId}` on the messages endpoint. So
+"mark this wave read" and "mark this activity read" are two different mechanisms.
+
+**There is no pagination.** `?limit`, `?cursor`, `?before`, `?page` and `?offset`
+were each tried; every one returned a byte-identical body. The feed is a fixed
+snapshot — the last 100 waves plus the live activity events.
+
+**A bucket brings its models only when it is non-empty.** The measured space had zero
+mentions and the response carried no mention model whatsoever, so a reader must
+tolerate an id list it cannot resolve rather than assume the store is complete. For
+the same reason the mention, reaction and reply joins in
+`packages/gather_client/lib/src/activity_feed.dart` are **unverified**: no space
+available to measure had one of them in it.
+
+**This is not the same thing as `ActivityEvent` on the socket.** The model is in the
+state dump too — 2 rows, in [the census](#what-arrives-in-a-state-dump) — but was
+never seen in a delta patch, so the socket is not a live tail for it. Waves *are*
+live on the socket, as `WaveEvent` on the event bus. That makes REST the backfill and
+the bus the tail, and means nothing has to poll.
+
 ## The game socket
 
 Binary msgpack frames, both directions. Handshake order, captured from a live
@@ -720,11 +827,55 @@ Captured off the real client, or confirmed by probe:
 | `updateSubscription` | `['ModelSubscription', '<id>', {modelIds[]}]` | replaces that subscription's id list |
 | `move` | `['SpaceUser', id, {direction:'Up'\|'Down'\|'Left'\|'Right'}]` | **one tile per call** |
 | `teleport` | `['SpaceUser', id, {x, y, direction}]` | flat `x`/`y`; `floorId` optional |
+| `faceDirection` | `['SpaceUser', id, 'Down']` | **bare string.** Turns without stepping |
+| `setAvailability` | `['SpaceUser', id, {availability:'Active'\|'Busy'\|'Away'}]` | writes `userSetAvailability` |
+| `setCustomStatus` | `['SpaceUser', id, {text, emoji?, clearCondition?}]` | `clearCondition` is `{type:'DateTime', clearAt:<ext-1 DateTime>}` |
+| `clearCustomStatus` | `['SpaceUser', id]` | **two args** |
+| `setHandRaised` | `['SpaceUser', id, true]` | **bare bool** |
+| `startSpeaking` / `stopSpeaking` | `['SpaceUser', id]` | **two args.** Voice activity, not mute |
+| `leaveCluster` | `['SpaceUser', id]` | **two args.** Leaves the conversation, stays put |
+| `broadcastEmote` | `['SpaceUser', id, {emote, count, ambientlyConnectedUserIds}]` | see below |
+| `updateTargetMeetingArea` | `['SpaceUser', id, {}]` | seen with an empty payload only |
+| `markContextualOnboardingPOICompleted` | `['SpaceUserOnboarding', id, 'Profile']` | **not `SpaceUser`** — the model is per-action |
 
 Probed and confirmed **not** to exist on `SpaceUser`: `moveTo`, `setPosition`,
 `updatePosition`, `walkTo`, `setDestination`, `goTo`. `teleport` rejects
 `{position:{x,y}}` — the coordinates must be flat, and `direction` is required even
 when teleporting.
+
+**The third argument is not always a map, and that is the trap.** Four of these
+send a bare value (`faceDirection` a string, `setHandRaised` a bool) and three
+send no third argument at all — their `args` is two elements long. Sending
+`{raised:true}` where the server wants `true` is a zod failure, and a zod failure
+executes nothing. A client that assumes the `move`/`teleport` shape will find that
+half this vocabulary silently does nothing.
+
+**Availability is a value object on the way back and a bare string on the way
+out.** `userSetAvailability` arrives as `{$type, value}`; `setAvailability` takes
+`{availability: 'Busy'}`. `Offline` is written by the server when a connection
+goes away — it is not one a client should set. `Focused` and `FocusedCoworking`
+arrive on the field but come from entering a focus area, not from this action.
+
+**`broadcastEmote` is how a wave is sent.** The eight in Gather's own tray, with
+the codepoints, because two of them carry a variation selector and the string is
+echoed to every other client exactly as sent:
+
+| 👋 | ❤️ | 🎉 | 👍️ | 🤣 | 👏 | 💯 | 🔥 |
+|---|---|---|---|---|---|---|---|
+| `U+1F44B` | `U+2764 U+FE0F` | `U+1F389` | `U+1F44D U+FE0F` | `U+1F923` | `U+1F44F` | `U+1F4AF` | `U+1F525` |
+
+`count` was `1` on every observed send and `ambientlyConnectedUserIds` was `[]`
+even from a client that was in a call at the time — the server evidently works the
+fan-out out for itself. It comes back on the event bus as `EmoteEvent`, whose
+`targetUserIds` includes the sender, so you receive your own.
+
+**`EmoteEvent` names its sender `senderUserId`, not `senderId`.** `WaveEvent` uses
+`senderId`. A reader that keys on one loses the sender of the other, silently,
+because both carry `targetUserIds` and so still route correctly.
+
+All of the above except `startSpeaking`/`stopSpeaking`/`updateTargetMeetingArea`
+are implemented in `packages/gather_client/lib/src/direct_collector.dart` and
+asserted frame-for-frame in its test.
 
 ### An observer can move. Entering is not a prerequisite for writing
 
@@ -1188,6 +1339,14 @@ Three things to take from this table:
 - `ChatMessage` rows arrive (43, from 18 distinct authors) but **every body is empty
   and `type` is `'System'`**. Message text is not exposed to an observer connection,
   so the bridge's unused `chat.message` event cannot be filled from here.
+
+  **Scope corrected 2026-08-13: this is a property of the game socket, not of the
+  account.** The same rows fetched over REST *do* carry their text. Two Meeting
+  channels read through `/chat/channels/:id/messages` returned 11 of 30 and 4 of 48
+  messages with non-empty bodies, all `type: 'Regular'`; the empty ones are
+  `'System'` rows, which is what a wave is, and those are genuinely empty
+  everywhere. So message text is withheld from the *socket*, and is one REST call
+  away. See [The activity feed](#the-activity-feed).
 
 ## Media — the SFU
 
@@ -1821,9 +1980,14 @@ positions, and `Authenticate` frames contain a live JWT.
 5. **Token lifetime in practice.** Refresh works (~60 min ID tokens), but nothing has
    run long enough to see whether a refresh token survives the desktop client
    signing out.
-6. **The rest of the action vocabulary.** Six names are known; status, chat, follow,
-   desks and hand-raising are all presumably actions too, and all discoverable by
-   probing. Nobody has swept it.
+6. **The rest of the action vocabulary.** Twenty names are known now — a capture on
+   2026-08-13 of somebody switching every setting in the desktop client resolved
+   status, availability, hand-raising, emotes, facing and leaving a cluster. What is
+   still unswept: **chat**, **following somebody**, and **desks**. All are
+   presumably actions and all are discoverable by the probing channel above.
+   Unresolved on the ones that *are* known: whether `broadcastEmote`'s `count`
+   accepts anything above 1, and what `clearCondition` types exist besides
+   `DateTime`.
 7. `unknownFrames` occasionally counts 1–2 server frames the interpreter does not
    recognise. Harmless for presence, unidentified.
 8. Delta envelope names were matched structurally, not against a labelled frame.

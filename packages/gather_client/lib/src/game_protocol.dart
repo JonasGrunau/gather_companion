@@ -227,6 +227,14 @@ class RosterRow {
   bool get isPresent => connected == true && availability != 'Offline';
 }
 
+/// The three a person can choose, in the order Gather's own picker offers them.
+///
+/// `Offline` is missing on purpose, and so are `Focused` and `FocusedCoworking`:
+/// the first is written by the server when a connection goes away, and the other
+/// two are set by entering a focus area rather than by picking them. All of them
+/// can arrive on [RosterRow.availability]; only these three can be sent.
+const settableAvailabilities = ['Active', 'Busy', 'Away'];
+
 /// A whole roster, as [PresenceTracker] consumes it.
 class Roster {
   const Roster({required this.selfId, required this.rows, this.spaceName});
@@ -313,6 +321,14 @@ class GameProtocolReader {
 
   /// UserAccount id belonging to me, the slower route to [selfId].
   String? _myUserAccountId;
+
+  /// My `UserAccount` id, which is a different identity from [selfId].
+  ///
+  /// The game plane keys on `SpaceUser` and the media plane on `UserAccount`, so
+  /// this is what the SFU router wants as `srcId`. Handing it [selfId] instead
+  /// returns a stream that does not exist — silently, which is Gather's usual way
+  /// of refusing something.
+  String? get selfAccountId => _myUserAccountId;
 
   /// Meetings, for the two things somebody can do at you that are state, not bus.
   final _MeetingWatch _meetings = _MeetingWatch();

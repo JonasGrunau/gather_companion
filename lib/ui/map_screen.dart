@@ -69,8 +69,6 @@ class _MapScreenState extends State<MapScreen> {
     final map = widget.state.map;
     _wantArt(widget.state.art);
 
-    final me = widget.state.myTile;
-    final here = map == null || me == null ? null : map.roomAt(me.x, me.y);
     // Everybody in the room, me included: "here" is a count of the office, and the
     // reader is standing in it. `peopleOnMap` deliberately excludes me, because
     // every other screen is asking about other people.
@@ -79,13 +77,13 @@ class _MapScreenState extends State<MapScreen> {
 
     return Scaffold(
       backgroundColor: t.background,
-      // Where the room name and the head count live: the map is the screen, and a
+      // Where the space name and the head count live: the map is the screen, and a
       // strip above it repeating what it already shows was costing the map a fifth
       // of a phone.
       appBar: AppBar(
         backgroundColor: t.background,
         titleSpacing: 0,
-        title: _Where(room: here?.name, space: widget.state.spaceName, map: map),
+        title: _Where(space: widget.state.spaceName),
         actions: [
           if (map != null) _HeadCount(present: present),
           const SizedBox(width: 12),
@@ -100,53 +98,36 @@ class _MapScreenState extends State<MapScreen> {
   }
 }
 
-/// Where you are, in the app bar: the room you are standing in, or the floor's size
-/// until there is a roster to place you on it.
+/// The space's name, in the app bar.
+///
+/// It used to carry a second line underneath — the named area you were standing
+/// in, falling back to the floor's size in tiles. Both are gone. The area name
+/// changed as you walked, which put a line of type that flickers directly under
+/// the one that does not, and neither answer was worth the movement: the map
+/// already draws the zone names on the floor, and nobody opens the office to find
+/// out how many tiles it is.
 class _Where extends StatelessWidget {
-  const _Where({required this.room, required this.space, required this.map});
-
-  /// The named area you are standing in, if you are standing in one.
-  final String? room;
+  const _Where({required this.space});
 
   /// The space's own name, from Gather.
   final String? space;
 
-  final SpaceMap? map;
-
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    // The space names the screen and the room says where in it you are standing —
-    // the title is the thing that does not change while you walk around.
-    final title = space ?? 'The office';
-    final subtitle = room ?? (map == null ? null : '${map!.width}×${map!.height} tiles');
 
     return Padding(
       padding: const EdgeInsets.only(left: 4),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.center,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 17,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -0.2,
-              color: t.foreground,
-            ),
-          ),
-          if (subtitle != null)
-            Text(
-              subtitle,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11.5, height: 1.25, color: t.faint),
-            ),
-        ],
+      child: Text(
+        space ?? 'The office',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -0.2,
+          color: t.foreground,
+        ),
       ),
     );
   }
@@ -1034,7 +1015,7 @@ class _OfficePainter extends CustomPainter {
         // Opaque, so a plate that lands on a zone label covers it rather than mixing
         // two names into one smudge.
         fill: person.isMe ? tokens.brand : tokens.background,
-        dot: _availability(person.availability),
+        dot: availabilityColor(tokens, person.availability),
       );
       if (arriving < 1) canvas.restore();
     }
@@ -1102,15 +1083,6 @@ class _OfficePainter extends CustomPainter {
 
     canvas.restore();
   }
-
-  /// The dot, in the colour the state deserves. `Offline` never gets here — those
-  /// rows are not on the map at all — so the fallback is green rather than grey.
-  Color _availability(String? availability) => switch (availability) {
-        'Busy' => tokens.danger,
-        'Focused' || 'FocusedCoworking' => tokens.warn,
-        'Away' => tokens.faint,
-        _ => tokens.ok,
-      };
 
   /// Laid-out text, kept between frames.
   ///

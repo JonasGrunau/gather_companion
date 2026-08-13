@@ -5,8 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'src/app_state.dart';
+import 'src/media/live_call.dart';
 import 'theme/gather_theme.dart';
-import 'ui/feed_screen.dart';
+import 'ui/home_shell.dart';
 import 'ui/pair_screen.dart';
 
 Future<void> main() async {
@@ -35,7 +36,19 @@ class GatherCompanionApp extends StatefulWidget {
 }
 
 class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBindingObserver {
-  final _state = AppState();
+  /// The one place the media layer is named.
+  ///
+  /// `AppState` takes it as a seam rather than importing it, so everything above
+  /// the microphone stays testable on a machine that has none — see
+  /// `src/media/media_engine.dart`.
+  final _state = AppState(
+    buildCall: (auth, spaceId, srcId) => LiveCall(
+      auth: auth,
+      spaceId: spaceId,
+      srcId: srcId,
+      log: debugPrint,
+    ),
+  );
 
   @override
   void initState() {
@@ -91,7 +104,9 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
               ),
             ),
             AppState(isConfigured: false) => (_Phase.pairing, PairScreen(state: _state)),
-            _ => (_Phase.feed, FeedScreen(state: _state, onUnpair: _state.unpair)),
+            // The tabs start here and not before: there is nothing to navigate
+            // between until there is a Gather credential to navigate with.
+            _ => (_Phase.home, HomeShell(state: _state, onUnpair: _state.unpair)),
           };
 
           // Keyed by phase, never by state identity: a ValueKey that changed on
@@ -108,4 +123,4 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
   }
 }
 
-enum _Phase { booting, pairing, feed }
+enum _Phase { booting, pairing, home }

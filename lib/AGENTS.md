@@ -29,7 +29,7 @@ fallback.
 | Directory | Purpose |
 |-----------|---------|
 | `src/` | State, transport, pairing, settings, notifications, feed classification (see `src/AGENTS.md`) |
-| `ui/` | The three screens (see `ui/AGENTS.md`) |
+| `ui/` | The screens, and the shell that tabs between three of them (see `ui/AGENTS.md`) |
 | `theme/` | Design tokens and `ThemeData` (see `theme/AGENTS.md`) |
 
 ## For AI Agents
@@ -43,6 +43,11 @@ fallback.
 - **The phase key must stay a phase, not an identity.** `AnimatedSwitcher` is
   keyed by `_Phase`; keying it by anything that changes per notification would
   restart the transition on every frame and make the screen strobe.
+- **`_Phase` is above the tabs, not one of them.** `booting` and `pairing` are
+  whole-app states with no navigation in them; `home` hands off to `HomeShell`,
+  which owns the map/activity/settings rail. There is nothing to navigate between
+  until there is a Gather credential, so the rail must never appear before
+  `isConfigured`.
 - The booting phase deliberately renders an empty `ColoredBox` in
   `GatherTokens.dark.background`, matching the launch storyboard. Booting is a
   preferences read — a spinner inside that window is pure flicker.

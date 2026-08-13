@@ -177,6 +177,17 @@ extension GatherThemeContext on BuildContext {
 const double kGutter = 16;
 const double kTextGutter = 20;
 
+/// The floating nav rail's own geometry, and the room it asks every tab to leave
+/// at the bottom.
+///
+/// Here rather than in `ui/home_shell.dart` because the tabs need [kRailInset]
+/// too — the shell adds it to their `MediaQuery` padding, and a screen placing
+/// something over the rail by hand has to be able to ask how tall it is. Reading
+/// it from the shell would mean each tab importing the thing that builds it.
+const double kRailHeight = 56;
+const double kRailGap = 8;
+const double kRailInset = kRailHeight + kRailGap + 8;
+
 const kMonoFallback = <String>[
   'SF Mono',
   'ui-monospace',
@@ -283,6 +294,33 @@ ThemeData buildGatherTheme() {
     extensions: const [t],
   );
 }
+
+/// The dot beside a name, in the colour the state deserves.
+///
+/// Lives here rather than on the painter that used to own it, because three
+/// things now draw it — the map's name plates, the control bar's avatar, and the
+/// status sheet's picker — and a person's own dot disagreeing with the one over
+/// their head would be the worst possible place for these to drift apart.
+///
+/// `Offline` deliberately falls through to [GatherTokens.ok] rather than to grey:
+/// nothing offline is ever drawn, so reaching the fallback means the field was
+/// absent, not that the person is away.
+Color availabilityColor(GatherTokens t, String? availability) => switch (availability) {
+      'Busy' => t.danger,
+      'Focused' || 'FocusedCoworking' => t.warn,
+      'Away' => t.faint,
+      _ => t.ok,
+    };
+
+/// What the picker calls each one. Gather's own wording, which is worth keeping:
+/// somebody who has seen the desktop client should not have to learn a second
+/// vocabulary for the same three states.
+String availabilityLabel(String availability) => switch (availability) {
+      'Busy' => 'Busy',
+      'Away' => 'Away',
+      'Focused' || 'FocusedCoworking' => 'Focused',
+      _ => 'Active',
+    };
 
 /// A stable colour per person, so the same face keeps the same dot across
 /// sessions without the bridge having to send one.

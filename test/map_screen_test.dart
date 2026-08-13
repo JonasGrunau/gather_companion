@@ -43,6 +43,18 @@ RosterRow _row(
       availability: availability,
     );
 
+/// The floor's painter, out of a live tree.
+///
+/// Matched by name because `_OfficePainter` is private and there is deliberately
+/// no seam for reaching it — [officePainter] exists for building one *outside* a
+/// widget tree, which is the other half of the same job. The D-pad's painter is
+/// the only other one down here, so the name is enough to tell them apart.
+CustomPainter _officePainter(WidgetTester tester) => tester
+    .widgetList<CustomPaint>(find.byType(CustomPaint))
+    .map((widget) => widget.painter)
+    .whereType<CustomPainter>()
+    .firstWhere((painter) => painter.runtimeType.toString().contains('OfficePainter'));
+
 void main() {
   // The same pair of listenables the app opens this screen with. `state` alone is
   // not enough: walking is not a presence event, so a roster where everybody moved
@@ -142,49 +154,21 @@ void main() {
     expect(find.text('3 here'), findsOneWidget, reason: 'Ada, Bram and me');
   });
 
-  testWidgets('the room you are standing in is named', (tester) async {
-    final state = AppState()
-      ..debugApplyLink(const LinkStatus(LinkState.live))
-      ..debugMap = _map(rooms: const [
-        SpaceRoom(
-          id: 'r1',
-          name: 'Green Park',
-          type: 'Common',
-          x: 4,
-          y: 4,
-          width: 4,
-          height: 4,
-          walled: false,
-        ),
-      ])
-      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 5, 5)]));
-
-    await tester.pumpWidget(wrap(state));
-    await tester.pump();
-
-    expect(find.text('Green Park'), findsOneWidget);
-  });
-
   testWidgets('walking redraws the map, though nothing else counts it as a change', (tester) async {
     // The bug: PresenceTracker never looks at coordinates — being near somebody says
     // nothing about whether they want you, which is this app's whole argument — so a
     // roster carrying only movement leaves `stateChanged` false. The map was the one
     // screen that needed it, and it sat frozen until somebody happened to follow you
     // or drop off.
+    //
+    // Asserted on the painter rather than on the app bar, which is where this used
+    // to read the answer: the bar named the room you were standing in, and walking
+    // between two rooms changed it. That line is gone, and the painter is the
+    // honest place to ask anyway — repainting the floor *is* the behaviour, and the
+    // app bar only ever stood in for it.
     final state = AppState()
       ..debugApplyLink(const LinkStatus(LinkState.live))
-      ..debugMap = _map(rooms: const [
-        SpaceRoom(
-          id: 'r1',
-          name: 'Green Park',
-          type: 'Common',
-          x: 4,
-          y: 4,
-          width: 4,
-          height: 4,
-          walled: false,
-        ),
-      ]);
+      ..debugMap = _map();
 
     await tester.pumpWidget(wrap(state));
     state.debugApplyRoster(Roster(selfId: 'me', rows: [
@@ -192,7 +176,7 @@ void main() {
       _row('ada', 8, 4, name: 'Ada'),
     ]));
     await tester.pump();
-    expect(find.text('20×10 tiles'), findsOneWidget, reason: 'standing in no room');
+    final before = _officePainter(tester);
 
     // Only a position moves. Same people, same names, same connections.
     state.debugApplyRoster(Roster(selfId: 'me', rows: [
@@ -201,7 +185,11 @@ void main() {
     ]));
     await tester.pump();
 
-    expect(find.text('Green Park'), findsOneWidget, reason: 'I walked into the park');
+    expect(
+      _officePainter(tester).shouldRepaint(before),
+      isTrue,
+      reason: 'a roster carrying only movement still has to reach the floor',
+    );
   });
 
   group('framing', () {
@@ -246,16 +234,37 @@ void main() {
     });
   });
 
-  testWidgets('outside every room it falls back to the size of the floor', (tester) async {
+  testWidgets('the app bar names the space and nothing else', (tester) async {
+    // It used to carry a second line: the room you were standing in, falling back
+    // to the floor's size in tiles. Both are gone — the area name changed as you
+    // walked, which put a flickering line directly under one that does not move,
+    // and the map already writes the zone names on the floor.
     final state = AppState()
       ..debugApplyLink(const LinkStatus(LinkState.live))
-      ..debugMap = _map()
-      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1)]));
+      ..debugMap = _map(rooms: const [
+        SpaceRoom(
+          id: 'r1',
+          name: 'Green Park',
+          type: 'Common',
+          x: 4,
+          y: 4,
+          width: 4,
+          height: 4,
+          walled: false,
+        ),
+      ])
+      ..debugApplyRoster(Roster(
+        selfId: 'me',
+        rows: [_row('me', 5, 5)],
+        spaceName: 'Test Space',
+      ));
 
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    expect(find.text('20×10 tiles'), findsOneWidget);
+    expect(find.text('Test Space'), findsOneWidget);
+    expect(find.text('Green Park'), findsNothing, reason: 'standing in it is not news');
+    expect(find.text('20×10 tiles'), findsNothing);
   });
 
   testWidgets('a teleport is drawn from both ends at once', (tester) async {

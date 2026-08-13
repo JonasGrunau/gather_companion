@@ -7,6 +7,7 @@ import 'package:gather_events/gather_events.dart';
 import 'credentials.dart';
 import 'link_status.dart';
 import 'map_person.dart';
+import 'media/call.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
@@ -43,20 +44,36 @@ class AppState extends ChangeNotifier {
     GatherCredentialStore? credentials,
     // Test seam: lets a suite drive a fake Gather without a network.
     DirectCollector Function(GatherAuth auth, String? spaceId)? buildCollector,
+    ActivityFeed Function(GatherAuth auth)? buildActivityFeed,
+    // The media seam, and the reason this file does not import `flutter_webrtc`:
+    // a [Call] is a microphone, a camera and an SFU, none of which a test runner
+    // has. `main.dart` supplies the real one.
+    Call Function(GatherAuth auth, String spaceId, String srcId)? buildCall,
   })  : _notifier = notifier ?? Notifier(),
         // ignore: prefer_initializing_formals
         _push = push,
         _credentialStore = credentials ?? GatherCredentialStore(),
-        _buildCollector = buildCollector ?? _realCollector;
+        _buildCollector = buildCollector ?? _realCollector,
+        _buildActivityFeed = buildActivityFeed ?? _realActivityFeed,
+        // ignore: prefer_initializing_formals
+        _buildCall = buildCall;
 
   static DirectCollector _realCollector(GatherAuth auth, String? spaceId) =>
       DirectCollector(auth: auth, spaceId: spaceId);
+
+  static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
   final Notifier _notifier;
   Notifier get notifier => _notifier;
 
   final GatherCredentialStore _credentialStore;
   final DirectCollector Function(GatherAuth auth, String? spaceId) _buildCollector;
+  final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
+
+  /// Null in a build with no media layer — a widget test, or a platform where
+  /// there is nothing to capture. [canCall] reads false and the bar says so,
+  /// rather than offering a button that throws when pressed.
+  final Call Function(GatherAuth auth, String spaceId, String srcId)? _buildCall;
 
   /// Built lazily and never eagerly: `FirebaseMessaging.instance` throws when
   /// Firebase was not initialised, which is the normal state in widget tests and on a
@@ -77,6 +94,11 @@ class AppState extends ChangeNotifier {
   DirectCollector? _collector;
   PartyMode? _party;
   Walk? _walk;
+
+  /// Held from [_attach], because the call is built later — on the first tap —
+  /// and needs the same credential the socket runs on.
+  GatherAuth? _auth;
+  Call? _call;
   final PresenceTracker _tracker = PresenceTracker();
   final _subs = <StreamSubscription<dynamic>>[];
 
@@ -377,6 +399,196 @@ class AppState extends ChangeNotifier {
     return result.ok ? null : (result.state.detail ?? 'Party mode could not start.');
   }
 
+  // ---- being a person in the room ---------------------------------------------
+  //
+  // Everything here addresses our own `SpaceUser` row, which is the same row the
+  // desktop client drives. There is no second body: setting yourself Busy on the
+  // phone is the same act as setting it on the Mac, and it lands in one place.
+
+  /// My availability as Gather has it — `Active`, `Busy`, `Away`, and the two
+  /// `Focused` states a focus area sets. Null before the first roster.
+  ///
+  /// Read back off the roster rather than remembered, so the desktop client
+  /// changing it is reflected here without this app being told.
+  String? get myAvailability => _myRow()?.availability;
+
+  /// Who I am in a conversation with — Gather's `clusterId`, which is how it
+  /// remembers who is talking to whom.
+  ///
+  /// What makes "leave the conversation" a control that is only offered when
+  /// there is one to leave, the same rule the D-pad follows: a button that cannot
+  /// do anything is indistinguishable from a broken one.
+  List<String> get huddle =>
+      debugHuddle ??
+      [for (final row in _roster?.myCluster ?? const []) row.name ?? 'Someone'];
+
+  bool get inHuddle => huddle.isNotEmpty;
+
+  /// Test seam, as [debugCanWalk]: a huddle takes two people standing close
+  /// enough for Gather to have decided they are talking.
+  @visibleForTesting
+  List<String>? debugHuddle;
+
+  /// The status line I last set from this phone.
+  ///
+  /// Local, and deliberately not read back: `SpaceUserStatus` is one of the 43
+  /// models [GameProtocolReader] discards, so there is nowhere to read it from.
+  /// It is an echo of what this app did rather than a claim about what Gather
+  /// holds, which is why it goes away on a restart instead of persisting a
+  /// guess.
+  ({String text, String? emoji})? get customStatus => _customStatus;
+  ({String text, String? emoji})? _customStatus;
+
+  /// Whether my hand is up. Local for the same reason as [customStatus] —
+  /// `handRaisedAt` is on the model and not in the tracked field set.
+  bool get handRaised => _handRaised;
+  bool _handRaised = false;
+
+  /// Turns a collector answer into the sentence-or-null contract the UI expects.
+  String? _sent(({bool ok, String? detail}) result, String whatFailed) {
+    if (result.ok) return null;
+    final detail = result.detail;
+    return detail == null ? whatFailed : '$whatFailed ($detail)';
+  }
+
+  /// Active, Busy or Away.
+  ///
+  /// Optimistic in neither direction: the roster patch that follows is what moves
+  /// the dot, so a refusal leaves the picker showing what is actually true rather
+  /// than what was asked for.
+  Future<String?> setAvailability(String availability) async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    return _sent(collector.setAvailability(availability), 'Could not set your status.');
+  }
+
+  /// Sets the line of text under my name.
+  Future<String?> setCustomStatus({
+    required String text,
+    String? emoji,
+    DateTime? clearAt,
+  }) async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return clearCustomStatus();
+
+    final failed = _sent(
+      collector.setCustomStatus(text: trimmed, emoji: emoji, clearAt: clearAt),
+      'Could not set your status.',
+    );
+    if (failed == null) {
+      _customStatus = (text: trimmed, emoji: emoji);
+      notifyListeners();
+    }
+    return failed;
+  }
+
+  Future<String?> clearCustomStatus() async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+
+    final failed = _sent(collector.clearCustomStatus(), 'Could not clear your status.');
+    if (failed == null) {
+      _customStatus = null;
+      notifyListeners();
+    }
+    return failed;
+  }
+
+  /// Throws an emoji over the room.
+  Future<String?> sendEmote(String emote) async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    return _sent(collector.broadcastEmote(emote), 'Could not send that.');
+  }
+
+  Future<String?> setHandRaised(bool raised) async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+
+    final failed = _sent(
+      collector.setHandRaised(raised),
+      raised ? 'Could not raise your hand.' : 'Could not lower your hand.',
+    );
+    if (failed == null) {
+      _handRaised = raised;
+      notifyListeners();
+    }
+    return failed;
+  }
+
+  /// Steps out of the conversation without walking away from it.
+  Future<String?> leaveHuddle() async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    return _sent(collector.leaveCluster(), 'Could not leave the conversation.');
+  }
+
+  // ---- the call ---------------------------------------------------------------
+
+  /// What our microphone and camera are doing, and whether the room is receiving
+  /// them. Everything off, and no hardware held, until the first tap.
+  CallState get call => _call?.state ?? const CallState();
+
+  /// Whether there is enough identity to open one at all.
+  ///
+  /// The media plane keys on `UserAccount` while the game plane keys on
+  /// `SpaceUser`, so this needs a *different* id from everything else here — and
+  /// it arrives with the state dump rather than at connect.
+  bool get canCall =>
+      debugCanCall ??
+      (_buildCall != null &&
+          _collector?.selfAccountId != null &&
+          _spaceIdForCall != null);
+
+  /// Test seam, as [debugCanWalk].
+  @visibleForTesting
+  bool? debugCanCall;
+
+  String? get _spaceIdForCall => _snapshot.self.spaceId ?? _spaceId;
+
+  Future<String?> setMicOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setMicOn(on);
+    notifyListeners();
+    return failed;
+  }
+
+  Future<String?> setCameraOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setCameraOn(on);
+    notifyListeners();
+    return failed;
+  }
+
+  Future<void> switchCamera() async {
+    await _call?.switchCamera();
+    notifyListeners();
+  }
+
+  /// Builds the call on first use, or null while we do not yet know who we are.
+  ///
+  /// Lazy on purpose: opening a router socket for somebody who never presses
+  /// either button is a connection and a battery spent on nothing.
+  Call? _callOrNull() {
+    final existing = _call;
+    if (existing != null) return existing;
+
+    final build = _buildCall;
+    final auth = _auth;
+    final srcId = _collector?.selfAccountId;
+    final spaceId = _spaceIdForCall;
+    if (build == null || auth == null || srcId == null || spaceId == null) return null;
+
+    final call = _call = build(auth, spaceId, srcId);
+    _subs.add(call.states.listen((_) => notifyListeners()));
+    return call;
+  }
+
   // ---- walking ---------------------------------------------------------------
 
   /// Whether there is anything for a D-pad to drive.
@@ -422,6 +634,115 @@ class AppState extends ChangeNotifier {
     await Future.wait([collector.resync(), floor]);
   }
 
+  // ---- the activity feed -----------------------------------------------------
+
+  /// Gather's own activity feed, which is a different thing from the log this app
+  /// deleted.
+  ///
+  /// The class doc above explains why nothing is remembered: a history the phone
+  /// builds itself can only cover the minutes it was awake. This one is not built
+  /// here. It is Gather's, recorded server-side, and it is the same list the
+  /// desktop client shows — so it is full when you open it after a weekend, which
+  /// is exactly when the local one was empty.
+  ActivityFeed? _activityFeed;
+
+  /// What the last fetch returned, newest first.
+  List<ActivityItem> _fetched = const [];
+
+  /// Waves seen on the socket since that fetch.
+  ///
+  /// Provisional, and cleared by the next refresh rather than merged into it: the
+  /// REST list is authoritative and already contains them by then, so replacing
+  /// wholesale is what keeps one wave from appearing twice. The alternative —
+  /// matching a live event to a row whose id we never saw — would have to guess.
+  List<ActivityItem> _live = const [];
+
+  bool _loadingActivity = false;
+  Object? _activityError;
+
+  /// The feed as the screen reads it: live waves on top, then the last fetch.
+  List<ActivityItem> get activity => [..._live, ..._fetched];
+
+  /// What a badge shows. Live waves are unread by definition — they arrived while
+  /// you were looking elsewhere.
+  int get unreadActivityCount =>
+      _live.length + _fetched.where((item) => !item.isRead).length;
+
+  bool get isLoadingActivity => _loadingActivity;
+
+  /// The last failure, or null. Kept so the screen can say what went wrong instead
+  /// of showing an empty list, which would read as "nothing ever happened".
+  Object? get activityError => _activityError;
+
+  /// The space the feed belongs to, once Gather has told us which one that is.
+  String? get _activitySpaceId => _snapshot.self.spaceId ?? _spaceId;
+
+  /// Which space [_fetched] was fetched for, so a reconnect into a different space
+  /// does not leave the previous one's history on screen.
+  String? _fetchedFor;
+
+  Future<void> refreshActivity() async {
+    final feed = _activityFeed;
+    final spaceId = _activitySpaceId;
+    if (feed == null || spaceId == null || _loadingActivity) return;
+
+    _loadingActivity = true;
+    notifyListeners();
+    try {
+      final page = await feed.fetch(spaceId);
+      _fetched = page.items;
+      _fetchedFor = spaceId;
+      _live = const [];
+      _activityError = null;
+    } catch (error) {
+      _activityError = error;
+    } finally {
+      _loadingActivity = false;
+      notifyListeners();
+    }
+  }
+
+  /// Marks items read in Gather, so the desktop client's badge clears too.
+  ///
+  /// Optimistic: the rows flip here first and are put back if Gather refuses.
+  /// Waiting on a round trip to un-bold a line the user has already read is the
+  /// kind of latency that makes an app feel like a web page.
+  Future<void> markActivityRead(Iterable<ActivityItem> items) async {
+    final feed = _activityFeed;
+    final spaceId = _activitySpaceId;
+    final markable = items.where((item) => item.canMarkRead && !item.isRead).toList();
+    if (feed == null || spaceId == null || markable.isEmpty) return;
+
+    final before = _fetched;
+    final ids = markable.map((item) => item.id).toSet();
+    _fetched = [
+      for (final item in _fetched) ids.contains(item.id) ? item.markedRead() : item,
+    ];
+    notifyListeners();
+
+    try {
+      await feed.markRead(spaceId, markable);
+    } catch (error) {
+      _fetched = before;
+      _activityError = error;
+      notifyListeners();
+    }
+  }
+
+  /// A wave off the socket, shown before the next fetch confirms it.
+  void _noteActivity(BusEvent event) {
+    if (event.name != 'WaveEvent') return;
+    if (!event.isFor(_collector?.selfId)) return;
+    _live = [
+      WaveActivity(
+        id: 'wave:live:${event.sentTime ?? ''}:${event.senderId ?? ''}',
+        at: DateTime.tryParse(event.sentTime ?? '')?.toUtc() ?? DateTime.now().toUtc(),
+        actorSpaceUserId: event.senderId,
+      ),
+      ..._live,
+    ];
+  }
+
   /// Best available name for a player id, falling back to a short id.
   String nameFor(String id) {
     for (final player in _snapshot.players) {
@@ -435,7 +756,7 @@ class AppState extends ChangeNotifier {
   void _attach() {
     unawaited(_detach());
 
-    final auth = GatherAuth(
+    final auth = _auth = GatherAuth(
       credentials: _credentials,
       // Google may rotate the refresh token. Persisting the new one immediately is
       // what keeps a phone working across the rotation instead of silently holding a
@@ -445,6 +766,10 @@ class AppState extends ChangeNotifier {
         await _credentialStore.save(next);
       },
     );
+
+    // Same credential as the socket, different transport: the feed is REST, and
+    // the phone mints its own ID tokens for both.
+    _activityFeed = _buildActivityFeed(auth);
 
     final collector = _collector = _buildCollector(auth, _spaceId);
     final party = _party = PartyMode(collector: () => _collector);
@@ -466,6 +791,9 @@ class AppState extends ChangeNotifier {
         _onFold(out);
       }))
       ..add(collector.interactions.listen((event) {
+        // Before the fold, so a wave is on the list by the time the notification
+        // it produces wakes the screen that shows it.
+        _noteActivity(event);
         _onFold(_tracker.applyInteraction(event));
       }))
       ..add(collector.statuses.listen(_onCollectorStatus))
@@ -482,10 +810,25 @@ class AppState extends ChangeNotifier {
     final collector = _collector;
     final party = _party;
     final walk = _walk;
+    final call = _call;
     _subs.clear();
     _collector = null;
     _party = null;
     _walk = null;
+    _call = null;
+    _auth = null;
+    // The status line and the raised hand are echoes of what this connection did.
+    // Carried across a reconnect they would be claims about a socket that no
+    // longer exists, and after an unpair they would be somebody else's.
+    _customStatus = null;
+    _handRaised = false;
+    // The feed belongs to a credential and a space. Unpairing and pairing again as
+    // somebody else must not leave the previous person's waves on the screen.
+    _activityFeed = null;
+    _fetched = const [];
+    _live = const [];
+    _fetchedFor = null;
+    _activityError = null;
     // A hop belongs to the connection that made it. Kept across a reconnect it would
     // teleport a body on the first frame after the map came back.
     _lastTeleport = null;
@@ -495,6 +838,10 @@ class AppState extends ChangeNotifier {
     }
     await party?.dispose();
     await walk?.dispose();
+    // Before the collector: the call holds a microphone and a camera, and the one
+    // failure worth avoiding here is leaving either running after the socket that
+    // justified them has gone.
+    await call?.dispose();
     await collector?.dispose();
   }
 
@@ -526,8 +873,20 @@ class AppState extends ChangeNotifier {
     }
     if (out.emit.isNotEmpty || out.stateChanged) {
       _snapshot = _tracker.snapshot();
+      _maybeLoadActivity();
       notifyListeners();
     }
+  }
+
+  /// Fetches the feed once the space is known, and again if it changes.
+  ///
+  /// Which space we are in arrives with the state dump, not at attach — so this is
+  /// checked wherever the snapshot is replaced rather than fired from [_attach],
+  /// where the answer would still be null.
+  void _maybeLoadActivity() {
+    final spaceId = _activitySpaceId;
+    if (spaceId == null || spaceId == _fetchedFor || _loadingActivity) return;
+    unawaited(refreshActivity());
   }
 
   void _onCollectorStatus(CollectorStatus status) {
@@ -553,9 +912,14 @@ class AppState extends ChangeNotifier {
     if (!status.healthy) {
       _party?.stop(status.detail ?? 'lost the connection to Gather');
       _walk?.release();
+      // And the call: publishing outlives the game socket, so without this the
+      // phone keeps its microphone open and its camera light on for a room it is
+      // no longer connected to. The buttons come back off, which is the truth.
+      unawaited(_call?.hangUp() ?? Future<void>.value());
     }
 
     _snapshot = _tracker.snapshot();
+    _maybeLoadActivity();
     notifyListeners();
   }
 
@@ -612,6 +976,19 @@ class AppState extends ChangeNotifier {
     _roster = roster;
     _positions.tick();
     _onFold(_tracker.applyRoster(roster));
+  }
+
+  /// Feeds a feed in as though Gather had answered, so the activity screen can be
+  /// exercised without a network.
+  ///
+  /// Sets [_fetchedFor] as a real fetch would, so the auto-load does not then fire
+  /// over the top of what a test just placed.
+  @visibleForTesting
+  void debugApplyActivity(List<ActivityItem> items, {Object? error}) {
+    _fetched = items;
+    _fetchedFor = _activitySpaceId ?? 'test-space';
+    _activityError = error;
+    notifyListeners();
   }
 
   /// Feeds a hop in as though party mode had fired one, for the map to draw.

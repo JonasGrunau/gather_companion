@@ -287,6 +287,31 @@ class SfuSession {
     }
   }
 
+  /// Whether we currently have a producer for [tag].
+  bool publishing(SfuTag tag) => _producers.containsKey(tag);
+
+  /// Mute, as the wire understands it.
+  ///
+  /// Muting at the device stops the *sound*; this stops the *stream*, and it is
+  /// what makes a colleague's client draw the crossed-out microphone next to your
+  /// name. Both are wanted: the device mute is what makes iOS drop its recording
+  /// indicator, and this is what makes the mute visible to anyone else.
+  ///
+  /// The producer is kept rather than closed, so unmuting is a resume rather than
+  /// a fresh negotiation. `produce-pause` takes only a tag — the SFU knows which
+  /// producer is ours.
+  void pause(SfuTag tag) {
+    if (!_producers.containsKey(tag)) return;
+    _producers[tag]?.pause();
+    _node?.emit('produce-pause', {'tag': tag.wire});
+  }
+
+  void resume(SfuTag tag) {
+    if (!_producers.containsKey(tag)) return;
+    _producers[tag]?.resume();
+    _node?.emit('produce-resume', {'tag': tag.wire});
+  }
+
   /// Stops publishing one track, telling the server rather than just going quiet.
   Future<void> unpublish(SfuTag tag) async {
     final producer = _producers.remove(tag);

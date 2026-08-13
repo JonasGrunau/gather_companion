@@ -197,9 +197,25 @@ void main() {
     test('a value Gather could not read is refused, not mangled', () {
       // Gather ignores a frame it cannot parse in silence, so guessing here would
       // surface as a mysterious failure to connect.
-      expect(() => msgpackEncode(DateTime.now()), throwsArgumentError);
       expect(() => msgpackEncode({1: 'int key'}), throwsArgumentError);
       expect(() => msgpackEncode(double.infinity), throwsArgumentError);
+      expect(() => msgpackEncode(Object()), throwsArgumentError);
+    });
+
+    test('a DateTime goes out as ext 1, the way one comes back', () {
+      // This used to be on the refused list, and it was correct to be: nothing we
+      // sent carried a time. `setCustomStatus` does — `clearCondition.clearAt` is
+      // when Gather should take the status line down by itself — so the encoder
+      // learned the shape its own decoder had always known.
+      final when = DateTime.utc(2026, 8, 13, 18, 33, 7);
+      expect(msgpackDecode(msgpackEncode(when)), when);
+
+      // Nine bytes of int64 payload, so it lands in ext8 rather than any of the
+      // fixed-width forms: 0xc7, length, type.
+      final bytes = msgpackEncode(when);
+      expect(bytes[0], 0xc7);
+      expect(bytes[1], 9);
+      expect(bytes[2], 1);
     });
 
     test('undefined is dropped from a map, null is kept', () {

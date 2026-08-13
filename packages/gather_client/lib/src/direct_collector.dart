@@ -161,6 +161,10 @@ class DirectCollector {
   /// Our own `SpaceUser` id, once the dump has told us which row is us.
   String? get selfId => reader.selfId;
 
+  /// Our own `UserAccount` id — what the media plane keys on. See
+  /// [GameProtocolReader.selfAccountId].
+  String? get selfAccountId => reader.selfAccountId;
+
   /// The floor plan for a floor, or null until the dump has carried enough of it.
   ///
   /// Read through rather than cached: the builder rebuilds only when a map model
@@ -273,8 +277,104 @@ class DirectCollector {
     return _act('teleport', {'x': x, 'y': y, 'direction': direction});
   }
 
+  // ---- being a person in the room ---------------------------------------------
+  //
+  // Everything below was read off a live capture rather than guessed: a probe run
+  // on 2026-08-13 switched each setting in the desktop client and recorded what
+  // went out. That matters because the arg shapes are not uniform and the server
+  // rejects a wrong one wholesale — see [_act].
+
+  /// Active, Busy or Away. What the dot on everybody's name plate is reading.
+  ///
+  /// The field this lands on is `SpaceUser.userSetAvailability`, which is a value
+  /// object on the way back (`{$type, value}`) but a bare string on the way out.
+  /// `Offline` is deliberately not offered: it is what the *server* writes when a
+  /// connection goes away, and setting it by hand while holding an open socket
+  /// claims something contradicted by the socket carrying it.
+  ({bool ok, String? detail}) setAvailability(String availability) {
+    if (!settableAvailabilities.contains(availability)) {
+      return (ok: false, detail: '$availability is not an availability');
+    }
+    return _act('setAvailability', {'availability': availability});
+  }
+
+  /// The line of text under your name, with an emoji beside it.
+  ///
+  /// [clearAt] is when Gather should drop it by itself. Null means it stands until
+  /// [clearCustomStatus] — the capture only ever carried the `DateTime` condition,
+  /// so the no-expiry case omits `clearCondition` rather than inventing a shape
+  /// for it.
+  ({bool ok, String? detail}) setCustomStatus({
+    required String text,
+    String? emoji,
+    DateTime? clearAt,
+  }) =>
+      _act('setCustomStatus', {
+        'text': text,
+        // Omitted rather than sent as null when there is no emoji — an absent
+        // optional field and one explicitly nulled are different things here.
+        'emoji': ?emoji,
+        if (clearAt != null)
+          'clearCondition': {'type': 'DateTime', 'clearAt': clearAt.toUtc()},
+      });
+
+  /// Takes the status line down. Two args, not three.
+  ({bool ok, String? detail}) clearCustomStatus() => _act('clearCustomStatus');
+
+  /// Throws an emoji over the room.
+  ///
+  /// It comes back on the event bus as `EmoteEvent` — including our own, whose
+  /// `targetUserIds` names the sender as well as the recipients.
+  ///
+  /// [count] was `1` on every send in the capture. The field name suggests Gather's
+  /// own client bundles a held press into one frame, but a larger value has never
+  /// been seen accepted, so the default is the observed one.
+  ({bool ok, String? detail}) broadcastEmote(String emote, {int count = 1}) {
+    if (emote.isEmpty) return (ok: false, detail: 'no emote to send');
+    return _act('broadcastEmote', {
+      'emote': emote,
+      'count': count,
+      // Empty on every observed send, including from a client that was in a call
+      // at the time — the server evidently works the fan-out out for itself.
+      'ambientlyConnectedUserIds': <String>[],
+    });
+  }
+
+  /// Puts a hand up, or takes it down. A bare bool, not a map.
+  ({bool ok, String? detail}) setHandRaised(bool raised) =>
+      _act('setHandRaised', raised);
+
+  /// Steps out of the huddle without walking away from it.
+  ///
+  /// Gather forms conversations by proximity and remembers them in `clusterId`, so
+  /// leaving one and staying where you are is a thing only this action can express.
+  /// Two args, not three.
+  ({bool ok, String? detail}) leaveCluster() => _act('leaveCluster');
+
+  /// Turns on the spot, without taking the step [move] would.
+  ({bool ok, String? detail}) faceDirection(String direction) {
+    if (!moveDirections.contains(direction)) {
+      return (ok: false, detail: '$direction is not a direction');
+    }
+    // A bare string third argument, unlike `move`, which wraps the same value.
+    return _act('faceDirection', direction);
+  }
+
+  /// "No third argument was passed", which `null` cannot say because `null` is
+  /// itself a legitimate one. Compared with [identical], so it can only ever match
+  /// the default.
+  static const _nothing = Object();
+
   /// One action against our own `SpaceUser` row, on the socket we already hold.
-  ({bool ok, String? detail}) _act(String action, Map<String, Object?> args) {
+  ///
+  /// [args] is the third element of the `args` tuple, and it is deliberately
+  /// `Object?` rather than a map: the captured vocabulary is not uniform. `move`
+  /// and `setAvailability` pass a map, `setHandRaised` passes a bare `true`,
+  /// `faceDirection` a bare `"Down"`, and `clearCustomStatus` and `leaveCluster`
+  /// pass nothing at all — their `args` is two elements long, not three. Sending a
+  /// map where the server wants a bool is a schema failure, so the shape is the
+  /// caller's to state.
+  ({bool ok, String? detail}) _act(String action, [Object? args = _nothing]) {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) {
       return (ok: false, detail: 'not connected to Gather');
@@ -289,7 +389,10 @@ class DirectCollector {
         'type': 'Action',
         'txnId': _txnId(),
         'action': action,
-        'args': ['SpaceUser', self, args],
+        // `null` is a legitimate third argument, so absence is its own sentinel
+        // rather than null — a two-element tuple is what the server was observed
+        // to receive for these, and padding it with null is a different frame.
+        'args': ['SpaceUser', self, if (!identical(args, _nothing)) args],
       }));
       return (ok: true, detail: null);
     } on Object catch (error) {

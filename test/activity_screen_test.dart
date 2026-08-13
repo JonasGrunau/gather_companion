@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
-import 'package:gather_companion/ui/feed_screen.dart';
+import 'package:gather_companion/ui/activity_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
 /// Widget-level checks for the one thing the screen exists to say: who is
@@ -30,7 +30,7 @@ void main() {
         theme: buildGatherTheme(),
         home: ListenableBuilder(
           listenable: state,
-          builder: (context, _) => FeedScreen(state: state, onUnpair: () {}),
+          builder: (context, _) => ActivityScreen(state: state),
         ),
       );
 

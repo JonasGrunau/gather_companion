@@ -270,4 +270,31 @@ class FakeGatherHttp implements GatherHttp {
   @override
   Future<({int status, Object? body})> getJson(Uri uri, String bearer) async =>
       (status: 200, body: spaces);
+
+  /// Msgpack bodies, keyed by the last path segment of the URI they answer.
+  Map<String, List<int>> bytes = const {};
+
+  /// The status [getBytes] and [postBytes] answer with. Separate from [status],
+  /// which belongs to the token endpoint — a suite needs to fail one without
+  /// failing the other.
+  int byteStatus = 200;
+
+  /// Every [postJson] call, in order, so a test can assert what was sent.
+  final List<({Uri uri, Object? body})> posts = [];
+
+  @override
+  Future<({int status, List<int> body})> getBytes(Uri uri, String bearer) async => (
+        status: byteStatus,
+        body: bytes[uri.pathSegments.last] ?? const <int>[],
+      );
+
+  @override
+  Future<({int status, List<int> body})> postJson(
+    Uri uri,
+    String bearer,
+    Object? body,
+  ) async {
+    posts.add((uri: uri, body: body));
+    return (status: byteStatus, body: const <int>[]);
+  }
 }

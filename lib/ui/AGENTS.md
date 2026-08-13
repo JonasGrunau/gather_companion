@@ -9,12 +9,19 @@ The screens. Each file holds one public entry point plus the private
 widgets it composes — there is no shared widget library, because nothing has
 needed to be shared twice yet.
 
+`home_shell.dart` is the one exception to "one file, one screen": it holds the
+three tabs together and is what the app shows once it is paired.
+
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `feed_screen.dart` | The main screen. `_TopBar`, `_LinkStrip`, `_AroundYou`, `_PartyCard`, `_FollowerCard`, `_PersonChip`, `_Avatar`. Answers "is anyone following me" from the snapshot, and carries the party switch. Named for the scrolling activity feed it used to have; the name outlived it. |
-| `map_screen.dart` | The office, drawn in Gather's own artwork. `_Where`, `_HeadCount`, `_Waiting`, `_Plan`, `_Legend`, `_OfficePainter`, plus the `officePainter()` and `framedOn()` test seams. Floors, walls, furniture and avatars, sorted into one depth order; the old schematic is still underneath for while the art is in flight. People walk rather than hop — see `../src/map_motion.dart` — except when they teleport, which is drawn as a teleport: the body dissolves where it stood while a new one fades and grows into place at the destination, two entries in the same depth list so each folds behind the right desk. They are otherwise drawn on the client's own animation table: the walk cycle while they are mid-step, `idle-sit` on a chair, the talking loop while they are speaking. Labels are Gather's own capsules: a name plate above each head with an availability dot, and the ten **team** zones named above themselves — the fourteen meeting rooms are deliberately not written on the floor, since the one you are standing in is already in the app bar. Covers the screen at minimum zoom and cannot be panned off it (`boundaryMargin: EdgeInsets.zero`, and `framedOn` clamps the transforms the screen sets itself); opens centred on you at 3×, pinch/double-tap to 20×. Opened by `feed_screen.dart` on `Listenable.merge([state, state.positions])`; `state` alone leaves it frozen, because walking changes nothing the presence tracker reports. |
+| `home_shell.dart` | `HomeShell` — the three destinations and the rail between them. `_Tab`, `_TabView`, `_NavRail`, `_NavItem`. Activity, the office, settings, left to right, opening on Activity. **`_Tab`'s declaration order is the only place that order lives**: the rail and the `IndexedStack` are both built by walking `_Tab.values`, because they were once hand-written as parallel lists and reordering the enum alone silently swapped two tabs' bodies. All three tabs sit in an `IndexedStack` so the map keeps its decoded artwork, its pan and zoom, and its already-played opening shot; each is wrapped in a `TickerMode` so the ones behind are kept without being kept *running*. `AppState.positions` is merged in only while the map is the selected tab. The rail floats over the content rather than docking under it, and the shell adds `kRailInset` to the bottom of every tab's `MediaQuery` padding so each tab's existing `SafeArea(top: false)` clears it without knowing a rail exists. |
+| `activity_screen.dart` | The activity tab: what is happening to you, over what happened. Pinned at the top, the questions only the live socket answers — `_LinkStrip`, `_AroundYou`/`_FollowerCard`, `_PartyCard` — then `_History` under them, which is Gather's *own* activity feed: `_ActivityTile`, `_Glyph`, `_NoHistory`, `_withDayHeaders`. Waves, mentions, reactions, thread replies and "your meeting notes are ready", read over REST from `../../packages/gather_client/lib/src/activity_feed.dart` and topped up by `WaveEvent` off the socket, so nothing polls; grouped by day, because the list spans months. One `CustomScrollView` rather than a card over a nested list — two scrollables would leave the follower card sitting still while the history slid under it. Only the subscription-backed kinds are tappable: a memo can be marked read in Gather and a wave cannot — its read state is a chat cursor — so waves show no dot rather than one the screen could not clear. Was `feed_screen.dart` until the rail gave it a name a person would use, and lost its `_TopBar` when the rail and the settings tab took over what was in it. |
+| `settings_screen.dart` | `SettingsScreen` — what the app can tell you about itself. `_SectionLabel`, `_Card`, `_Row`. The connection and the space it is in, a reconnect, the mic and camera check, the paired computer and whether it can still wake the app, and unpairing. Replaced the `PopupMenuButton` on the feed: a menu can only hold verbs, and most of what belongs here is nouns. The `Notifier` flags are deliberately absent until something persists them. |
+| `map_screen.dart` | The office, drawn in Gather's own artwork. `_Where`, `_HeadCount`, `_Waiting`, `_Plan`, `_Legend`, `_OfficePainter`, plus the `officePainter()` and `framedOn()` test seams. Floors, walls, furniture and avatars, sorted into one depth order; the old schematic is still underneath for while the art is in flight. People walk rather than hop — see `../src/map_motion.dart` — except when they teleport, which is drawn as a teleport: the body dissolves where it stood while a new one fades and grows into place at the destination, two entries in the same depth list so each folds behind the right desk. They are otherwise drawn on the client's own animation table: the walk cycle while they are mid-step, `idle-sit` on a chair, the talking loop while they are speaking. Labels are Gather's own capsules: a name plate above each head with an availability dot, and the ten **team** zones named above themselves — the fourteen meeting rooms are deliberately not written on the floor, since the one you are standing in is already in the app bar. Covers the screen at minimum zoom and cannot be panned off it (`boundaryMargin: EdgeInsets.zero`, and `framedOn` clamps the transforms the screen sets itself); opens centred on you at 3×, pinch/double-tap to 20×. Built by `home_shell.dart` on `Listenable.merge([state, state.positions])` while it is the selected tab; `state` alone leaves it frozen, because walking changes nothing the presence tracker reports. Its body is deliberately not in a `SafeArea` — the floor runs under the home indicator and under the nav rail — while the D-pad and legend are, which is how they lift clear of the rail without this file knowing about it. |
+| `control_bar.dart` | `ControlBar` — Gather's own bottom bar, adapted: you (tap for the status sheet), your microphone, your camera, the eight reactions, a raised hand, and leaving the conversation you are in. Undecorated rows, because `home_shell.dart`'s `_Dock` paints the island both it and the navigation sit in. `kControlBarInset` is what the map tab pays for it. Gather's screen-share and its *leave* door are deliberately absent — there is nothing on a phone worth sharing, and the socket this app holds **is** its presence, so a door out of the space would switch the product off; `leaveCluster` is the honest replacement. Mic and camera drive a real capture session through `../src/media/call.dart` and publish to the SFU. |
+| `status_sheet.dart` | `showStatusSheet()` — Active / Busy / Away, and the line of text under your name. Availability reads back off the roster and is authoritative; the status line does not, because `SpaceUserStatus` is one of the models the reader discards, so what is shown is an echo of what this phone last sent and goes away on a restart. |
 | `dpad.dart` | `DPad` — the pad that walks your own avatar, floating over the lower half of the map. One `Listener` rather than four buttons, so rolling a thumb from one quarter to the next changes direction without the walk ever stopping; the hub in the middle is how you stop without lifting. Each direction owns a full quarter of the disc, split on the same diagonals the hit test uses, so what you aim at is what you get. `../../packages/gather_client/lib/src/walk.dart` does the stepping. |
 | `pair_screen.dart` | Camera pairing. `_Header`, `_Viewfinder`, `_CornersPainter`, `_CameraUnavailable`, `_Hint`, `_Command`. Opens the camera immediately and keeps the typed route available throughout. |
 | `media_check_screen.dart` | `MediaCheckScreen` — mic and camera, before you need them. `_Preview`, `_Message`, `_Controls`, `_Toggle`. Talks to no server; it opens the hardware, draws it and lets go. Owns an `RTCVideoRenderer`, which is why it is stateful: the texture must be initialised before use and disposed with the widget, and `srcObject` is cleared *before* the engine stops the tracks under it. Three distinct states — starting, permission denied, no camera — because a refused permission is fixed in Settings and a busy camera is not, and neither is a spinner. |
@@ -24,11 +31,33 @@ needed to be shared twice yet.
 
 ### Working In This Directory
 
-- **The screen only says what it can currently answer.** It used to be a snapshot
-  card over a scrolling history. The history is gone — once the app talked to
-  Gather itself, the log only recorded what happened while the app was open, so it
-  was empty exactly when it mattered. Push notifications carry that job now.
-  `_SectionLabel`, `_EventRow`, `_EmptyFeed` and `_BackgroundToggle` went with it.
+- **A control that cannot do anything is absent, not dimmed.** The conversation
+  button appears when there is a conversation to leave and goes with it; the
+  camera flip appears once there is a camera running. This is the same rule the
+  D-pad follows for its own visibility, and it is why nothing in the control bar
+  is ever greyed out — a bar whose buttons keep changing which of them work is
+  one you stop trusting.
+- **Off is a colour; pressed is not.** A muted microphone is crossed out in
+  `t.danger`, matching the media check and Gather itself. That is a *state*, and
+  states are allowed a colour. The D-pad's rule — pressed is a step of opacity,
+  never a different paint — is about a control being *pushed* and still holds.
+- **Every action answers.** Everything on the control bar and the status sheet
+  returns `Future<String?>` — null on success, a sentence on failure — and the
+  sentence goes to a `SnackBar`. That is the contract `AppState.setPartyMode`
+  set. A tap that silently does nothing is the one outcome not allowed.
+
+- **The history the activity tab shows is Gather's, never the phone's.** The
+  app's own `EventLogStore` was deleted and must not come back: it could only
+  record what happened while the app was open, which is the one window in which
+  the user was already looking, so it was empty exactly when it mattered. That
+  was an argument against a log *this app keeps*, not against a history — the
+  list under the cards is read from Gather over REST and was there while the
+  phone was asleep. `_SectionLabel`, `_EventRow`, `_EmptyFeed` and
+  `_BackgroundToggle` are gone for good.
+- **Live above, history below, in one scroll view.** The follower card and the
+  party switch answer questions that are stale a minute later; the feed under
+  them is a record. Nesting the second inside its own scrollable would pin the
+  first in place, which is not what "above" means.
 - `CustomScrollView` needs `AlwaysScrollableScrollPhysics` or the screen — now
   shorter than the viewport — cannot be over-scrolled, and pull-to-refresh
   silently does nothing.
@@ -82,11 +111,26 @@ needed to be shared twice yet.
 - **Pressed is a step of opacity, not a colour.** The brand blue was tried on the held
   quarter and made the pad look like it was reporting something rather than being
   pushed; a heavier dark read as a hole cut in the disc.
+- **Selected is a colour, though.** That rule is about a control being *pushed*; a
+  nav item is a control that is *in a state*, so `_NavItem` follows the media
+  check's toggles instead and uses `t.brand` on a `t.secondary` plate. The plate is
+  what stops three loose glyphs on a floating bar reading as decoration.
+- **Tabs are kept alive, and that is a cost as well as the point.** Anything with a
+  ticker or a subscription behind a tab keeps running unless something stops it —
+  `TickerMode` covers clocks, but a new tab holding hardware or a stream must
+  handle its own. `MediaCheckScreen` is pushed from settings rather than made a
+  tab for exactly this reason: it opens the camera in `initState` and would hold
+  it forever behind another tab.
+- **A screen inside a tab does not add bottom padding of its own.** The shell has
+  already put the rail's height into `MediaQuery.padding.bottom`, so
+  `SafeArea(top: false)` or `MediaQuery.paddingOf(context).bottom` is the way to
+  clear it. Hard-coding the rail's height in a second place is how the two drift.
 
 ### Testing Requirements
 
 ```sh
-flutter test test/feed_screen_test.dart test/map_screen_test.dart test/dpad_test.dart
+flutter test test/home_shell_test.dart test/activity_screen_test.dart \
+             test/settings_screen_test.dart test/map_screen_test.dart test/dpad_test.dart
 ```
 
 Widget tests drive real screens through `AppState`'s debug seams. Being followed

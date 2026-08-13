@@ -1,180 +1,97 @@
+/// The activity tab: what is happening to you right now, over what happened.
+///
+/// Two things that used to be one screen each, stacked in the order they matter.
+/// At the top, the questions only the live socket can answer — who is following
+/// you, and whether the party is on — which are worth a glance and are stale a
+/// minute later. Underneath, Gather's own activity feed: waves, mentions,
+/// meeting notes, kept server-side and the same list the desktop client shows.
+///
+/// The phone's *local* history is still gone and is not coming back. It could
+/// only ever record its own waking hours, so it was empty exactly when it
+/// mattered. That was never an argument against a history — only against one
+/// this app kept for itself. The list below is Gather's, and it was there while
+/// the phone was asleep.
+///
+/// ## What a row can and cannot do
+///
+/// Read state is not uniform, and the screen does not pretend otherwise. Meeting
+/// memos and onboarding nudges have an `ActivityEventSubscription` row behind
+/// them, so tapping one marks it read in Gather and the desktop badge clears
+/// too. A wave does not — its read state is a chat read cursor on a DM channel,
+/// a different mechanism this app does not implement. So waves arrive already
+/// reported read and are not tappable. Showing an unread dot we could not clear
+/// would be worse than showing none.
+library;
+
 import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
 import '../src/app_state.dart';
 import '../src/link_status.dart';
-import 'map_screen.dart';
-import 'media_check_screen.dart';
 import '../theme/gather_theme.dart';
 
-/// The main screen: who is following you, right now.
-///
-/// It used to be two things — that answer at the top, and a scrolling history of
-/// everything that had happened underneath. The history is gone. It was worth
-/// keeping while the bridge held a 500-event ring on a computer that was awake all
-/// day; once the app started talking to Gather itself, the log could only record
-/// what happened while the app was open, which is the one window in which you were
-/// already looking at the screen. A list that is empty exactly when you need it and
-/// full of things you already saw otherwise is not history, it is furniture.
-///
-/// What that history was *for* survives as push notifications, which arrive whether
-/// the app is open or not. So the screen is now only the questions it can actually
-/// answer live: who is following you, and whether the party is on.
-class FeedScreen extends StatelessWidget {
-  const FeedScreen({super.key, required this.state, required this.onUnpair});
+class ActivityScreen extends StatelessWidget {
+  const ActivityScreen({super.key, required this.state});
 
   final AppState state;
-  final VoidCallback onUnpair;
 
+  /// Read here rather than inside the `Scaffold`: the shell puts the nav rail's
+  /// height into the bottom padding, and `Scaffold` is entitled to take that off
+  /// its body. This context sits above it and sees the real number.
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    final items = state.activity;
 
     return Scaffold(
       backgroundColor: t.background,
-      body: SafeArea(
-        bottom: false,
-        child: Column(
-          children: [
-            _TopBar(state: state, onUnpair: onUnpair),
-            _LinkStrip(status: state.link),
-            Expanded(
-              child: RefreshIndicator(
-                color: t.brand,
-                backgroundColor: t.card,
-                onRefresh: state.reconnect,
-                child: CustomScrollView(
-                  // The screen is shorter than the viewport now, so without this
-                  // there is nothing to over-scroll and pull-to-refresh silently
-                  // does nothing.
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  slivers: [
-                    SliverToBoxAdapter(child: _AroundYou(state: state)),
-                    SliverToBoxAdapter(child: _PartyCard(state: state)),
-                    const SliverToBoxAdapter(child: SizedBox(height: 32)),
-                  ],
-                ),
-              ),
+      appBar: AppBar(
+        backgroundColor: t.background,
+        title: const Text('Activity'),
+        titleTextStyle: Theme.of(context).textTheme.titleLarge,
+        actions: [
+          if (items.any((item) => item.canMarkRead && !item.isRead))
+            TextButton(
+              onPressed: () => state.markActivityRead(items),
+              child: Text('Mark all read', style: TextStyle(color: t.brand)),
             ),
+        ],
+      ),
+      // Not wrapped in a `SafeArea`: the list runs under the rail, and the
+      // trailing sliver below is what lets the last row be scrolled clear of it.
+      body: RefreshIndicator(
+        color: t.brand,
+        backgroundColor: t.card,
+        onRefresh: () => _refresh(state),
+        child: CustomScrollView(
+          // Without this there is nothing to over-scroll on a short screen and
+          // pull-to-refresh silently does nothing.
+          physics: const AlwaysScrollableScrollPhysics(),
+          slivers: [
+            SliverToBoxAdapter(child: _LinkStrip(status: state.link)),
+            SliverToBoxAdapter(child: _AroundYou(state: state)),
+            SliverToBoxAdapter(child: _PartyCard(state: state)),
+            if (items.isEmpty)
+              SliverToBoxAdapter(child: _NoHistory(state: state))
+            else
+              _History(state: state, items: items),
+            SliverToBoxAdapter(child: SizedBox(height: bottomInset + 32)),
           ],
         ),
       ),
     );
   }
-}
 
-class _TopBar extends StatelessWidget {
-  const _TopBar({required this.state, required this.onUnpair});
-
-  final AppState state;
-  final VoidCallback onUnpair;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-
-    return Padding(
-      // Symmetric on purpose: 10/8 left the whole block sitting a pixel high of
-      // centre against the icon buttons, which is small enough to look like a
-      // mistake rather than a choice.
-      padding: const EdgeInsets.fromLTRB(kTextGutter, 10, kGutter - 6, 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  // The dot is 7pt against a titleLarge line box, so it has to be
-                  // told where to sit; left alone it hangs off whatever the row's
-                  // tallest child happens to be.
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    // Flexible because the name is long enough to crowd the
-                    // header buttons on a 320pt phone.
-                    Flexible(
-                      child: Text('Gather Companion', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge),
-                    ),
-                    const SizedBox(width: 8),
-                    _LiveDot(live: state.link.isLive),
-                  ],
-                ),
-                // No subtitle. It used to name the paired computer, from when the
-                // bridge relayed everything the app knew — but the phone talks to
-                // Gather directly now and the bridge only does pairing and push,
-                // so which computer it is stopped being a thing worth a permanent
-                // row. It was also what pushed this title off centre: blank in
-                // normal use, and an empty `Text` still occupies a full line box.
-              ],
-            ),
-          ),
-          IconButton(
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => ListenableBuilder(
-                  // Both: `state` for the connection and the party, `positions` for
-                  // people walking — which the presence tracker deliberately does
-                  // not treat as a change, because no other screen draws it.
-                  listenable: Listenable.merge([state, state.positions]),
-                  builder: (context, _) => MapScreen(state: state),
-                ),
-              ),
-            ),
-            visualDensity: VisualDensity.compact,
-            icon: Icon(Icons.map_outlined, color: t.mutedForeground, size: 21),
-            tooltip: 'The office',
-          ),
-          IconButton(
-            onPressed: state.reconnect,
-            visualDensity: VisualDensity.compact,
-            icon: Icon(Icons.refresh_rounded, color: t.mutedForeground, size: 21),
-            tooltip: 'Reconnect',
-          ),
-          PopupMenuButton<String>(
-            icon: Icon(Icons.more_horiz_rounded, color: t.mutedForeground),
-            color: t.popover,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(t.radius),
-              side: BorderSide(color: t.border),
-            ),
-            onSelected: (value) {
-              switch (value) {
-                case 'media':
-                  Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const MediaCheckScreen()));
-                case 'unpair':
-                  onUnpair();
-              }
-            },
-            itemBuilder: (context) => const [PopupMenuItem(value: 'media', child: Text('Mic & camera')), PopupMenuItem(value: 'unpair', child: Text('Forget this computer'))],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LiveDot extends StatelessWidget {
-  const _LiveDot({required this.live});
-
-  final bool live;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    return Container(
-      width: 7,
-      height: 7,
-      decoration: BoxDecoration(
-        color: live ? t.ok : t.faint,
-        shape: BoxShape.circle,
-        boxShadow: live ? [BoxShadow(color: t.ok.withValues(alpha: 0.5), blurRadius: 6, spreadRadius: 1)] : null,
-      ),
-    );
-  }
+  /// One pull, both sources. The cards above come off the socket and the list
+  /// below comes off Gather's API, and a person pulling down on this screen
+  /// means "all of it" rather than one of the two.
+  static Future<void> _refresh(AppState state) =>
+      Future.wait([state.reconnect(), state.refreshActivity()]);
 }
 
 /// Only present when the link is unhealthy — no permanent "connected" chrome
@@ -267,7 +184,7 @@ class _LinkStripBody extends StatelessWidget {
           };
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.fromLTRB(kGutter, 0, kGutter, 8),
+      margin: const EdgeInsets.fromLTRB(kGutter, 4, kGutter, 8),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: tint.withValues(alpha: 0.12),
@@ -355,7 +272,8 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
 
   /// Ties the controller to the bridge's answer, and stops it otherwise — a
   /// ticker left running behind a switched-off card costs a rebuild every frame
-  /// for something nobody can see.
+  /// for something nobody can see. Behind another tab the shell's `TickerMode`
+  /// mutes it as well, which this does not need to know about.
   void _sync() {
     final on = widget.state.partyMode && !_reduceMotion;
     if (on && !_spin.isAnimating) {
@@ -379,7 +297,19 @@ class _PartyCardState extends State<_PartyCard> with SingleTickerProviderStateMi
     if (error == null || !mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(error)));
+      ..showSnackBar(SnackBar(
+        content: Text(error),
+        // Lifted over the nav rail by hand. A floating snackbar measures itself
+        // against the bottom of the nearest `Scaffold`, and this screen's one
+        // knows nothing about a rail floating above it in the shell — so the
+        // one message this screen can show would appear underneath it.
+        margin: EdgeInsets.fromLTRB(
+          kGutter,
+          0,
+          kGutter,
+          kRailInset + MediaQuery.paddingOf(context).bottom + 8,
+        ),
+      ));
   }
 
   @override
@@ -699,4 +629,281 @@ class _Avatar extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Why the list below is empty, which is three different things.
+///
+/// "Still reading" and "could not read" are not the same as "nothing happened",
+/// and a person who cannot tell them apart has no way to know whether to pull
+/// again.
+class _NoHistory extends StatelessWidget {
+  const _NoHistory({required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 48, 32, 24),
+      child: Center(
+        child: Text(
+          state.activityError != null
+              ? "Couldn't read your activity from Gather.\nPull to try again."
+              : state.isLoadingActivity
+                  ? 'Reading your activity…'
+                  : 'Nothing yet.\nWaves and meeting notes show up here.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: t.mutedForeground, height: 1.5),
+        ),
+      ),
+    );
+  }
+}
+
+/// Gather's feed, split into days.
+///
+/// A sliver rather than its own `ListView` so it scrolls as one piece with the
+/// cards pinned above it — two nested scrollables here would mean the follower
+/// card stayed put while the history moved under it, which is not what "above"
+/// is supposed to mean.
+class _History extends StatelessWidget {
+  const _History({required this.state, required this.items});
+
+  final AppState state;
+  final List<ActivityItem> items;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final rows = _withDayHeaders(items);
+
+    return SliverList.builder(
+      itemCount: rows.length,
+      itemBuilder: (context, index) => switch (rows[index]) {
+        _DayHeader(:final label) => Padding(
+            padding: const EdgeInsets.fromLTRB(kTextGutter, 24, kTextGutter, 8),
+            child: Text(
+              label,
+              style: TextStyle(
+                color: t.mutedForeground,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.6,
+              ),
+            ),
+          ),
+        _Row(:final item) => _ActivityTile(state: state, item: item),
+      },
+    );
+  }
+}
+
+sealed class _Line {
+  const _Line();
+}
+
+class _DayHeader extends _Line {
+  const _DayHeader(this.label);
+  final String label;
+}
+
+class _Row extends _Line {
+  const _Row(this.item);
+  final ActivityItem item;
+}
+
+/// Splits the list into days. The feed spans months, and a wall of times with no
+/// dates is unreadable past the first screen.
+List<_Line> _withDayHeaders(List<ActivityItem> items) {
+  final out = <_Line>[];
+  String? current;
+  for (final item in items) {
+    final label = _dayLabel(item.at);
+    if (label != current) {
+      out.add(_DayHeader(label));
+      current = label;
+    }
+    out.add(_Row(item));
+  }
+  return out;
+}
+
+String _dayLabel(DateTime? at) {
+  if (at == null) return 'EARLIER';
+  final local = at.toLocal();
+  final now = DateTime.now();
+  final day = DateTime(local.year, local.month, local.day);
+  final today = DateTime(now.year, now.month, now.day);
+  final delta = today.difference(day).inDays;
+  if (delta == 0) return 'TODAY';
+  if (delta == 1) return 'YESTERDAY';
+  if (delta < 7) return _weekdays[local.weekday - 1].toUpperCase();
+  return '${local.day} ${_months[local.month - 1]} ${local.year}'.toUpperCase();
+}
+
+const _weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const _months = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', //
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+class _ActivityTile extends StatelessWidget {
+  const _ActivityTile({required this.state, required this.item});
+
+  final AppState state;
+  final ActivityItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final unread = !item.isRead;
+    final actor = item.actorSpaceUserId;
+    final name = actor == null ? null : state.nameFor(actor);
+
+    return InkWell(
+      // Only the subscription-backed kinds can be flipped; the rest are not
+      // pretending to be buttons.
+      onTap: item.canMarkRead && unread ? () => state.markActivityRead([item]) : null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: kTextGutter, vertical: 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _Glyph(item: item, name: name),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _title(item, name),
+                    style: TextStyle(
+                      color: t.foreground,
+                      fontSize: 15,
+                      height: 1.35,
+                      fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  ),
+                  if (_detail(item) case final detail?) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      detail,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: t.mutedForeground, fontSize: 13, height: 1.35),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  _time(item.at),
+                  style: TextStyle(color: t.faint, fontSize: 12),
+                ),
+                if (unread) ...[
+                  const SizedBox(height: 6),
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(color: t.brand, shape: BoxShape.circle),
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// An initial for a person, an icon for everything else.
+class _Glyph extends StatelessWidget {
+  const _Glyph({required this.item, required this.name});
+
+  final ActivityItem item;
+  final String? name;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+
+    final icon = switch (item) {
+      MeetingArtifactActivity() => Icons.description_outlined,
+      OnboardingActivity() => Icons.school_outlined,
+      UnknownActivity() => Icons.bolt_outlined,
+      _ => null,
+    };
+
+    return Container(
+      width: 36,
+      height: 36,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: icon == null ? t.brandTint : t.secondary,
+        shape: BoxShape.circle,
+      ),
+      child: icon != null
+          ? Icon(icon, size: 18, color: t.mutedForeground)
+          : Text(
+              _initial(name),
+              style: TextStyle(color: t.brand, fontWeight: FontWeight.w700, fontSize: 15),
+            ),
+    );
+  }
+}
+
+String _initial(String? name) {
+  final trimmed = name?.trim() ?? '';
+  return trimmed.isEmpty ? '?' : trimmed.characters.first.toUpperCase();
+}
+
+String _title(ActivityItem item, String? name) {
+  final who = name ?? 'Someone';
+  return switch (item) {
+    WaveActivity() => '$who waved at you',
+    MentionActivity() => '$who mentioned you',
+    ReactionActivity() => '$who reacted to your message',
+    ReplyActivity() => '$who replied in your thread',
+    MeetingArtifactActivity(:final meetingTitle, :final hasVideoRecording, :final hasMeetingMemo) =>
+      switch ((hasMeetingMemo, hasVideoRecording)) {
+        (true, true) => 'Notes and recording ready${_from(meetingTitle)}',
+        (false, true) => 'Recording ready${_from(meetingTitle)}',
+        _ => 'Notes ready${_from(meetingTitle)}',
+      },
+    OnboardingActivity(:final kind) => switch (kind) {
+        activityOnboardingChat => 'Try chatting in Gather',
+        activityOnboardingDesk => 'Claim a desk in Gather',
+        _ => 'Getting started in Gather',
+      },
+    // Deliberately says what it is rather than inventing a sentence for it: a kind
+    // nobody has decoded yet is more useful named than paraphrased.
+    UnknownActivity(:final kind) => kind,
+  };
+}
+
+String _from(String? title) => title == null ? '' : ' from $title';
+
+String? _detail(ActivityItem item) => switch (item) {
+      MentionActivity(:final message) => message,
+      ReactionActivity(:final message) => message,
+      ReplyActivity(:final message) => message,
+      MeetingArtifactActivity(:final participantCount) =>
+        participantCount == null ? null : '$participantCount people',
+      _ => null,
+    };
+
+/// Clock time within the day; the day itself is the header above.
+String _time(DateTime? at) {
+  if (at == null) return '';
+  final local = at.toLocal();
+  final hour = local.hour.toString().padLeft(2, '0');
+  final minute = local.minute.toString().padLeft(2, '0');
+  return '$hour:$minute';
 }

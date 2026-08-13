@@ -39,6 +39,11 @@ const gatherFirebaseKey = 'AIzaSyDPwTbXLMPbIkg6UKr49VrHWwkrOdRh__E';
 /// own bundle: `/api/v2/users/me` answers 403, while `/users/me` answers 404.
 const gatherApiBase = 'https://api.v2.gather.town/api/v2';
 
+/// What Gather's REST API speaks. Measured 2026-08-13: the activity feed answers
+/// `content-type: application/x.gather.msgpack`, so REST bodies decode with the
+/// same [msgpackDecode] the game socket uses.
+const gatherMsgpackContentType = 'application/x.gather.msgpack';
+
 const _tokenEndpoint = 'https://securetoken.googleapis.com/v1/token';
 
 /// Refresh this long before expiry, so a request never races the deadline.
@@ -129,6 +134,26 @@ abstract class GatherHttp {
   );
 
   Future<({int status, Object? body})> getJson(Uri uri, String bearer);
+
+  /// Like [getJson], but hands back the bytes.
+  ///
+  /// Gather's REST API answers `application/x.gather.msgpack` — the same encoding
+  /// as the game socket, not JSON. [getJson] runs the body through `utf8.decode`
+  /// and `jsonDecode`, which mangles it beyond recovery, so a msgpack route needs
+  /// its own method rather than a reinterpretation of that one.
+  Future<({int status, List<int> body})> getBytes(Uri uri, String bearer);
+
+  /// POSTs JSON and hands back the response as bytes.
+  ///
+  /// The asymmetry is Gather's, measured 2026-08-13 against
+  /// `/chat/activity-feed/toggle-read-status`: the request is
+  /// `application/json`, and the response comes back as msgpack. So this takes a
+  /// map and returns bytes rather than being symmetric in either direction.
+  Future<({int status, List<int> body})> postJson(
+    Uri uri,
+    String bearer,
+    Object? body,
+  );
 }
 
 class IoGatherHttp implements GatherHttp {
@@ -180,6 +205,47 @@ class IoGatherHttp implements GatherHttp {
     } finally {
       client.close(force: true);
     }
+  }
+
+  @override
+  Future<({int status, List<int> body})> getBytes(Uri uri, String bearer) async {
+    final client = HttpClient()..connectionTimeout = _timeout;
+    try {
+      final request = await client.getUrl(uri);
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $bearer');
+      request.headers.set(HttpHeaders.acceptHeader, gatherMsgpackContentType);
+      final response = await request.close().timeout(_timeout);
+      return (status: response.statusCode, body: await _drain(response));
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  @override
+  Future<({int status, List<int> body})> postJson(
+    Uri uri,
+    String bearer,
+    Object? body,
+  ) async {
+    final client = HttpClient()..connectionTimeout = _timeout;
+    try {
+      final request = await client.postUrl(uri);
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $bearer');
+      request.headers.contentType = ContentType.json;
+      request.headers.set(HttpHeaders.acceptHeader, gatherMsgpackContentType);
+      request.write(jsonEncode(body));
+      final response = await request.close().timeout(_timeout);
+      return (status: response.statusCode, body: await _drain(response));
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// Concatenates the response chunks. `expand` rather than `BytesBuilder` keeps
+  /// this readable; these bodies are tens of kilobytes, not megabytes.
+  static Future<List<int>> _drain(HttpClientResponse response) async {
+    final chunks = await response.toList();
+    return chunks.expand((chunk) => chunk).toList(growable: false);
   }
 }
 

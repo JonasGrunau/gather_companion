@@ -362,6 +362,10 @@ void _write(BytesBuilder out, Object? value) {
     _writeMap(out, value);
     return;
   }
+  if (value is DateTime) {
+    _writeDateTime(out, value);
+    return;
+  }
   throw ArgumentError.value(
     value,
     'value',
@@ -388,6 +392,48 @@ void _writeInt(BytesBuilder out, int value) {
   out.addByte(0xd3); // int64
   final head = ByteData(8)..setInt64(0, value);
   out.add(head.buffer.asUint8List());
+}
+
+/// Gather's ext 1: a `DateTime` as msgpack integer milliseconds.
+///
+/// Symmetric with the reader's `case 1`, down to the payload being *itself*
+/// msgpack rather than raw bytes. That is what makes the length vary — epoch
+/// millis are past 2^32, so [_writeInt] spends nine bytes on an int64 — and why
+/// this cannot assume one of the fixed-width `fixext` forms.
+///
+/// Only reachable through `setCustomStatus`, which is the one thing we send that
+/// carries a time at all.
+void _writeDateTime(BytesBuilder out, DateTime value) {
+  final payload = msgpackEncode(value.toUtc().millisecondsSinceEpoch);
+  final length = payload.lengthInBytes;
+
+  switch (length) {
+    case 1:
+      out.addByte(0xd4); // fixext1
+    case 2:
+      out.addByte(0xd5); // fixext2
+    case 4:
+      out.addByte(0xd6); // fixext4
+    case 8:
+      out.addByte(0xd7); // fixext8
+    case 16:
+      out.addByte(0xd8); // fixext16
+    default:
+      if (length <= 0xff) {
+        out
+          ..addByte(0xc7) // ext8 — where a nine-byte int64 payload lands
+          ..addByte(length);
+      } else if (length <= 0xffff) {
+        out.addByte(0xc8); // ext16
+        out.add((ByteData(2)..setUint16(0, length)).buffer.asUint8List());
+      } else {
+        out.addByte(0xc9); // ext32
+        out.add((ByteData(4)..setUint32(0, length)).buffer.asUint8List());
+      }
+  }
+
+  out.addByte(1);
+  out.add(payload);
 }
 
 void _writeDouble(BytesBuilder out, double value) {
