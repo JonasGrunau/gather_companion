@@ -61,7 +61,8 @@ This document maps the API. It does not describe how the bridge works today — 
 - [Actions — the write API](#actions-the-write-api)
   - [The server tells you the API if you ask wrong](#the-server-tells-you-the-api-if-you-ask-wrong)
   - [Known actions](#known-actions)
-  - [The server does not validate walkability](#the-server-does-not-validate-walkability)
+  - [`move` is collision-checked, and the check is inside `setPosition`](#move-is-collision-checked-and-the-check-is-inside-setposition)
+  - [The server does not validate walkability *for a teleport*](#the-server-does-not-validate-walkability-for-a-teleport)
   - [Entering costs something](#entering-costs-something)
 - [What arrives in a state dump](#what-arrives-in-a-state-dump)
   - [Checked because they looked alarming](#checked-because-they-looked-alarming)
@@ -842,7 +843,10 @@ Captured off the real client, or confirmed by probe:
 Probed and confirmed **not** to exist on `SpaceUser`: `moveTo`, `setPosition`,
 `updatePosition`, `walkTo`, `setDestination`, `goTo`. `teleport` rejects
 `{position:{x,y}}` — the coordinates must be flat, and `direction` is required even
-when teleporting.
+when teleporting. What the client *puts* in it is the way you travelled, not a
+constant: `MoveController.teleport` derives it with
+`position.positionToDirectionIgnoringAxis(goal)` and abandons the hop outright if that
+answers null. `space_map.dart`'s `headingTo` is the transcription.
 
 **Speed is three actions, and the go-kart is one of them.** There is no vehicle
 model on the wire, no ride action, and nothing anywhere that says "in a kart".
@@ -859,6 +863,49 @@ never above the ceiling, so every route decelerates and the last six tiles of
 anything are walked; and a non-`isPublicWalkway` area forces a walk outright). The
 shift key is a separate door with none of those rules:
 `setSpeedModifier(shift ? DRIVING : WALKING)`.
+
+`isPublicWalkway` is the rule that decides whether you may drive through somewhere, so
+it is worth having in full rather than by reference. It is exhaustive over
+`MapAreaType` — the six below are all of them, and the getter ends in
+`assertUnreachable` rather than a default:
+
+```js
+get isPublicWalkway() { switch (this.mapAreaType) {
+  case Public: case Lobby: case Team: return true;
+  case Common: case MeetingRoom: case Desk: return false;
+  default: assertUnreachable(A) } }
+```
+
+**A go-kart's cadence is accepted: 21 `move`s a second, measured.** Every capture
+before this one happened to be walking — a median 142 ms between moves — so driving
+was three times a rate nothing had ever tested. Measured 2026-08-15 on the throwaway
+space, instance B, by walking the same corridor twice at each pace:
+
+| | sent | acks | non-`Success` | travelled | `/position/x` patches | biggest jump |
+|---|---|---|---|---|---|---|
+| 7/s (143 ms) | 20 | 20 | 0 | 12 | 12 | 1 |
+| 21/s (48 ms) | 20 | 20 | 0 | 12 | 9 | 2 |
+
+Row `y = 29` is walled west of `x = 32` and west of `x = 45`, so the corridor is 12
+steps wide and a 20-move run has 8 moves it cannot make. Holding the path constant is
+the point: **both paces reached the same wall**. Every move geometry allowed landed,
+every action returned `Success`, and nothing was throttled or dropped. This also
+demonstrates the refusal from
+[the section above](#move-is-collision-checked-and-the-check-is-inside-setposition)
+from the wire rather than from the source — 20 moves, 12 position changes, no error.
+
+**Position patches coalesce, and driving is where you notice.** Same 12 tiles, 12
+patches at a walk and 9 in a kart, with single patches carrying a 2-tile jump. So a
+position patch is not "one step" and must never be drawn as one; `map_motion.dart`
+paces each leg over the *gap that produced it* for exactly this reason.
+
+The negative evidence agrees, and is worth keeping: `move` carries no
+`rateLimitCost`, which only the map-editing actions do, at 0.5.
+
+Byte for byte the same body as `shouldNavigateToTile`, which Gather keeps as a
+separate getter directly above it. Two questions — "may I drive across this?" and
+"does tapping here mean the tile or the room?" — that happen to partition the same
+way; `space_map.dart` keeps them as two functions for the same reason.
 
 **The third argument is not always a map, and that is the trap.** Four of these
 send a bare value (`faceDirection` a string, `setHandRaised` a bool) and six
@@ -983,10 +1030,14 @@ party mode moved into the app when the app got its own socket, and the D-pad was
 only ever possible there — and they are the reason the walkability finding below is
 load-bearing rather than trivia.
 
-### `move` checks nothing, so the client is the only thing that does
+### `move` is collision-checked, and the check is inside `setPosition`
 
-Read off the model, 2026-08-13. The action Gather's own client sends for a keypress
-is three lines and a delta:
+Read off the model, 2026-08-13; **corrected 2026-08-15**, when the check was finally
+found one call deeper. This section previously said "`move` checks nothing" on the
+strength of the three visible lines below. That was wrong, and the correction resolves
+what looked like a contradiction with the frame capture — see the end of this section.
+
+The action Gather's own client sends for a keypress is three lines and a delta:
 
 ```js
 w(this, "move", MethodAction({
@@ -1002,30 +1053,150 @@ w(this, "move", MethodAction({
 }));
 ```
 
-No collision test, no bounds test, no walkability test — the same finding as
-`teleport`, arrived at from the other end. Whether a step is legal is decided
-entirely on the client *before* the action is sent, by `Position#isBlockedBy(map,
-prevPosition)`, which is `blockedAtPosition` for the destination tile and
-`canPassThrough` for the line between the two.
+The three lines carry no test, but the fourth call does. `setPosition` is where a
+`move` is arbitrated, and it refuses rather than clamps:
 
-Three consequences for anything driving an avatar over this socket:
+```js
+setPosition(A, e) {
+  const g = e?.map ?? this.floor.activeMapOrThrow;
+  if (isNotNil(e?.prevPosition) && A.isBlockedBy(g, e?.prevPosition)) { return false }
+  if (!this.isPermittedToMoveTo(A, g)) return false;
+  this.position.x = A.x; this.position.y = A.y;
+  return true
+}
+```
 
-- **It turns whether or not it moves.** `direction` is written before the position
-  is touched, so `move` is also the turn.
-- **A second client must re-implement collision or it walks through the office.**
-  `SpaceMap.canStep` is that re-implementation; `walk.dart` is the caller.
-- **`optimistic: true` is a hint about latency, not about trust.** The client draws
-  the step immediately and the confirming patch arrives later, which is why the
-  phone has to track its own tile: the roster is coalesced at 250ms and a walk runs
-  at seven tiles a second, so the wire is always two steps behind the thumb.
+`isBlockedBy` is `blockedAtPosition` for the destination tile and `canPassThrough`
+for the line between the two — the same pair `space_map.dart` transcribes.
 
-### The server does not validate walkability
+Four consequences for anything driving an avatar over this socket:
+
+- **It turns whether or not it moves.** `direction` is assigned before `setPosition`
+  is consulted, so a `move` into a wall turns you to face the wall and moves nobody.
+  This is what the frame capture saw: 36 `/direction` patches against 26 position
+  patches for the same 36 moves — see
+  [`observed-wire-protocol.md`](protocol/observed-wire-protocol.md). Ten of those
+  moves were refused, not "turns in place".
+- **The client sends them anyway.** `gameMove(A)` is
+  `currentSpaceUser.move({direction: A.value})` with no collision test in front of
+  it, and `onArrowKeyDown` pumps it on an interval regardless of what is ahead. The
+  desktop client does not decide whether a step is legal — it asks, every 143 ms,
+  and lets the model answer.
+- **A second client must still re-implement collision, for a different reason than
+  this document used to give.** Not because nothing else would stop it, but because
+  a refused `move` changes nothing and says nothing: there is no rejection on the
+  wire, only a position patch that does not arrive. Without the same rule locally,
+  an optimistic tile runs ahead of an avatar that never left. `SpaceMap.canStep` is
+  that re-implementation; `walk.dart` is the caller, and it hands the *wall* case to
+  Gather (so the turn happens) while keeping the off-grid case to itself.
+- **`optimistic: true` is a hint about latency, not about trust.** The client applies
+  the same `fn` locally, so its optimistic step runs the same `setPosition` gate and
+  is refused in the same place — which is how it stays in sync without being told.
+  The phone still has to track its own tile: the roster is coalesced at 250 ms and a
+  walk runs at seven tiles a second, so the wire is always two steps behind the thumb.
+
+**A second gate sits behind the first.** `isPermittedToMoveTo` refuses any position
+inside a private area you may not enter, and it applies to `teleport` as well:
+
+```js
+isPermittedToMoveTo(A, e) {
+  const g = e.areaPositions.privateAreaAtPosition(A);
+  if (isNotNil(g) && !g.canBeEnteredBy(this)) {
+    publishEvent(g.currentMeeting?.id
+      ? GameEvents.UserIsNotPermittedToEnterMeetingArea
+      : GameEvents.UserIsNotPermittedToEnterLockedArea, …,
+      {targetUserIds: new Set([this.id])});
+    return false
+  }
+  return true
+}
+```
+
+Note where the refusal goes: an **event**, addressed to you alone, and no patch at
+all. The action still returns `Success`. A client that only applies patches learns
+nothing except that it did not move.
+
+The door itself is `MapArea.canBeEnteredBy`, five clauses deep:
+
+```js
+canBeEnteredBy(A) {
+  if (!this.isLocked) return true;                                          // 1
+  if (this.isDesk) { if (this.deskOwner?.id === A.id) return true }         // 2
+  const e = this.currentMeeting;
+  if (isNotNil(e) && e.canSpaceUserAccess(A)) return true;                  // 3
+  const g = Object.values(this.mapEntityIdentifier.areaAccessRequests)
+    .find(e => e.spaceUserId === A.id && e.responseStatus === Accepted);
+  if (g) return true;                                                       // 4
+  if (A.isInOffice &&
+      A.currentPrivateMapArea?.stableId_USE_THIS_INSTEAD_OF_ID === this.stableId…)
+    return true;                                                            // 5
+  return false
+}
+```
+
+and the area it is asked about is `privateAreaAtPosition` — the **last walled** area
+covering the tile, `last` rather than smallest, which is not the same question
+`areaAtPosition` answers.
+
+`space_map.dart`'s `canEnterRoom` answers all five, four of them whole;
+`privateAreaAt` is the lookup. Clauses 3 and 4 need two more models, and **the join
+is the part worth writing down** — both are
+`ReverseRelationReference(this, …, "areaId")` on **`MapEntityIdentifier`**, so
+`AreaAccessRequest.areaId` and `Meeting.areaId` carry the `stableId` an area hangs
+off and never `MapArea.id`. Getting that backwards finds nothing, silently, and locks
+everybody out.
+
+| clause | model | rule |
+|---|---|---|
+| 4 | `AreaAccessRequest` | `spaceUserId` is mine and `responseStatus` is `Accepted` |
+| 3 | `Meeting` + `MeetingParticipant` | I hold a participant row on a meeting whose `areaId` is this area |
+
+Clause 3 is the partial one, and deliberately so. `canSpaceUserAccess` opens with
+`if (isNotNil(this.meetingParticipantsBySpaceUserId[A.id])) return true` — being
+*listed* is the whole test, with no response status about it — and then falls through
+to `combinedCalendarEvent.isSpaceUserAttendeeOrOrganizer` for anybody who is not,
+which is a chain of calendar models this app has no reason to read. So somebody
+invited by calendar alone, never added as a participant, still answers false locally.
+
+Two loosenesses go the other way, on purpose: any meeting on the area counts rather
+than only the current one, and a participant row is taken at face value. **Erring
+towards yes is the safe direction here**, because the server holds the real rule,
+refuses the move, and publishes a refusal the app handles (`AppState.notices`).
+Erring towards no is the failure with no way back — it never sends anything, so
+nothing can correct it. Gather's own client pre-refuses in exactly the same place,
+with `onLeftDoubleClick` publishing `AttemptToMoveToLockedArea`.
+
+### The server does not validate walkability *for a teleport*
 
 Eight teleports to uniformly random tiles across the full 124×82 grid were **all
 accepted**, including tiles at the map edges that are certainly wall or void. No
-rejection, no clamping, no collision check. **Collision is enforced client-side
-only.** Worth knowing both as a capability and as a measure of how much the game
-server trusts its clients.
+rejection, no clamping, no collision check.
+
+Corrected 2026-08-15: this said "**collision is enforced client-side only**", which
+generalised the result from `teleport` to `move` and is wrong — see
+[`move` is collision-checked](#move-is-collision-checked-and-the-check-is-inside-setposition).
+One line of `teleport`'s body explains both halves at once:
+
+```js
+fn: () => A => {
+  const e = {x: this.x, y: this.y};
+  const g = this.setPosition(new Position(A.x, A.y), {map: this.floor.activeMapOrThrow});
+  if (g) { this.direction = new Direction(A.direction); publishEvent(Teleport, …) }
+}
+```
+
+`move` passes `prevPosition` and `teleport` does not, and `setPosition` guards its
+collision test on `isNotNil(prevPosition)`. So the gate is not disabled for
+teleports, it is *unreachable* — there is no previous tile to have crossed a wall
+from. A hop is unvalidated because it has no line to check, not because the server
+trusts clients.
+
+Two details that follow, both load-bearing for `party.dart`:
+
+- **`isPermittedToMoveTo` still runs.** A teleport into a locked or private area you
+  cannot enter is refused like any move. Walkability is not checked; permission is.
+- **A refused teleport does not even turn you.** `direction` is assigned inside the
+  `if (g)`, so nothing at all changes.
 
 Map bounds come from the base `MapArea`: `FloorMap.baseAreaId` names it, and its
 `dimensionsInTiles` is an ext-0 `{$type:'Dimensions', width, height}` — 124×82 for
@@ -1558,6 +1729,16 @@ assignment and capability negotiation are startup work, and only produce/consume
 for somebody to stand next to you. A client that defers opening the SFU socket until a
 cluster forms is doing something the real client does not.
 
+**What this app does, and why it is a deviation worth naming.** It opens the media
+plane when a *conversation* forms rather than at space join — a phone spends most of
+its day in a pocket, and an assignment held all day for a call that never happens is a
+socket and a battery spent on nothing. The consequence, which is the part that has to
+be got right: opening it on the first **tap** instead, which is what it used to do,
+means the phone cannot hear anybody until it starts talking. Walking up to a group and
+listening — the ordinary thing to do in an office — was the one thing it could not do.
+So the trigger is the cluster, not the microphone button, and nothing about capture or
+permissions rides along with it.
+
 ### What the router actually offers
 
 The measured `routerRtpCapabilities`, which is what `Device.load()` consumes:
@@ -1733,11 +1914,10 @@ Settled by capture. A real screen share produced
 The bundle's H264 mention is either a fallback that never fires or was misread. The
 router's advertised capabilities contain no H264 at all, which agrees.
 
-Codecs: **VP8** camera, **H264** screen share, Opus with DTX/NACK/FEC. Three simulcast
-layers via `scaleResolutionDownBy` and per-layer `active`. **TURN credentials rotate
-through `restart-ice`**, which returns fresh `iceServers` → `updateIceServers()` +
-`restartIce()`; there is no REST TURN endpoint. `TURN_CREDENTIAL_EXPIRY_S = 86400`,
-`TURN_REFRESH_INTERVAL_S = 14400`.
+So the codec set is **VP8 for both camera and screen share**, and Opus with
+DTX/NACK/FEC for audio. (A paragraph here used to repeat "**H264** screen share"
+three lines under the heading correcting it, along with a second copy of the TURN
+constants above — both were left behind when the capture settled the question.)
 
 Peers can be spread across **several SFU nodes at once** — `getSFUsByPlayerId`,
 `getPrimarySFUByPlayerId`, `moveSFU`, `migratingParticipants`. One media connection is
@@ -2147,3 +2327,21 @@ positions, and `Authenticate` frames contain a live JWT.
 7. `unknownFrames` occasionally counts 1–2 server frames the interpreter does not
    recognise. Harmless for presence, unidentified.
 8. Delta envelope names were matched structurally, not against a labelled frame.
+9. **`transport-create` — request *and* response.** It appears in no capture at all:
+   both probes attached at space join, by which time the desktop had already built
+   its transports, and the second rig published no media so the produce path never
+   ran. Everything on the send and receive sides hangs off it, and the client here
+   sends `{direction, iceTransportRequestOptions}` and expects the standard
+   mediasoup `{id, iceParameters, iceCandidates, dtlsParameters}` plus Gather's
+   `iceServers` — assumed, not measured. `transport-connect` and `restart-ice` were
+   transcribed from the bundle rather than seen. A `probe-sfu.mjs reload` *during* a
+   live call is still the one measurement that settles all three, and it is the same
+   run that would settle the `sessionId` in #4.
+10. **What `set-player-conversation-metadata` is for.** The shape is measured
+    (`{meetingId, clusterId}`) and the desktop sends it on every cluster change, so
+    this client does too — but nothing observable changed when it did, so whether it
+    affects routing, recording or only telemetry is unknown.
+11. **`disable-video`, `move-off`, `consume-not-allowed` and `consume-connected`.**
+    Declared in the bundle's server→client set, never caught on the wire, payloads
+    unknown. This client logs them and acts on none of them; guessing at `move-off`
+    in particular risks a reconnection loop over a message nobody has seen.

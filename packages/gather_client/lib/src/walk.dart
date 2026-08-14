@@ -289,6 +289,29 @@ class Walk {
     }
   }
 
+  /// The gait Gather has been told about, as far as this knows.
+  ///
+  /// Not the same thing as [_gait], and the gap between the two is the point. The
+  /// send is fire-and-forget over a socket that can be down, and the one message that
+  /// really has to land is the one getting us *out* of the kart: `speed.modifier` is a
+  /// synced field, so a `drive` that arrived followed by a `walk` that did not leaves
+  /// this avatar sitting in a go-kart on every other screen in the space. It stays
+  /// there, too — [_setGait] only speaks when the gait changes, and a walk rebuilt on a
+  /// reconnect starts out believing it is walking, so nothing ever says otherwise.
+  ///
+  /// So the last thing successfully said is remembered and [noteRoster] says it again
+  /// until it lands. Starting at [Gait.walking] rather than at null is the conservative
+  /// half: a fresh walk has told Gather nothing and assumes nothing needs saying, which
+  /// keeps it from announcing a gait at somebody whose desktop client is legitimately
+  /// driving the same avatar.
+  Gait _announced = Gait.walking;
+
+  /// Put [gait] on the wire, and remember whether it got there.
+  void _tell(Gait gait) {
+    final sent = _collector()?.setGait(gait);
+    if (sent != null && sent.ok) _announced = gait;
+  }
+
   /// What is left of the beat spent climbing into the kart, in microseconds.
   ///
   /// `pauseMovingMsRemaining`. Counted in the same currency the client uses — it
@@ -322,9 +345,8 @@ class Walk {
     if (want == _gait) return false;
     _gait = want;
     // Only ever announced, never asked. A socket that is not there yet is not a reason
-    // to walk at the wrong speed — the pace is local, and the next gait change will
-    // say so again.
-    _collector()?.setGait(want);
+    // to walk at the wrong speed — the pace is local.
+    _tell(want);
     // Entering only. The name says "InOut" but the client calls it from exactly two
     // places and both test `=== DRIVING` first, so climbing out is free.
     if (want == Gait.driving) _pause = kartPause.inMicroseconds;
@@ -538,7 +560,32 @@ class Walk {
     if (!map.canStep(x, y, direction)) {
       // A wall. Only a held direction reaches here now — a route has already had its
       // go at finding another way round.
-      if (held == null) release();
+      if (held == null) {
+        release();
+        return (ok: false, detail: 'blocked');
+      }
+      // Sent anyway, which is Gather's own behaviour and not a shortcut. `gameMove` is
+      // `currentSpaceUser.move({direction})` with no collision test in front of it —
+      // the client sends every held-key step and lets the model arbitrate — and the
+      // model assigns `direction` *before* it consults `setPosition`. So a step into a
+      // wall turns you to face the wall and moves nobody, which is what leaning on the
+      // furniture looks like on the desktop.
+      //
+      // The tile is deliberately not advanced. `setPosition` refuses the position
+      // (`isBlockedBy(map, prevPosition)`, and it returns false rather than clamping),
+      // so believing it would put this walk a tile ahead of an avatar that never left.
+      //
+      // **Except off the grid**, which is the one refusal not to hand over. Gather
+      // arbitrates with `blockedAtPosition`, which consults the object map and nothing
+      // else, so the emptiness outside the building is not blocked — it is unoccupied.
+      // A move over the edge would very likely be *accepted*, and the position it
+      // writes is one no client has any art for. That refusal stays here.
+      final step = stepOf(direction)!;
+      final tx = x + step.dx;
+      final ty = y + step.dy;
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) {
+        collector.move(direction: direction);
+      }
       return (ok: false, detail: 'blocked');
     }
 
@@ -610,6 +657,13 @@ class Walk {
 
   /// What Gather says about where we are. See the library doc.
   void noteRoster(Roster roster) {
+    // A gait that never reached Gather, said again now that a roster proves the socket
+    // is carrying traffic. Before the position work below and outside all of its early
+    // returns: this has to happen whether or not the roster happens to name us, and the
+    // case it exists for is a connection that dropped mid-drive, where nothing else is
+    // going to run again — the timer is cancelled and no step will ever be taken.
+    if (_announced != _gait) _tell(_gait);
+
     RosterRow? me;
     for (final row in roster.rows) {
       if (row.id == roster.selfId) {

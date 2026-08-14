@@ -19,6 +19,10 @@ end-to-end test against a real running bridge.
 | `settings_screen_test.dart` | That the four connection states stay four different sentences — in particular that a revoked credential asks you to act rather than to wait — and that unpairing calls through exactly once. Also one case per `PushReach`, because that card used to render "is an address stored" under the word *Unreachable*: it called a sleeping Mac reachable forever and a phone with no bridge address unreachable, and the second one sends you to inspect a computer that is fine. |
 | `push_test.dart` | Push registration, entirely about the *outcome*. Every failure here is silent by construction — the phone registers or does not, FCM answers `200` either way — so these pin that "APNs never answered", "the Mac is asleep", "the Mac has no credentials" and "no bridge address" stay four different answers, that the POST is re-attempted every call (it is the reachability probe), and that the FCM token is fetched once rather than waiting on APNs again per resume. |
 | `bridge_settings_store_test.dart` | The keychain move and its migration. The migration is the risky half: shipping it without one would unpair every phone that is already paired, which is the same failure it exists to fix, caused deliberately. Also that the `installId` is minted once, and survives an unpair — it names the phone, not the relationship. |
+| `sfu_session_test.dart` | The conversation with Gather's media plane: assignment, the node pool, reconciling `consume-try`, and the three things a device cannot be made to do on cue — a router that has not placed somebody yet, a socket that drops and comes back holding nothing, and a node being drained mid-call. The transport underneath is tested against a real socket in `packages/gather_client`; this is about what is *said*. |
+| `live_call_test.dart` | The two buttons and the order they force. Driven through a real `SfuSession` over the same rig, so the assertions are about what reached the wire rather than about a mock being called. Two production bugs came out of writing it: turning the camera on dropped the audio producer and never put it back, and a refused `produce` hung the button for twenty seconds. |
+| `call_cluster_test.dart` | When the app speaks to the media plane and when it stays quiet — the cluster becoming a subscription, the wider in-range set becoming the allow list, and the asymmetric debounce. `fakeAsync`, because it is entirely about *when*. |
+| `call_screen_test.dart` | The video surface with no camera near it, plus the quality requests: one face full-screen asks for the top simulcast layer, a grid asks for thumbnails, and closing the route asks everybody to stop sending detail. |
 | `live_bridge_test.dart` | End-to-end against a real bridge, exercising the app's own pairing and client code rather than mocks. **Skipped unless configured**, so `flutter test` stays green on a machine with no Gather on it. |
 
 ## For AI Agents
@@ -28,6 +32,20 @@ end-to-end test against a real running bridge.
 - **Use the debug seams, not fakes.** `AppState.debugApplySnapshot`,
   `debugApplyEvent` and `debugApplyLink` are `@visibleForTesting` for exactly this
   reason — the tests drive the real state object.
+- **The media fakes stand in for hardware only, never for our own code.**
+  `fake_signalling.dart` (the socket), `fake_mediasoup.dart` (`Device`,
+  `Transport`, `Producer`, `Consumer`) and `fake_capture_engine.dart` (the
+  camera) are the whole set, wired together by `sfu_rig.dart`. `SfuSession` and
+  `LiveCall` themselves are the real thing in both suites — a fake of either
+  would test the fake. The mediasoup ones use `implements` plus `noSuchMethod`
+  rather than reimplementation, so the members we *do* override are checked
+  against the real signatures and a library upgrade breaks here rather than on a
+  device.
+- **Two seams exist purely so that works**, and both are the same shape as
+  `MediaEngine`: `SfuSession(buildDevice:)` injects the mediasoup device, which
+  is the only part of that file needing a platform channel, and `CaptureEngine`
+  is the narrow interface carrying `MediaStream` so `LiveCall` does not have to
+  name `WebrtcMediaEngine`. Keep new native calls behind one of them.
 - **Being followed cannot be produced on demand.** It needs a colleague to
   actually follow you around a real space, so without these tests the follower
   card would only ever be seen by accident. That is why it is pinned here.

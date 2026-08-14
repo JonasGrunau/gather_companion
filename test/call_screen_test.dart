@@ -16,6 +16,8 @@ import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 
+import 'fake_call.dart';
+
 void main() {
   /// A tile that draws its label and nothing else.
   Widget inertTile(BuildContext context, CallTile tile) => TileFrame(tile: tile);
@@ -121,6 +123,61 @@ void main() {
 
     expect(find.byType(GridView), findsOneWidget);
     expect(find.text('3 other people'), findsOneWidget);
+  });
+
+  testWidgets('a face filling the screen is asked for at full size',
+      (tester) async {
+    final call = FakeCall();
+    final state = stateWith(const CallState(participants: [
+      CallParticipant(srcId: 'account-1', hasVideo: true),
+    ]))
+      ..debugAttachCall(call);
+    await show(tester, state);
+
+    // Nobody sends more than their smallest layer until a consumer asks, so
+    // without this the one face on a phone screen stays a thumbnail.
+    expect(call.watching.last.srcIds, ['account-1']);
+    expect(call.watching.last.quality, VideoQuality.full);
+  });
+
+  testWidgets('a grid of four asks for thumbnails', (tester) async {
+    final call = FakeCall();
+    final state = stateWith(const CallState(
+      media: LocalMediaState(capturing: true),
+      participants: [
+        CallParticipant(srcId: 'a', hasVideo: true),
+        CallParticipant(srcId: 'b', hasVideo: true),
+        CallParticipant(srcId: 'c', hasVideo: true),
+      ],
+    ))
+      ..debugAttachCall(call);
+    await show(tester, state);
+
+    // Four tiles counting our own, so nobody is bigger than a quarter of a
+    // phone. Asking for full frames here would spend three uplinks on detail
+    // that lands in a hundred-pixel box.
+    expect(call.watching.last.quality, VideoQuality.thumbnail);
+    expect(call.watching.last.srcIds, ['a', 'b', 'c']);
+  });
+
+  testWidgets('closing the screen tells everybody to stop sending detail',
+      (tester) async {
+    final call = FakeCall();
+    final state = stateWith(const CallState(participants: [
+      CallParticipant(srcId: 'account-1', hasVideo: true),
+    ]))
+      ..debugAttachCall(call);
+    await show(tester, state);
+    expect(call.watching.last.quality, VideoQuality.full);
+
+    // The map draws no video, so once this route is gone nobody is looking at
+    // anything — and until it is said, a colleague keeps encoding a big layer
+    // for a screen that no longer exists.
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+
+    expect(call.watching.last.srcIds, isEmpty);
+    expect(call.watching.last.quality, VideoQuality.thumbnail);
   });
 
   test('a screen share is what the tile shows, when there is one', () {

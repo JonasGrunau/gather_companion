@@ -22,8 +22,11 @@
 ///
 /// **The correlation key is the Socket.IO ack id.** Gather's `sendWithResponse`
 /// is not a bespoke mechanism layered on a socket; it is `emit(name, args, cb)`.
-/// So [sendWithResponse] is a thin wrapper over `emitWithAckAsync` rather than the
-/// hand-rolled pending-completer map the game socket would have needed.
+/// So [sendWithResponse] is a thin wrapper over `emitWithAck` rather than the
+/// hand-rolled pending-completer map the game socket would have needed — and
+/// specifically **not** `emitWithAckAsync`, for the reason spelled out at the call
+/// itself: half of Gather's methods answer with an empty array, which that method
+/// cannot survive.
 ///
 /// **Most calls carry a sequence number, but not all.** The envelope is
 /// `{wsSequenceNumber, zodData}` — except for [_bareMethods], which send their
@@ -100,6 +103,34 @@ const _socketIoPath = '/socket.io/';
 /// `{srcId, srcStreamId}` while everything else on the same socket was wrapped.
 /// `addrs` and `reassign` are on the bundle's exemption list too.
 const _bareMethods = {'get-addr', 'unsubscribe', 'reassign', 'addrs'};
+
+/// Everything the server is known to say unprompted, on either socket.
+///
+/// The measured set from `docs/gather-api.md` — `consume-try`, `consume-close`,
+/// `producer-paused`/`-resumed`, `set-max-spatial-layer`, `server-info` — plus
+/// the router's `addrs`, `cordon-sfu` and `reassign`, and the four the bundle
+/// declares but no capture has caught yet (`consume-connected`,
+/// `consume-not-allowed`, `disable-video`, `move-off`).
+///
+/// This list exists to be *wrong* eventually. Anything outside it lands in
+/// [SfuSignalling.unknownEvents], which is how a protocol change announces itself
+/// as a number going up rather than as a feature quietly not working.
+const _knownEvents = {
+  'addrs',
+  'cordon-sfu',
+  'reassign',
+  'consume-try',
+  'consume-close',
+  'consume-connected',
+  'consume-not-allowed',
+  'producer-paused',
+  'producer-resumed',
+  'set-max-spatial-layer',
+  'server-info',
+  'double-connected',
+  'disable-video',
+  'move-off',
+};
 
 const _defaultTimeout = Duration(seconds: 15);
 
@@ -213,8 +244,16 @@ class SfuSignalling {
   ///
   /// Counted rather than dropped, for the same reason `GameProtocolReader.stats()`
   /// counts unknown frames: a protocol change should show up as a number going up,
-  /// not as a feature quietly not working.
+  /// not as a feature quietly not working. The names it is counted against are
+  /// [_knownEvents].
+  ///
+  /// Only ordinary server events reach it. Socket.IO's own `connect` and
+  /// `disconnect` go out through `emitReserved`, which does not run the `onAny`
+  /// listeners, so the lifecycle cannot inflate this.
   int unknownEvents = 0;
+
+  /// The names behind [unknownEvents], for a log line worth reading.
+  final Set<String> unknownEventNames = {};
 
   final _notifications = StreamController<SfuNotification>.broadcast();
   final _statuses = StreamController<SfuStatus>.broadcast();
@@ -437,6 +476,12 @@ class SfuSignalling {
     // `unknownEvents` instead of vanishing.
     socket.onAny((String event, Object? data) {
       if (_socket != socket) return;
+      if (!_knownEvents.contains(event)) {
+        unknownEvents++;
+        if (unknownEventNames.add(event)) {
+          _log('sfu: $_url said "$event", which this client does not know');
+        }
+      }
       if (_notifications.isClosed) return;
       _notifications.add(SfuNotification(event, _asMap(data)));
     });

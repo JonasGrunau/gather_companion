@@ -68,6 +68,27 @@ void main() {
     expect(roster.myCluster.map((r) => r.id), ['them-1']);
   });
 
+  test('the conversation has a name, and standing alone is null', () {
+    // The media plane wants the id as well as the membership:
+    // `set-player-conversation-metadata {meetingId, clusterId}`. Null and
+    // "not in one" are the same answer, which is why this is nullable rather
+    // than an empty string.
+    final together = _read([
+      _dump([
+        {'id': _me, 'name': 'Me', 'connected': true, 'clusterId': 'bubble-1'},
+        {'id': 'them-1', 'name': 'Them', 'connected': true, 'clusterId': 'bubble-1'},
+      ]),
+    ]);
+    expect(together.myClusterId, 'bubble-1');
+
+    final alone = _read([
+      _dump([
+        {'id': _me, 'name': 'Me', 'connected': true, 'clusterId': null},
+      ]),
+    ]);
+    expect(alone.myClusterId, isNull);
+  });
+
   test('a bubble forming arrives as a replace patch, not a new row', () {
     // The reason `clusterId` has to be in the tracked-field set: Gather patches
     // the field on rows that already exist, so a reader that only reads whole

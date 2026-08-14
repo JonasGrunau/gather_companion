@@ -127,6 +127,29 @@ class CallParticipant {
       '${[if (hasAudio) 'audio', if (videoLive) 'video'].join('+')})';
 }
 
+/// How much of the screen somebody's video is getting.
+///
+/// The names are sizes rather than layer numbers on purpose: the screen knows
+/// how big it is drawing a face, and only [LiveCall] needs to know that Gather
+/// spells that as a simulcast spatial layer between 0 and 2.
+enum VideoQuality {
+  /// Nobody is looking. Also what everyone off-screen gets.
+  thumbnail,
+
+  /// Sharing the screen with one or two others.
+  half,
+
+  /// Filling it.
+  full;
+
+  /// Gather's spatial layer, as `consume-set-spatial` wants it.
+  int get spatialLayer => switch (this) {
+        VideoQuality.thumbnail => 0,
+        VideoQuality.half => 1,
+        VideoQuality.full => 2,
+      };
+}
+
 /// The two buttons, and what it takes to honour them.
 ///
 /// Every method is safe to call in any order and at any time: the first one that
@@ -163,7 +186,27 @@ abstract class Call {
   /// The whole desired set every time rather than joins and leaves, because that
   /// is the shape the cluster arrives in and diffing in one place is the only way
   /// to be sure somebody who vanished between two rosters is actually let go.
+  ///
+  /// **A non-empty set connects the media plane**, without waiting for anybody to
+  /// press anything. That is what the desktop client does — it holds both media
+  /// sockets from the moment it joins the space — and it is what lets you hear a
+  /// conversation you have walked into without first announcing yourself by
+  /// unmuting.
   Future<void> setListeningTo(Set<String> srcIds);
+
+  /// Which conversation we are in, by Gather's own `clusterId`.
+  ///
+  /// Passed straight through to `set-player-conversation-metadata`. Null when
+  /// standing alone, which is a thing worth saying rather than a thing to omit.
+  Future<void> setConversation(String? clusterId);
+
+  /// Who is on screen, most important first, and how big they are drawn.
+  ///
+  /// Peers left out get the smallest layer. An empty list therefore means "nobody
+  /// is looking at video", which is the normal state of a companion app: the map
+  /// draws no faces, so the call screen being closed should cost the room's
+  /// uplink nothing.
+  Future<void> setWatching(List<String> srcIds, {required VideoQuality quality});
 
   /// Puts the hardware down and stops publishing. The call can be restarted.
   Future<void> hangUp();

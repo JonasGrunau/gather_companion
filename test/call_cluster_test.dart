@@ -6,46 +6,12 @@
 /// plane, including the identity swap the two planes force.
 library;
 
-import 'dart:async';
-
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
-import 'package:gather_companion/src/media/call.dart';
 
-class FakeCall implements Call {
-  final List<Set<String>> told = [];
-  final List<Set<String>> shownTo = [];
-  final _states = StreamController<CallState>.broadcast();
-
-  @override
-  Future<void> setVisibleTo(Set<String> srcIds) async => shownTo.add(srcIds);
-
-  @override
-  CallState get state => const CallState();
-
-  @override
-  Stream<CallState> get states => _states.stream;
-
-  @override
-  Future<void> setListeningTo(Set<String> srcIds) async => told.add(srcIds);
-
-  @override
-  Future<String?> setMicOn(bool on) async => null;
-
-  @override
-  Future<String?> setCameraOn(bool on) async => null;
-
-  @override
-  Future<void> switchCamera() async {}
-
-  @override
-  Future<void> hangUp() async {}
-
-  @override
-  Future<void> dispose() async => _states.close();
-}
+import 'fake_call.dart';
 
 void main() {
   /// A fake clock, not a real one.
@@ -215,6 +181,63 @@ void main() {
       expect(call.shownTo.last, {'acct-talking', 'acct-watching'});
       // And it is still only the conversation we ask to *hear*.
       expect(call.told.last, {'acct-talking'});
+    });
+  });
+
+  test('the conversation is named as soon as we are in one', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      clock.flushMicrotasks();
+
+      // `set-player-conversation-metadata` is in the measured method table and
+      // the desktop client sends it on every change. Undebounced: it is a name,
+      // not a subscription, and nothing is negotiated by saying it.
+      expect(call.conversations, ['c1']);
+      // And the subscription is still waiting on its debounce.
+      expect(call.told, isEmpty);
+    });
+  });
+
+  test('standing alone is a conversation id worth saying too', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      settle(clock);
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', account: 'acct-me'),
+      ]));
+      settle(clock);
+
+      // Null, not silence: leaving a conversation is a change of state the SFU
+      // is entitled to hear about, and omitting it would leave us named as a
+      // member of a bubble we have walked out of.
+      expect(call.conversations, ['c1', null]);
+    });
+  });
+
+  test('a conversation that has not changed is not re-named', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      final roster = Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]);
+      state.debugApplyRoster(roster);
+      settle(clock);
+      state.debugApplyRoster(roster);
+      settle(clock);
+
+      expect(call.conversations, hasLength(1));
     });
   });
 

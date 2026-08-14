@@ -387,6 +387,33 @@ void main() {
       final waiting = firstWhere(s.notifications, (n) => n.name == 'something-new');
       conn.push('something-new', {'x': 1});
       expect((await waiting).name, 'something-new');
+
+      // And it is counted, which is the half that was missing: the field existed
+      // and its comment promised a number going up, but nothing ever incremented
+      // it — so the one alarm this client has for a protocol change was wired to
+      // nothing.
+      expect(s.unknownEvents, 1);
+      expect(s.unknownEventNames, {'something-new'});
+    });
+
+    test('a known event is not counted as a protocol change', () async {
+      final s = build();
+      final conn = await connected(s);
+
+      // Everything the server is measured to say, plus the router's own. If this
+      // list drifts from `docs/gather-api.md` the counter cries wolf on every
+      // call and stops meaning anything.
+      final waiting = firstWhere(s.notifications, (n) => n.name == 'server-info');
+      conn
+        ..push('consume-try', {'srcId': 'them', 'producerIdMap': <String, String>{}})
+        ..push('producer-paused', {'srcId': 'them', 'tag': 'audio'})
+        ..push('set-max-spatial-layer', {'kind': 'video', 'layer': 1})
+        ..push('double-connected', <String, Object?>{})
+        ..push('cordon-sfu', {'sfuAddr': 'wss://elsewhere'})
+        ..push('server-info', <String, Object?>{});
+      await waiting;
+
+      expect(s.unknownEvents, 0);
     });
   });
 

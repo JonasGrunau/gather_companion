@@ -685,6 +685,7 @@ class AppState extends ChangeNotifier {
     // first thing you do after opening the app is the one time nobody can see
     // you.
     unawaited(call.setVisibleTo(_visibleTo));
+    unawaited(call.setConversation(_conversation));
     unawaited(call.setListeningTo(_clusterWanted));
     return call;
   }
@@ -705,6 +706,7 @@ class AppState extends ChangeNotifier {
   /// walked away from, which is the worse of the two.
   void _noteCluster(Roster roster) {
     _noteNeighbours(roster);
+    _noteConversation(roster);
     // Their `UserAccount.id`, which is what the media plane is keyed on — see
     // `RosterRow.userAccountId`. Somebody whose row has not carried it yet is
     // skipped rather than guessed at, and picked up on a later roster.
@@ -725,7 +727,14 @@ class AppState extends ChangeNotifier {
           : const Duration(milliseconds: 600),
       () {
         _lastAppliedCluster = _clusterWanted;
-        unawaited(_call?.setListeningTo(_clusterWanted) ?? Future<void>.value());
+        // A conversation is reason enough to build the call, where merely being
+        // near somebody is not. Waiting for a tap instead meant the phone could
+        // not hear anyone until it started talking — the `Call` was built by
+        // [setMicOn], so until then there was nothing to hand a cluster to.
+        // Building one opens no hardware: the engine holds nothing until
+        // `startCapture`, and the permission prompts still belong to the buttons.
+        final call = _clusterWanted.isEmpty ? _call : _callOrNull();
+        unawaited(call?.setListeningTo(_clusterWanted) ?? Future<void>.value());
       },
     );
   }
@@ -733,6 +742,22 @@ class AppState extends ChangeNotifier {
   Set<String> _clusterWanted = const {};
   Set<String> _lastAppliedCluster = const {};
   Timer? _clusterDebounce;
+
+  /// Tell the media plane which conversation we are in, by Gather's own id.
+  ///
+  /// `set-player-conversation-metadata` is in the measured method table and the
+  /// desktop client sends it on every change, so this does too. Undebounced and
+  /// separate from the membership on purpose: it is a name, not a subscription,
+  /// and naming the room you are in late is the one part of this that costs
+  /// nothing to get right immediately.
+  void _noteConversation(Roster roster) {
+    final id = roster.myClusterId;
+    if (id == _conversation) return;
+    _conversation = id;
+    unawaited(_call?.setConversation(id) ?? Future<void>.value());
+  }
+
+  String? _conversation;
 
   /// Who may see and hear us — everybody Gather counts as *in range*.
   ///
@@ -902,7 +927,11 @@ class AppState extends ChangeNotifier {
 
     final collector = _collector;
     if (collector == null) return 'Not connected to Gather.';
-    final sent = collector.teleport(x: goal.x, y: goal.y);
+    final sent = collector.teleport(
+      x: goal.x,
+      y: goal.y,
+      direction: headingTo(fromX: at.x, fromY: at.y, toX: goal.x, toY: goal.y),
+    );
     if (!sent.ok) return sent.detail ?? 'Gather refused that.';
 
     _noteTeleport(goal.x.toDouble(), goal.y.toDouble());
@@ -978,6 +1007,19 @@ class AppState extends ChangeNotifier {
     // A desk on another floor, or a floor plan that has not arrived yet. Both are
     // "not something to walk to from here", which is the only question asked.
     return null;
+  }
+
+  /// Whether that room's door is open to me. See [canEnterRoom] for the rule and for
+  /// the two clauses of it this app cannot answer.
+  bool canEnter(SpaceRoom room) {
+    final map = this.map;
+    final at = myTile;
+    return canEnterRoom(
+      room,
+      myDeskId: _myRow()?.deskId,
+      standingIn: map == null || at == null ? null : map.privateAreaAt(at.x, at.y),
+      meId: _collector?.selfId ?? _roster?.selfId,
+    );
   }
 
   /// Whether I am standing on my own desk.
@@ -1197,6 +1239,78 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Sentences that arrive rather than being asked for.
+  ///
+  /// Everything else the user can trigger answers `Future<String?>` and the control
+  /// that triggered it puts the answer on screen. A refusal from the server has no
+  /// such control waiting on it — it lands seconds after the tap, halfway across the
+  /// office — so it needs a channel of its own. Broadcast, because it is news and not
+  /// a queue: nothing is owed delivery if no screen is listening.
+  Stream<String> get notices => _notices.stream;
+  final _notices = StreamController<String>.broadcast();
+
+  /// Gather refusing to let us in somewhere, which arrives as an event and no patch.
+  ///
+  /// `isPermittedToMoveTo` is the second gate in `setPosition` and it refuses `move`
+  /// and `teleport` alike. What it does *not* do is fail the action: the refusal is
+  /// published to us alone, `{targetUserIds: new Set([this.id])}`, while the action
+  /// itself returns `Success` and the position patch simply never comes. So a client
+  /// that only applies patches sees a walk that stops making progress and no reason
+  /// for it — which is what this app did until the rule was found.
+  ///
+  /// Stopping the walk first is the client's own order of business:
+  ///
+  /// ```js
+  /// addEventListener(GameEvents.UserIsNotPermittedToEnterLockedArea, async ({spaceUserId, areaId}) => {
+  ///   if (currentSpaceUser.id !== spaceUserId) return;
+  ///   MoveController.stopPathMovement(false, true);
+  ///   await currentSpaceUser.unfollow();
+  ///   … openAreaRequestModal(area)
+  /// })
+  /// ```
+  ///
+  /// The modal at the end is Gather asking whether to knock. This app has nowhere to
+  /// put that yet, so it says what happened and stops — [Walk] would otherwise
+  /// re-plan into the same shut door four times over.
+  void _noteRefusal(BusEvent event) {
+    const locked = 'UserIsNotPermittedToEnterLockedArea';
+    const meeting = 'UserIsNotPermittedToEnterMeetingArea';
+    if (event.name != locked && event.name != meeting) return;
+
+    // Addressed twice over — the envelope names us in `targetUserIds` and the payload
+    // repeats it in `spaceUserId`, which is the half the client actually checks.
+    // Either is enough, and requiring both would drop the event if Gather ever
+    // widened the envelope.
+    // Either source will do, and having both is the point: the collector resolves
+    // self from the `Connection` row and the roster carries the same answer, so an
+    // event that lands in the gap before one of them is ready is still ours to read.
+    final me = _collector?.selfId ?? _roster?.selfId;
+    if (me == null) return;
+    if (!event.isFor(me) && event.payload['spaceUserId'] != me) return;
+
+    _walk?.release();
+    notifyListeners();
+    _notices.add(_refusalText(event, meeting: event.name == meeting));
+  }
+
+  /// What to say about a refusal, naming the room when the floor plan knows it.
+  ///
+  /// `areaId` is the area's `stableId_USE_THIS_INSTEAD_OF_ID`, which is the id
+  /// [SpaceRoom.stableId] carries — matching it against [SpaceRoom.id] finds nothing.
+  String _refusalText(BusEvent event, {required bool meeting}) {
+    if (meeting) return 'That meeting is private.';
+    final areaId = event.payload['areaId'];
+    for (final room in map?.rooms ?? const <SpaceRoom>[]) {
+      final name = room.name;
+      if (room.stableId == areaId && name != null) return '$name is locked.';
+    }
+    return 'That room is locked.';
+  }
+
+  /// Test seam: the refusal path without a socket to deliver it. See [_noteRefusal].
+  @visibleForTesting
+  void debugNoteEvent(BusEvent event) => _noteRefusal(event);
+
   /// A wave off the socket, shown before the next fetch confirms it.
   void _noteActivity(BusEvent event) {
     if (event.name != 'WaveEvent') return;
@@ -1278,6 +1392,7 @@ class AppState extends ChangeNotifier {
           // Before the fold, so a wave is on the list by the time the notification
           // it produces wakes the screen that shows it.
           _noteActivity(event);
+          _noteRefusal(event);
           _onFold(_tracker.applyInteraction(event));
         }),
       )
@@ -1296,6 +1411,14 @@ class AppState extends ChangeNotifier {
     final party = _party;
     final walk = _walk;
     final call = _call;
+    // Before the collector goes, and that ordering is the whole of it: [Walk] reaches
+    // its collector through a closure over the field below, so a release after this
+    // line has nothing to send on even though the socket is still open until the end of
+    // this method. What it needs to send is the `walk` that gets us out of the go-kart.
+    // `speed.modifier` is a synced field and the only thing every other client reads, so
+    // unpairing mid-drive without saying otherwise parks this avatar in a kart on every
+    // screen in the space.
+    walk?.release();
     _subs.clear();
     _collector = null;
     _party = null;
@@ -1525,6 +1648,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _positions.dispose();
+    unawaited(_notices.close());
     // A face resolved a millisecond before the app closed would otherwise
     // notify a disposed notifier, which throws.
     _faceNotice?.cancel();

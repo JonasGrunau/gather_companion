@@ -87,6 +87,7 @@ class SfuSession {
     required String srcId,
     String routerUrl = gatherSfuRouter,
     SfuSignalling Function(String url, String? sessionId)? openSignalling,
+    ms.Device Function()? buildDevice,
     void Function(String)? log,
     // Assigned the long way round because a named parameter cannot be a private
     // initializing formal — same as `DirectCollector` and `SfuSignalling`.
@@ -101,9 +102,19 @@ class SfuSession {
         _routerUrl = routerUrl,
         // ignore: prefer_initializing_formals
         _openSignalling = openSignalling,
+        _buildDevice = buildDevice ?? _realDevice,
         _log = log ?? _noop;
 
   static void _noop(String _) {}
+
+  /// The mediasoup half, and the only part of this file a test cannot run.
+  ///
+  /// `Device.load()` reaches for an `RTCPeerConnection` to ask the platform what
+  /// it can encode, so it needs a device — while everything this class is
+  /// *about* (assignment, the node pool, reconciliation, recovery) is ordinary
+  /// logic that should not. Same seam as `MediaEngine`, one layer down: the
+  /// native part is injected, so the reverse-engineered part can be tested.
+  static ms.Device _realDevice() => ms.Device();
 
   final GatherAuth _auth;
   final String _spaceId;
@@ -113,6 +124,8 @@ class SfuSession {
 
   /// Test seam: lets a suite hand back a signalling client pointed at a fake.
   final SfuSignalling Function(String url, String? sessionId)? _openSignalling;
+
+  final ms.Device Function() _buildDevice;
 
   SfuSignalling? _router;
   SfuSignalling? _node;
@@ -149,9 +162,30 @@ class SfuSession {
   /// Peers we have asked the server to send us.
   final Set<String> _subscribed = {};
 
+  /// Peers we want but the router could not place yet. See [_addressFor].
+  final Set<String> _awaitingAddr = {};
+  Timer? _addrRetry;
+
+  /// Nodes whose socket is currently down, so a later `healthy` reads as a
+  /// reconnection rather than as the first connect.
+  final Set<String> _nodeDown = {};
+
+  final Map<String, StreamSubscription<SfuStatus>> _nodeHealth = {};
+
   final _remotes = StreamController<List<RemoteMedia>>.broadcast();
   final _notifications = StreamController<SfuNotification>.broadcast();
-  final List<StreamSubscription<SfuNotification>> _nodeSubscriptions = [];
+  final _republish = StreamController<void>.broadcast();
+  final Map<String, StreamSubscription<SfuNotification>> _nodeSubscriptions = {};
+
+  /// Fires when our producers are gone and only the owner of the tracks can
+  /// bring them back.
+  ///
+  /// A dropped socket or a drained node takes the send transport and every
+  /// producer with it, server-side. This session cannot republish by itself —
+  /// it never held the camera, [MediaEngine] did — so the honest thing is to say
+  /// so and let [LiveCall] put the same tracks back. Without this, a call
+  /// survives a lift as a socket that looks connected and carries nothing.
+  Stream<void> get needsRepublish => _republish.stream;
 
   /// Everybody we are currently receiving, most recently changed last.
   List<RemoteMedia> get remotes => _remoteList();
@@ -172,30 +206,43 @@ class SfuSession {
 
   /// Steps 1–4: assigned, connected, and capable.
   Future<void> start() async {
+    _stopped = false;
     final router = _open(_routerUrl, null);
     _router = router;
+
+    // The router talks back, and for a while nothing was listening to it.
+    // `cordon-sfu` — the notice that a node is being drained — is **router**
+    // vocabulary (`docs/gather-api.md`, "Two sockets, then a pool"), so a session
+    // that watched only its media nodes could never hear the one message that
+    // says everything it has built is about to stop working.
+    _routerSub = router.notifications.listen(_onNotification);
     await router.start();
 
-    // The router answers `{addrFound}` in the ack and the address itself in a
-    // *separate* `addrs` event, so the ack alone is not enough to proceed on.
-    // Listening has to start *before* the question goes out, or a fast answer
-    // arrives while nobody is at the door.
-    final addrs = _firstNotification(
-      router,
-      'addrs',
-      where: (n) => n.data['srcId'] == _srcId,
-    );
-    final found = await router.sendWithResponse(
-      'get-addr',
-      {'srcId': _srcId, 'srcStreamId': _spaceId},
-    );
-    if (found['addrFound'] == false) {
-      throw const SfuException('the router has no SFU assigned to us yet');
-    }
+    await _assign();
 
-    final addr = (await addrs)?.data['sfuAddr'];
-    if (addr is! String || addr.isEmpty) {
-      throw const SfuException('the router never sent us an address');
+    // Gather's own constants: credentials last 86400s and it refreshes every
+    // 14400. A phone call rarely runs four hours, so this is insurance rather
+    // than routine — but the failure it insures against is a relay silently
+    // expiring mid-call, which looks exactly like the other person going quiet.
+    _turnTimer?.cancel();
+    _turnTimer = Timer.periodic(
+      const Duration(seconds: 14400),
+      (_) => unawaited(refreshTurn()),
+    );
+  }
+
+  /// Find our node, connect to it, and become able to publish on it.
+  ///
+  /// Separate from [start] because it happens **twice**: once at the beginning,
+  /// and again whenever the node we were assigned is drained and the router hands
+  /// us a different one. Everything here is safe to run a second time.
+  Future<void> _assign() async {
+    final router = _router;
+    if (router == null) throw const SfuException('the router is not connected');
+
+    final addr = await _addressFor(_srcId, attempts: 4);
+    if (addr == null) {
+      throw const SfuException('the router has not assigned us an SFU node yet');
     }
     _sfuAddr = addr;
     _log('sfu: assigned $addr');
@@ -209,7 +256,7 @@ class SfuSession {
       throw const SfuException('the SFU returned no routerRtpCapabilities');
     }
 
-    final device = ms.Device();
+    final device = _buildDevice();
     await device.load(
       routerRtpCapabilities:
           ms.RtpCapabilities.fromMap(Map<String, dynamic>.from(routerCaps)),
@@ -217,26 +264,24 @@ class SfuSession {
     _device = device;
     _log('sfu: device loaded');
 
-    // Re-send the allow list to the node we just connected to. The client does
-    // exactly this in `playerConnectedSFU` — `Object.keys(this.allowed).forEach(
-    // e => r.allow(e))` — because the list lives on the *node*, so a list built
-    // before this socket existed means nothing to it.
+    _replayAllow(node);
+    _sendConversation();
+  }
+
+  /// Re-send the allow list to [node].
+  ///
+  /// The client does exactly this in `playerConnectedSFU` —
+  /// `Object.keys(this.allowed).forEach(e => r.allow(e))` — because the list
+  /// lives on the *node*. A list built before this socket existed, or one built
+  /// before the socket dropped and came back, means nothing to it.
+  void _replayAllow(SfuSignalling node) {
     for (final dstId in _allowed) {
       node.emit('consume-allow', {'dstId': dstId, 'allowed': true});
     }
-
-    // Gather's own constants: credentials last 86400s and it refreshes every
-    // 14400. A phone call rarely runs four hours, so this is insurance rather
-    // than routine — but the failure it insures against is a relay silently
-    // expiring mid-call, which looks exactly like the other person going quiet.
-    _turnTimer?.cancel();
-    _turnTimer = Timer.periodic(
-      const Duration(seconds: 14400),
-      (_) => unawaited(refreshTurn()),
-    );
   }
 
   Timer? _turnTimer;
+  StreamSubscription<SfuNotification>? _routerSub;
 
   /// A connected socket to [url], reused if we already hold one.
   ///
@@ -248,42 +293,87 @@ class SfuSession {
 
     final node = _open(url, null);
     _nodes[url] = node;
-    _nodeSubscriptions.add(node.notifications.listen(_onNotification));
+    _nodeSubscriptions[url] = node.notifications.listen(_onNotification);
     try {
       await node.start();
     } on Object {
       // Do not leave a half-open node in the pool: the next caller would reuse it
       // and get `not connected` rather than a fresh attempt.
       _nodes.remove(url);
+      await _nodeSubscriptions.remove(url)?.cancel();
       await node.dispose();
       rethrow;
     }
+
+    // Subscribed *after* the first connect, so the `healthy` event that start()
+    // just consumed does not read as a reconnection.
+    _nodeHealth[url] = node.statuses.listen((status) {
+      if (!status.healthy) {
+        _nodeDown.add(url);
+        return;
+      }
+      if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
+    });
     return node;
   }
 
   /// The router's answer to "where is this person's media?".
   ///
-  /// Cached per peer. The router will answer again on `reassign`, which is the
-  /// event that invalidates it.
+  /// Cached per peer. `cordon-sfu` and `reassign` are what invalidate it.
   Future<String?> _nodeUrlFor(String srcId) async {
     final cached = _peerNode[srcId];
     if (cached != null) return cached;
+    final addr = await _addressFor(srcId);
+    if (addr == null) return null;
+    return _peerNode[srcId] = addr;
+  }
 
+  /// Ask the router which node carries [srcId], retrying while it says nobody.
+  ///
+  /// **`addrFound: false` is a normal answer, not an error** — measured, and
+  /// stated as such in `docs/protocol/observed-wire-protocol.md`. It means the
+  /// router has not assigned that person a node *yet*, which is a race a client
+  /// runs into constantly: at join, and again every time somebody walks up
+  /// before their own client has finished connecting. Treating it as fatal is
+  /// what made a first tap fail permanently and a colleague stay silent forever.
+  ///
+  /// The answer arrives in two pieces — `{addrFound}` in the ack and the address
+  /// itself in a separate `addrs` event — so listening has to start *before* the
+  /// question goes out, or a fast answer lands while nobody is at the door.
+  Future<String?> _addressFor(String srcId, {int attempts = 1}) async {
     final router = _router;
     if (router == null) return null;
 
-    final addrs = _firstNotification(
-      router,
-      'addrs',
-      where: (n) => n.data['srcId'] == srcId,
-    );
-    await router.sendWithResponse(
-      'get-addr',
-      {'srcId': srcId, 'srcStreamId': _spaceId},
-    );
-    final addr = (await addrs)?.data['sfuAddr'];
-    if (addr is! String || addr.isEmpty) return null;
-    return _peerNode[srcId] = addr;
+    var wait = const Duration(milliseconds: 400);
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) {
+        await Future<void>.delayed(wait);
+        wait *= 2;
+      }
+
+      final addrs = _firstNotification(
+        router,
+        'addrs',
+        where: (n) => n.data['srcId'] == srcId,
+        timeout: const Duration(seconds: 6),
+      );
+      final ack = await router.sendWithResponse(
+        'get-addr',
+        {'srcId': srcId, 'srcStreamId': _spaceId},
+      );
+
+      if (ack['addrFound'] == false) {
+        // No `addrs` is coming for this one. Left to settle null on its own
+        // timeout rather than awaited — waiting six seconds for a reply the
+        // server has already declined to send is the whole cost this avoids.
+        unawaited(addrs);
+        continue;
+      }
+
+      final addr = (await addrs)?.data['sfuAddr'];
+      if (addr is String && addr.isNotEmpty) return addr;
+    }
+    return null;
   }
 
   /// The next notification matching [name], or **null** if it never comes.
@@ -345,6 +435,7 @@ class SfuSession {
       'transport-create',
       {'direction': 'send', 'iceTransportRequestOptions': <String, Object?>{}},
     );
+    _checkTransportReply(reply, 'send');
 
     // NOT `createSendTransportFromMap`: that helper hardcodes `iceServers: []`,
     // which would drop Gather's TURN servers on the floor. The failure mode is
@@ -382,6 +473,7 @@ class SfuSession {
       } on Object catch (error) {
         _log('sfu: transport-connect failed: $error');
         data['errback'](error);
+        _failPendingProducer(error);
       }
     });
 
@@ -402,11 +494,46 @@ class SfuSession {
       } on Object catch (error) {
         _log('sfu: produce failed: $error');
         data['errback'](error);
+        // And tell whoever is waiting, which `errback` alone does not.
+        //
+        // mediasoup treats a failed `produce` as a failed *task*: the producer
+        // is never built, so `producerCallback` never fires, so [publish] waits
+        // out its own twenty-second timeout before saying anything. Twenty
+        // seconds of a dead unmute button, for a refusal the server sent
+        // immediately.
+        _failPendingProducer(error);
       }
     });
 
     _sendTransport = transport;
     return transport;
+  }
+
+  /// The one thing in this file no capture has ever confirmed.
+  ///
+  /// `transport-create` appears in no transcript — the probes attached at space
+  /// join, after the desktop had already built its transports, and
+  /// `docs/protocol/observed-wire-protocol.md` records the produce path as never
+  /// having run. So the request arguments and this reply are the *standard
+  /// mediasoup* shape, assumed, and everything downstream hangs off them.
+  ///
+  /// If that assumption is ever wrong, this is where it should say so. The
+  /// alternative was a bare `reply['id'] as String`, which fails as a cast error
+  /// naming neither the message nor the assumption, three frames deep in a
+  /// callback, and reads on a device log like a bug in the WebRTC plugin.
+  void _checkTransportReply(Map<String, Object?> reply, String direction) {
+    const required = ['id', 'iceParameters', 'iceCandidates', 'dtlsParameters'];
+    final missing = [
+      for (final key in required)
+        if (reply[key] == null) key,
+    ];
+    if (missing.isEmpty && reply['id'] is String) return;
+    throw SfuException(
+      'transport-create ($direction) answered in a shape this client does not '
+      'know: missing ${missing.join(', ')}, got ${reply.keys.join(', ')}. The '
+      'standard mediasoup reply is the one assumption in this file that no '
+      'capture has confirmed.',
+    );
   }
 
   /// Where the transport delivers a finished Producer.
@@ -420,6 +547,11 @@ class SfuSession {
     if (pending != null && !pending.isCompleted) pending.complete(producer);
   }
 
+  void _failPendingProducer(Object error) {
+    final pending = _pendingProducer;
+    if (pending != null && !pending.isCompleted) pending.completeError(error);
+  }
+
   /// Step 6: put a track on the wire.
   ///
   /// [stream] is the capture the track came from; mediasoup needs it to build the
@@ -430,6 +562,13 @@ class SfuSession {
     required SfuTag tag,
   }) async {
     if (_producers.containsKey(tag)) return;
+    // Standing down means standing down. Without this the claim that [displaced]
+    // is sticky was only a comment: the next tap would publish again and restart
+    // the fight with the desktop that stopping was meant to end.
+    if (_displaced) {
+      throw const SfuException(
+          'another client of yours is holding this call — quit Gather there');
+    }
     final transport = await _sendTransportOrCreate();
 
     // One at a time. The callback is per-transport rather than per-produce, so
@@ -546,9 +685,109 @@ class SfuSession {
     _node?.emit('consume-allow', {'dstId': dstId, 'allowed': allowed});
   }
 
+  /// Which conversation we are publishing into, as the SFU understands it.
+  ///
+  /// `set-player-conversation-metadata {meetingId, clusterId}` is in the measured
+  /// method table and the desktop client sends it whenever the bubble changes.
+  /// What the server *does* with it is not measured — grouping for recording and
+  /// for the meeting views are both plausible — so this is sent because the real
+  /// client sends it, and its failure is logged rather than raised.
+  void setConversation({String? clusterId, String? meetingId}) {
+    if (clusterId == _clusterId && meetingId == _meetingId) return;
+    _clusterId = clusterId;
+    _meetingId = meetingId;
+    _sendConversation();
+  }
+
+  String? _clusterId;
+  String? _meetingId;
+
+  void _sendConversation() {
+    final node = _node;
+    if (node == null) return;
+    unawaited(
+      node.sendWithResponse('set-player-conversation-metadata', {
+        'meetingId': _meetingId,
+        'clusterId': _clusterId,
+      }).then(
+        (_) {},
+        onError: (Object error) =>
+            _log('sfu: the conversation metadata was refused: $error'),
+      ),
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Receiving
   // ---------------------------------------------------------------------------
+
+  /// Who is on screen, most important first, and how much of the screen they get.
+  ///
+  /// This is the receive-side half of simulcast, and skipping it is not free: a
+  /// peer sends the bottom layer until somebody asks for better, so without this
+  /// a face filling a phone screen stays a quarter-resolution thumbnail no matter
+  /// how much bandwidth is going spare. The reverse matters more — when the call
+  /// screen is closed, nobody is watching anything, and asking for layer 0
+  /// everywhere hands back both their uplink and our download.
+  ///
+  /// Only the camera tag is steered. A screen share is text more often than not,
+  /// and a downscaled one is unreadable rather than merely soft.
+  void setWatching(List<String> srcIds, {required int layer}) {
+    final wanted = layer.clamp(0, 2);
+    for (final srcId in _subscribed) {
+      final want = srcIds.contains(srcId) ? wanted : 0;
+      final had = _spatial[srcId];
+      if (had == want) continue;
+      // Layer 0 is where a consumer starts, so saying so before we have ever
+      // said anything else is a frame that changes nothing.
+      if (had == null && want == 0) continue;
+      _spatial[srcId] = want;
+      _setRemoteSpatial(srcId, want);
+    }
+
+    if (_priority.length != srcIds.length ||
+        !Iterable<int>.generate(srcIds.length)
+            .every((i) => _priority[i] == srcIds[i])) {
+      _priority = List.unmodifiable(srcIds);
+      _sendPriority();
+    }
+  }
+
+  /// The layer we have asked for from each peer, so a reconnect can ask again.
+  final Map<String, int> _spatial = {};
+  List<String> _priority = const [];
+
+  void _setRemoteSpatial(String srcId, int layer) {
+    final url = _peerNode[srcId];
+    if (url == null) return;
+    _nodes[url]?.emit('consume-set-spatial', {
+      'srcId': srcId,
+      'srcStreamId': _spaceId,
+      'tag': SfuTag.video.wire,
+      'spatialLayer': layer,
+    });
+  }
+
+  /// Rank the peers for the SFU, one message per node.
+  ///
+  /// The message names no node of its own, and the people in one conversation
+  /// can be spread over several, so each node is told about the peers it
+  /// actually carries — in the order they matter.
+  void _sendPriority() {
+    final byNode = <String, List<String>>{};
+    for (final srcId in _priority) {
+      final url = _peerNode[srcId];
+      if (url == null) continue;
+      (byNode[url] ??= []).add(srcId);
+    }
+    for (final entry in byNode.entries) {
+      _nodes[entry.key]?.emit('consume-set-priority', {
+        'srcStreamId': _spaceId,
+        'tag': SfuTag.video.wire,
+        'srcIds': entry.value,
+      });
+    }
+  }
 
   /// Ask the server to start sending us [srcId]'s media.
   ///
@@ -564,21 +803,77 @@ class SfuSession {
     // round trip because we granted them late.
     allow(srcId, allowed: true);
 
-    final url = await _nodeUrlFor(srcId);
-    if (url == null) {
-      _log('sfu: the router does not know where $srcId is');
-      _subscribed.remove(srcId);
-      return;
-    }
-
-    final node = await _nodeAt(url);
-    await node.sendWithResponse('consume-request', {
-      'srcId': srcId,
-      'srcStreamId': _spaceId,
-      'requested': true,
-    });
-    _log('sfu: subscribed to $srcId on $url');
+    await _requestPeer(srcId);
   }
+
+  /// Tell whichever node carries [srcId] that we want their media.
+  ///
+  /// The one place that resolves a peer's node and asks for them, so recovery
+  /// after a reconnect or a drained node is the same code path as the first
+  /// subscription rather than a second, less-tested one.
+  Future<void> _requestPeer(String srcId) async {
+    if (!_subscribed.contains(srcId)) return;
+
+    // Nothing in here may throw. It is called from a retry timer and from two
+    // server pushes, none of which has a caller to catch anything — an escaping
+    // error there is an unhandled asynchronous exception, which in this app
+    // means a crash report for a colleague who has not finished connecting.
+    try {
+      final url = await _nodeUrlFor(srcId);
+      if (url == null) {
+        // Kept, not dropped. Forgetting them here is what left a colleague
+        // silent until the cluster happened to change — `setSubscriptions`
+        // diffs against the desired set, so a peer quietly removed from it is
+        // never asked for again.
+        _log('sfu: the router cannot place $srcId yet; will ask again');
+        _awaitingAddr.add(srcId);
+        _scheduleAddrRetry();
+        return;
+      }
+
+      final node = await _nodeAt(url);
+      await node.sendWithResponse('consume-request', {
+        'srcId': srcId,
+        'srcStreamId': _spaceId,
+        'requested': true,
+      });
+      _awaitingAddr.remove(srcId);
+      _log('sfu: subscribed to $srcId on $url');
+
+      // The quality we asked for lives on the node too, so a peer we have just
+      // (re)placed has to be told again.
+      final layer = _spatial[srcId];
+      if (layer != null && layer != 0) _setRemoteSpatial(srcId, layer);
+      if (_priority.contains(srcId)) _sendPriority();
+    } on Object catch (error) {
+      _log('sfu: asking for $srcId failed: $error');
+      _awaitingAddr.add(srcId);
+      _scheduleAddrRetry();
+    }
+  }
+
+  /// Keep asking the router about people it could not place.
+  ///
+  /// Ten seconds is slow enough to be free — one small frame per unplaced peer —
+  /// and quick enough that somebody who walks up while their own client is still
+  /// connecting is heard within a breath rather than never.
+  void _scheduleAddrRetry() {
+    if (_addrRetry != null || _stopped) return;
+    _addrRetry = Timer.periodic(const Duration(seconds: 10), (timer) {
+      _awaitingAddr.removeWhere((srcId) => !_subscribed.contains(srcId));
+      if (_awaitingAddr.isEmpty || _stopped) {
+        timer.cancel();
+        _addrRetry = null;
+        return;
+      }
+      for (final srcId in _awaitingAddr.toList()) {
+        unawaited(_requestPeer(srcId));
+      }
+    });
+  }
+
+  /// Set by [stop], so timers and retries do not outlive the session.
+  bool _stopped = false;
 
   /// Stop receiving [srcId], and stop the server sending.
   ///
@@ -586,6 +881,8 @@ class SfuSession {
   /// packets we drop on the floor, which is somebody's battery.
   Future<void> unsubscribe(String srcId) async {
     if (!_subscribed.remove(srcId)) return;
+    _awaitingAddr.remove(srcId);
+    _spatial.remove(srcId);
 
     final url = _peerNode.remove(srcId);
     final node = url == null ? null : _nodes[url];
@@ -674,7 +971,16 @@ class SfuSession {
         if (n.data['kind'] != 'video') return;
         final layer = n.data['layer'];
         if (layer is! num) return;
-        unawaited(_setMaxSpatialLayer(layer.toInt()));
+        _wantedSpatialLayer = layer.toInt();
+        // Debounced, as the client's own handler is. The server steers by
+        // consumer demand, so this arrives in bursts when somebody opens a
+        // full-screen tile — and every one of them is a renegotiation of what
+        // the encoder is doing.
+        _spatialDebounce?.cancel();
+        _spatialDebounce = Timer(const Duration(milliseconds: 300), () {
+          final wanted = _wantedSpatialLayer;
+          if (wanted != null) unawaited(_setMaxSpatialLayer(wanted));
+        });
 
       // The SFU has noticed two connections claiming to be us — this phone and
       // the desktop client, which share one `UserAccount` and therefore one
@@ -707,8 +1013,21 @@ class SfuSession {
       case 'cordon-sfu':
       case 'reassign':
         unawaited(_reassign(n.data['sfuAddr']));
+
+      // Declared in the bundle, never yet caught on the wire, so their payloads
+      // are unknown. Logged rather than acted on: guessing at what `move-off`
+      // means and reconnecting on it would risk a loop over a message we have
+      // never seen, and the notification is passed on regardless for anyone
+      // upstream who does know what to do with it.
+      case 'move-off':
+      case 'disable-video':
+      case 'consume-not-allowed':
+        _log('sfu: ${n.name} ${n.data}');
     }
   }
+
+  Timer? _spatialDebounce;
+  int? _wantedSpatialLayer;
 
   /// How many `double-connected` notices we have taken before giving up.
   ///
@@ -946,6 +1265,7 @@ class SfuSession {
       'transport-create',
       {'direction': 'recv', 'iceTransportRequestOptions': <String, Object?>{}},
     );
+    _checkTransportReply(reply, 'recv');
 
     final transport = device.createRecvTransport(
       id: reply['id'] as String,
@@ -973,6 +1293,9 @@ class SfuSession {
       } on Object catch (error) {
         _log('sfu: recv transport-connect failed: $error');
         data['errback'](error);
+        for (final pending in _pendingConsumers.values) {
+          if (!pending.isCompleted) pending.completeError(error);
+        }
       }
     });
 
@@ -988,19 +1311,138 @@ class SfuSession {
 
   /// The node we were on is being drained; find out where we go instead.
   Future<void> _reassign(Object? sfuAddr) async {
-    final leaving = sfuAddr is String && sfuAddr.isNotEmpty ? sfuAddr : _sfuAddr;
+    final leaving =
+        sfuAddr is String && sfuAddr.isNotEmpty ? sfuAddr : _sfuAddr;
+    if (leaving == null) return;
     _log('sfu: $leaving is being drained');
 
-    // Everything we knew about locations is now suspect, including our own.
-    _peerNode.removeWhere((_, url) => url == leaving);
+    final moved = _forgetPeersOn(leaving);
+
     if (leaving == _sfuAddr) {
-      // Our own producers live on that node. Rebuilding them is the caller's
-      // business — it owns the tracks — so say so rather than half-heal.
-      _log('sfu: our own node was drained; the session needs restarting');
+      await _moveOwnNode();
+    } else {
+      await _dropNode(leaving);
     }
-    for (final srcId in _subscribed.toList()) {
-      unawaited(_reconcile(srcId));
+
+    // Ask the router where each of them went. The answers can be several
+    // different nodes, which the pool already models.
+    for (final srcId in moved) {
+      unawaited(_requestPeer(srcId));
     }
+  }
+
+  /// A node's socket dropped and came back. Everything it held died with it.
+  ///
+  /// Transports, producers and consumers all live on the far side of that
+  /// socket, so a reconnection is a fresh, empty session wearing the same URL.
+  /// Nothing here is optional: without the allow-list replay nobody may consume
+  /// us, and without the republish we hold a connected socket that carries no
+  /// media at all — the failure that reads as "it worked until I walked into a
+  /// lift".
+  Future<void> _onNodeReconnected(String url) async {
+    if (_stopped) return;
+    final node = _nodes[url];
+    if (node == null) return;
+    _log('sfu: $url came back; rebuilding what was on it');
+
+    final moved = _forgetPeersOn(url);
+
+    if (url == _sfuAddr) {
+      _dropProducers();
+      _sendTransport?.close();
+      _sendTransport = null;
+      _replayAllow(node);
+      _sendConversation();
+      _announceRepublish();
+    }
+
+    for (final srcId in moved) {
+      unawaited(_requestPeer(srcId));
+    }
+  }
+
+  /// Our own node is going away. Get another one and rebuild on it.
+  Future<void> _moveOwnNode() async {
+    if (_moving || _stopped) return;
+    _moving = true;
+    try {
+      final old = _sfuAddr;
+      _dropProducers();
+      _sendTransport?.close();
+      _sendTransport = null;
+      _node = null;
+      _sfuAddr = null;
+      if (old != null) await _dropNode(old);
+
+      await _assign();
+      if (_stopped) {
+        // Stopped while we were moving. The node `_assign` just opened is not in
+        // the pool `stop()` emptied, so drop it here or it outlives the session.
+        final orphan = _sfuAddr;
+        if (orphan != null) await _dropNode(orphan);
+        return;
+      }
+      _log('sfu: moved to $_sfuAddr');
+      _announceRepublish();
+    } on Object catch (error) {
+      // Logged rather than thrown: this runs from a server push, so there is no
+      // caller to catch it, and a session that cannot move is still a session
+      // that can receive.
+      _log('sfu: could not move to another node: $error');
+    } finally {
+      _moving = false;
+    }
+  }
+
+  bool _moving = false;
+
+  /// Forget everything we knew about the peers on [url], returning who they were.
+  ///
+  /// Their consumers point at a node that is going away, and their announced
+  /// `producerIdMap` describes producers that will not exist on the next one. The
+  /// fresh `consume-try` that follows re-requesting is what rebuilds both, which
+  /// is why this clears rather than tries to carry anything across.
+  List<String> _forgetPeersOn(String url) {
+    final moved = [
+      for (final entry in _peerNode.entries)
+        if (entry.value == url) entry.key,
+    ];
+    for (final srcId in moved) {
+      _peerNode.remove(srcId);
+      _announced.remove(srcId);
+      for (final tag in SfuTag.values) {
+        _closeConsumer(srcId, tag);
+      }
+    }
+    _recvTransports.remove(url)?.close();
+    if (moved.isNotEmpty) _publishRemotes();
+    return moved;
+  }
+
+  Future<void> _dropNode(String url) async {
+    await _nodeSubscriptions.remove(url)?.cancel();
+    await _nodeHealth.remove(url)?.cancel();
+    _nodeDown.remove(url);
+    _recvTransports.remove(url)?.close();
+    final node = _nodes.remove(url);
+    await node?.dispose();
+  }
+
+  /// Close our producers locally, without telling the server.
+  ///
+  /// For when the server has already lost them. `produce-close` would either be
+  /// addressed to a session that no longer exists or — worse, on a socket that
+  /// has just come back — be a claim about a producer we are one moment away
+  /// from creating.
+  void _dropProducers() {
+    for (final producer in _producers.values) {
+      producer.close();
+    }
+    _producers.clear();
+  }
+
+  void _announceRepublish() {
+    if (!_republish.isClosed) _republish.add(null);
   }
 
   List<RemoteMedia> _remoteList() {
@@ -1031,8 +1473,16 @@ class SfuSession {
   }
 
   Future<void> stop() async {
+    _stopped = true;
     _turnTimer?.cancel();
     _turnTimer = null;
+    _addrRetry?.cancel();
+    _addrRetry = null;
+    _spatialDebounce?.cancel();
+    _spatialDebounce = null;
+    _awaitingAddr.clear();
+    _spatial.clear();
+    _priority = const [];
     for (final tag in _producers.keys.toList()) {
       await unpublish(tag);
     }
@@ -1055,15 +1505,23 @@ class SfuSession {
     _device = null;
 
     // Cancel before disposing, or a node's closing notifications arrive at a
-    // handler that reaches for state we have just cleared.
-    for (final subscription in _nodeSubscriptions) {
+    // handler that reaches for state we have just cleared — and its status
+    // stream would read the close as a reconnection and start rebuilding.
+    for (final subscription in _nodeSubscriptions.values) {
       await subscription.cancel();
     }
     _nodeSubscriptions.clear();
+    for (final subscription in _nodeHealth.values) {
+      await subscription.cancel();
+    }
+    _nodeHealth.clear();
+    _nodeDown.clear();
     for (final node in _nodes.values.toList()) {
       await node.dispose();
     }
     _nodes.clear();
+    await _routerSub?.cancel();
+    _routerSub = null;
     await _router?.dispose();
     _node = null;
     _router = null;
@@ -1076,6 +1534,7 @@ class SfuSession {
     await stop();
     await _remotes.close();
     await _notifications.close();
+    await _republish.close();
   }
 
   SfuSignalling _open(String url, String? sessionId) =>

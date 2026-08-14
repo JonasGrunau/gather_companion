@@ -60,6 +60,9 @@ class _FakeCollector implements DirectCollector {
 
   @override
   ({bool ok, String? detail}) setGait(Gait gait) {
+    // A socket that refuses steps refuses gear changes too, which is the whole of the
+    // "left parked in a go-kart" case: `drive` landed, and then the `walk` did not.
+    if (refuse) return (ok: false, detail: 'not connected to Gather');
     gaits.add(gait);
     return (ok: true, detail: null);
   }
@@ -218,18 +221,23 @@ void main() {
   });
 
   group('not walking through the office', () {
+    // What "not walking through" means on the wire is worth being precise about. The
+    // step is still *sent* — `gameMove` has no collision test in front of it and the
+    // model writes `direction` before it consults `setPosition`, so the desktop client
+    // turns you to face what stopped you. What must not happen is believing the tile.
     test('into furniture', () {
       map = _obstructed();
       final w = build()..noteRoster(_at(4, 5));
       w.press('Right');
 
-      expect(collector.steps, isEmpty, reason: 'the desk at (5,5)');
-      expect(w.at, (x: 4, y: 5));
+      expect(collector.steps, ['Right'], reason: 'turning to face the desk at (5,5)');
+      expect(w.at, (x: 4, y: 5), reason: 'and going nowhere');
 
       // Only that tile, and only in that direction: a desk beside you is not a reason
       // to be unable to walk past it.
       w.press('Down');
-      expect(collector.steps, ['Down']);
+      expect(collector.steps, ['Right', 'Down']);
+      expect(w.at, (x: 4, y: 6));
     });
 
     test('through a wall', () {
@@ -237,15 +245,20 @@ void main() {
       final w = build()..noteRoster(_at(8, 2));
       w.press('Right');
 
-      expect(collector.steps, isEmpty);
-      expect(w.at, (x: 8, y: 2));
+      expect(collector.steps, ['Right']);
+      expect(w.at, (x: 8, y: 2), reason: 'the wall on the west side of column 9');
     });
 
-    test('off the edge of the grid', () {
+    test('off the edge of the grid, which is not even sent', () {
+      // The one refusal not handed to Gather. `blockedAtPosition` consults the object
+      // map and nothing else, so the void outside the building is unoccupied rather
+      // than blocked and a move over the edge would likely be *accepted* — a position
+      // no client has any art for. Unlike a wall, this one is ours to refuse.
       final w = build()..noteRoster(_at(0, 0));
       w.press('Left');
 
       expect(collector.steps, isEmpty);
+      expect(w.at, (x: 0, y: 0));
       w.press('Right');
       expect(collector.steps, ['Right'], reason: 'and inwards is fine');
     });
@@ -261,7 +274,8 @@ void main() {
       expect(w.walking, isTrue);
 
       w.press('Down');
-      expect(collector.steps, ['Down']);
+      expect(collector.steps, ['Right', 'Down']);
+      expect(w.at, (x: 8, y: 3), reason: 'and only the one that was not a wall landed');
     });
   });
 
@@ -875,6 +889,80 @@ void main() {
 
       expect(w.gait, Gait.walking);
       expect(w.boost, isTrue, reason: 'but the latch itself survives');
+    });
+
+    test('a gear change the socket dropped is said again', () {
+      // The one that matters, and the only one that cannot fix itself: `drive` lands,
+      // the connection goes, and the `walk` on the way out is sent into nothing. Since
+      // a gait is only ever announced when it *changes*, nothing would say it again —
+      // and `speed.modifier` is a synced field, so the avatar sits in a go-kart on
+      // every other screen in the space until somebody happens to take a long walk.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+      expect(collector.gaits, [Gait.driving]);
+
+      collector.refuse = true;
+      w.release();
+      expect(collector.gaits, [Gait.driving], reason: 'the way out never left');
+      expect(w.gait, Gait.walking, reason: 'though the legs are local and know better');
+
+      collector.refuse = false;
+      w.noteRoster(_at(4, 4));
+      expect(collector.gaits, [Gait.driving, Gait.walking]);
+
+      w.noteRoster(_at(4, 4));
+      expect(collector.gaits, [Gait.driving, Gait.walking],
+          reason: 'and once it has landed it is not repeated');
+    });
+
+    test('a walk nobody ever contradicted says nothing on a roster', () {
+      // The conservative half of the same mechanism. A fresh walk has told Gather
+      // nothing, so it assumes nothing needs saying — announcing a gait at an avatar
+      // whose desktop client is legitimately driving it would be the phone making
+      // something up.
+      build()
+        ..noteRoster(_at(4, 4))
+        ..noteRoster(_at(4, 5));
+
+      expect(collector.gaits, isEmpty);
+    });
+  });
+
+  group('walking into things', () {
+    test('a held direction into a wall still turns the avatar', () {
+      // `gameMove` is `currentSpaceUser.move({direction})` with no collision test in
+      // front of it: the desktop client sends every held-key step and lets the model
+      // arbitrate. The model assigns `direction` before it consults `setPosition`, so
+      // the step turns you and moves nobody.
+      final w = Walk(
+        collector: () => collector,
+        map: () => _obstructed(),
+        now: () => DateTime(2026),
+      )..noteRoster(_at(8, 4));
+
+      w.press('Right');
+      expect(w.direction, 'Right', reason: 'and the thumb is still down');
+      expect(collector.steps, ['Right'], reason: 'sent, so Gather turns us');
+      expect(w.at, (x: 8, y: 4), reason: 'and not believed, because it did not land');
+      expect(w.step().detail, 'blocked');
+      expect(collector.steps, ['Right', 'Right'], reason: 'leaning on it keeps sending');
+      w.release();
+    });
+
+    test('a route that meets a wall does not send the step', () {
+      // The other path, and deliberately not the same: a route has a pathfinder behind
+      // it, so a blocked next tile is a route to re-plan rather than a wall to lean on.
+      final w = Walk(
+        collector: () => collector,
+        map: () => _obstructed(),
+        now: () => DateTime(2026),
+      )..noteRoster(_at(8, 4));
+
+      w.follow(const [(x: 8, y: 4), (x: 9, y: 4)]);
+
+      expect(collector.steps, isEmpty);
+      expect(w.onRoute, isFalse);
+      w.release();
     });
   });
 }

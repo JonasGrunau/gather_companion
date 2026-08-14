@@ -16,14 +16,21 @@
 /// a republish, and it happens at most once per call, which is a better trade
 /// than a camera light nobody asked for.
 ///
-/// ## The SFU is connected on the first publish, not at join
+/// ## The SFU is connected when there is somebody to hear, not at join
 ///
 /// Steps 1–4 of `SfuSession` (assignment, connection, capabilities) are being
-/// *ready* to publish rather than publishing, and the desktop client does them at
-/// space join. This does them on the first tap instead: a companion app is open
-/// on a phone in someone's pocket far more often than it is used to talk, and a
-/// router assignment held all day for a call that never happens is a socket and a
-/// battery spent on nothing.
+/// *ready* rather than publishing, and the desktop client does them at space
+/// join — `docs/gather-api.md` is explicit that "a client that defers opening the
+/// SFU socket until a cluster forms is doing something the real client does not".
+///
+/// This connects on the first *conversation* instead. Waiting for a tap, which is
+/// what it used to do, had a consequence worth stating plainly: a phone could not
+/// hear anybody until it started talking, because nothing opened the socket that
+/// carries other people's audio. Walking up to a group and listening — the
+/// ordinary thing to do in an office — was the one thing the app could not do.
+///
+/// Standing alone still costs nothing. An empty cluster opens no socket, and a
+/// phone in a pocket in an empty room is exactly where it was before.
 library;
 
 import 'dart:async';
@@ -32,6 +39,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:gather_client/gather_client.dart';
 
 import 'call.dart';
+import 'capture_engine.dart';
 import 'media_engine.dart';
 import 'sfu_session.dart';
 import 'webrtc_media_engine.dart';
@@ -41,7 +49,7 @@ class LiveCall implements Call {
     required GatherAuth auth,
     required String spaceId,
     required String srcId,
-    WebrtcMediaEngine? engine,
+    CaptureEngine? engine,
     SfuSession Function()? buildSfu,
     void Function(String)? log,
   })  : _log = log ?? _noop,
@@ -61,13 +69,24 @@ class LiveCall implements Call {
   static void _noop(String _) {}
 
   final void Function(String) _log;
-  final WebrtcMediaEngine _engine;
+  final CaptureEngine _engine;
   final SfuSession Function() _buildSfu;
 
   StreamSubscription<LocalMediaState>? _engineSub;
   StreamSubscription<List<RemoteMedia>>? _remoteSub;
   StreamSubscription<SfuNotification>? _noticeSub;
+  StreamSubscription<void>? _republishSub;
   SfuSession? _sfu;
+
+  /// Let go of a session's streams before it is thrown away.
+  Future<void> _detach() async {
+    await _remoteSub?.cancel();
+    _remoteSub = null;
+    await _noticeSub?.cancel();
+    _noticeSub = null;
+    await _republishSub?.cancel();
+    _republishSub = null;
+  }
 
   /// Who we want to hear, held here rather than only in the session.
   ///
@@ -120,7 +139,9 @@ class LiveCall implements Call {
 
         await _ensureCapture();
         await _engine.setAudioEnabled(true);
-        return _publish(SfuTag.audio);
+        final detail = await _publish(SfuTag.audio);
+        await _republishOthers(SfuTag.audio);
+        return detail;
       });
 
   @override
@@ -135,8 +156,29 @@ class LiveCall implements Call {
 
         await _ensureCapture();
         await _engine.setVideoEnabled(true);
-        return _publish(SfuTag.video);
+        final detail = await _publish(SfuTag.video);
+        await _republishOthers(SfuTag.video);
+        return detail;
       });
+
+  /// Put back whatever a capture restart took with it.
+  ///
+  /// [_ensureCapture] closes both producers before it reopens the hardware,
+  /// because they are about to point at tracks that no longer exist — and the
+  /// tap that caused it only ever republishes its own. So turning the camera on
+  /// while talking used to close the audio producer and never reopen it: the
+  /// camera came on and you went silent, with every button still saying you
+  /// were live.
+  Future<void> _republishOthers(SfuTag just) async {
+    final sfu = _sfu;
+    if (sfu == null) return;
+    if (_wantMic && just != SfuTag.audio && !sfu.publishing(SfuTag.audio)) {
+      await _publish(SfuTag.audio);
+    }
+    if (_wantCamera && just != SfuTag.video && !sfu.publishing(SfuTag.video)) {
+      await _publish(SfuTag.video);
+    }
+  }
 
   @override
   Future<void> switchCamera() => _engine.switchCamera();
@@ -195,6 +237,13 @@ class LiveCall implements Call {
       }
     } on Object catch (error) {
       _log('call: publishing ${tag.wire} failed: $error');
+      if (_sfu?.displaced ?? false) {
+        return _fail(
+          tag,
+          'Your Mac keeps taking this call back. Quit Gather there, then turn '
+          'your microphone on again here.',
+        );
+      }
       // The hardware is live and only the wire failed, so the button stays on:
       // the person is unmuted, and the sentence says the room cannot hear them
       // yet. Silently flipping it back would read as the tap not registering.
@@ -210,32 +259,66 @@ class LiveCall implements Call {
     return null;
   }
 
-  Future<SfuSession> _sfuOrStart() async {
+  /// The connected session, connecting it if this is the first thing to need one.
+  ///
+  /// Single-flight. Two things can now ask for a session at once — a tap on the
+  /// microphone and a colleague walking into the cluster — and without this they
+  /// would each build one, leaving the loser's sockets open with nothing reading
+  /// them and its producers publishing into a session nobody consults.
+  Future<SfuSession> _sfuOrStart() {
     final existing = _sfu;
-    if (existing != null && existing.ready) return existing;
+    if (existing != null && existing.ready) return Future.value(existing);
+    return _starting ??= _start().whenComplete(() => _starting = null);
+  }
+
+  Future<SfuSession>? _starting;
+
+  Future<SfuSession> _start() async {
+    final existing = _sfu;
     if (existing != null) {
       // Started once and did not finish — a half-open session is worse than none.
       // Disposed rather than stopped: it is being thrown away, and `stop` leaves
       // its stream controllers open with nothing left to feed them.
-      await _remoteSub?.cancel();
-      _remoteSub = null;
-      await _noticeSub?.cancel();
-      _noticeSub = null;
+      await _detach();
       await existing.dispose();
     }
     final sfu = _sfu = _buildSfu();
     _remoteSub = sfu.remoteChanges.listen(_onRemotes);
     _noticeSub = sfu.notifications.listen(_onNotice);
+    // A dropped socket or a drained node takes every producer with it, and only
+    // this class holds the tracks to put back.
+    _republishSub = sfu.needsRepublish.listen(_onNeedsRepublish);
     // Before `start()`, so the node replays it the moment it connects rather
     // than after the first track has already gone out unwatchable.
     sfu.setAllowed(_visibleTo);
+    sfu.setConversation(clusterId: _clusterId);
     await sfu.start();
 
     // Whatever the room looked like while we were not connected is what it
     // should look like now. Without this, everybody who was already standing
     // there when the mic was first tapped would be silent.
     if (_listeningTo.isNotEmpty) await sfu.setSubscriptions(_listeningTo);
+    if (_watching.isNotEmpty) {
+      sfu.setWatching(_watching, layer: _quality.spatialLayer);
+    }
     return sfu;
+  }
+
+  /// Put back whatever the person still wants, after the wire lost it.
+  ///
+  /// Queued behind anything already in flight rather than run inline: a
+  /// reconnection can land in the middle of a tap, and republishing while
+  /// `_ensureCapture` is restarting the session would produce on a track that is
+  /// about to be stopped.
+  void _onNeedsRepublish(void _) {
+    if (!_wantMic && !_wantCamera) return;
+    _log('call: the SFU lost our producers; putting them back');
+    unawaited(_serialise(() async {
+      if (_sfu == null) return null;
+      if (_wantMic) await _publish(SfuTag.audio);
+      if (_wantCamera) await _publish(SfuTag.video);
+      return null;
+    }));
   }
 
   @override
@@ -258,13 +341,48 @@ class LiveCall implements Call {
     }
     _listeningTo = Set.unmodifiable(srcIds);
 
-    // Only reconciled against a session that already exists. Somebody walking
-    // past must not be what opens a socket — the person here has not asked for
-    // anything yet, and a call nobody started should cost nothing.
-    final sfu = _sfu;
-    if (sfu == null || !sfu.ready) return;
-    await sfu.setSubscriptions(_listeningTo);
+    if (_listeningTo.isEmpty) {
+      // Nobody left to hear. The session stays up if it exists — we may still be
+      // publishing, and tearing it down over an empty cluster would cost a full
+      // reconnection the moment somebody walks back.
+      final sfu = _sfu;
+      if (sfu != null && sfu.ready) await sfu.setSubscriptions(const {});
+      return;
+    }
+
+    try {
+      // Connects if nothing has yet. Being in a conversation is reason enough:
+      // the cluster is already debounced by 1.5 seconds upstream, so this is a
+      // conversation somebody has actually stopped to have, not a passer-by.
+      final sfu = await _sfuOrStart();
+      await sfu.setSubscriptions(_listeningTo);
+    } on Object catch (error) {
+      // Deliberately quiet. Nobody pressed anything, so there is no button to
+      // put back and no sentence anybody asked for; the next roster tries again.
+      _log('call: could not join the conversation: $error');
+    }
   }
+
+  @override
+  Future<void> setConversation(String? clusterId) async {
+    if (clusterId == _clusterId) return;
+    _clusterId = clusterId;
+    _sfu?.setConversation(clusterId: clusterId);
+  }
+
+  @override
+  Future<void> setWatching(
+    List<String> srcIds, {
+    required VideoQuality quality,
+  }) async {
+    _watching = List.unmodifiable(srcIds);
+    _quality = quality;
+    _sfu?.setWatching(_watching, layer: quality.spatialLayer);
+  }
+
+  String? _clusterId;
+  List<String> _watching = const [];
+  VideoQuality _quality = VideoQuality.thumbnail;
 
   /// The streams for one participant, for the widget that draws them.
   ///
@@ -333,10 +451,7 @@ class LiveCall implements Call {
   Future<void> hangUp() async {
     _wantMic = false;
     _wantCamera = false;
-    await _remoteSub?.cancel();
-    _remoteSub = null;
-    await _noticeSub?.cancel();
-    _noticeSub = null;
+    await _detach();
     await _sfu?.dispose();
     _sfu = null;
     _remoteStreams.clear();
@@ -351,10 +466,7 @@ class LiveCall implements Call {
   Future<void> dispose() async {
     await _engineSub?.cancel();
     _engineSub = null;
-    await _remoteSub?.cancel();
-    _remoteSub = null;
-    await _noticeSub?.cancel();
-    _noticeSub = null;
+    await _detach();
     await _sfu?.dispose();
     _sfu = null;
     _remoteStreams.clear();

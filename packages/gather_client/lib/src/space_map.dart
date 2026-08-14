@@ -199,6 +199,39 @@ Gait gaitOf(num? modifier) => switch (modifier?.round()) {
       _ => null,
     };
 
+/// Which way you went, to get from one tile to another.
+///
+/// `teleport` requires a `direction` even though a hop passes through no tiles, and the
+/// client fills it in with the way you travelled rather than with a constant — its
+/// `MoveController.teleport` is
+///
+/// ```js
+/// teleport(A, e) {
+///   const g = gameSpace.currentSpaceUser;
+///   const t = g.position.positionToDirectionIgnoringAxis(A);
+///   if (!t) return;
+///   g.teleport({x: A.x, y: A.y, direction: t.value});
+/// }
+/// ```
+///
+/// Only the call site was read, not `positionToDirectionIgnoringAxis` itself, so the
+/// tie-break here is a reading of the name rather than a transcription: a hop that moves
+/// on both axes has to ignore one of them, and the one that moved further is the one
+/// worth keeping. A hop that goes nowhere has no direction at all and answers [fallback].
+String headingTo({
+  required int fromX,
+  required int fromY,
+  required int toX,
+  required int toY,
+  String fallback = 'Down',
+}) {
+  final dx = toX - fromX;
+  final dy = toY - fromY;
+  if (dx == 0 && dy == 0) return fallback;
+  if (dx.abs() >= dy.abs()) return dx > 0 ? 'Right' : 'Left';
+  return dy > 0 ? 'Down' : 'Up';
+}
+
 /// One rectangle on the floor: a room, a desk, a team's corner.
 ///
 /// Carried because a map of anonymous blocked tiles is a maze, and a map with
@@ -215,6 +248,7 @@ class SpaceRoom {
     required this.walled,
     this.stableId,
     this.locked = false,
+    this.admits = const {},
   });
 
   final String id;
@@ -245,6 +279,14 @@ class SpaceRoom {
   /// Whether this area draws walls. Gather treats this as the definition of a
   /// private area, and so does party mode.
   final bool walled;
+
+  /// Who this area lets in even though [locked] — the `SpaceUser` ids of everybody
+  /// holding an accepted access request or a seat at a meeting held here.
+  ///
+  /// Empty on an unlocked area, where it would mean nothing, and empty on any area
+  /// whose `mapEntityIdentifierId` never arrived. See `SpaceMapBuilder._admitted` for
+  /// which clauses of `canBeEnteredBy` this covers and which it cannot.
+  final Set<String> admits;
 
   /// Whether the door is shut. `MapEntityIdentifier.isLocked`.
   ///
@@ -456,6 +498,28 @@ class SpaceMap {
   /// where you are standing" and skips the 62 unnamed desks, while this answers
   /// "which area are you *in*" for [routeTo], where a desk is exactly the thing that
   /// has to count. `MapAreaPositions.areaAtPosition`.
+  /// The *private* area covering a tile — `MapAreaPositions.privateAreaAtPosition`.
+  ///
+  /// ```js
+  /// privateAreaAtPosition(A) {
+  ///   return last(this.getAreasAtPosition(A).filter(A => A.isPrivate))
+  /// }
+  /// ```
+  ///
+  /// Two differences from [areaAt] and neither is cosmetic. It considers only
+  /// **walled** areas — `get isPrivate(){ return this.isWalled }`, which is a
+  /// statement about audio rather than about architecture but is the field the rule
+  /// reads — and it breaks ties with `last` rather than by size, so the order the
+  /// floor plan arrived in decides. This is what `isPermittedToMoveTo` consults, so
+  /// it is what [canEnterRoom] must be asked about.
+  SpaceRoom? privateAreaAt(int x, int y) {
+    SpaceRoom? found;
+    for (final room in rooms) {
+      if (room.walled && room.contains(x, y)) found = room;
+    }
+    return found;
+  }
+
   SpaceRoom? areaAt(int x, int y) {
     SpaceRoom? best;
     for (final room in rooms) {
@@ -750,6 +814,69 @@ bool navigatesToTile(SpaceRoom room) => switch (room.type) {
       _ => false,
     };
 
+/// Whether [room]'s door is open to you — `MapArea.canBeEnteredBy`, as far as a
+/// second client can tell.
+///
+/// This is the rule behind `SpaceUser.isPermittedToMoveTo`, which is the **second**
+/// gate inside `setPosition` and applies to `teleport` as much as to `move`:
+///
+/// ```js
+/// isPermittedToMoveTo(A, e) {
+///   const g = e.areaPositions.privateAreaAtPosition(A);
+///   if (isNotNil(g) && !g.canBeEnteredBy(this)) { publishEvent(…); return false }
+///   return true
+/// }
+///
+/// canBeEnteredBy(A) {
+///   if (!this.isLocked) return true;                                        // 1
+///   if (this.isDesk) { if (this.deskOwner?.id === A.id) return true }       // 2
+///   const e = this.currentMeeting;
+///   if (isNotNil(e) && e.canSpaceUserAccess(A)) return true;                // 3
+///   const g = Object.values(this.mapEntityIdentifier.areaAccessRequests)
+///     .find(e => e.spaceUserId === A.id && e.responseStatus === Accepted);
+///   if (g) return true;                                                     // 4
+///   if (A.isInOffice &&
+///       A.currentPrivateMapArea?.stableId_USE_THIS_INSTEAD_OF_ID === this.stableId…)
+///     return true;                                                          // 5
+///   return false
+/// }
+/// ```
+///
+/// **All five are answered, four of them whole.** 1 is [SpaceRoom.locked]; 2 is
+/// [myDeskId] against [SpaceRoom.stableId] — the same one-to-one `isAtOwnDesk` uses;
+/// 3 and 4 are [SpaceRoom.admits], joined in `SpaceMapBuilder._admitted`; and 5 is
+/// [standingIn], which is why the caller passes [SpaceMap.privateAreaAt] rather than
+/// [SpaceMap.areaAt] — the client compares against the *private* area you are in, not
+/// the smallest one.
+///
+/// Clause 3 is the partial one. `Meeting.canSpaceUserAccess` admits anybody holding a
+/// `MeetingParticipant` row, which is transcribed, and then falls through to
+/// `combinedCalendarEvent.isSpaceUserAttendeeOrOrganizer` for anybody who does not —
+/// a chain of calendar models this app has no reason to read. Somebody invited to a
+/// meeting by calendar alone, who has never been added as a participant, therefore
+/// still answers false here.
+///
+/// Which is survivable, because this is not the only line of defence and is not meant
+/// to be: `isPermittedToMoveTo` runs on the server with all five clauses in hand, and
+/// the refusal it publishes is handled. This answers what is knowable so that a walk
+/// which is obviously going to be refused is never started; the wire settles the rest.
+bool canEnterRoom(
+  SpaceRoom room, {
+  String? myDeskId,
+  SpaceRoom? standingIn,
+  String? meId,
+}) {
+  if (!room.locked) return true;
+  if (room.type == 'Desk' && myDeskId != null && room.stableId == myDeskId) return true;
+  if (meId != null && room.admits.contains(meId)) return true;
+  // Already inside. The client logs this one as "should never happen" and then lets
+  // you stay, which is the only humane answer: the alternative is being unable to
+  // move within a room somebody locked around you.
+  final inside = standingIn?.stableId;
+  if (inside != null && inside == room.stableId) return true;
+  return false;
+}
+
 /// A binary heap keyed on `f`, because the route search pops the cheapest tile a few
 /// thousand times and a list scan would be the whole cost of it.
 ///
@@ -812,6 +939,17 @@ class SpaceMapBuilder {
   /// The identifier rows areas hang their lock and their chat channel off.
   final Map<String, Map<String, Object?>> _identifiers = {};
 
+  /// The three rows that decide who a *locked* area lets in anyway.
+  ///
+  /// All keyed the same way, and it is not the way you would guess: both
+  /// `AreaAccessRequest.areaId` and `Meeting.areaId` are
+  /// `ReverseRelationReference(this, …, "areaId")` **on `MapEntityIdentifier`**, so
+  /// the id they carry is [SpaceRoom.stableId] and never `MapArea.id`. Joining the
+  /// wrong one finds nothing, silently, and everybody stays locked out.
+  final Map<String, Map<String, Object?>> _requests = {};
+  final Map<String, Map<String, Object?>> _meetings = {};
+  final Map<String, Map<String, Object?>> _participants = {};
+
   bool _dirty = true;
   Map<String, SpaceMap> _maps = const {};
 
@@ -855,6 +993,56 @@ class SpaceMapBuilder {
     return _art.putIfAbsent('${map.floorId}/$dark', () => _buildArt(map, dark: dark));
   }
 
+  /// Who a locked area lets in besides its owner — clauses 3 and 4 of
+  /// `MapArea.canBeEnteredBy`, joined on the `MapEntityIdentifier` id [stable].
+  ///
+  /// **Clause 4, whole.** An `AreaAccessRequest` of mine that came back `Accepted` is
+  /// exactly "somebody let me in", and the client reads it the same way — the
+  /// response handler even walks you there on acceptance
+  /// (`moveSpaceUserToMapArea(g.area)`).
+  ///
+  /// **Clause 3, the first line of it.** `Meeting.canSpaceUserAccess` opens with
+  /// `if (isNotNil(this.meetingParticipantsBySpaceUserId[A.id])) return true` — being
+  /// *listed* on the meeting is enough, with no response status about it — and that
+  /// list is the `MeetingParticipant` rows this already receives. What is not
+  /// transcribed is the tail: a meeting with no participant row falls through to
+  /// `combinedCalendarEvent.isSpaceUserAttendeeOrOrganizer`, which is a chain of
+  /// calendar models this app does not read at all.
+  ///
+  /// Two deliberate loosenesses, both erring the same way. Any meeting on the area
+  /// counts rather than only the current one — picking the current one means
+  /// `confirmedMeetings.filter(isActive)` sorted by `actualStartDate`, which is more
+  /// state than this needs — and a participant row is taken at face value. Both can
+  /// say yes where Gather says no, and that is the safe direction: the server holds
+  /// the real rule, refuses the move, and the refusal event says so out loud. Saying
+  /// *no* wrongly is the failure with no way back, because it never sends anything.
+  Set<String> _admitted(String stable) {
+    final out = <String>{};
+
+    for (final request in _requests.values) {
+      if (request['areaId'] != stable) continue;
+      if (request['responseStatus'] != 'Accepted') continue;
+      final who = _str(request['spaceUserId']);
+      if (who != null) out.add(who);
+    }
+
+    final meetings = <String>{};
+    for (final meeting in _meetings.values) {
+      if (meeting['areaId'] != stable) continue;
+      final id = _str(meeting['id']);
+      if (id != null) meetings.add(id);
+    }
+    if (meetings.isNotEmpty) {
+      for (final participant in _participants.values) {
+        if (!meetings.contains(participant['meetingId'])) continue;
+        final who = _str(participant['spaceUserId']);
+        if (who != null) out.add(who);
+      }
+    }
+
+    return out;
+  }
+
   Map<String, Map<String, Object?>>? _storeFor(String model) => switch (model) {
         'MapArea' => _areas,
         'MapObject' => _objects,
@@ -862,6 +1050,9 @@ class SpaceMapBuilder {
         'CatalogItem' => _items,
         'FloorMap' => _floors,
         'MapEntityIdentifier' => _identifiers,
+        'AreaAccessRequest' => _requests,
+        'Meeting' => _meetings,
+        'MeetingParticipant' => _participants,
         _ => null,
       };
 
@@ -1436,6 +1627,7 @@ class SpaceMapBuilder {
           walled: walled,
           stableId: stableId,
           locked: identifier?['isLocked'] == true,
+          admits: stableId == null ? const {} : _admitted(stableId),
         ));
 
         if (walled) {

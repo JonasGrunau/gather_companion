@@ -73,6 +73,10 @@ const _models = {
   // state rather than sent over the event bus. See [_MeetingWatch].
   'MeetingParticipant',
   'MeetingJoinRequest',
+  // A locked meeting room admits whoever its meeting lists, so the door needs these
+  // as well as the notifications do. See `SpaceMapBuilder._admitted`.
+  'AreaAccessRequest',
+  'Meeting',
   // What people look like. Neither model answers on its own: `hashOutfit` joins an
   // outfit's wearable ids and appends the newest `lastSyncAuthoredAt` among them,
   // so the sprite URL needs both. See `avatar.dart`.
@@ -91,6 +95,11 @@ const _mapModels = {
   'CatalogItemVariant',
   'CatalogItem',
   'MapEntityIdentifier',
+  // Who a locked area lets in anyway. Both hang off `MapEntityIdentifier` by
+  // `areaId`, which is why they are map rows rather than presence: they describe a
+  // door, not a person. See `SpaceMapBuilder._admitted`.
+  'AreaAccessRequest',
+  'Meeting',
 };
 
 /// SpaceUser fields worth tracking, for field-level `replace` patches.
@@ -302,6 +311,21 @@ class Roster {
   final String? selfId;
   final List<RosterRow> rows;
   final String? spaceName;
+
+  /// The conversation we are in, by Gather's own id, or null when standing alone.
+  ///
+  /// The media plane wants this as well as the membership: the desktop client
+  /// sends `set-player-conversation-metadata {meetingId, clusterId}` so the SFU
+  /// knows which bubble a publisher belongs to. Null and absent are the same
+  /// answer here — both mean "no conversation to name".
+  String? get myClusterId {
+    final me = selfId;
+    if (me == null) return null;
+    for (final row in rows) {
+      if (row.id == me) return row.clusterId;
+    }
+    return null;
+  }
 
   /// The people in the same conversation as us, excluding ourselves.
   ///
@@ -596,6 +620,11 @@ class GameProtocolReader {
     }
 
     if (model == 'MeetingParticipant' || model == 'MeetingJoinRequest') {
+      // The floor plan wants the participant rows too — a locked room admits the
+      // people its meeting lists — and it must be told here rather than by adding the
+      // model to [_mapModels], because that branch returns before this one and the
+      // invite notifications would stop arriving.
+      mapBuilder.apply(model, patch);
       _meetings.apply(model, patch, isNews: isNews, selfId: selfId, out: _pending);
       // Never "the roster changed": meetings are not people standing in a room, and
       // republishing a 79-row snapshot because a calendar row moved is exactly the

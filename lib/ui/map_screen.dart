@@ -410,16 +410,23 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       return;
     }
     // A shut door is worth a sentence, because it is the one refusal here that is
-    // about somebody else rather than about the floor. Gather refuses this too —
-    // `AttemptToMoveToLockedArea` — and has to, since neither `move` nor `teleport`
-    // is checked server-side.
-    final locked = target.room;
-    if (locked != null && locked.locked) {
+    // about somebody else rather than about the floor. Gather refuses this too, in
+    // the same place — `onLeftDoubleClick` publishes `AttemptToMoveToLockedArea` when
+    // `area.isLocked && !area.canBeEnteredBy(me)` and opens a modal offering to ask
+    // for access.
+    //
+    // The test is `canEnter` and not `room.locked`, and the difference is a bug this
+    // used to have: your own locked desk is yours to walk into, and so is the room
+    // you are already standing in. The server enforces the same rule from the other
+    // side — see `AppState.notices` — which is what covers the two clauses of
+    // `canBeEnteredBy` this app cannot evaluate.
+    final room = target.room;
+    if (room != null && !widget.state.canEnter(room)) {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(
-          content: Text('${locked.name ?? 'That room'} is locked.'),
+          content: Text('${room.name ?? 'That room'} is locked.'),
         ));
       return;
     }
@@ -510,10 +517,23 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       final to = _zoomTo;
       if (to != null) _view.value = to.value;
     });
+    // A refusal from Gather arrives with no control waiting on it — see
+    // [AppState.notices]. Heard here because this is the screen walking happens on,
+    // and because a sentence about a door needs somewhere to be shown.
+    _notices = widget.state.notices.listen((notice) {
+      if (!mounted) return;
+      setState(() => _selected = null);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(notice)));
+    });
   }
+
+  StreamSubscription<String>? _notices;
 
   @override
   void dispose() {
+    unawaited(_notices?.cancel());
     _tapWindow?.cancel();
     _motion.dispose();
     _zoom.dispose();

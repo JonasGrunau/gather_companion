@@ -11,7 +11,8 @@ declaration. It is the companion to
 [`observed-wire-protocol.md`](./observed-wire-protocol.md), which records what
 two live clients actually said to each other. Where that file shows message
 shape and timing from real frames, this one shows the full surface those frames
-are drawn from.
+are drawn from. The method behind both, and the runbook for repeating it against
+a newer app version, is [`how-it-was-mapped.md`](./how-it-was-mapped.md).
 
 ## Totals
 

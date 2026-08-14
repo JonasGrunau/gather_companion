@@ -54,6 +54,7 @@ import 'dart:async';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import 'capture_engine.dart';
 import 'media_engine.dart';
 
 /// Capture constraints, tuned for a proximity call rather than a broadcast.
@@ -75,7 +76,7 @@ const _videoConstraints = <String, dynamic>{
   ],
 };
 
-class WebrtcMediaEngine implements MediaEngine {
+class WebrtcMediaEngine implements CaptureEngine {
   WebrtcMediaEngine({void Function(String)? log}) : _log = log ?? _noop;
 
   static void _noop(String _) {}
@@ -93,11 +94,14 @@ class WebrtcMediaEngine implements MediaEngine {
   @override
   LocalMediaState get state => _state;
 
-  /// The live capture, for the widget that draws it.
+  /// The live capture, for the widget that draws it and the session that
+  /// publishes it.
   ///
   /// Deliberately not on [MediaEngine]: a `MediaStream` crossing that interface
   /// would drag the plugin into every file that imports it, and the fake could no
-  /// longer stand in. The preview widget reaches for this concrete type instead.
+  /// longer stand in. It lives on [CaptureEngine] instead — the narrower
+  /// interface for the two callers that genuinely need the native handle.
+  @override
   MediaStream? get localStream => _stream;
 
   @override

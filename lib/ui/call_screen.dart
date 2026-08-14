@@ -26,10 +26,13 @@
 /// — everything except the pixels, which are the platform's job anyway.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../src/app_state.dart';
+import '../src/media/call.dart';
 import '../src/media/live_call.dart';
 import '../src/media/sfu_session.dart';
 import '../theme/gather_theme.dart';
@@ -67,7 +70,17 @@ class CallTile {
 
 typedef CallTileBuilder = Widget Function(BuildContext context, CallTile tile);
 
-class CallScreen extends StatelessWidget {
+/// The call, at the size it is being drawn.
+///
+/// Stateful for one reason beyond layout: **somebody has to tell the SFU that
+/// anyone is looking.** A peer publishes its smallest simulcast layer until a
+/// consumer asks for better, so a face filling a phone screen stays a
+/// quarter-resolution thumbnail unless this screen says otherwise — and, more
+/// usefully, everybody drops back to that thumbnail the moment this route is
+/// popped, because the map draws no video and nothing else here wants the
+/// bandwidth. That is `consume-set-spatial`, and it is the receive-side half of
+/// the simulcast the publisher already implements.
+class CallScreen extends StatefulWidget {
   const CallScreen({super.key, required this.state, this.buildTile});
 
   final AppState state;
@@ -76,22 +89,82 @@ class CallScreen extends StatelessWidget {
   final CallTileBuilder? buildTile;
 
   @override
+  State<CallScreen> createState() => _CallScreenState();
+}
+
+class _CallScreenState extends State<CallScreen> {
+  List<String> _watching = const [];
+  VideoQuality _quality = VideoQuality.thumbnail;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.state.addListener(_noteWatching);
+    _noteWatching();
+  }
+
+  @override
+  void dispose() {
+    widget.state.removeListener(_noteWatching);
+    // Nobody is looking any more. Said on the way out rather than left to a
+    // timeout, because until it is said every peer keeps encoding a layer for a
+    // screen that has gone — their battery, spent on our behalf.
+    unawaited(
+      widget.state.callHandle?.setWatching(
+            const [],
+            quality: VideoQuality.thumbnail,
+          ) ??
+          Future<void>.value(),
+    );
+    super.dispose();
+  }
+
+  /// Who is on screen and how big, in the same terms [_Grid] lays them out in.
+  void _noteWatching() {
+    final call = widget.state.call;
+    final ids = [for (final person in call.participants) person.srcId];
+    // Ourselves included, because the self tile takes a share of the screen
+    // without anybody having to send it to us.
+    final tiles = ids.length + (call.media.capturing ? 1 : 0);
+    final quality = switch (tiles) {
+      0 || 1 => VideoQuality.full,
+      2 => VideoQuality.half,
+      _ => VideoQuality.thumbnail,
+    };
+
+    if (quality == _quality &&
+        ids.length == _watching.length &&
+        Iterable<int>.generate(ids.length).every((i) => ids[i] == _watching[i])) {
+      return;
+    }
+    _watching = ids;
+    _quality = quality;
+    unawaited(
+      widget.state.callHandle?.setWatching(ids, quality: quality) ??
+          Future<void>.value(),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final t = context.tokens;
     return Scaffold(
       backgroundColor: t.background,
       body: SafeArea(
         child: ListenableBuilder(
-          listenable: state,
+          listenable: widget.state,
           builder: (context, _) {
-            final tiles = _tiles(state);
+            final tiles = _tiles(widget.state);
             return Column(
               children: [
                 _Header(count: tiles.where((tile) => !tile.isSelf).length),
                 Expanded(
                   child: tiles.isEmpty
                       ? const _Nobody()
-                      : _Grid(tiles: tiles, buildTile: buildTile ?? _defaultTile),
+                      : _Grid(
+                          tiles: tiles,
+                          buildTile: widget.buildTile ?? _defaultTile,
+                        ),
                 ),
               ],
             );

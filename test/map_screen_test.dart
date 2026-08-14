@@ -527,7 +527,10 @@ void main() {
     testWidgets('a locked room is refused, and says why', (tester) async {
       // The one refusal here that is about a person rather than about the floor, so
       // the one that earns a sentence. `isLocked` lives on `MapEntityIdentifier`
-      // rather than on the area, and nothing server-side enforces it.
+      // rather than on the area. The server enforces it too — `isPermittedToMoveTo`,
+      // the second gate inside `setPosition` — but silently, by not moving you and
+      // publishing an event no patch accompanies, so refusing here is what turns it
+      // into something a person can read.
       await tester.pumpWidget(wrap(ready(rooms: [
         SpaceRoom(
           id: 'area-1',
@@ -726,6 +729,169 @@ void main() {
 
       expect(find.textContaining('still arriving'), findsNothing);
       expect(find.textContaining('Drawing the office'), findsNothing);
+    });
+  });
+
+  group('shut doors', () {
+    // `canBeEnteredBy`, which is the rule behind `isPermittedToMoveTo`. Three of its
+    // five clauses are answerable from a roster and a floor plan; these are those.
+    SpaceRoom door({
+      String type = 'MeetingRoom',
+      bool locked = true,
+      String? stableId,
+    }) =>
+        SpaceRoom(
+          id: 'area-1',
+          name: 'Boardroom',
+          type: type,
+          x: 0,
+          y: 0,
+          width: 20,
+          height: 10,
+          walled: true,
+          locked: locked,
+          stableId: stableId,
+        );
+
+    AppState standing(SpaceRoom room, {String? deskId, num x = 4, num y = 4}) =>
+        AppState()
+          ..debugApplyLink(const LinkStatus(LinkState.live))
+          ..debugMap = _map(rooms: [room])
+          ..debugApplyRoster(Roster(selfId: 'me', rows: [
+            RosterRow(id: 'me', x: x, y: y, floorId: 'f1', connected: true, deskId: deskId),
+          ]));
+
+    test('an unlocked room is open to anybody', () {
+      final room = door(locked: false);
+      expect(standing(room).canEnter(room), isTrue);
+    });
+
+    test('a locked one is not', () {
+      // No desk of ours, and standing outside it — the floor is 20x10 and the room
+      // covers all of it, so "outside" has to be off the map.
+      final room = door(stableId: 'boardroom');
+      expect(standing(room, x: -5, y: -5).canEnter(room), isFalse);
+    });
+
+    test('my own locked desk is still mine to walk into', () {
+      // Clause 2. `deskId` is a `MapEntityIdentifier` id, so it matches `stableId`
+      // and never `id` — matching the wrong one finds nothing and locks you out of
+      // your own desk, which is the bug this pins.
+      final desk = door(type: 'Desk', stableId: 'desk-1');
+      expect(standing(desk, deskId: 'desk-1').canEnter(desk), isTrue);
+      // From outside it, since standing inside is a clause of its own.
+      expect(standing(desk, deskId: 'someone-elses', x: -5, y: -5).canEnter(desk), isFalse);
+    });
+
+    test('and so is the room I am already inside', () {
+      // Clause 5. The client logs this case as "should never happen" and then allows
+      // it, because the alternative is being unable to move within a room somebody
+      // locked around you.
+      final room = door(stableId: 'boardroom');
+      expect(standing(room).canEnter(room), isTrue);
+    });
+
+    SpaceRoom boardroom({Set<String> admits = const {}}) => SpaceRoom(
+          id: 'area-1',
+          name: 'Boardroom',
+          type: 'MeetingRoom',
+          x: 0,
+          y: 0,
+          width: 20,
+          height: 10,
+          walled: true,
+          locked: true,
+          stableId: 'boardroom',
+          admits: admits,
+        );
+
+    test('a room I was let into is mine to walk to', () {
+      // Clause 4, end to end. This is the case the local rule used to get wrong: an
+      // accepted access request is exactly "somebody let me in", and refusing it was
+      // a door the phone could not open even though Gather would have.
+      final room = boardroom(admits: const {'me'});
+      expect(standing(room, x: -5, y: -5).canEnter(room), isTrue);
+    });
+
+    test('but not one somebody else was let into', () {
+      final room = boardroom(admits: const {'ada'});
+      expect(standing(room, x: -5, y: -5).canEnter(room), isFalse);
+    });
+
+    test('a refusal from Gather stops the walk and names the room', () async {
+      final room = door(stableId: 'boardroom');
+      final state = standing(room, x: -5, y: -5)..debugOnRoute = true;
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteEvent(BusEvent(
+        name: 'UserIsNotPermittedToEnterLockedArea',
+        senderId: null,
+        sentTime: null,
+        targetUserIds: const ['me'],
+        payload: const {'spaceUserId': 'me', 'areaId': 'boardroom'},
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, ['Boardroom is locked.']);
+    });
+
+    test('a refusal aimed at somebody else is not ours to report', () async {
+      final room = door(stableId: 'boardroom');
+      final state = standing(room, x: -5, y: -5);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteEvent(BusEvent(
+        name: 'UserIsNotPermittedToEnterLockedArea',
+        senderId: null,
+        sentTime: null,
+        targetUserIds: const ['ada'],
+        payload: const {'spaceUserId': 'ada', 'areaId': 'boardroom'},
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, isEmpty);
+    });
+
+    test('a meeting refuses in its own words', () async {
+      final room = door(stableId: 'boardroom');
+      final state = standing(room, x: -5, y: -5);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteEvent(BusEvent(
+        name: 'UserIsNotPermittedToEnterMeetingArea',
+        senderId: null,
+        sentTime: null,
+        targetUserIds: const ['me'],
+        payload: const {'spaceUserId': 'me', 'meetingId': 'meeting-1'},
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, ['That meeting is private.']);
+    });
+
+    testWidgets('and the sentence reaches the screen', (tester) async {
+      final room = door(stableId: 'boardroom');
+      final state = standing(room, x: -5, y: -5);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      state.debugNoteEvent(BusEvent(
+        name: 'UserIsNotPermittedToEnterLockedArea',
+        senderId: null,
+        sentTime: null,
+        targetUserIds: const ['me'],
+        payload: const {'spaceUserId': 'me', 'areaId': 'boardroom'},
+      ));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Boardroom is locked.'), findsOneWidget);
     });
   });
 }

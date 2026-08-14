@@ -300,10 +300,17 @@ A representative message A received:
   "sequenceNumber": 142 }
 ```
 
-**`/direction` is emitted on every move, but position only when a tile boundary is
-crossed** — 36 direction patches against 26 position patches (`x` 12, `y` 14) for
-the same 36 moves. A turn-in-place therefore produces a direction patch with no
-position change.
+**`/direction` is emitted on every move, but position only on the moves that were
+allowed** — 36 direction patches against 26 position patches (`x` 12, `y` 14) for the
+same 36 moves.
+
+The ten-patch gap was read as turns-in-place when this was written. It is not: the
+model refused those ten. `move`'s body assigns `direction` and then calls
+`setPosition`, which returns false without writing anything when
+`isBlockedBy(map, prevPosition)` — and `gameMove` sends every held-key step without
+checking first, so leaning on a wall produces exactly this signature. The mechanism is
+in [`gather-api.md`](../gather-api.md#move-is-collision-checked-and-the-check-is-inside-setposition);
+the correction was made 2026-08-15 from the bundle, not from a new capture.
 
 **Acknowledgements are strictly private to the originating client.** A also sent
 7 actions of its own during the capture, and its socket received exactly 7
@@ -490,7 +497,10 @@ protocol:
 The rig is documented in [`two-instance-rig.md`](./two-instance-rig.md); its
 scripts live outside this repo in `~/.gather-alt/` (`gather-alt.sh` to run extra
 isolated instances, `record.mjs` to capture, `drive.mjs` to apply a stimulus).
-Raw captures for this document were `cap-9222.jsonl` and `cap-9333.jsonl`.
+Raw captures for this document were `cap-9222.jsonl` and `cap-9333.jsonl`. The
+method as a whole — which instrument answers which question, and which ones
+turned out to answer nothing — is in
+[`how-it-was-mapped.md`](./how-it-was-mapped.md).
 
 A second instance needs nothing but its own `--user-data-dir` and
 `--remote-debugging-port`: Electron keeps its single-instance lock inside the

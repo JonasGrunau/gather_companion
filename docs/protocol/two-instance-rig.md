@@ -10,6 +10,8 @@ This is the apparatus. What it found is written up alongside it:
 timing taken from real frames, and
 [`client-action-surface.md`](./client-action-surface.md) for the full catalogue of
 actions and endpoints with the server's verdict on each.
+[`how-it-was-mapped.md`](./how-it-was-mapped.md) is the method that produced both,
+and the runbook for repeating it against a newer app version.
 
 The scripts themselves live outside this repo, in `~/.gather-alt/`, because they
 drive a third-party desktop app rather than build this one.

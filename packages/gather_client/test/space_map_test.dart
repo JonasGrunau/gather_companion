@@ -1084,4 +1084,233 @@ void main() {
     expect(b.forFloor(null), isNotNull);
     expect(b.forFloor('some-other-floor'), isNull);
   });
+
+  group('which way you went', () {
+    // `teleport` requires a direction even though a hop crosses no tiles, and the
+    // client fills it with the way you travelled — `positionToDirectionIgnoringAxis`.
+    test('a hop along one axis faces the way it went', () {
+      expect(headingTo(fromX: 4, fromY: 4, toX: 9, toY: 4), 'Right');
+      expect(headingTo(fromX: 9, fromY: 4, toX: 4, toY: 4), 'Left');
+      expect(headingTo(fromX: 4, fromY: 4, toX: 4, toY: 9), 'Down');
+      expect(headingTo(fromX: 4, fromY: 9, toX: 4, toY: 4), 'Up');
+    });
+
+    test('a diagonal one keeps the axis it moved further along', () {
+      expect(headingTo(fromX: 0, fromY: 0, toX: 10, toY: 3), 'Right');
+      expect(headingTo(fromX: 0, fromY: 0, toX: 3, toY: 10), 'Down');
+    });
+
+    test('a hop to nowhere has no direction to name', () {
+      expect(headingTo(fromX: 4, fromY: 4, toX: 4, toY: 4), 'Down');
+      expect(
+        headingTo(fromX: 4, fromY: 4, toX: 4, toY: 4, fallback: 'Up'),
+        'Up',
+      );
+    });
+  });
+
+  group('shut doors', () {
+    SpaceRoom area({
+      required String id,
+      String type = 'MeetingRoom',
+      bool walled = true,
+      bool locked = false,
+      String? stableId,
+      int x = 0,
+      int y = 0,
+      int width = 6,
+      int height = 6,
+    }) =>
+        SpaceRoom(
+          id: id,
+          name: id,
+          type: type,
+          x: x,
+          y: y,
+          width: width,
+          height: height,
+          walled: walled,
+          locked: locked,
+          stableId: stableId,
+        );
+
+    test('the private area at a tile is the last walled one, not the smallest', () {
+      // `privateAreaAtPosition` filters to `isPrivate` and takes `last`, so the order
+      // the floor plan arrived in decides — unlike `areaAt`, which takes the smallest.
+      // An unwalled area covering the same tile is not private and never wins.
+      final map = SpaceMap(
+        floorId: 'f1',
+        width: 20,
+        height: 20,
+        blocked: const {},
+        rooms: [
+          area(id: 'outer', width: 12, height: 12),
+          area(id: 'inner', width: 4, height: 4),
+          area(id: 'open-plan', walled: false, width: 2, height: 2),
+        ],
+      );
+
+      expect(map.privateAreaAt(1, 1)?.id, 'inner');
+      expect(map.areaAt(1, 1)?.id, 'open-plan', reason: 'which asks a different thing');
+      expect(map.privateAreaAt(8, 8)?.id, 'outer');
+      expect(map.privateAreaAt(15, 15), isNull);
+    });
+
+    test('an unlocked door is open to anybody', () {
+      expect(canEnterRoom(area(id: 'a')), isTrue);
+      expect(canEnterRoom(area(id: 'a', locked: true)), isFalse);
+    });
+
+    test('a locked desk answers to its owner', () {
+      final desk = area(id: 'd', type: 'Desk', locked: true, stableId: 'desk-1');
+      expect(canEnterRoom(desk, myDeskId: 'desk-1'), isTrue);
+      expect(canEnterRoom(desk, myDeskId: 'desk-2'), isFalse);
+      // The id has to be the `MapEntityIdentifier` one. Matching `id` instead finds
+      // nothing and locks somebody out of their own desk.
+      expect(canEnterRoom(desk, myDeskId: 'd'), isFalse);
+    });
+
+    test('a locked meeting room does not, even for a desk owner', () {
+      final room = area(id: 'r', locked: true, stableId: 'room-1');
+      expect(canEnterRoom(room, myDeskId: 'room-1'), isFalse,
+          reason: 'clause 2 is guarded on isDesk');
+    });
+
+    test('being inside already is enough', () {
+      final room = area(id: 'r', locked: true, stableId: 'room-1');
+      expect(canEnterRoom(room, standingIn: room), isTrue);
+      final elsewhere = area(id: 'other', locked: true, stableId: 'room-2');
+      expect(canEnterRoom(room, standingIn: elsewhere), isFalse);
+    });
+  });
+
+  group('who a locked door lets in', () {
+    /// A locked meeting room on the base floor, hanging off identifier [stable].
+    SpaceMapBuilder locked({String stable = 'ident-1', String type = 'MeetingRoom'}) {
+      final b = _base();
+      b.apply('MapEntityIdentifier', _add({'id': stable, 'isLocked': true}));
+      b.apply('MapArea', _add({
+        'id': 'room',
+        'mapId': 'map-1',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(4, 4),
+        'mapAreaType': type,
+        'wallsTexture': 'Brick',
+        'mapEntityIdentifierId': stable,
+      }));
+      return b;
+    }
+
+    SpaceRoom roomOf(SpaceMapBuilder b) =>
+        b.forFloor('floor-1')!.rooms.firstWhere((r) => r.id == 'room');
+
+    test('an accepted access request is a key', () {
+      final b = locked();
+      b.apply('AreaAccessRequest', _add({
+        'id': 'req-1',
+        'areaId': 'ident-1',
+        'spaceUserId': 'ada',
+        'responseStatus': 'Accepted',
+      }));
+
+      final room = roomOf(b);
+      expect(room.locked, isTrue);
+      expect(room.admits, {'ada'});
+      expect(canEnterRoom(room, meId: 'ada'), isTrue);
+      expect(canEnterRoom(room, meId: 'bob'), isFalse);
+    });
+
+    test('a request still pending, or refused, is not', () {
+      final b = locked();
+      b.apply('AreaAccessRequest', _add({
+        'id': 'req-1',
+        'areaId': 'ident-1',
+        'spaceUserId': 'ada',
+        'responseStatus': 'Pending',
+      }));
+      b.apply('AreaAccessRequest', _add({
+        'id': 'req-2',
+        'areaId': 'ident-1',
+        'spaceUserId': 'bob',
+        'responseStatus': 'Declined',
+      }));
+
+      expect(roomOf(b).admits, isEmpty);
+    });
+
+    test('a request against the area id finds nothing, which is the join to get wrong', () {
+      // `areaId` is the `MapEntityIdentifier` id, not `MapArea.id`. Reading it the
+      // other way round is silent and locks everybody out.
+      final b = locked();
+      b.apply('AreaAccessRequest', _add({
+        'id': 'req-1',
+        'areaId': 'room',
+        'spaceUserId': 'ada',
+        'responseStatus': 'Accepted',
+      }));
+
+      expect(roomOf(b).admits, isEmpty);
+    });
+
+    test('a seat at a meeting held there is also a key', () {
+      // `canSpaceUserAccess` opens on `meetingParticipantsBySpaceUserId[id]` and asks
+      // nothing about the response status — being listed is the whole test.
+      final b = locked();
+      b.apply('Meeting', _add({'id': 'meet-1', 'areaId': 'ident-1'}));
+      b.apply('MeetingParticipant', _add({
+        'id': 'part-1',
+        'meetingId': 'meet-1',
+        'spaceUserId': 'ada',
+      }));
+
+      expect(roomOf(b).admits, {'ada'});
+    });
+
+    test('a seat at a meeting held somewhere else is not', () {
+      final b = locked();
+      b.apply('Meeting', _add({'id': 'meet-2', 'areaId': 'other-ident'}));
+      b.apply('MeetingParticipant', _add({
+        'id': 'part-1',
+        'meetingId': 'meet-2',
+        'spaceUserId': 'ada',
+      }));
+
+      expect(roomOf(b).admits, isEmpty);
+    });
+
+    test('an unlocked room admits nobody in particular, because it admits everybody', () {
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'room',
+        'mapId': 'map-1',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(4, 4),
+        'mapAreaType': 'MeetingRoom',
+        'wallsTexture': 'Brick',
+      }));
+
+      final room = roomOf(b);
+      expect(room.admits, isEmpty);
+      expect(canEnterRoom(room, meId: 'ada'), isTrue);
+    });
+
+    test('a key granted mid-session opens the door without a reconnect', () {
+      // The rows arrive as patches like everything else, and the map is rebuilt on
+      // the next read — so an access request accepted while you are standing outside
+      // is answered by the next tap, not by the next session.
+      final b = locked();
+      expect(roomOf(b).admits, isEmpty);
+
+      b.apply('AreaAccessRequest', _add({
+        'id': 'req-1',
+        'areaId': 'ident-1',
+        'spaceUserId': 'ada',
+        'responseStatus': 'Accepted',
+      }));
+
+      expect(roomOf(b).admits, {'ada'});
+    });
+  });
 }

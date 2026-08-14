@@ -325,6 +325,13 @@ class DirectCollector {
     if (!x.isFinite || !y.isFinite) {
       return (ok: false, detail: 'teleport needs finite coordinates');
     }
+    // Checked here rather than left to the gateway, for the reason [_act] gives: the
+    // schema is `nativeEnum(MoveDirection)` and a zod failure executes *nothing*, so an
+    // unrecognised direction would not be a teleport that landed facing oddly — it
+    // would be a teleport that silently did not happen.
+    if (!moveDirections.contains(direction)) {
+      return (ok: false, detail: '$direction is not a direction');
+    }
     // Flat x/y — `{position:{x,y}}` is rejected — and `direction` is required even
     // though teleporting does not pass through any tiles.
     return _act('teleport', {'x': x, 'y': y, 'direction': direction});
