@@ -16,7 +16,7 @@ or the npm package.
 | `probe-connect.mjs` | The direct-connection spike, still the fastest way to ask Gather a question. `adopt` reuses the desktop session; `spaces` lists ids; `connect` opens a read-only game socket. **`map`** dumps the shape of the map models and tries the REST routes (all 404 — the map is only ever on the socket). **`walkable`** builds the collision grid and scores it against the live roster, which is how the rounding rule in `space_map.dart` was settled. `--dump <file>` writes the raw rows so hypotheses can be swept offline instead of over somebody's workspace. |
 | `probe-events.mjs` | The instrument that found Gather's event bus. Prints the full model census, dumps the interaction-shaped models whole, then watches **every** delta patch and bus event unfiltered — which is what `probe-connect.mjs` structurally could not do, since it pipes frames through the four-model reader. Read-only observer; never sends `enterSpace`. |
 | `probe-sfu.mjs` | The media-plane capture. Attaches to a running desktop client over CDP and records **every** WebSocket it owns — the upgrade request and its headers, both frame directions, and the close — then prints a grammar summary: where the credential lives, what the correlation key is, and the full ordered method vocabulary per socket. Decodes msgpack (the game socket) and Engine.IO/Socket.IO (the router and SFU sockets). Sends nothing to Gather. |
-| `make_icons.mjs` | Draws the icon from constants and writes all fifteen asset-catalogue sizes, the launch mark on alpha, and the squircled `docs/icon.png`. Zero dependencies — the PNG encoder is `node:zlib` plus a CRC table. |
+| `make_icons.mjs` | Draws the icon from constants and writes all fifteen asset-catalogue sizes, the launch mark on alpha, and the squircled `assets/icon.png`. Zero dependencies — the PNG encoder is `node:zlib` plus a CRC table. |
 | `upload-testflight.sh` | Uploads `build/ios/ipa/gather_companion.ipa` via `xcrun altool`. **CI runs this exact script**, so the human path and the automated path cannot drift. |
 | `icon-preview.png` | Output of `--preview`, committed for review. |
 
@@ -109,7 +109,7 @@ before changing it — CI depends on it.
 
 ### Internal
 
-`make_icons.mjs` → `ios/Runner/Assets.xcassets/`, `docs/icon.png`, and the token
+`make_icons.mjs` → `ios/Runner/Assets.xcassets/`, `assets/icon.png`, and the token
 values in `lib/theme/gather_theme.dart`.
 `upload-testflight.sh` → `ios/ExportOptions.plist`, `build/ios/ipa/`, and is
 invoked by `.github/workflows/publish.yml`.

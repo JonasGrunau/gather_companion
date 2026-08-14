@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/icon.png" width="104" alt="Gather Companion — a ping on a pixel grid">
+<img src="assets/icon.png" width="104" alt="Gather Companion — a ping on a pixel grid">
 
 # Gather Companion
 
@@ -805,7 +805,7 @@ dark indigo tile is the app's own `background`, not Gather's blue square. It is
 drawn by `tool/make_icons.mjs` (zero-dep: `node:zlib` plus a CRC table, same
 spirit as the bridge's hand-rolled `qr.js`), which writes three sets from one
 source of truth: all fifteen asset-catalog sizes, the launch mark on alpha, and
-the squircled `docs/icon.png` at the top of this page.
+the squircled `assets/icon.png` at the top of this page.
 
 ```sh
 node tool/make_icons.mjs --preview

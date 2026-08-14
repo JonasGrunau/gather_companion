@@ -336,18 +336,18 @@ for (const [name, size] of Object.entries(LAUNCH)) {
 }
 
 // The READMEs show the icon as a phone would: squircled, on alpha, so it sits on
-// either GitHub theme. Written into `docs/` rather than next to the catalogue
+// either GitHub theme. Written into `assets/` rather than next to the catalogue
 // because it is documentation, not an app asset — and generated here rather than
 // hand-rounded so it cannot drift from what the app actually ships. Supersampled
 // harder than the catalogue sizes: this one is a single large render, and its
 // curve is the whole point.
-const docs = join(here, '..', '..', 'docs');
-mkdirSync(docs, { recursive: true });
+const assets = join(here, '..', 'assets');
+mkdirSync(assets, { recursive: true });
 writeFileSync(
-  join(docs, 'icon.png'),
+  join(assets, 'icon.png'),
   encodePng(512, render(512, { mask: true, ss: 8 }), { alpha: true }),
 );
-console.log(`  ${'docs/icon.png'.padEnd(30)} 512×512  (squircle, alpha)`);
+console.log(`  ${'assets/icon.png'.padEnd(30)} 512×512  (squircle, alpha)`);
 
 if (process.argv.includes('--preview')) {
   const out = join(here, 'icon-preview.png');
