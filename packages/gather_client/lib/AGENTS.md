@@ -21,16 +21,16 @@ you change something here, look at the JS twin named in the table.
 | `msgpack.dart` | `bridge/lib/msgpack.js` | Decoder for everything Gather sends, incl. 5 ext types. Shallow encoder for the 5 frames we send. |
 | `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, plus `MeetingWatch` for invites and knocks. |
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
-| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, backoff, `describeClose()`, and the `_silenceLimit` deaf-socket watchdog. The watchdog and the close-code wording are ports and must not drift: `SILENCE_LIMIT_MS` / `_silenceLimit`, `describeClose` on both sides. |
+| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, `setGait`, backoff, `describeClose()`, and the `_silenceLimit` deaf-socket watchdog. The watchdog and the close-code wording are ports and must not drift: `SILENCE_LIMIT_MS` / `_silenceLimit`, `describeClose` on both sides. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
 | `activity_feed.dart` | *(no counterpart)* | `ActivityFeed` + the `ActivityItem` hierarchy — Gather's own activity feed, over **REST**, not the socket. `GET /chat/activity-feed` answers `application/x.gather.msgpack`, so `msgpackDecode` reads it and `GatherHttp.getBytes` exists because `getJson` would mangle it. The body is normalised like a state dump: id lists per kind plus a model store, so `parseActivityFeed` is a set of joins — a wave's actor is on `ChatMessageMetadata`, not on the message, and read state is `ActivityEventSubscription.readAt`, not on the event. There is no pagination; every query param is ignored. `markRead` is **JSON** (the response is still msgpack — the endpoint is not symmetric), names the *event* id rather than the subscription that carries `readAt`, sends one request per item because no batch form exists, and is a **toggle** with no `read: true` — so filtering to unread items is correctness, not an optimisation, or "mark all read" un-reads most of the list. All four were guessed wrong before being captured off the desktop client; the shapes are in `../../../docs/gather-api.md#marking-activity-read`. **Waves and activity events are measured; the mention, reaction and reply joins are not** — no space available had one, so each degrades to `UnknownActivity` rather than throwing. The bridge has no counterpart because push already covers what it would use this for. |
 | `sfu_signalling.dart` | *(no counterpart)* | `SfuSignalling` — the media plane's Socket.IO transport: CONNECT auth, ack-keyed `sendWithResponse`, the `{wsSequenceNumber, zodData}` envelope, server-push notifications, backoff. The bridge will never speak to the SFU. |
 | `party.dart` | *(deleted from the bridge)* | `PartyMode`. Lives only here now — the app holds the socket, and two parties driving one avatar would fight. Draws its tiles from `space_map.dart`. |
 | `space_art.dart` | *(no counterpart)* | `SpaceArt` / `ArtGround` / `ArtFloor` / `ArtWall` / `ArtSprite`, and the URL rules for Gather's floor, wall and furniture art. **Transcribed from the client bundle.** Gather ships no tileset: this is the list of images to fetch and where each one goes, 573 of them totalling 222 KB on the measured space. Note the two depths a wall can have — the sides are `ArtWall` in `ground`, while the north and south bands are `ArtSprite`s in `props`, because `ensureImmersiveWalls` gives them depths of their own. |
-| `profile_photos.dart` | *(no counterpart)* | `ProfilePhotos`. Turns a `SpaceUser.profilePictureId` into a URL you can load, which takes a REST call: the `UserFile` rows **are** in the state dump and all three of their URL fields come across msgpack-undefined on every row, and the bucket refuses an unsigned request. `GET /spaces/:id/files/:fileId` answers a CloudFront signature valid 24 hours that needs **no** authorization header — which is why this hands back a URL rather than bytes. Cached hard, failures included: the map draws a hundred faces and rebuilds four times a second. |
-| `avatar.dart` | *(no counterpart)* | `hashOutfit` / `avatarSpriteUrl` / `avatarAnimation` / `AvatarAnimation` / `avatarFrame` / `Facing` / `Pose`. The sprite service composites an outfit into one 72-frame sheet; the "hash" is the wearable ids joined with dots plus a timestamp, and getting its order or format wrong is a 404 rather than a wrong-looking person. The animation table is `Ae` from the client, transcribed with its frame rates: walking at 7fps, talking at 4, a still pose declared as one frame at 60. |
-| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas), "may I take *this* step" (`canStep` / `canPassThrough` — walls are lines between tiles, not tiles), "what is this room called" and "is somebody standing here sitting down" (`isSeat` — `playerState` never reaches the wire, so it is derived from the chair). `artFor()` builds the drawable scene from the same rows. Also "how do I walk there" (`routeTo`) and "where do I stand when the answer is a whole room" (`tilesClosestTo`), both transcribed from the client's own pathfinder — see below. `isPublicWalkway` and `navigatesToTile` are its two area predicates, top-level rather than methods because they are pure functions of `mapAreaType`. |
-| `walk.dart` | *(no counterpart)* | `Walk` — all of movement. Repeats `move` at Gather's own walking pace while a direction is held, applies `SpaceMap.canStep` to every step, and tracks its own tile because the roster is always two steps behind a walk. `follow(route)` is the other half: the tapped-destination walk, stepping a route from `SpaceMap.routeTo` to its end. **One stepper, deliberately** — a route and a held D-pad driving the same avatar would fight, so `press` cancels a route outright. The route is held as *tiles* rather than as directions, so each step re-derives its direction from wherever the roster says we actually are, and a correction that puts us somewhere the route does not pass through ends the walk instead of blindly applying the rest of it. |
+| `profile_photos.dart` | *(no counterpart)* | `ProfilePhotos`. Turns a `SpaceUser.profilePictureId` into a URL you can load, which takes a REST call: the `UserFile` rows **are** in the state dump and all three of their URL fields come across msgpack-undefined on every row, and the bucket refuses an unsigned request. `GET /spaces/:id/files/:fileId` answers a CloudFront signature valid 24 hours that needs **no** authorization header — which is why this hands back a URL rather than bytes. Cached hard, failures included: the map draws a hundred faces and rebuilds four times a second. Every test in `test/profile_photos_test.dart` is a count of requests, because that is the only interesting question here — and the first of them was written because `whenComplete(() => _inFlight.remove(id))` handed its own future back to itself and deadlocked every lookup. The cache still filled, so faces still appeared; they just waited for the next rebuild caused by something else. |
+| `avatar.dart` | *(no counterpart)* | `hashOutfit` / `avatarSpriteUrl` / `avatarAnimation` / `AvatarAnimation` / `avatarFrame` / `Facing` / `Pose`. The sprite service composites an outfit into one 72-frame sheet; the "hash" is the wearable ids joined with dots plus a timestamp, and getting its order or format wrong is a 404 rather than a wrong-looking person. The animation table is `Ae` from the client, transcribed with its frame rates: walking at 7fps, talking at 4, a still pose declared as one frame at 60. Also `goKartUrl` / `goKartAnimation` / `goKartFrameSize`: the run cycle and the go-kart, which used to be unreachable here and are not any more. `Pose.running` is chosen on `speed.modifier > 1` — running and driving share it, there is no third cycle — and the kart is a separate 512×32 sheet of 16 frames laid **over** the body. Its frame order starts *east* where the avatar's starts south, which is exactly the sort of thing that silently points everybody's kart the wrong way. |
+| `space_map.dart` | *(no counterpart)* | `SpaceMap` / `SpaceRoom` / `SpaceMapBuilder` — the floor plan. **Transcribed from Gather's client bundle**, not inferred: every rule names the getter it came from. Answers "which tiles can I stand on" (`walkable`), "where may a party go" (`open`, which also drops walled areas), "may I take *this* step" (`canStep` / `canPassThrough` — walls are lines between tiles, not tiles), "what is this room called" and "is somebody standing here sitting down" (`isSeat` — `playerState` never reaches the wire, so it is derived from the chair). `artFor()` builds the drawable scene from the same rows. Also "how do I walk there" (`routeTo`) and "where do I stand when the answer is a whole room" (`tilesClosestTo`), both transcribed from the client's own pathfinder — see below. `isPublicWalkway` and `navigatesToTile` are its two area predicates, top-level rather than methods because they are pure functions of `mapAreaType`. It also owns the **movement vocabulary** that is not geometry — `moveDirections`, `stepOf`, and `Gait` / `gaitOf` — because `direct_collector.dart` needs those words and importing `walk.dart` for them would be a cycle. |
+| `walk.dart` | *(no counterpart)* | `Walk` — all of movement. Repeats `move` at Gather's own walking pace while a direction is held, applies `SpaceMap.canStep` to every step, and tracks its own tile because the roster is always two steps behind a walk. `follow(route)` is the other half: the tapped-destination walk, stepping a route from `SpaceMap.routeTo` to its end. **One stepper, deliberately** — a route and a held D-pad driving the same avatar would fight, so `press` cancels a route outright. The route is held as *tiles* rather than as directions, so each step re-derives its direction from wherever the roster says we actually are, and a correction that puts us somewhere the route does not pass through **re-plans** (`_replan`) rather than blindly applying the rest of it. That is the client's own recovery — `updatePathMove` re-runs the whole pathfinder every tick and takes `moveRoute[1]` — done on divergence rather than on every tick, since at a kart's pace every tick would be twenty-one searches a second. It used to simply stop, which was survivable at seven tiles a second and was not at twenty-one. **How fast is also here**, and it is the client's own arithmetic: `gaitToSetOff` picks a ceiling from the route's length (walk to 13 tiles, run to 23, take the go-kart past that), `gaitFor` recomputes from what is *left* on every step and never exceeds the ceiling, so a route only ever decelerates and the last six tiles of anything are walked. The gait divides the step interval — `getMoveInterval(m) = (1000/7) / m` — so the timer is re-timed whenever it changes, and entering `Gait.driving` parks a `kartPause` of two walking steps in which nothing moves at all, which is the beat the kart appears in. Standing in an area that is not a public walkway forces a walk however far there is left to go. `boost` is the shift key, and it is a live field rather than an argument because shift can be pressed *during* a walk: while it is on you drive, full stop — no distance test, no deceleration, no area test, exactly as `onArrowKeyDown(dir, shiftKey)` has none of the three. |
 
 ## Things that will bite you
 
@@ -56,6 +56,15 @@ you change something here, look at the JS twin named in the table.
   connection. **The JS twin `bridge/lib/direct.js` must never grow these frames** —
   that divergence is the one exception to the never-drift rule, and
   `bridge/test/direct.test.js` guards it.
+- **`SfuSignalling.start()` waits for the handshake, and that is load-bearing.**
+  `_open()` ends at `socket.connect()`, which only *starts* it. A `start()` that
+  awaited `_open()` alone resolved a round trip early, so the caller's first
+  question came back `not connected` — followed a beat later by the connection
+  succeeding. Every first call failed and every retry worked, which reads as a
+  flaky server rather than a bug here. A refusal settles it immediately rather
+  than making a tapped button wait out the ten-second timeout, and a second
+  concurrent `start()` joins the first attempt instead of replacing its completer
+  and stranding whoever was already waiting.
 - **Never use `emitWithAckAsync` on the SFU sockets.** `socket_io_client`
   dispatches an ack with `Function.apply(ack, args)`, so an ack whose payload is
   `[]` calls back with **zero** arguments — and that method's internal callback
@@ -101,11 +110,66 @@ you change something here, look at the JS twin named in the table.
   drunk. Note also that this is not textbook A\* — the came-from map doubles as the
   visited set, so a node is enqueued once and never re-opened. That is transcribed
   too; diverging would put this client on different routes from the desktop one.
+- **A destination is relocated, never refused.** The single most important thing
+  about `routeTo`'s callers, and getting it wrong made tap-to-walk look broken.
+  `blockedAtPosition` has **no exemption for seats** — a chair carrying collision
+  points is as impassable as a wall in Gather too — and the client does not care,
+  because `startPathMoveOnCurrentFloor` runs `getNearestFreeTile(goal, dir, 4)` over
+  a blocked goal and walks you to the tile beside it. `moveSpaceUserToTile` does the
+  same for a tile somebody is standing on. `nearestFree` is that rule; anything that
+  refuses on `!isWalkable` is reproducing the bug. Note the search box: **2 by
+  default, 4 when starting a walk**. One ring is not enough — a chair in the middle
+  of a desk cluster is more than one tile from open floor.
+- **A route that cannot be found ends in a teleport, not in an apology.**
+  `shouldTeleport(reason)` is true for `NoPathFound` and `MaxDepthReached`, so
+  `setPathMoveTo` blinks you there rather than telling you the place is unreachable.
+  That matters more here than it does in the client, because the area rule above
+  makes "no route" an ordinary answer in a real office. Note the bounds check it is
+  paired with: `Hh` measures the goal against `baseArea.dimensionsInTiles`, which is
+  the **whole grid** and not the office footprint, and `moveSpaceUserToTile` navigates
+  to a tile with no area at all (`isNil(E) || E.shouldNavigateToTile()`). So the
+  emptiness around the building is a destination like any other. This screen briefly
+  refused it — a teleport into the void looked like a trap — and that was an invented
+  rule: the way back is another tap, and a second client that quietly disallows what
+  the first allows is worse than one that lets you stand somewhere odd.
+- **There is no go-kart.** No vehicle model, no ride action, nothing on the wire that
+  says "in a kart". There is `speed.modifier`, it is 1, 2 or 3, and
+  `PlayerEntityRenderer` draws a kart under anybody who reaches 3
+  (`if (getSpeedModifier() === Speed.DRIVING) this.setVehicle({id: "goKart-for-speed-modifier"})`).
+  So "implement the go-kart" is: send `drive`, step three times as often, and draw
+  the sheet. Miss the first of those and the pace is still right on this phone and
+  wrong on every other screen in the space — an avatar crossing the office at
+  twenty-one tiles a second in an idle pose.
+- **Speed is a multiplier on everything, including the things measured in steps.**
+  A go-kart sends `move` three times as often, so anything counted in *steps* buys a
+  third as much *time* — and the roster it is being reconciled against did not speed
+  up. `_maxPending` was a flat 16 and so covered 2.3 seconds at a walk and 0.76 of a
+  second while driving, which is three roster ticks; one late roster past that and
+  the tile it names has already fallen off the list, so a roster that was merely
+  behind reads as a correction from nowhere and the walk ends in the middle of the
+  office. `_pendingLimit` scales it by the gait. Anything else expressed in steps
+  wants the same treatment before the kart is trusted at speed.
+- **Gather has two doors to driving and they obey different rules.** The automatic
+  one picks a gait from the route's length and then *decelerates*, so the kart is
+  gone for the last sixteen tiles of every journey. The manual one is the shift key,
+  and `onArrowKeyDown` does nothing but
+  `setSpeedModifier(shift ? DRIVING : WALKING)` — no distance, no deceleration, no
+  area check. Wiring the manual door through the automatic one's machinery is a bug
+  that has already been made here once: a latched kart on a twenty-tile route lasted
+  four steps before the deceleration cancelled it, which reads as the feature not
+  working at all. `Walk.boost` bypasses all three rules, deliberately.
 - **`SpaceRoom.locked` is a join, not a field.** `isLocked` lives on
   `MapEntityIdentifier` and the area only points at it, which is why that model is in
   `_models`. Nothing server-side enforces a lock — `move` and `teleport` both validate
   nothing — so a client that does not ask walks into a meeting somebody shut the door
   on.
+- **An area has two ids and they are not interchangeable.** `SpaceRoom.id` is the
+  `MapArea` row; `SpaceRoom.stableId` is the `MapEntityIdentifier` it points at, and
+  that is the one everything outside the floor plan addresses it by. `SpaceUser.deskId`
+  is a one-to-one at `MapEntityIdentifier`, so a desk is found by matching `stableId` —
+  matching `id` compiles, reads correctly, and finds nobody's desk on a live space.
+  Gather's own property name for it is `stableId_USE_THIS_INSTEAD_OF_ID`, shouting
+  included.
 - **Wall collision does not follow the wall art.** `Collisions.addArea` runs its side
   walls the full height of the room; `space_art.dart`'s drawing loop stops three rows
   short because the north and south bands are two tiles tall and cover the corners.

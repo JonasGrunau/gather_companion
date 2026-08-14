@@ -23,25 +23,40 @@
 /// A phone has one microphone and two cameras, and the second is a button rather
 /// than a menu, so those are gone too.
 ///
-/// ## Off is red, and pressed is not
+/// ## What red means, and the one control that is dimmed
 ///
-/// A muted microphone is drawn crossed out in [GatherTokens.danger], which is
-/// what the media check already does and what Gather does. That is a *state*, and
-/// states are allowed a colour. The D-pad's rule — pressed is a step of opacity,
-/// never a different paint — is about a control being *pushed*, and still holds
-/// for the press itself.
+/// Red used to be the mute state: a crossed-out microphone painted in
+/// [GatherTokens.danger]. It is not any more, because the glyph had already said
+/// it. `mic_off` *is* a microphone with a line through it — the shape carries the
+/// state — and painting it red as well spent the bar's one alarming colour on the
+/// most ordinary thing a person does in a meeting. Off is now the same grey every
+/// other resting icon is, and [GatherTokens.brand] marks the two controls that are
+/// actually broadcasting.
 ///
-/// Nothing here is ever greyed out. A control that cannot do anything is not
-/// dimmed, it is absent: the conversation button appears when there is a
-/// conversation and is gone when there is not, so the bar never contains a
-/// button that does nothing when pressed.
+/// Red is spent instead on the desk, where it says something no glyph can: you are
+/// not where the office has you filed. The D-pad's rule — pressed is a step of
+/// opacity, never a different paint — is about a control being *pushed*, and still
+/// holds for the press itself.
+///
+/// The desk is also the one control here that is ever greyed out, against the
+/// standing rule that a button which can do nothing is absent rather than dimmed.
+/// The rule is right for the others: the conversation button appears when there is
+/// a conversation to leave and is gone when there is not, and its absence costs the
+/// reader nothing. Being at your own desk is different. It is the answer to "where
+/// am I", it is the state a person opens the bar to check, and a button that has
+/// vanished cannot tell anybody they have arrived. So the desk is absent only when
+/// Gather has given you no desk at all, and dim when you are already sitting at it.
 library;
 
 import 'package:flutter/material.dart';
+// For [RenderProxyBox] — `material.dart` does not re-export the render tree, and
+// [_NoWidthOpinion] needs one box that measures itself differently.
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
+import 'call_screen.dart';
 import 'person_avatar.dart';
 import 'status_sheet.dart';
 
@@ -106,6 +121,31 @@ class _ControlBarState extends State<ControlBar> {
     await _run(() => widget.state.sendEmote(emote));
   }
 
+  /// The way back to your own desk, in the three states it has.
+  ///
+  /// Gather's own toolbar button, transcribed — the shape of it is not ours:
+  ///
+  /// ```js
+  /// onClick: hasDesk ? () => moveSpaceUserToDesk() : () => startGuidedClaimDeskFlow(),
+  /// disabled: currentUserAtDesk
+  /// ```
+  ///
+  /// The desktop offers to *claim* a desk when you have none. This cannot: claiming
+  /// one is a guided flow over a map you cannot edit from a phone. So the branch
+  /// this app keeps is the other one, and no desk means no button — dimming it
+  /// would tell somebody who has never had a desk that they are sitting at it.
+  Widget _deskButton(BuildContext context, AppState state) {
+    if (state.myDesk == null) return const SizedBox.shrink();
+    final atDesk = state.atMyDesk;
+
+    return _BarButton(
+      icon: Icons.meeting_room_rounded,
+      label: atDesk ? 'You are at your desk' : 'Back to my desk',
+      tint: atDesk ? null : context.tokens.danger,
+      onTap: atDesk ? null : () => _run(state.goToMyDesk),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
@@ -114,6 +154,10 @@ class _ControlBarState extends State<ControlBar> {
 
     return Column(
       mainAxisSize: MainAxisSize.min,
+      // The dock stretches this to the island's width; this passes that width on
+      // to both rows, so the tray's eight reactions and the controls above the
+      // navigation all divide the same span instead of each finding their own.
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         // A row of the same island rather than a thing floating over it: the tray
         // pushes the dock upwards when it opens and lets it back down when a
@@ -137,13 +181,15 @@ class _ControlBarState extends State<ControlBar> {
               _BarButton(
                 icon: call.micOn ? Icons.mic_rounded : Icons.mic_off_rounded,
                 label: call.micOn ? 'Mute' : 'Unmute',
-                tint: call.micOn ? t.brand : t.danger,
+                // Brand while it is live, and the bar's ordinary resting grey once
+                // it is not. See the header: the crossed-out glyph is the state.
+                tint: call.micOn ? t.brand : t.mutedForeground,
                 onTap: () => _run(() => state.setMicOn(!call.micOn)),
               ),
               _BarButton(
                 icon: call.cameraOn ? Icons.videocam_rounded : Icons.videocam_off_rounded,
                 label: call.cameraOn ? 'Turn the camera off' : 'Turn the camera on',
-                tint: call.cameraOn ? t.brand : t.danger,
+                tint: call.cameraOn ? t.brand : t.mutedForeground,
                 onTap: () => _run(() => state.setCameraOn(!call.cameraOn)),
               ),
               // Only once there is a camera running to flip. Absent rather than
@@ -154,6 +200,24 @@ class _ControlBarState extends State<ControlBar> {
                   label: 'Switch camera',
                   onTap: state.switchCamera,
                 ),
+              // The way to the faces — including your own. The camera being on
+              // is enough: turning it on and having nowhere to see the picture
+              // reads as the camera not working, which is exactly how this was
+              // first reported. A route rather than a panel, because an
+              // `RTCVideoRenderer` that is off-screen still decodes, so the
+              // surface should not exist while nobody is looking at it.
+              if (call.hasCompany || call.cameraOn)
+                _BarButton(
+                  icon: Icons.groups_rounded,
+                  label: call.hasCompany
+                      ? 'See the conversation'
+                      : 'See your camera',
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => CallScreen(state: state),
+                    ),
+                  ),
+                ),
               const _Rule(),
               _BarButton(
                 icon: Icons.add_reaction_outlined,
@@ -161,11 +225,14 @@ class _ControlBarState extends State<ControlBar> {
                 on: _tray,
                 onTap: _toggleTray,
               ),
-              _BarButton(
-                icon: Icons.back_hand_outlined,
-                label: state.handRaised ? 'Lower your hand' : 'Raise your hand',
-                on: state.handRaised,
-                onTap: () => _run(() => state.setHandRaised(!state.handRaised)),
+              // Its own listener. Walking is deliberately not a `notifyListeners`
+              // — movement must not wake the whole tree — and this is the one
+              // control in the bar whose answer changes as you walk. Without it the
+              // button stays red under the thumb that pressed it until something
+              // unrelated happens to rebuild the bar.
+              ListenableBuilder(
+                listenable: state.positions,
+                builder: (context, _) => _deskButton(context, state),
               ),
               if (state.inHuddle) ...[
                 const _Rule(),
@@ -253,14 +320,17 @@ class _BarButton extends StatelessWidget {
 
   final IconData icon;
   final String label;
-  final VoidCallback onTap;
+
+  /// Null for a control that is present but cannot be pressed — see the header for
+  /// why exactly one of these is allowed to exist.
+  final VoidCallback? onTap;
 
   /// Whether this is a control that is currently *in* a state, as opposed to one
   /// that merely does something when pressed.
   final bool on;
 
-  /// Overrides the colour entirely, for the two controls that are red when off
-  /// rather than grey.
+  /// Overrides the colour entirely, for the controls that are painted by what they
+  /// are reporting rather than by whether they are pressed.
   final Color? tint;
 
   @override
@@ -269,15 +339,24 @@ class _BarButton extends StatelessWidget {
     // Concentric with the island, like the nav plates below: the dock's corner
     // minus the inset to here. See `_NavItem` in home_shell.dart.
     final radius = BorderRadius.circular(t.radius + 4);
+    // Dimmed rather than recoloured, so a control that has gone quiet is plainly
+    // the same control. `tint` is ignored here on purpose: red means "go back", and
+    // a faded red would read as a warning being whispered rather than withdrawn.
+    final colour = onTap == null
+        ? t.mutedForeground.withValues(alpha: 0.38)
+        : tint ?? (on ? t.brand : t.mutedForeground);
 
     return Semantics(
       button: true,
+      enabled: onTap != null,
       label: label,
       child: Tooltip(
         message: label,
         child: Material(
           color: Colors.transparent,
           child: InkWell(
+            // A null callback is what makes the plate inert: no splash, no
+            // highlight, no tap.
             onTap: onTap,
             borderRadius: radius,
             child: AnimatedContainer(
@@ -292,7 +371,7 @@ class _BarButton extends StatelessWidget {
               child: TweenAnimationBuilder<Color?>(
                 duration: const Duration(milliseconds: 220),
                 curve: Curves.easeOutCubic,
-                tween: ColorTween(end: tint ?? (on ? t.brand : t.mutedForeground)),
+                tween: ColorTween(end: colour),
                 builder: (context, colour, _) => Icon(icon, size: 22, color: colour),
               ),
             ),
@@ -322,6 +401,22 @@ class _Rule extends StatelessWidget {
 /// Undecorated: the dock paints the island, and a second bordered box inside it
 /// would read as a dialog sitting on a bar rather than as the bar having grown a
 /// row.
+///
+/// ## Why the eight divide the width instead of setting it
+///
+/// The whole dock is sized by an [IntrinsicWidth] over its rows, so anything with
+/// an opinion about its own width can move the island. Eight 40-point reactions
+/// have a very firm one — 328 points, eight past the [kRailMinWidth] floor the two
+/// permanent rows settle on — and the island grew by those eight points every time
+/// the tray opened and shrank back every time a reaction was picked. Nothing was
+/// wrong with the tray; the dock was being asked a question by a row that is only
+/// up for a second.
+///
+/// So the tray answers zero when asked how wide it wants to be ([_NoWidthOpinion])
+/// and divides whatever it is handed between the eight ([Expanded]). The closed
+/// tray already worked this way by accident: a childless `SizedBox(width:
+/// double.infinity)` reports an intrinsic width of zero, which is exactly the
+/// "fill it, don't set it" this needed all along.
 class _Tray extends StatelessWidget {
   const _Tray({required this.onPick});
 
@@ -331,35 +426,58 @@ class _Tray extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
-      decoration: BoxDecoration(
-        border: Border(bottom: BorderSide(color: t.border)),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          for (final emote in _emotes)
-            Semantics(
-              button: true,
-              label: 'Send $emote',
-              child: Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  onTap: () => onPick(emote),
-                  borderRadius: BorderRadius.circular(t.radius + 4),
-                  child: SizedBox(
-                    width: 40,
-                    height: 40,
-                    child: Center(
-                      child: Text(emote, style: const TextStyle(fontSize: 21)),
+    return _NoWidthOpinion(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+        decoration: BoxDecoration(
+          border: Border(bottom: BorderSide(color: t.border)),
+        ),
+        child: Row(
+          children: [
+            for (final emote in _emotes)
+              Expanded(
+                child: Semantics(
+                  button: true,
+                  label: 'Send $emote',
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () => onPick(emote),
+                      borderRadius: BorderRadius.circular(t.radius + 4),
+                      child: SizedBox(
+                        height: 40,
+                        child: Center(
+                          child: Text(emote, style: const TextStyle(fontSize: 21)),
+                        ),
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
+}
+
+/// A child that takes the width it is given and asks for none of its own.
+///
+/// [RenderProxyBox] passes layout, painting and hit-testing straight through and
+/// forwards every intrinsic measurement to the child; this overrides the two
+/// horizontal ones to zero and leaves the vertical pair alone, because the dock
+/// genuinely does need the tray's height to animate to. See [_Tray].
+class _NoWidthOpinion extends SingleChildRenderObjectWidget {
+  const _NoWidthOpinion({required Widget super.child});
+
+  @override
+  RenderProxyBox createRenderObject(BuildContext context) => _RenderNoWidthOpinion();
+}
+
+class _RenderNoWidthOpinion extends RenderProxyBox {
+  @override
+  double computeMinIntrinsicWidth(double height) => 0;
+
+  @override
+  double computeMaxIntrinsicWidth(double height) => 0;
 }

@@ -256,6 +256,11 @@ class AppState extends ChangeNotifier {
       speaking: _snapshot.players.any((p) => p.id == me.id && p.speaking),
       avatarUrl: _collector?.avatarUrlFor(me.id),
       direction: me.direction,
+      // Mine off [Walk] and not off the row. The gait changes twice inside a single
+      // route and the roster is coalesced to a quarter of a second, so reading my own
+      // back off the wire would show me climbing into the kart two tiles after the
+      // avatar started driving, and still in it after I stopped.
+      gait: gait,
       availability: me.availability,
       isMe: true,
     );
@@ -297,6 +302,7 @@ class AppState extends ChangeNotifier {
           speaking: speaking.contains(row.id),
           avatarUrl: _collector?.avatarUrlFor(row.id),
           direction: row.direction,
+          gait: gaitOf(row.speed),
           availability: row.availability,
         ),
       );
@@ -452,13 +458,6 @@ class AppState extends ChangeNotifier {
   /// status is a status to whoever is reading it.
   PersonStatus? get customStatus => _myRow()?.status;
 
-  /// Whether my hand is up.
-  ///
-  /// Local, unlike [customStatus]: `handRaisedAt` is on the model but not in the
-  /// tracked field set, so there is nothing to read it back from yet.
-  bool get handRaised => _handRaised;
-  bool _handRaised = false;
-
   // ---- faces -------------------------------------------------------------------
 
   ProfilePhotos? _photos;
@@ -487,10 +486,47 @@ class AppState extends ChangeNotifier {
     // safe, and `isResolved` above is what stops the rebuild asking again.
     unawaited(
       photos.urlFor(spaceId: spaceId, fileId: fileId).then((url) {
-        if (url != null && _photos == photos) notifyListeners();
+        if (url != null && _photos == photos) _announceFaces();
       }),
     );
     return null;
+  }
+
+  /// The picture URLs known so far for [spaceUserIds].
+  ///
+  /// Same lazy contract as [photoUrlFor] — asking is what starts the lookups —
+  /// but for a screenful at once, which is what a list wants when it is about
+  /// to warm an image cache. Ids still being looked up are simply absent; their
+  /// answers arrive as a change on this object, and the next call includes
+  /// them.
+  ///
+  /// A set on the way out, because the same person on four rows is one picture,
+  /// and the caller is going to hand these to a cache that would rather be told
+  /// once.
+  List<String> photosFor(Iterable<String> spaceUserIds) {
+    if (_photos == null) return const [];
+
+    final urls = <String>{};
+    for (final id in spaceUserIds.toSet()) {
+      final url = photoUrlFor(id);
+      if (url != null) urls.add(url);
+    }
+    return urls.toList(growable: false);
+  }
+
+  Timer? _faceNotice;
+
+  /// Announces resolved faces at most once a frame.
+  ///
+  /// A screenful of people is a screenful of REST answers landing within
+  /// milliseconds of each other, and one `notifyListeners` each would rebuild
+  /// the whole tree once per face — on the map, which is fed by this too, forty
+  /// times over. They are all wanted in the same frame anyway.
+  void _announceFaces() {
+    _faceNotice ??= Timer(const Duration(milliseconds: 16), () {
+      _faceNotice = null;
+      notifyListeners();
+    });
   }
 
   RosterRow? _rowFor(String id) {
@@ -545,18 +581,6 @@ class AppState extends ChangeNotifier {
     return _sent(collector.broadcastEmote(emote), 'Could not send that.');
   }
 
-  Future<String?> setHandRaised(bool raised) async {
-    final collector = _collector;
-    if (collector == null) return 'Not connected to Gather.';
-
-    final failed = _sent(collector.setHandRaised(raised), raised ? 'Could not raise your hand.' : 'Could not lower your hand.');
-    if (failed == null) {
-      _handRaised = raised;
-      notifyListeners();
-    }
-    return failed;
-  }
-
   /// Steps out of the conversation without walking away from it.
   Future<String?> leaveHuddle() async {
     final collector = _collector;
@@ -568,7 +592,7 @@ class AppState extends ChangeNotifier {
 
   /// What our microphone and camera are doing, and whether the room is receiving
   /// them. Everything off, and no hardware held, until the first tap.
-  CallState get call => _call?.state ?? const CallState();
+  CallState get call => debugCall ?? _call?.state ?? const CallState();
 
   /// Whether there is enough identity to open one at all.
   ///
@@ -580,6 +604,19 @@ class AppState extends ChangeNotifier {
   /// Test seam, as [debugCanWalk].
   @visibleForTesting
   bool? debugCanCall;
+
+  /// Test seam: installs a call without going through [_callOrNull], which wants
+  /// a credential, a space and an account id that a suite has no way to produce.
+  @visibleForTesting
+  void debugAttachCall(Call call) => _call = call;
+
+  /// Test seam: the call state a screen renders, with no media layer behind it.
+  ///
+  /// Overrides [call] when set. A widget test cannot build a real [Call] — it
+  /// would want a microphone and a socket — but the screens that draw one still
+  /// need every shape it can take, including the ones a device rarely produces.
+  @visibleForTesting
+  CallState? debugCall;
 
   String? get _spaceIdForCall => _snapshot.self.spaceId ?? _spaceId;
 
@@ -604,6 +641,27 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The call itself, for the one screen that draws video.
+  ///
+  /// Typed as [Call], so nothing here has heard of `MediaStream` and this file
+  /// stays free of the WebRTC plugin. The screen that needs the native streams
+  /// checks for `LiveCall` and asks it directly — the same split
+  /// `WebrtcMediaEngine.localStream` makes one level down.
+  Call? get callHandle => _call;
+
+  /// The person behind a media-plane `srcId`, or null if no row claims it.
+  ///
+  /// The two planes are keyed differently — `srcId` is a `UserAccount.id` and the
+  /// roster is `SpaceUser.id` — so a tile has no name until this bridges them.
+  /// Null is normal and temporary: a row that has not yet carried its
+  /// `userAccountId` cannot be matched, and the next roster usually fixes it.
+  RosterRow? rowForSrcId(String srcId) {
+    for (final row in _roster?.rows ?? const <RosterRow>[]) {
+      if (row.userAccountId == srcId) return row;
+    }
+    return null;
+  }
+
   /// Builds the call on first use, or null while we do not yet know who we are.
   ///
   /// Lazy on purpose: opening a router socket for somebody who never presses
@@ -620,8 +678,86 @@ class AppState extends ChangeNotifier {
 
     final call = _call = build(auth, spaceId, srcId);
     _subs.add(call.states.listen((_) => notifyListeners()));
+
+    // Hand it the room as it stands. The call is built on the first tap, long
+    // after the rosters that worked out who is nearby, and without this it would
+    // publish to an empty allow list until somebody happened to move — so the
+    // first thing you do after opening the app is the one time nobody can see
+    // you.
+    unawaited(call.setVisibleTo(_visibleTo));
+    unawaited(call.setListeningTo(_clusterWanted));
     return call;
   }
+
+  /// Who the call should be listening to, kept in step with Gather's own idea of
+  /// the conversation.
+  ///
+  /// **`clusterId`, not distance.** Gather computes the bubble server-side and
+  /// publishes it in state, so this is the same relation the desktop client draws
+  /// a ring around — no reimplementation of the twelve-stage proximity pipeline,
+  /// and no risk of the phone disagreeing with the Mac about who is in the room.
+  ///
+  /// Debounced. `clusterId` flickers as somebody walks past a group, and a call
+  /// that subscribed on every roster would spend its life negotiating transports
+  /// for people who kept walking. The delay is deliberately longer on the way in
+  /// than on the way out: joining late is a moment of missing the start of a
+  /// sentence, while leaving late means still hearing a conversation you have
+  /// walked away from, which is the worse of the two.
+  void _noteCluster(Roster roster) {
+    _noteNeighbours(roster);
+    // Their `UserAccount.id`, which is what the media plane is keyed on — see
+    // `RosterRow.userAccountId`. Somebody whose row has not carried it yet is
+    // skipped rather than guessed at, and picked up on a later roster.
+    final wanted = <String>{
+      for (final row in roster.myCluster) ?row.userAccountId,
+    };
+
+    if (wanted.length == _clusterWanted.length &&
+        _clusterWanted.containsAll(wanted)) {
+      return;
+    }
+    _clusterWanted = wanted;
+
+    _clusterDebounce?.cancel();
+    _clusterDebounce = Timer(
+      wanted.length >= _lastAppliedCluster.length
+          ? const Duration(milliseconds: 1500)
+          : const Duration(milliseconds: 600),
+      () {
+        _lastAppliedCluster = _clusterWanted;
+        unawaited(_call?.setListeningTo(_clusterWanted) ?? Future<void>.value());
+      },
+    );
+  }
+
+  Set<String> _clusterWanted = const {};
+  Set<String> _lastAppliedCluster = const {};
+  Timer? _clusterDebounce;
+
+  /// Who may see and hear us — everybody Gather counts as *in range*.
+  ///
+  /// A wider circle than the cluster, and undebounced. Both differences are
+  /// deliberate and both are copied from the desktop client:
+  ///
+  ///  * **Wider**, because `consume-allow` is what permits anybody to consume us
+  ///    at all, and the camera in a circle over your avatar is something people
+  ///    merely standing near you can see. Allowing only your conversation means
+  ///    that circle never appears for anyone else — which is exactly how this was
+  ///    reported.
+  ///  * **Undebounced**, because a permission is cheap and being late with it is
+  ///    not. Somebody walking up sees an empty circle until it arrives, and the
+  ///    thing a debounce protects against — negotiating transports for passers-by
+  ///    — does not apply: nothing is negotiated by allowing someone.
+  void _noteNeighbours(Roster roster) {
+    final wanted = <String>{for (final row in roster.nearby) ?row.userAccountId};
+    if (wanted.length == _visibleTo.length && _visibleTo.containsAll(wanted)) {
+      return;
+    }
+    _visibleTo = wanted;
+    unawaited(_call?.setVisibleTo(wanted) ?? Future<void>.value());
+  }
+
+  Set<String> _visibleTo = const {};
 
   // ---- walking ---------------------------------------------------------------
 
@@ -641,6 +777,39 @@ class AppState extends ChangeNotifier {
   /// Held rather than tapped: the pad calls this for as long as a thumb is down, and
   /// [Walk] repeats the step at Gather's own walking pace until [stopWalking].
   void walk(String direction) => _walk?.press(direction);
+
+  /// How fast we are going, and so whether to draw a go-kart under our own avatar.
+  ///
+  /// Ours only. Everybody else's comes off the roster, where `speed.modifier` is a
+  /// synced field — see [Person.gait]. This one cannot: the wire is a quarter of a
+  /// second behind a walk that changes gait twice in it.
+  Gait get gait => debugGait ?? (_walk?.gait ?? Gait.walking);
+
+  /// Test seam, as [debugCanWalk].
+  @visibleForTesting
+  Gait? debugGait;
+
+  /// Take the go-kart, whatever the distance.
+  ///
+  /// The phone's shift key. On the desktop, driving has two entirely separate doors:
+  /// hold shift while the arrow keys walk you, or let the route pick a gait for you on
+  /// distance. A phone has the second and no way at all to hold the first, so this
+  /// latches — and, as on the desktop, it means *drive*, not "drive if it is far
+  /// enough": see [Walk.boost]. It applies to a walk already running, which is why it
+  /// is forwarded rather than read at the off.
+  /// Held here rather than read back off [Walk], because the latch outlives a
+  /// reconnect and the walk does not: `_walk` is rebuilt with the collector every time
+  /// the socket comes back, and a preference that quietly reset itself under a lit
+  /// button would be worse than no latch at all. [_attach] hands it to each new one.
+  bool get boost => _boost;
+  bool _boost = false;
+
+  set boost(bool value) {
+    if (_boost == value) return;
+    _boost = value;
+    _walk?.boost = value;
+    notifyListeners();
+  }
 
   void stopWalking() {
     _walk?.release();
@@ -675,12 +844,82 @@ class AppState extends ChangeNotifier {
     final at = walk.at;
     if (at == null) return 'Still working out where you are.';
 
-    final route = map.routeTo(fromX: at.x, fromY: at.y, toX: x, toY: y, avoid: _occupied());
-    if (route == null) return 'There is no way to walk there.';
+    final occupied = _occupied();
+    final taken = {for (final tile in occupied) tile.y * map.width + tile.x};
 
-    walk.follow(route);
-    notifyListeners();
+    // A destination that cannot be stood on is *moved*, not refused — the client's
+    // own rule, and the reason tapping a chair works there. `blockedAtPosition` has
+    // no exemption for seats, so a chair is as impassable as a wall and
+    // `startPathMoveOnCurrentFloor` relocates to the nearest free tile regardless.
+    // A tile somebody is standing on gets the same treatment.
+    var goal = (x: x, y: y);
+    if (!map.isWalkable(x, y) || taken.contains(y * map.width + x)) {
+      final free = map.nearestFree(x, y, occupied: taken);
+      if (free == null) return 'There is nowhere to stand there.';
+      goal = free;
+    }
+
+    return _travelTo(map, walk, at, goal, occupied);
+  }
+
+  /// Walk if there is a way to walk, and otherwise arrive anyway.
+  ///
+  /// The fallback is not a shortcut around the decision to walk — it is what walking
+  /// *is* on the desktop. `setPathMoveTo` runs the search and then:
+  ///
+  /// ```js
+  /// if (opts?.forceTeleport || this.shouldTeleport(reason)) { this.teleport(goal, true) }
+  /// // shouldTeleport(reason) → reason === NoPathFound || reason === MaxDepthReached
+  /// ```
+  ///
+  /// So the client never tells anybody a destination is unreachable; it walks when it
+  /// can and blinks when it cannot. That matters more here than it does there, because
+  /// [SpaceMap.routeTo] refuses to cross anybody else's desk or coworking area — which
+  /// is correct, and which makes "no route" an ordinary answer in a real office rather
+  /// than a rare one. Refusing on it was the bug.
+  String? _travelTo(
+    SpaceMap map,
+    Walk walk,
+    ({int x, int y}) at,
+    ({int x, int y}) goal,
+    List<({int x, int y})> occupied,
+  ) {
+    final route = map.routeTo(
+      fromX: at.x,
+      fromY: at.y,
+      toX: goal.x,
+      toY: goal.y,
+      avoid: occupied,
+    );
+    if (route != null) {
+      walk.follow(route);
+      notifyListeners();
+      return null;
+    }
+
+    // Any route still running was aimed somewhere else.
+    walk.release();
+
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    final sent = collector.teleport(x: goal.x, y: goal.y);
+    if (!sent.ok) return sent.detail ?? 'Gather refused that.';
+
+    _noteTeleport(goal.x.toDouble(), goal.y.toDouble());
     return null;
+  }
+
+  /// Tell the map we hopped, now rather than when the roster catches up.
+  ///
+  /// [_positions] and not [notifyListeners], for the reason [_onPartyHop] gives: this
+  /// is movement, and movement must not wake the whole tree. Without it the body
+  /// stands on the old tile for up to a quarter of a second and the arrival is drawn
+  /// as a very fast walk instead of as a teleport.
+  void _noteTeleport(double x, double y) {
+    final id = _collector?.selfId;
+    if (id == null) return;
+    _lastTeleport = (id: id, x: x, y: y, seq: ++_teleportSeq);
+    _positions.tick();
   }
 
   /// Walk into a room, landing on a seat if it has a free one.
@@ -701,15 +940,106 @@ class AppState extends ChangeNotifier {
 
     final occupied = _occupied();
     final taken = {for (final tile in occupied) tile.y * map.width + tile.x};
-    for (final tile in map.tilesClosestTo(room, toward).take(_landingTries)) {
-      if (taken.contains(tile.y * map.width + tile.x)) continue;
+
+    final wanted = [
+      for (final tile in map.tilesClosestTo(room, toward).take(_landingTries))
+        if (!taken.contains(tile.y * map.width + tile.x)) tile,
+    ];
+    if (wanted.isEmpty) return 'There is nowhere free in ${room.name ?? 'there'}.';
+
+    // Every seat and standing tile in turn — the client's `altMoveGoals`, which exist
+    // so a seat somebody took while you were walking falls through to the next one.
+    for (final tile in wanted) {
       final route = map.routeTo(fromX: at.x, fromY: at.y, toX: tile.x, toY: tile.y, avoid: occupied);
       if (route == null) continue;
       walk.follow(route);
       notifyListeners();
       return null;
     }
-    return 'There is no way to walk into ${room.name ?? 'there'}.';
+    // None of them can be walked to — a sealed room, or one whose only door is
+    // through somebody else's desk. Arrive at the best of them anyway, the way
+    // `shouldTeleport` does.
+    return _travelTo(map, walk, at, wanted.first, occupied);
+  }
+
+  /// The desk Gather has given me, or null if it has given me none.
+  ///
+  /// `SpaceUser.deskId` is a one-to-one at `MapEntityIdentifier`, so the match is
+  /// against [SpaceRoom.stableId] and never against `SpaceRoom.id` — the two are
+  /// different ids for the same rectangle and matching the wrong one finds nothing
+  /// at all. Read off the roster rather than remembered, so a desk manager moving
+  /// me arrives here the same way it arrives in the desktop client.
+  SpaceRoom? get myDesk {
+    final deskId = _myRow()?.deskId;
+    if (deskId == null) return null;
+    for (final room in map?.rooms ?? const <SpaceRoom>[]) {
+      if (room.stableId == deskId) return room;
+    }
+    // A desk on another floor, or a floor plan that has not arrived yet. Both are
+    // "not something to walk to from here", which is the only question asked.
+    return null;
+  }
+
+  /// Whether I am standing on my own desk.
+  ///
+  /// The client's own test, transcribed:
+  ///
+  /// ```js
+  /// get isAtOwnDesk() {
+  ///   return this.currentMapArea?.stableId_USE_THIS_INSTEAD_OF_ID === this.deskId
+  /// }
+  /// ```
+  ///
+  /// `currentMapArea` is the *innermost* area at your feet and a desk is the
+  /// innermost thing there is, so "the current area is my desk" and "my desk's
+  /// rectangle contains me" are the same claim, and the second needs no area
+  /// hierarchy to answer.
+  ///
+  /// Position comes from [Walk] first, which is the live tile, and from the roster
+  /// only before a walk exists. Reading the roster alone would leave the button
+  /// still offering to walk you somewhere you have already arrived for as long as a
+  /// quarter of a second — the same lag [mePerson] avoids for the same reason.
+  bool get atMyDesk {
+    final desk = myDesk;
+    if (desk == null) return false;
+    final at = _walk?.at;
+    if (at != null) return desk.contains(at.x, at.y);
+    final me = _myRow();
+    final x = me?.x, y = me?.y;
+    if (x == null || y == null || !x.isFinite || !y.isFinite) return false;
+    return desk.contains(x.round(), y.round());
+  }
+
+  /// Walk back to my own desk.
+  ///
+  /// `moveSpaceUserToDesk`, which is a *walk* and not a hop:
+  ///
+  /// ```js
+  /// const desk = currentSpaceUser.desk
+  /// if (!desk) { toast("You don't have a desk yet"); return }
+  /// const goal = desk.spawn.availablePosition(currentSpaceUser.coreRole)
+  /// this.setPathMoveTo(goal, { altMoveGoals: Seats.availableStandingTilesOf(desk), … })
+  /// currentSpaceUser.turnOffAVS()
+  /// ```
+  ///
+  /// [goToRoom] is that, already: a best-first list of the room's tiles with seats
+  /// ahead of standing room, tried in turn so a chair taken on the way falls through
+  /// to the next one, and [_travelTo]'s hop as the last resort the desktop's own
+  /// `shouldTeleport` provides. The desk's middle is the tie-breaker because a desk
+  /// is one or two tiles across and every part of it is equally "there".
+  ///
+  /// The one line deliberately not copied is `turnOffAVS()`. Gather cuts your
+  /// microphone and camera when you sit back down, which is defensible on a desktop
+  /// where the walk is a keystroke — and on a phone it would be a button that
+  /// silently hangs up the call you are holding, which is a second action nobody
+  /// asked this one to take.
+  Future<String?> goToMyDesk() async {
+    final desk = myDesk;
+    if (desk == null) return 'Gather has not given you a desk.';
+    return goToRoom(
+      desk,
+      toward: (x: desk.x + desk.width ~/ 2, y: desk.y + desk.height ~/ 2),
+    );
   }
 
   /// How many of a room's tiles to try before giving up on it.
@@ -721,12 +1051,13 @@ class AppState extends ChangeNotifier {
 
   /// Tiles other people are standing on, for a route to go round.
   ///
-  /// The client is stricter — its `GoalBlocked` refuses a goal outright when somebody
-  /// is standing within one tile of it — and that rule is deliberately not copied. It
-  /// is written for a mouse pointer that can see exactly which square it is over; on a
-  /// phone you tap a place, and refusing every tap that lands beside a colleague would
-  /// refuse most taps in a busy office. Routing *around* people is the part worth
-  /// keeping, and arriving is allowed to be a scramble.
+  /// The client's own `GoalBlocked` is narrower than it first reads —
+  /// `usersAtPosition(goal)` filtered by `position.manhattanDistance(start) <= 1`, so
+  /// it fires only when the goal is occupied *and* next to you — and it never comes up
+  /// in either client, because `moveSpaceUserToTile` has already relocated an occupied
+  /// goal by then. [goTo] relocates for the same reason, so this list is only ever
+  /// used to route *around* people.
+  ///
   /// Read off [peopleOnMap] rather than the roster directly, so "somebody is standing
   /// there" means the same thing here as it does on the screen: present rather than
   /// merely connected, on this floor, and never me.
@@ -919,7 +1250,10 @@ class AppState extends ChangeNotifier {
       // follows: the two are up to a quarter of a second apart, which is a quarter of
       // a second of a button offering to cancel a walk that already finished.
       onRouteEnded: notifyListeners,
-    );
+      // Same reasoning: the kart appearing and disappearing is a thing the screen
+      // shows, and it happens mid-walk rather than on a roster boundary.
+      onGaitChanged: notifyListeners,
+    )..boost = _boost;
 
     _subs
       ..add(
@@ -934,6 +1268,7 @@ class AppState extends ChangeNotifier {
           // The collector already coalesces and only publishes when something in the
           // state actually moved, so this is "the map changed", not a clock.
           _positions.tick();
+          _noteCluster(roster);
           final out = _tracker.applyRoster(roster);
           _onFold(out);
         }),
@@ -967,11 +1302,6 @@ class AppState extends ChangeNotifier {
     _walk = null;
     _call = null;
     _auth = null;
-    // The raised hand is an echo of what this connection did. Carried across a
-    // reconnect it would be a claim about a socket that no longer exists, and
-    // after an unpair it would be somebody else's. The status line needs no such
-    // care — it is read off the roster, so it arrives and leaves with one.
-    _handRaised = false;
     // Faces are signed per space and per person. Pairing again as somebody else
     // must not serve them the previous account's cache.
     _photos?.clear();
@@ -1114,14 +1444,8 @@ class AppState extends ChangeNotifier {
   /// it at all — rather than waiting for the roster that follows — is what keeps the
   /// body from standing on the old tile for up to a quarter of a second before it
   /// vanishes from it.
-  void _onPartyHop(PartyTile tile) {
-    final id = _collector?.selfId;
-    // Party mode cannot start without knowing which avatar is ours, so this is
-    // belt and braces rather than a real case.
-    if (id == null) return;
-    _lastTeleport = (id: id, x: tile.x.toDouble(), y: tile.y.toDouble(), seq: ++_teleportSeq);
-    _positions.tick();
-  }
+  void _onPartyHop(PartyTile tile) =>
+      _noteTeleport(tile.x.toDouble(), tile.y.toDouble());
 
   // ---- test seams ------------------------------------------------------------
 
@@ -1137,6 +1461,9 @@ class AppState extends ChangeNotifier {
   void debugApplyRoster(Roster roster) {
     _roster = roster;
     _positions.tick();
+    // Same order as the real listener, and not a shortened version of it: a seam
+    // that skips a step is a seam that passes while the app does the wrong thing.
+    _noteCluster(roster);
     _onFold(_tracker.applyRoster(roster));
   }
 
@@ -1198,6 +1525,14 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _positions.dispose();
+    // A face resolved a millisecond before the app closed would otherwise
+    // notify a disposed notifier, which throws.
+    _faceNotice?.cancel();
+    _faceNotice = null;
+    // Same reasoning: a cluster change half a second before the app closed would
+    // otherwise fire into a call that has already been torn down.
+    _clusterDebounce?.cancel();
+    _clusterDebounce = null;
     unawaited(_detach());
     // Outside `_detach` on purpose: token rotation is about this device, not about any
     // one connection, so it must survive a reconnect and only end with the app.

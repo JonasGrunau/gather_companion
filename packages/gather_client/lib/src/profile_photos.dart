@@ -104,8 +104,14 @@ class ProfilePhotos {
     final hit = _cache[fileId];
     if (hit != null && hit.until.isAfter(_now())) return Future.value(hit.url);
 
-    return _inFlight[fileId] ??= _fetch(spaceId: spaceId, fileId: fileId)
-        .whenComplete(() => _inFlight.remove(fileId));
+    // The braces matter. `Map.remove` answers with the value it removed, which
+    // here is this very future, and a `whenComplete` callback that returns a
+    // future is waited on — so the arrow form made every lookup wait for
+    // itself. The URL still reached [_cache], which is why faces appeared at
+    // all, but only ever on the next rebuild something else happened to cause.
+    return _inFlight[fileId] ??= _fetch(spaceId: spaceId, fileId: fileId).whenComplete(() {
+      _inFlight.remove(fileId);
+    });
   }
 
   Future<String?> _fetch({required String spaceId, required String fileId}) async {

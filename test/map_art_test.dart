@@ -253,6 +253,24 @@ Future<Uint8List> _sheet() async {
   return data!.buffer.asUint8List();
 }
 
+/// A kart sheet in the same trick as [_sheet], distinguishable from it: 16 frames of
+/// 32×32, frame *n* carrying red *n* over a **blue** channel of 7 rather than 200. A
+/// kart is drawn over the body it hides, so telling the two apart at one pixel is the
+/// whole of the test.
+Future<Uint8List> _kartSheet() async {
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  for (var frame = 0; frame < 16; frame++) {
+    canvas.drawRect(
+      Rect.fromLTWH(frame * 32.0, 0, 32, 32),
+      Paint()..color = Color.fromARGB(255, frame, 128, 7),
+    );
+  }
+  final image = await recorder.endRecording().toImage(16 * 32, 32);
+  final data = await image.toByteData(format: ui.ImageByteFormat.png);
+  return data!.buffer.asUint8List();
+}
+
 const _avatarUrl = 'https://sprite.v2.gather.town/v2/sprite/avatar-x.png';
 
 extension on ByteData {
@@ -693,6 +711,87 @@ void main() {
       expect(frame, greaterThanOrEqualTo(32), reason: 'walk-s is 32–35, not idle-s 0');
       expect(frame, lessThanOrEqualTo(35));
       motion.dispose();
+    });
+
+    /// Somebody driving, mid-step, with both sheets loaded.
+    ///
+    /// Mid-step because a kart's cycle is `moving-` only while the body is moving —
+    /// and because the run cycle is only chosen while walking at all.
+    Future<ByteData> paintDriving({Gait gait = Gait.driving}) async {
+      var now = Duration.zero;
+      final motion = MapMotion(clock: () => now);
+      MapPerson at(double x) => MapPerson(
+            id: 'a',
+            label: 'Ada',
+            x: x,
+            y: 2,
+            isFollowingMe: false,
+            speaking: false,
+            avatarUrl: _avatarUrl,
+            direction: 'Down',
+            gait: gait,
+          );
+      motion.update([at(4)]);
+      now += const Duration(seconds: 1);
+      motion.update([at(3)]);
+      now += const Duration(microseconds: 71428);
+
+      final art = _art();
+      final sheet = await _sheet();
+      final kart = await _kartSheet();
+      final cache = ArtCache(fetch: (url) async => switch (url) {
+            _avatarUrl => sheet,
+            goKartUrl => kart,
+            _ => _colours(url),
+          });
+      cache.prefetch([...art.urls, _avatarUrl, goKartUrl]);
+      for (var i = 0; i < 200 && !cache.settled; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+
+      final image = await _paint(art, cache, motion: motion, people: [at(3)]);
+      motion.dispose();
+      return (await image.toByteData())!;
+    }
+
+    test('somebody in a go-kart is drawn running, with the kart over the top', () async {
+      // Two assertions in one pixel. The kart is a 32×32 sprite on the body's own
+      // tile and the client draws it *in front* — `bringToTop(this.vehicleImage)` —
+      // which is what makes a flat sprite read as something being sat in. So the
+      // bottom half of the tile is kart, and the top half, a whole tile higher, is
+      // still the running body underneath.
+      final pixels = await paintDriving();
+
+      // Blue 7 is the kart sheet, blue 200 the avatar's.
+      final onTheTile = pixels.pixel(320, (3.5 * artTileSize).round(), (2.5 * artTileSize).round());
+      expect(onTheTile.b * 255, closeTo(7, 1), reason: 'the kart is drawn over the legs');
+      // `moving-s` is 4–7.
+      expect(onTheTile.r * 255, inInclusiveRange(4, 7));
+
+      // A tile higher is the avatar's own sprite, which hangs two tiles tall.
+      final above = pixels.pixel(320, (3.5 * artTileSize).round(), (1.5 * artTileSize).round());
+      expect(above.b * 255, closeTo(200, 1), reason: 'and the body above it is not hidden');
+      // `run-s` is 36–39, and this is the whole point of sending `drive`: everybody
+      // else reads `speed.modifier` and picks the run cycle off it.
+      expect(above.r * 255, inInclusiveRange(36, 39));
+    });
+
+    test('somebody merely running gets the cycle and no kart', () async {
+      final pixels = await paintDriving(gait: Gait.running);
+
+      final onTheTile = pixels.pixel(320, (3.5 * artTileSize).round(), (2.5 * artTileSize).round());
+      expect(onTheTile.b * 255, closeTo(200, 1), reason: 'no kart at a modifier of 2');
+      expect(onTheTile.r * 255, inInclusiveRange(36, 39), reason: 'but still running');
+    });
+
+    test('somebody walking is drawn walking', () async {
+      // The guard the two above are worth nothing without: `walk-s` is 32–35, and it
+      // is one frame away from the run, so a mixed-up table would look almost right.
+      final pixels = await paintDriving(gait: Gait.walking);
+
+      final onTheTile = pixels.pixel(320, (3.5 * artTileSize).round(), (2.5 * artTileSize).round());
+      expect(onTheTile.b * 255, closeTo(200, 1));
+      expect(onTheTile.r * 255, inInclusiveRange(32, 35));
     });
 
     test('somebody talking has their mouth going', () async {

@@ -18,12 +18,21 @@ import 'package:gather_companion/ui/dpad.dart';
 import 'package:gather_companion/ui/map_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
-SpaceMap _map({Set<int> blocked = const {}, List<SpaceRoom> rooms = const []}) => SpaceMap(
+SpaceMap _map({
+  Set<int> blocked = const {},
+  List<SpaceRoom> rooms = const [],
+  Set<int> inside = const {},
+}) => SpaceMap(
       floorId: 'f1',
       width: 20,
       height: 10,
       blocked: blocked,
       rooms: rooms,
+      // Empty means "all office" — the escape hatch for a space that names no areas
+      // beyond the base one — so a test that cares about the footprint has to say
+      // what it is. `rooms` alone does not: the builder derives one from the other,
+      // and this constructor takes both.
+      inside: inside,
     );
 
 RosterRow _row(
@@ -90,9 +99,16 @@ void main() {
   /// The map carries `onDoubleTap` for the one-handed zoom, so Flutter holds a single
   /// tap until the double-tap window closes before delivering it. A test that pumped
   /// one frame would see nothing and conclude the tap was ignored.
+  /// One tap in the middle of the floor, and **one frame**.
+  ///
+  /// The single frame is the assertion. This used to have to pump 400ms, because a
+  /// [GestureDetector] carrying `onDoubleTap` holds every tap until the double-tap
+  /// window closes — which is a third of a second between the finger and the reticle,
+  /// and is what "the tile selection is very laggy" was. Every test below that selects
+  /// something now also says it happened at once.
   Future<void> tapFloor(WidgetTester tester) async {
     await tester.tapAt(const Offset(400, 300));
-    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump();
   }
 
   testWidgets('a connected app with no map yet says it is still reading one', (tester) async {
@@ -271,11 +287,15 @@ void main() {
     /// the middle of the screen — so every tap in the middle would land on the one
     /// tile that means "clear the selection". The rule is worth having and worth
     /// testing; it is just not worth every other test having to know about it.
-    AppState ready({List<SpaceRoom> rooms = const [], Set<int> blocked = const {}}) =>
+    AppState ready({
+      List<SpaceRoom> rooms = const [],
+      Set<int> blocked = const {},
+      Set<int> inside = const {},
+    }) =>
         AppState()
           ..debugApplyLink(const LinkStatus(LinkState.live))
           ..debugCanWalk = true
-          ..debugMap = _map(rooms: rooms, blocked: blocked)
+          ..debugMap = _map(rooms: rooms, blocked: blocked, inside: inside)
           ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('ada', 8, 4, name: 'Ada')]));
 
     testWidgets('nothing is offered until something is tapped', (tester) async {
@@ -290,6 +310,35 @@ void main() {
       await tester.pumpWidget(wrap(ready()));
       await tester.pump();
       await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
+    });
+
+    testWidgets('a second tap zooms and leaves no reticle behind', (tester) async {
+      // The double tap is counted by hand precisely so the first one can select at
+      // once — and the price of that is the second one having to put back what the
+      // first displaced. A pinch-to-zoom that left a Go-to pill on whatever happened
+      // to be under the middle of the screen would be the same bug in reverse.
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+
+      await tapFloor(tester);
+      expect(find.text('Go here'), findsOneWidget, reason: 'the first tap selects');
+
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      expect(find.text('Go here'), findsNothing);
+    });
+
+    testWidgets('two taps far apart are two selections, not a zoom', (tester) async {
+      // `kDoubleTapSlop` is Flutter's own figure and it is the whole difference
+      // between a double tap and two taps.
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+
+      await tapFloor(tester);
+      await tester.tapAt(const Offset(200, 150));
+      await tester.pump();
 
       expect(find.text('Go here'), findsOneWidget);
     });
@@ -320,6 +369,55 @@ void main() {
 
       expect(find.text('Go here'), findsOneWidget);
       expect(find.text('Go to Main floor'), findsNothing);
+    });
+
+    testWidgets('a tap on a chair still offers to go there', (tester) async {
+      // Reported as "tap to walk often does not work — chairs count as unwalkable".
+      // They can be: Gather's `blockedAtPosition` has no exemption for seats either.
+      // What Gather does that this was not doing is relocate rather than refuse, so
+      // a tap on furniture is a tap on the floor beside it.
+      final chair = 4 * 20 + 7;
+      await tester.pumpWidget(wrap(ready(blocked: {chair})));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
+    });
+
+    testWidgets('a tap in the middle of a desk cluster still offers to go there', (tester) async {
+      // A single blocked tile was always survivable. Several together were not: the
+      // search used to widen with the zoom and bottom out at one ring, so zoomed in
+      // most of the furniture in the office selected nothing at all.
+      await tester.pumpWidget(wrap(ready(blocked: {
+        for (var y = 3; y <= 5; y++)
+          for (var x = 6; x <= 8; x++) y * 20 + x,
+      })));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
+    });
+
+    testWidgets('the emptiness outside the office is a destination like any other', (tester) async {
+      // This screen had a rule of its own here for a while — refuse anything outside
+      // the office footprint, on the grounds that a route out there cannot be walked
+      // and so would end in a teleport into the void. The client has no such rule:
+      // `Hh` bounds-checks against `baseArea.dimensionsInTiles`, which is the whole
+      // grid, `moveSpaceUserToTile` navigates to a tile with no area at all
+      // (`isNil(E) || E.shouldNavigateToTile()`), and `shouldTeleport(NoPathFound)`
+      // puts you there. Being outside the building is not a trap — the way back is
+      // another tap — and inventing a restriction Gather does not have is how this
+      // client starts behaving differently from the one beside it.
+      //
+      // The office is the top-left corner; the tap lands well outside it.
+      await tester.pumpWidget(wrap(ready(inside: {
+        for (var y = 0; y < 4; y++)
+          for (var x = 0; x < 4; x++) y * 20 + x,
+      })));
+      await tester.pump();
+      await tapFloor(tester);
+
+      expect(find.text('Go here'), findsOneWidget);
     });
 
     testWidgets('a tap on nothing but furniture selects nothing', (tester) async {
@@ -368,6 +466,49 @@ void main() {
       expect(find.text('Stop'), findsOneWidget,
           reason: 'and without anything having been selected');
       expect(find.text('Go here'), findsNothing);
+    });
+
+    /// The kart, which on a phone is the only door to driving that a person opens
+    /// themselves — the other one is how far away the destination is, and it needs no
+    /// control at all.
+    final kart = find.byIcon(Icons.sports_motorsports_rounded);
+
+    testWidgets('the kart is offered alongside somewhere to go', (tester) async {
+      final state = ready();
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      expect(kart, findsNothing, reason: 'nothing to set off on yet');
+
+      await tapFloor(tester);
+      expect(kart, findsOneWidget);
+      expect(state.boost, isFalse, reason: 'and off until it is pressed');
+    });
+
+    testWidgets('pressing the kart latches it', (tester) async {
+      final state = ready();
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tapFloor(tester);
+
+      await tester.tap(kart);
+      await tester.pump();
+      expect(state.boost, isTrue);
+
+      await tester.tap(kart);
+      await tester.pump();
+      expect(state.boost, isFalse, reason: 'and unlatches again');
+    });
+
+    testWidgets('the kart stays up for the whole walk', (tester) async {
+      // Because it still does something: shift is a modifier on movement, not a
+      // property of a journey, so latching it mid-route takes the kart there and then.
+      final state = ready()..debugOnRoute = true;
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+
+      expect(find.text('Stop'), findsOneWidget);
+      expect(kart, findsOneWidget);
     });
 
     testWidgets('a tap the app cannot act on says so', (tester) async {

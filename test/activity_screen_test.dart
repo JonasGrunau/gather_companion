@@ -68,4 +68,31 @@ void main() {
     handle.dispose();
   });
 
+  testWidgets('the bones dissolve into the list rather than cutting to it', (tester) async {
+    final state = connected(snapshotWith(const []));
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // Nothing to fade into yet: the rows are not in the tree until the read
+    // answers, so there is no claim being made at any opacity.
+    expect(find.byType(SliverFadeTransition), findsNothing);
+
+    state.debugApplyActivity(const []);
+    await tester.pump();
+
+    expect(
+      tester.widget<SliverFadeTransition>(find.byType(SliverFadeTransition)).opacity.value,
+      lessThan(1),
+      reason: 'the swap should be a dissolve, not a cut',
+    );
+
+    // Explicit durations rather than `pumpAndSettle`: the bones breathe on a
+    // repeating controller, which never settles.
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(
+      tester.widget<SliverFadeTransition>(find.byType(SliverFadeTransition)).opacity.value,
+      1,
+    );
+  });
 }

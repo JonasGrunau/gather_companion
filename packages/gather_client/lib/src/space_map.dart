@@ -133,6 +133,59 @@ const _privateTypes = {'MeetingRoom', 'Desk'};
 /// reaches the model.
 const moveDirections = ['Up', 'Down', 'Left', 'Right'];
 
+/// How fast somebody is going, which in Gather is also *what they are going in*.
+///
+/// `SpeedModifier` in the client, and its numbers are the client's own:
+///
+/// ```js
+/// var L = (e => { e[e["WALKING"]=1]="WALKING";
+///                 e[e["RUNNING"]=2]="RUNNING";
+///                 e[e["DRIVING"]=3]="DRIVING"; return e })(L || {});
+/// getMoveInterval(A = 1) { return P.N4 * (1 / A) }        // P.N4 === 1e3/7
+/// ```
+///
+/// So the modifier is a **divisor on the step interval**, not a speed: driving covers
+/// three tiles in the time a walk covers one. And the go-kart is not a separate mode —
+/// there is no "get in the kart" action anywhere in the client. It is what
+/// `PlayerEntityRenderer` draws under anybody whose `speed.modifier` reached 3:
+///
+/// ```js
+/// if (this.playerEntity.getSpeedModifier() === s.Speed.DRIVING) {
+///   this.setVehicle({id: "goKart-for-speed-modifier"})
+/// }
+/// ```
+///
+/// Which is why [action] matters as much as [modifier]: stepping faster without
+/// sending it walks your avatar across the office at twenty-one tiles a second in an
+/// idle pose, on every other screen in the space.
+enum Gait {
+  walking(1, 'walk'),
+  running(2, 'run'),
+  driving(3, 'drive');
+
+  const Gait(this.modifier, this.action);
+
+  /// What divides the step interval. `SpeedModifier`'s own value.
+  final int modifier;
+
+  /// The action that tells Gather. `SpaceUser.walk`, `.run` and `.drive` are three
+  /// no-argument `MethodAction`s whose whole body is `this.speed = new Speed(...)`,
+  /// each requiring only `SpaceUserPermission.Move` — the same permission [move]
+  /// already needs.
+  final String action;
+}
+
+/// The gait a `speed.modifier` off the wire means, defaulting to a walk.
+///
+/// Absent, null and unrecognised all mean walking, because that is what the client
+/// does with them: `cachedGameSpeed` starts at `Speed.WALKING` and `setSpeedModifier`
+/// falls through to `default: e.walk()`.
+Gait gaitOf(num? modifier) => switch (modifier?.round()) {
+      2 => Gait.running,
+      3 => Gait.driving,
+      _ => Gait.walking,
+    };
+
 /// Which tile a step lands on, relative to the one you are standing on.
 ///
 /// `new Direction(A.direction).toPositionDelta()` in the `move` action's body. Y grows
@@ -160,10 +213,23 @@ class SpaceRoom {
     required this.width,
     required this.height,
     required this.walled,
+    this.stableId,
     this.locked = false,
   });
 
   final String id;
+
+  /// The `MapEntityIdentifier` row this area hangs off — `mapEntityIdentifierId`.
+  ///
+  /// The id everything *outside* the floor plan addresses an area by, and not the
+  /// same one as [id]. `SpaceUser.deskId` is a one-to-one at `MapEntityIdentifier`,
+  /// so a desk is found by matching this and never [id]; the client's own
+  /// `isAtOwnDesk` reads `currentMapArea?.stableId_USE_THIS_INSTEAD_OF_ID ===
+  /// deskId`, and the shouting in that property name is Gather's, not ours.
+  ///
+  /// Null for an area whose dump predates the row — the same absence [locked]
+  /// tolerates.
+  final String? stableId;
 
   /// Null for the 62 desks and the base area, which are unnamed.
   final String? name;
@@ -540,6 +606,86 @@ class SpaceMap {
     }
     route.add((x: xOf(start), y: yOf(start)));
     return route.reversed.toList();
+  }
+
+  /// Somewhere to stand near a tile that cannot be stood on.
+  ///
+  /// **A blocked destination is relocated, never refused.** That is the client's own
+  /// rule and it is the whole reason clicking a chair works there: `blockedAtPosition`
+  /// has no exemption for seats, so a chair with collision points is as impassable as
+  /// a wall — and `startPathMoveOnCurrentFloor` simply does not care:
+  ///
+  /// ```js
+  /// let i = A;
+  /// if (floor.activeMapOrThrow.collisions.blockedAtPosition(i)) {
+  ///   const e = this.getNearestFreeTile(i, direction, 4);
+  ///   if (e) { i = e }
+  /// }
+  /// ```
+  ///
+  /// `moveSpaceUserToTile` does the same for a tile somebody is standing on
+  /// (`areOtherPlayersOnCurrentFloorTile(i) || blockedAtPosition(i)`). So a tap on the
+  /// furniture is a tap on the floor beside it, and a tap on a colleague is a tap next
+  /// to them.
+  ///
+  /// [occupied] is who is standing where. [radius] is the box searched around the
+  /// tile — the client uses 2 by default and 4 when it is starting a walk.
+  ///
+  /// Null only when nothing in the box qualifies at all.
+  ({int x, int y})? nearestFree(
+    int x,
+    int y, {
+    int radius = 4,
+    Set<int> occupied = const {},
+  }) {
+    final goalArea = areaAt(x, y);
+    final candidates = <({int x, int y})>[];
+    for (var dy = -radius; dy <= radius; dy++) {
+      for (var dx = -radius; dx <= radius; dx++) {
+        final tx = x + dx, ty = y + dy;
+        if (!isWalkable(tx, ty)) continue;
+        if (occupied.contains(ty * width + tx)) continue;
+        if (!_freeForArea(tx, ty, goalArea)) continue;
+        candidates.add((x: tx, y: ty));
+      }
+    }
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) {
+      final da = (a.x - x).abs() + (a.y - y).abs();
+      final db = (b.x - x).abs() + (b.y - y).abs();
+      return da.compareTo(db);
+    });
+    return candidates.first;
+  }
+
+  /// `isTileFreeForThisArea`: a relocation may not wander into — or out of — a room.
+  ///
+  /// ```js
+  /// static isAreaDeskOrPrivate(A) { return A.isPrivate || A.isDesk }
+  /// isTileFreeForThisArea(A, e) {
+  ///   if (isNotNil(e)) {
+  ///     const I = e.map.areaPositions.areaAtPosition(A);
+  ///     if (isAreaDeskOrPrivate(e)) { if (I !== e) return false }
+  ///     else { if (isAreaDeskOrPrivate(I)) return false }
+  ///     if (A.isBlockedBy(g, null)) return false }
+  ///   …
+  /// }
+  /// ```
+  ///
+  /// Note `isPrivate` here is Gather's own `get isPrivate() { return this.isWalled }`
+  /// — the audio meaning, not [_privateTypes]. It reads oddly against the warning in
+  /// this file's own header, and it is right here for a different reason: the rule is
+  /// "do not let a relocation cross a wall", and the main floor being a walled `Public`
+  /// area simply means a relocation inside it stays inside it, which is what is wanted.
+  bool _freeForArea(int x, int y, SpaceRoom? goalArea) {
+    if (goalArea == null) return true;
+    final here = areaAt(x, y);
+    if (goalArea.walled || goalArea.type == 'Desk') {
+      if (here?.id != goalArea.id) return false;
+    } else if (here != null && (here.walled || here.type == 'Desk')) {
+      return false;
+    }
+    return true;
   }
 
   /// Where to stand when the target is a whole room, best first.
@@ -1276,7 +1422,8 @@ class SpaceMapBuilder {
         // One join, through `mapEntityIdentifierId`. Absent on a space whose dump
         // predates the row, which reads as unlocked — the same thing an empty
         // `isLocked` means.
-        final identifier = _identifiers[_str(area['mapEntityIdentifierId']) ?? ''];
+        final stableId = _str(area['mapEntityIdentifierId']);
+        final identifier = _identifiers[stableId ?? ''];
 
         rooms.add(SpaceRoom(
           id: id,
@@ -1287,6 +1434,7 @@ class SpaceMapBuilder {
           width: w,
           height: h,
           walled: walled,
+          stableId: stableId,
           locked: identifier?['isLocked'] == true,
         ));
 

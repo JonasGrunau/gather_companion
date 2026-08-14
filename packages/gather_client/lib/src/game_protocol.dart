@@ -119,6 +119,10 @@ const _trackedFields = {
   // drawing bodies rather than dots: an avatar sheet has a frame per direction and
   // without this everybody stands facing the camera while walking north.
   'direction',
+  // How fast they are going — 1, 2 or 3. Also the only thing that says whether
+  // somebody is in a go-kart: there is no vehicle field, the client draws one under
+  // anybody whose modifier reached 3.
+  'speed',
   // Whether they are actually there. `connected` alone is not that — see
   // [RosterRow.availability].
   'userSetAvailability',
@@ -126,6 +130,12 @@ const _trackedFields = {
   // they have not — measured on a live space, 45 of 98 rows carried one. It is
   // not a URL and cannot be turned into one here: see `profile_photos.dart`.
   'profilePictureId',
+  // Which desk is theirs. A `MapEntityIdentifier` id, so it matches
+  // [SpaceRoom.stableId] and never `SpaceRoom.id`. Tracked because it is the only
+  // way to answer "where do I belong", which is what "back to my desk" asks; it
+  // also changes under you when a desk manager reassigns one, and the whole point
+  // of tracking a field rather than remembering it is that the answer follows.
+  'deskId',
 };
 
 /// One interaction off `DeltaState.events[]`.
@@ -177,9 +187,12 @@ class RosterRow {
     this.followTargetId,
     this.clusterIdKnown = false,
     this.clusterId,
+    this.userAccountId,
     this.direction,
+    this.speed,
     this.availability,
     this.profilePictureId,
+    this.deskId,
     this.status,
   });
 
@@ -214,6 +227,17 @@ class RosterRow {
   /// value are in the same bubble.
   final String? clusterId;
 
+  /// Their `UserAccount.id` — **the media plane's name for them**, and not the
+  /// same thing as [id], which is their `SpaceUser.id`.
+  ///
+  /// The two planes are keyed on different identities: the game socket talks in
+  /// `SpaceUser`, the SFU talks in `UserAccount`, and `srcId` on the wire is this
+  /// one. Measured 2026-08-13 — asking the router about a `SpaceUser.id` returns
+  /// a stream that does not exist, silently, which is Gather's usual way of
+  /// saying no. Null until the row's `userAccountId` has arrived, which is why
+  /// anything joining a call has to tolerate a member it cannot yet address.
+  final String? userAccountId;
+
   /// `Up`, `Down`, `Left` or `Right` — which way the body is facing.
   ///
   /// `direction.value`, not `direction`: the wire carries a value object,
@@ -222,6 +246,18 @@ class RosterRow {
   /// as the client does — which is why reading this field wrongly does not look like
   /// a parsing bug, it looks like an office where everybody stares at the floor.
   final String? direction;
+
+  /// `1`, `2` or `3` — `speed.modifier`, walking, running or driving a go-kart.
+  ///
+  /// A third value object of the same family, and the only field of the three whose
+  /// inner name is not `value`. Absent on anybody standing still, because the client
+  /// sends it as the gear changes rather than continuously — so null means walking,
+  /// which is what [gaitOf] does with it.
+  ///
+  /// This is the whole of Gather's go-kart on the wire. There is no vehicle model and
+  /// no ride action: `PlayerEntityRenderer` puts a kart under anybody at 3 and takes
+  /// it away again when they drop back to 1.
+  final num? speed;
 
   /// `Active`, `Busy` or `Offline` — `userSetAvailability.value`, and the only field
   /// that answers "are they actually there".
@@ -239,6 +275,10 @@ class RosterRow {
   /// The `UserFile` id of their profile picture, or null if they have not set
   /// one. Resolve it with `ProfilePhotos`; it is not itself fetchable.
   final String? profilePictureId;
+
+  /// The desk assigned to them, as a `MapEntityIdentifier` id, or null if they
+  /// have not claimed one. Matches [SpaceRoom.stableId], never `SpaceRoom.id`.
+  final String? deskId;
 
   /// The line under their name, if it has not expired.
   final PersonStatus? status;
@@ -289,6 +329,48 @@ class Roster {
         if (row.id != me && row.clusterId == mine && row.connected != false) row,
     ];
   }
+
+  /// Everybody close enough to see and hear you — Gather's own `inRange`.
+  ///
+  /// Transcribed from the client: same floor, and squared euclidean distance
+  /// under `DIST_THRESHOLD * DIST_THRESHOLD` with `DIST_THRESHOLD = 12`. It is
+  /// the input to `playerMediaMags`, and the set the desktop client keys its
+  /// **allow list** on.
+  ///
+  /// This is a wider circle than [myCluster] and the difference is the whole
+  /// point. A cluster is a conversation you have joined; being *in range* is
+  /// merely being near enough that Gather draws your camera in a little circle
+  /// over your head. Allowing only your cluster means nobody standing beside you
+  /// may consume your video, so that circle never appears — which is exactly how
+  /// this was first reported.
+  ///
+  /// Positions can be absent on a row that has not moved since the dump; those
+  /// are excluded rather than treated as origin, because (0,0) is a real tile and
+  /// would put strangers in the top-left corner permanently in range.
+  List<RosterRow> get nearby {
+    final me = selfId;
+    if (me == null) return const [];
+
+    RosterRow? mine;
+    for (final row in rows) {
+      if (row.id == me) {
+        mine = row;
+        break;
+      }
+    }
+    final x = mine?.x;
+    final y = mine?.y;
+    if (mine == null || x == null || y == null) return const [];
+
+    const threshold = 12 * 12;
+    return [
+      for (final row in rows)
+        if (row.id != me && row.connected != false && row.floorId == mine.floorId)
+          if (row.x case final rx?)
+            if (row.y case final ry?)
+              if ((rx - x) * (rx - x) + (ry - y) * (ry - y) < threshold) row,
+    ];
+  }
 }
 
 /// Mutable accumulator for one SpaceUser as patches arrive.
@@ -311,8 +393,10 @@ class _Row {
   bool clusterIdKnown = false;
   String? clusterId;
   String? direction;
+  num? speed;
   String? availability;
   String? profilePictureId;
+  String? deskId;
   bool gone = false;
 }
 
@@ -699,6 +783,12 @@ class GameProtocolReader {
       return _merge(row, {'direction__value': patch['data']});
     }
 
+    // Changing gear. Sent on its own, ahead of the run of positions it explains, and
+    // twice per route — once into the kart and once back out of it.
+    if (field == 'speed' && sub.first == 'modifier') {
+      return _merge(row, {'speed__modifier': patch['data']});
+    }
+
     return false;
   }
 
@@ -731,6 +821,13 @@ class GameProtocolReader {
       set(row.profilePictureId, _nullableString(data['profilePictureId']),
           (v) => row.profilePictureId = v);
     }
+
+    // Read the same way, and nullable for the same reason: plenty of people in a
+    // space have never claimed a desk, and losing one is a `null` patch rather
+    // than a missing key.
+    if (data.containsKey('deskId')) {
+      set(row.deskId, _nullableString(data['deskId']), (v) => row.deskId = v);
+    }
     if (data.containsKey('connected')) {
       set(row.connected, _asBool(data['connected']), (v) => row.connected = v);
     }
@@ -761,6 +858,21 @@ class GameProtocolReader {
     if (data.containsKey('direction__value')) {
       set(row.direction, _nullableString(data['direction__value']),
           (v) => row.direction = v);
+    }
+
+    // The third value object of the same shape — `{$type: 'Speed', modifier: 1}` — and
+    // the field inside it is `modifier`, not `value`. Patches arrive on
+    // `/speed/modifier`, flattened to `speed__modifier` by [_replaceField].
+    if (data.containsKey('speed')) {
+      final value = data['speed'];
+      set(
+        row.speed,
+        value is Map<String, Object?> ? _asNum(value['modifier']) : _asNum(value),
+        (v) => row.speed = v,
+      );
+    }
+    if (data.containsKey('speed__modifier')) {
+      set(row.speed, _asNum(data['speed__modifier']), (v) => row.speed = v);
     }
 
     // A value object: ext-0 decodes to `{$type: 'SpaceUserAvailability', value: …}`,
@@ -903,9 +1015,12 @@ class GameProtocolReader {
         followTargetId: row.followTargetId,
         clusterIdKnown: row.clusterIdKnown,
         clusterId: row.clusterId,
+        userAccountId: row.userAccountId,
         direction: row.direction,
+        speed: row.speed,
         availability: row.availability,
         profilePictureId: row.profilePictureId,
+        deskId: row.deskId,
         status: _statusFor(row.id, now),
       ));
     }
@@ -1089,3 +1204,5 @@ String? _nullableString(Object? value) =>
     value is String && value.isNotEmpty ? value : null;
 
 bool? _asBool(Object? value) => value is bool ? value : null;
+
+num? _asNum(Object? value) => value is num ? value : null;

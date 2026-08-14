@@ -221,6 +221,37 @@ void main() {
       // `{position: {x, y}}` is rejected by the real server; flat is the shape.
       expect(args[2], {'x': 65, 'y': 38, 'direction': 'Down'});
     });
+
+    test('a gait is its own action, with no arguments at all', () async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      expect(c.setGait(Gait.driving).ok, isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      final sent = conn.received.lastWhere((f) => f['action'] == 'drive');
+      // Three separate actions rather than one with a number in it, and each takes
+      // nothing — so the tuple is two long, not three padded with null.
+      expect(sent['args'], ['SpaceUser', 'me-1']);
+    });
+
+    test('each gait names its own action', () async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      for (final gait in Gait.values) {
+        c.setGait(gait);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      final actions = [
+        for (final frame in conn.received)
+          if (const {'walk', 'run', 'drive'}.contains(frame['action'])) frame['action'],
+      ];
+      expect(actions, ['walk', 'run', 'drive']);
+    });
   });
 
   /// The shapes here are transcribed from a capture of the desktop client taken on

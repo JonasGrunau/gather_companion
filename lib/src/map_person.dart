@@ -8,6 +8,8 @@
 /// tempting every other screen to reason about proximity.
 library;
 
+import 'package:gather_client/gather_client.dart';
+
 class MapPerson {
   const MapPerson({
     required this.id,
@@ -18,6 +20,7 @@ class MapPerson {
     required this.speaking,
     this.avatarUrl,
     this.direction,
+    this.gait = Gait.walking,
     this.availability,
     this.isMe = false,
   });
@@ -47,6 +50,14 @@ class MapPerson {
 
   /// `Up`, `Down`, `Left`, `Right`, or null — which frame of the sheet to draw.
   final String? direction;
+
+  /// Walking, running, or driving a go-kart — which *row* of the sheet to draw, and
+  /// whether to put a kart under them.
+  ///
+  /// `speed.modifier` off the roster for everybody else; for me it comes from [Walk]
+  /// instead, because the wire is a quarter of a second behind a walk that changes
+  /// gait twice in that time and my own avatar is the one being watched closely.
+  final Gait gait;
 
   /// `Active`, `Focused`, `FocusedCoworking`, `Busy`, `Away` — the dot on the name
   /// plate, and the reason it is worth carrying: a plate whose dot is always green

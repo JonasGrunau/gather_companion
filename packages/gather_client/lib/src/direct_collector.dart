@@ -277,6 +277,31 @@ class DirectCollector {
     return _act('move', {'direction': direction});
   }
 
+  /// Says how fast we are going, which is what puts a go-kart under the avatar.
+  ///
+  /// Three actions, one per [Gait], and each body is a single assignment:
+  ///
+  /// ```js
+  /// w(this, "drive", MethodAction({
+  ///   target: this, id: "drive",
+  ///   requiredPermission: SpaceUserPermission.Move,
+  ///   optimistic: true,
+  ///   fn: () => () => { this.speed = new Speed(Speed.DRIVING) }}))
+  /// ```
+  ///
+  /// No arguments — the action *is* the argument — so this goes out as the same
+  /// two-element `args` tuple `clearCustomStatus` uses.
+  ///
+  /// **Nothing about position depends on this.** The pace is entirely in how often
+  /// [move] is sent, and the server neither reads `speed` back nor checks it. What it
+  /// buys is that `speed.modifier` is a synced field on `SpaceUser`, so this is the
+  /// only thing every other client in the space reads to pick the run cycle and to
+  /// draw the kart. Stepping fast without sending it is an avatar skating across the
+  /// office in an idle pose on everybody else's screen.
+  ///
+  /// Fire-and-forget for the same reason [move] is.
+  ({bool ok, String? detail}) setGait(Gait gait) => _act(gait.action);
+
   /// Moves our avatar to a tile. The one thing this collector writes.
   ///
   /// `SpaceUser` is per-person-per-space rather than per-connection, so this moves

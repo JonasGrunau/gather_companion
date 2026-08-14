@@ -21,6 +21,8 @@ Map<String, Object?> _availability(String value) =>
 
 Map<String, Object?> _direction(String value) => {r'$type': 'Direction', 'value': value};
 
+Map<String, Object?> _speed(num modifier) => {r'$type': 'Speed', 'modifier': modifier};
+
 Map<String, Object?> _dump(List<Map<String, Object?>> users) => {
       'type': 'FullStateChunk',
       'fullStatePatches': [
@@ -168,5 +170,49 @@ void main() {
     ]);
 
     expect(_row(roster, 'ada').direction, 'Left');
+  });
+
+  test('speed is a value object whose field is modifier, not value', () {
+    // The third of the family and the odd one out: `{$type: 'Speed', modifier: 3}`.
+    // Reading `value` off it gives null for everybody, and null means walking — so
+    // the failure is not an error, it is an office where nobody is ever in a kart.
+    final roster = _read([
+      _dump([
+        {'id': _me, 'connected': true},
+        {'id': 'ada', 'connected': true, 'speed': _speed(1)},
+      ]),
+      _delta([_replace('ada', '/speed', _speed(3))]),
+    ]);
+
+    expect(_row(roster, 'ada').speed, 3);
+    expect(gaitOf(_row(roster, 'ada').speed), Gait.driving);
+  });
+
+  test('changing gear arrives as a patch on the modifier, on its own', () {
+    // Which is the common case: the gear changes twice inside a single route and the
+    // client sends each on its own, ahead of the run of positions it explains.
+    final roster = _read([
+      _dump([
+        {'id': _me, 'connected': true},
+        {'id': 'ada', 'connected': true, 'speed': _speed(3)},
+      ]),
+      _delta([_replace('ada', '/speed/modifier', 2)]),
+    ]);
+
+    expect(gaitOf(_row(roster, 'ada').speed), Gait.running);
+  });
+
+  test('a row that never mentions speed is walking', () {
+    // Which is what the client does with it: `cachedGameSpeed` starts at WALKING and
+    // `setSpeedModifier` falls through to `default: e.walk()`.
+    final roster = _read([
+      _dump([
+        {'id': _me, 'connected': true},
+        {'id': 'ada', 'connected': true},
+      ]),
+    ]);
+
+    expect(_row(roster, 'ada').speed, isNull);
+    expect(gaitOf(_row(roster, 'ada').speed), Gait.walking);
   });
 }

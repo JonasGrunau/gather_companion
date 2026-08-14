@@ -81,7 +81,22 @@ class FakeSfuServer {
   /// When set, CONNECT is refused with this reason instead of accepted.
   String? refuseWith;
 
+  /// When true, CONNECT is neither accepted nor refused — the socket stays open
+  /// and silent. This is the half-open case a refusal does not cover: the TCP
+  /// connection succeeds, so nothing errors, and a client that mistakes "the
+  /// socket opened" for "the socket works" hangs here rather than failing.
+  bool stallConnect = false;
+
   String get url => 'http://127.0.0.1:${_server.port}';
+
+  /// The address shaped like one the **router** hands out, rather than a bare
+  /// origin: `wss://…:443/ip-<dashed-ip>`.
+  ///
+  /// Both halves are the parts that broke in the field — the explicit default
+  /// port and the `/ip-…` prefix — so anything testing a media node should use
+  /// this and not [url]. The port here is the real one, because the fake is not
+  /// on 443; the prefix and the `wss` scheme are what matter.
+  String get nodeUrl => 'ws://127.0.0.1:${_server.port}/ip-127-0-0-1';
 
   static Future<FakeSfuServer> start() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -129,6 +144,7 @@ class FakeSfuServer {
       conn.auth = body.isEmpty
           ? const {}
           : (jsonDecode(body) as Map).cast<String, Object?>();
+      if (stallConnect) return;
       final refusal = refuseWith;
       if (refusal != null) {
         conn.send('44${jsonEncode({'message': refusal})}');

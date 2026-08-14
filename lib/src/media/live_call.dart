@@ -65,7 +65,22 @@ class LiveCall implements Call {
   final SfuSession Function() _buildSfu;
 
   StreamSubscription<LocalMediaState>? _engineSub;
+  StreamSubscription<List<RemoteMedia>>? _remoteSub;
+  StreamSubscription<SfuNotification>? _noticeSub;
   SfuSession? _sfu;
+
+  /// Who we want to hear, held here rather than only in the session.
+  ///
+  /// The cluster can change while the SFU is not connected — a colleague walks
+  /// over before anyone has tapped anything — and the desired set has to survive
+  /// that so the session can be brought up to date once it exists.
+  Set<String> _listeningTo = const {};
+
+  /// Who may consume us — everybody in range, not just the conversation.
+  Set<String> _visibleTo = const {};
+
+  /// The streams behind [CallState.participants], by `srcId`.
+  final Map<String, Map<SfuTag, MediaStream>> _remoteStreams = {};
 
   final _states = StreamController<CallState>.broadcast();
   CallState _state = const CallState();
@@ -200,11 +215,113 @@ class LiveCall implements Call {
     if (existing != null && existing.ready) return existing;
     if (existing != null) {
       // Started once and did not finish — a half-open session is worse than none.
-      await existing.stop();
+      // Disposed rather than stopped: it is being thrown away, and `stop` leaves
+      // its stream controllers open with nothing left to feed them.
+      await _remoteSub?.cancel();
+      _remoteSub = null;
+      await _noticeSub?.cancel();
+      _noticeSub = null;
+      await existing.dispose();
     }
     final sfu = _sfu = _buildSfu();
+    _remoteSub = sfu.remoteChanges.listen(_onRemotes);
+    _noticeSub = sfu.notifications.listen(_onNotice);
+    // Before `start()`, so the node replays it the moment it connects rather
+    // than after the first track has already gone out unwatchable.
+    sfu.setAllowed(_visibleTo);
     await sfu.start();
+
+    // Whatever the room looked like while we were not connected is what it
+    // should look like now. Without this, everybody who was already standing
+    // there when the mic was first tapped would be silent.
+    if (_listeningTo.isNotEmpty) await sfu.setSubscriptions(_listeningTo);
     return sfu;
+  }
+
+  @override
+  Future<void> setVisibleTo(Set<String> srcIds) async {
+    if (_visibleTo.length == srcIds.length && _visibleTo.containsAll(srcIds)) {
+      return;
+    }
+    _visibleTo = Set.unmodifiable(srcIds);
+    // Held whether or not a session exists, and replayed by `start()`. Somebody
+    // can walk up to you long before you tap anything, and the allow list has to
+    // be right at the moment the first track goes out — not one roster later.
+    _sfu?.setAllowed(_visibleTo);
+  }
+
+  @override
+  Future<void> setListeningTo(Set<String> srcIds) async {
+    if (_listeningTo.length == srcIds.length &&
+        _listeningTo.containsAll(srcIds)) {
+      return;
+    }
+    _listeningTo = Set.unmodifiable(srcIds);
+
+    // Only reconciled against a session that already exists. Somebody walking
+    // past must not be what opens a socket — the person here has not asked for
+    // anything yet, and a call nobody started should cost nothing.
+    final sfu = _sfu;
+    if (sfu == null || !sfu.ready) return;
+    await sfu.setSubscriptions(_listeningTo);
+  }
+
+  /// The streams for one participant, for the widget that draws them.
+  ///
+  /// Concrete rather than on [Call], for the same reason [localStream] is: a
+  /// `MediaStream` on the interface would drag the plugin into everything that
+  /// reads call state.
+  Map<SfuTag, MediaStream> streamFor(String srcId) =>
+      _remoteStreams[srcId] ?? const {};
+
+  /// The one server-pushed message a person needs to be told about.
+  ///
+  /// The phone and the desktop client are one `UserAccount`, so they are one
+  /// `srcId` to the SFU. The phone keeps the call — you picked it up, so it is
+  /// where you are — but the desktop letting go is the *server's* doing, not
+  /// something this app can ask for: nothing in the protocol drops another
+  /// client. So the honest thing is to name what is happening and what to do
+  /// about it, rather than either going quiet or promising a handover we cannot
+  /// perform.
+  void _onNotice(SfuNotification n) {
+    if (n.name != 'double-connected') return;
+    final sfu = _sfu;
+
+    if (sfu?.displaced ?? false) {
+      _emit(_state.copyWith(
+        publishingAudio: false,
+        publishingVideo: false,
+        detail: 'Your Mac keeps taking this call back. Quit Gather there, then '
+            'turn your microphone on again here. You can still see and hear '
+            'everyone in the meantime.',
+      ));
+      return;
+    }
+
+    _emit(_state.copyWith(
+      detail: 'Gather is open on your Mac too. Quit it there if the sound '
+          'starts jumping between them.',
+    ));
+  }
+
+  void _onRemotes(List<RemoteMedia> remotes) {
+    _remoteStreams
+      ..clear()
+      ..addEntries(remotes.map((r) => MapEntry(r.srcId, r.streams)));
+
+    _emit(_state.copyWith(
+      participants: [
+        for (final r in remotes)
+          CallParticipant(
+            srcId: r.srcId,
+            hasAudio: r.streams.containsKey(SfuTag.audio),
+            hasVideo: r.streams.containsKey(SfuTag.video),
+            audioPaused: r.paused.contains(SfuTag.audio),
+            videoPaused: r.paused.contains(SfuTag.video),
+            sharingScreen: r.streams.containsKey(SfuTag.screen),
+          ),
+      ],
+    ));
   }
 
   String _fail(SfuTag tag, String sentence) {
@@ -216,9 +333,17 @@ class LiveCall implements Call {
   Future<void> hangUp() async {
     _wantMic = false;
     _wantCamera = false;
-    await _sfu?.stop();
+    await _remoteSub?.cancel();
+    _remoteSub = null;
+    await _noticeSub?.cancel();
+    _noticeSub = null;
+    await _sfu?.dispose();
     _sfu = null;
+    _remoteStreams.clear();
     await _engine.stopCapture();
+    // The desired set survives a hang-up: the cluster has not changed just
+    // because we stopped listening to it, and the next tap should pick up the
+    // same room rather than an empty one.
     _emit(const CallState());
   }
 
@@ -226,8 +351,13 @@ class LiveCall implements Call {
   Future<void> dispose() async {
     await _engineSub?.cancel();
     _engineSub = null;
-    await _sfu?.stop();
+    await _remoteSub?.cancel();
+    _remoteSub = null;
+    await _noticeSub?.cancel();
+    _noticeSub = null;
+    await _sfu?.dispose();
     _sfu = null;
+    _remoteStreams.clear();
     await _engine.dispose();
     if (!_states.isClosed) await _states.close();
   }

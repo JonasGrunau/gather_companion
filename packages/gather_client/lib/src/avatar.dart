@@ -56,6 +56,61 @@ const avatarFrameHeight = 64;
 /// `defaultAvatarOffsetY = -32 * scale` in the client.
 const avatarOffsetY = -32;
 
+/// The go-kart. One sheet for everybody, and the only vehicle Gather ships.
+///
+/// `GOKART_URL`, verbatim — a public CDN object with its own access token baked into
+/// the query string, the same shape every other Gather asset URL has. The client
+/// takes `vehicleSpritesheet || GOKART_URL`, and nothing in the space this was built
+/// against has ever set the first: a `Vehicle` model does not exist on the wire, and
+/// the kart is conjured entirely out of `speed.modifier` reaching 3.
+///
+/// Fetched at 512×32 — sixteen frames of 32×32 in one row, the same single-row
+/// convention the 2304×64 avatar sheets use.
+const goKartUrl =
+    'https://cdn.gather.town/storage.googleapis.com/v0/b/gather-town.appspot.com/o/'
+    'manually-uploaded%2Fgokarts%2Fgokart-spritesheet-august-2023.png'
+    '?alt=media&token=8b6bc4dd-d1f3-4176-ad06-293b57efcadf';
+
+/// One frame of the kart sheet. A kart is one tile, not two — it goes under a body,
+/// not around one.
+const goKartFrameSize = 32;
+
+/// Which frame of [goKartUrl] to draw, transcribed from `createVehicleImage`:
+///
+/// ```js
+/// animations: {"idle-e":{loop:true,frameRate:7,sequence:[0]},
+///              "idle-s":[4], "idle-w":[8], "idle-n":[12],
+///              "moving-e":{loop:true,frameRate:7,sequence:[0,3],useSequenceAsRange:true},
+///              "moving-s":[4..7], "moving-w":[8..11], "moving-n":[12..15]}
+/// ```
+///
+/// Note the order: **east first**, where the avatar sheet starts south. Four frames
+/// per direction, the first of which is the parked one, so a kart standing still is
+/// the moving cycle held on frame zero.
+AvatarAnimation goKartAnimation({required Facing facing, bool moving = true}) =>
+    moving ? _kartMoving[facing]! : _kartIdle[facing]!;
+
+const _kartStart = {
+  Facing.east: 0,
+  Facing.south: 4,
+  Facing.west: 8,
+  Facing.north: 12,
+};
+
+final _kartIdle = {
+  for (final MapEntry(key: facing, value: start) in _kartStart.entries)
+    facing: AvatarAnimation(frames: [start], fps: 7, loop: true),
+};
+
+final _kartMoving = {
+  for (final MapEntry(key: facing, value: start) in _kartStart.entries)
+    facing: AvatarAnimation(
+      frames: [start, start + 1, start + 2, start + 3],
+      fps: 7,
+      loop: true,
+    ),
+};
+
 /// Which way somebody is facing, as `SpaceUser.direction` spells it.
 ///
 /// The wire words are `Up`, `Down`, `Left`, `Right`; the client maps them to the
@@ -85,7 +140,7 @@ enum Facing {
 /// can tell us about. It has emotes too — clapping, waving, laughing, confetti — but
 /// those live on a second *extras* spritesheet and are announced over a channel this
 /// app does not listen to, so there is no honest way to draw them.
-enum Pose { standing, sitting, walking, dancing, talking, talkingSitting }
+enum Pose { standing, sitting, walking, running, dancing, talking, talkingSitting }
 
 /// One animation out of the client's table: which frames, how fast, and whether it
 /// loops — `{sequence, frameRate, loop}` in `Ae`, transcribed.
@@ -123,14 +178,26 @@ class AvatarAnimation {
 /// talking-idle-*: {loop:true,frameRate:4,…}
 /// ```
 ///
-/// `run-*` (36-39, 44-47, 52-55, 60-63) is deliberately absent: the client picks it
-/// on `speed.modifier > 1`, and on the space this was measured against all 98 rows
-/// report a modifier of exactly 1, so nothing here could ever choose it honestly.
+/// `run-*` is 36-39, 44-47, 52-55, 60-63 — the four frames after each walk cycle in
+/// the same row. The client chooses between the two in one expression:
+///
+/// ```js
+/// case "Moving":
+///   this.avatar.playAnim((this.playerEntity.getSpeedModifier() > 1 ? "run-" : "walk-")
+///                        + this.getDirectionAnimationNamePostfix(), true)
+/// ```
+///
+/// So running and driving share a pose: there is no third cycle, and somebody in a
+/// go-kart is drawn running with a kart over the top. It stayed unreachable here for
+/// a while, because every row of the measured dump reported a modifier of exactly 1
+/// and nothing could have chosen it honestly. `speed.modifier` is on the roster now,
+/// and this app sends its own, so it can.
 AvatarAnimation avatarAnimation({required Facing facing, Pose pose = Pose.standing}) =>
     switch (pose) {
       Pose.standing => _standing[facing]!,
       Pose.sitting => _sitting[facing]!,
       Pose.walking => _walking[facing]!,
+      Pose.running => _running[facing]!,
       Pose.talking => _talking[facing]!,
       Pose.talkingSitting => _talkingSitting[facing]!,
       Pose.dancing => _dancing,
@@ -166,6 +233,27 @@ final _walking = {
     Facing.west: 40,
     Facing.north: 48,
     Facing.east: 56,
+  }.entries)
+    facing: AvatarAnimation(
+      frames: [start, start + 1, start + 2, start + 3],
+      fps: 7,
+      loop: true,
+    ),
+};
+
+/// The four frames after each walk cycle, at the same rate.
+///
+/// Seven frames a second whatever the legs are doing, which is the client's own
+/// figure: the animation runs on Phaser's clock and the *steps* run on
+/// `getMoveInterval`, so a run covers two tiles per frame and a go-kart three. The
+/// cycle looking unhurried under a body that is moving fast is what selling the kart
+/// depends on — the kart is the thing that reads as speed, not the legs.
+final _running = {
+  for (final MapEntry(key: facing, value: start) in const {
+    Facing.south: 36,
+    Facing.west: 44,
+    Facing.north: 52,
+    Facing.east: 60,
   }.entries)
     facing: AvatarAnimation(
       frames: [start, start + 1, start + 2, start + 3],

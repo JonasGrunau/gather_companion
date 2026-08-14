@@ -138,4 +138,60 @@ void main() {
     expect(roster.selfId, isNull);
     expect(roster.myCluster, isEmpty, reason: 'a cluster we are not in is not our call');
   });
+
+  group('in range — who may see you, which is wider than who you talk to', () {
+    RosterRow at(String id, num x, num y, {String floor = 'f1'}) =>
+        RosterRow(id: id, name: id, x: x, y: y, floorId: floor, connected: true);
+
+    test('twelve tiles is the circle, transcribed from the client', () {
+      final roster = Roster(selfId: 'me', rows: [
+        at('me', 0, 0),
+        at('close', 3, 4), // 5 — in
+        at('edge', 0, 11), // 11 — in
+        at('far', 0, 12), // 12 — out; the client compares strictly less than
+      ]);
+
+      expect(roster.nearby.map((r) => r.id), ['close', 'edge']);
+    });
+
+    test('a different floor is not nearby, however close the numbers look', () {
+      final roster = Roster(selfId: 'me', rows: [
+        at('me', 0, 0),
+        at('upstairs', 1, 1, floor: 'f2'),
+      ]);
+
+      expect(roster.nearby, isEmpty);
+    });
+
+    test('a row with no position is left out, not placed at the origin', () {
+      // (0,0) is a real tile. Reading absent as origin would put every
+      // not-yet-moved stranger permanently in range of whoever stands there.
+      final roster = Roster(selfId: 'me', rows: [
+        at('me', 0, 0),
+        const RosterRow(id: 'ghost', name: 'ghost', floorId: 'f1', connected: true),
+      ]);
+
+      expect(roster.nearby, isEmpty);
+    });
+
+    test('being in range is wider than being in the conversation', () {
+      // The distinction the missing video bubble turned on: `myCluster` is who
+      // you are talking to and drives what we consume; `nearby` is who may
+      // consume *us*, and so who sees your camera over your avatar.
+      final roster = Roster(selfId: 'me', rows: [
+        const RosterRow(
+            id: 'me', x: 0, y: 0, floorId: 'f1', connected: true,
+            clusterIdKnown: true, clusterId: 'c1'),
+        const RosterRow(
+            id: 'talking', x: 1, y: 0, floorId: 'f1', connected: true,
+            clusterIdKnown: true, clusterId: 'c1'),
+        const RosterRow(
+            id: 'watching', x: 5, y: 0, floorId: 'f1', connected: true,
+            clusterIdKnown: true),
+      ]);
+
+      expect(roster.myCluster.map((r) => r.id), ['talking']);
+      expect(roster.nearby.map((r) => r.id), ['talking', 'watching']);
+    });
+  });
 }

@@ -41,6 +41,11 @@ SpaceMap _obstructed() => SpaceMap(
 /// A collector that records steps instead of sending them.
 class _FakeCollector implements DirectCollector {
   final List<String> steps = [];
+
+  /// Every gear change, in order. Gather hears about these separately from the steps
+  /// and they are the only thing that puts a kart under the avatar on anybody else's
+  /// screen, so "did we send it" is worth asserting on its own.
+  final List<Gait> gaits = [];
   bool refuse = false;
 
   @override
@@ -50,6 +55,12 @@ class _FakeCollector implements DirectCollector {
   ({bool ok, String? detail}) move({required String direction}) {
     if (refuse) return (ok: false, detail: 'not connected to Gather');
     steps.add(direction);
+    return (ok: true, detail: null);
+  }
+
+  @override
+  ({bool ok, String? detail}) setGait(Gait gait) {
+    gaits.add(gait);
     return (ok: true, detail: null);
   }
 
@@ -428,17 +439,58 @@ void main() {
       expect(collector.steps, ['Right'], reason: 'nothing more went out');
     });
 
-    test('a roster that puts us off the route stops the walk', () {
-      // The desktop client moved this same avatar, or a step was dropped. Either way
-      // the remaining tiles are relative to a tile we are not standing on, and
-      // walking them would take somebody somewhere they never asked to go.
+    test('a roster that puts us off the route finds the way again', () {
+      // The desktop client moved this same avatar, or a step was dropped. The
+      // remaining tiles are now relative to a tile we are not standing on — but the
+      // *destination* has not changed, and neither has what somebody asked for. The
+      // client re-runs its whole pathfinder every single tick for this reason; this
+      // does it when the route stops making sense, which is the same recovery with
+      // less arithmetic.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 9));
+      expect(collector.steps, ['Right']);
+
+      w.noteRoster(_at(12, 17));
+      expect(w.step().ok, isTrue);
+      expect(w.onRoute, isTrue, reason: 'the walk carries on from where we really are');
+      // (12,17) to the goal at (9,4) is up and to the left, so the new route is not
+      // the old one continued.
+      expect(collector.steps.last, anyOf('Up', 'Left'));
+    });
+
+    test('a correction that lands on the goal is an arrival, not a failure', () {
+      // Re-planning from the goal answers a route of one tile, and calling that
+      // "lost the way there" would put a sentence on screen about a walk that went
+      // perfectly well.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(east(4, 4, 9));
+
+      w.noteRoster(_at(9, 4));
+      expect(w.step(), (ok: false, detail: 'already there'));
+      expect(w.onRoute, isFalse);
+    });
+
+    test('a route that cannot be re-planned does give up', () {
+      // Sealed in. There is nowhere to re-plan *to*, so the walk ends rather than
+      // spending a search per tick forever.
+      map = SpaceMap(
+        floorId: 'f1',
+        width: 20,
+        height: 20,
+        // A ring of furniture around (12,17), so a route out of it does not exist.
+        blocked: {
+          for (var dx = -1; dx <= 1; dx++)
+            for (var dy = -1; dy <= 1; dy++)
+              if (dx != 0 || dy != 0) (17 + dy) * 20 + (12 + dx),
+        },
+        rooms: const [],
+      );
       final w = build()..noteRoster(_at(4, 4));
       w.follow(east(4, 4, 9));
 
       w.noteRoster(_at(12, 17));
       expect(w.step(), (ok: false, detail: 'lost the way there'));
       expect(w.onRoute, isFalse);
-      expect(collector.steps, ['Right']);
     });
 
     test('a roster that has merely not caught up does not stop the walk', () {
@@ -520,6 +572,309 @@ void main() {
       expect(collector.steps, isEmpty);
       expect(w.onRoute, isFalse);
       expect(w.at, (x: 4, y: 4), reason: 'and nothing was believed');
+    });
+  });
+
+  group('how fast', () {
+    // Wide enough to actually walk a driving-length route to its end. The default
+    // twenty-tile floor runs out at the far wall, which stops the route early and
+    // takes the deceleration with it.
+    setUp(() => map = _open(width: 60));
+
+    /// The route [SpaceMap.routeTo] hands back for a straight line east, [tiles] long
+    /// counting the one being stood on — which is what both of the gait rules measure.
+    List<({int x, int y})> route(int tiles) =>
+        [for (var x = 0; x < tiles; x++) (x: 4 + x, y: 4)];
+
+    group('picking a gear', () {
+      // `calculateSpeedModifierForPathStarting`: the seven it subtracts is the tail
+      // every route spends slowing down, so the thresholds are cruising distance and
+      // the boundaries land at 13 and 23 rather than at 6 and 16.
+      test('a walk to the next desk is a walk', () {
+        expect(gaitToSetOff(1), Gait.walking);
+        expect(gaitToSetOff(13), Gait.walking);
+      });
+
+      test('across the room is a run', () {
+        expect(gaitToSetOff(14), Gait.running);
+        expect(gaitToSetOff(23), Gait.running);
+      });
+
+      test('across the office is worth the go-kart', () {
+        expect(gaitToSetOff(24), Gait.driving);
+        expect(gaitToSetOff(90), Gait.driving);
+      });
+    });
+
+    group('slowing down', () {
+      // `calculateSpeedModifierForPathRemaining`, whose `Math.min` is the whole of it.
+      test('the last six tiles of anything are walked', () {
+        expect(gaitFor(6, Gait.driving), Gait.walking);
+        expect(gaitFor(1, Gait.driving), Gait.walking);
+      });
+
+      test('the ten before those are run', () {
+        expect(gaitFor(7, Gait.driving), Gait.running);
+        expect(gaitFor(16, Gait.driving), Gait.running);
+      });
+
+      test('anything further off is driven', () {
+        expect(gaitFor(17, Gait.driving), Gait.driving);
+      });
+
+      test('a route never goes faster than it set off', () {
+        // The ceiling is fixed at the off, so a long walk that began as a walk stays
+        // one — this is what stops a route accelerating in its own middle.
+        expect(gaitFor(40, Gait.walking), Gait.walking);
+        expect(gaitFor(40, Gait.running), Gait.running);
+      });
+    });
+
+    test('a long route sets off in the kart and tells Gather so', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+
+      expect(w.gait, Gait.driving);
+      expect(collector.gaits, [Gait.driving]);
+    });
+
+    test('a short one neither speeds up nor says anything', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(8));
+
+      expect(w.gait, Gait.walking);
+      // Nothing changed, so nothing is sent. `setSpeedModifier` returns false on an
+      // unchanged gait for exactly this reason.
+      expect(collector.gaits, isEmpty);
+    });
+
+    test('a route slows into its destination and announces each gear', () {
+      // Long enough to start driving, and stepped all the way to the end so both
+      // downshifts happen.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+      while (w.onRoute) {
+        w.step();
+      }
+
+      expect(collector.gaits, [Gait.driving, Gait.running, Gait.walking]);
+      expect(collector.steps.length, 29, reason: 'thirty tiles is twenty-nine steps');
+    });
+
+    test('a gear change shortens the step it is announced on', () {
+      final w = build()..noteRoster(_at(4, 4));
+      expect(w.pace, const Duration(hours: 1));
+
+      w.follow(route(30));
+      expect(w.pace, const Duration(minutes: 20), reason: 'an hour divided by three');
+    });
+
+    test('climbing into the kart costs a beat of standing still', () {
+      // At the real pace, because the pause is an absolute 285.714ms and only means
+      // anything measured against a real interval. Six decrements of a 47.619ms
+      // driving step clear it — six rather than two precisely because the interval
+      // divides with the gait, so this is the timing rule tested without a clock.
+      final w = walk = Walk(
+        collector: () => collector,
+        map: () => map,
+        interval: walkStep,
+      )..noteRoster(_at(4, 4));
+
+      w.follow(route(30));
+      expect(collector.steps, isEmpty, reason: 'the first step is swallowed by the kart');
+
+      var refused = 1;
+      while (collector.steps.isEmpty) {
+        final out = w.step();
+        if (out.ok) break;
+        expect(out.detail, 'getting into the go-kart');
+        refused++;
+        expect(refused, lessThan(10), reason: 'and it does end');
+      }
+      expect(refused, 5);
+      expect(w.gait, Gait.driving, reason: 'and then it drives');
+    });
+
+    test('stopping gets out of the kart', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+      collector.gaits.clear();
+
+      w.release();
+
+      expect(w.gait, Gait.walking);
+      expect(collector.gaits, [Gait.walking],
+          reason: 'an avatar left parked in one is what everybody else keeps seeing');
+    });
+
+    test('a room is walked through however far there is left to go', () {
+      // The area rule outranks the distance, and it is the current tile that decides:
+      // `if (area && !area.isPublicWalkway) return WALKING`.
+      map = SpaceMap(
+        floorId: 'f1',
+        width: 20,
+        height: 20,
+        blocked: const {},
+        rooms: const [
+          SpaceRoom(id: 'r1', name: 'Green Park', type: 'MeetingRoom', x: 3, y: 3, width: 4, height: 4, walled: true),
+        ],
+      );
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+
+      expect(w.gait, Gait.walking);
+      expect(collector.gaits, isEmpty);
+    });
+
+    test('a public walkway is driven across', () {
+      map = SpaceMap(
+        floorId: 'f1',
+        width: 20,
+        height: 20,
+        blocked: const {},
+        rooms: const [
+          SpaceRoom(id: 'r1', name: 'The floor', type: 'Public', x: 0, y: 0, width: 20, height: 20, walled: false),
+        ],
+      );
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(30));
+
+      expect(w.gait, Gait.driving);
+    });
+
+    test('shift on the pad drives without asking how far', () {
+      // `setSpeedModifier(shift ? DRIVING : WALKING)` — no distance test and no area
+      // test either, which is the whole difference between this path and a route.
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.press('Right');
+
+      expect(w.gait, Gait.driving);
+      expect(collector.gaits, [Gait.driving]);
+    });
+
+    test('a held direction without shift walks', () {
+      final w = build()..noteRoster(_at(4, 4));
+      w.press('Right');
+
+      expect(w.gait, Gait.walking);
+      expect(collector.gaits, isEmpty);
+    });
+
+    test('letting go of shift slows a hold that is already running', () {
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.press('Right');
+      w.boost = false;
+
+      expect(w.gait, Gait.walking);
+      expect(collector.gaits, [Gait.driving, Gait.walking]);
+      expect(w.walking, isTrue, reason: 'and the thumb is still down');
+    });
+
+    test('the kart is taken for the whole route, not just its long middle', () {
+      // The bug this replaces, and it was mine rather than Gather's: `boost` used to
+      // raise `basePathSpeedModifier` and leave the deceleration alone, so latching
+      // the kart on a twenty-tile walk bought four driving steps — a fifth of a
+      // second — before `gaitFor` took it away again. On the desktop, shift is not a
+      // ceiling. It is `setSpeedModifier(DRIVING)` and it holds until you let go.
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.follow(route(20));
+
+      expect(w.gait, Gait.driving);
+      while (w.onRoute) {
+        expect(w.gait, Gait.driving, reason: 'and it does not fade out at the end');
+        w.step();
+      }
+      expect(collector.steps.length, 19);
+      // Once in, once out at the end, and nothing in between.
+      expect(collector.gaits, [Gait.driving, Gait.walking]);
+    });
+
+    test('a boost makes even a short walk a drive', () {
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.follow(route(5));
+
+      expect(w.gait, Gait.driving);
+    });
+
+    test('a boost drives through a room the automatic gait would walk', () {
+      // Faithfully: the arrow-key path never consults an area, and shift-driving into
+      // a meeting room on the desktop drives you in.
+      map = SpaceMap(
+        floorId: 'f1',
+        width: 60,
+        height: 20,
+        blocked: const {},
+        rooms: const [
+          SpaceRoom(id: 'r1', name: 'Green Park', type: 'MeetingRoom', x: 3, y: 3, width: 4, height: 4, walled: true),
+        ],
+      );
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.follow(route(30));
+
+      expect(w.gait, Gait.driving);
+    });
+
+    test('latching mid-walk takes the kart there and then', () {
+      // Which is the point of it being a live field rather than an argument: the pill
+      // is on screen for the whole walk, so pressing it has to mean something.
+      final w = build()..noteRoster(_at(4, 4));
+      w.follow(route(8));
+      expect(w.gait, Gait.walking);
+
+      w.boost = true;
+      expect(w.gait, Gait.driving);
+      expect(collector.gaits, [Gait.driving]);
+    });
+
+    test('a kart remembers three times as far back as a walk does', () {
+      // The bug behind "it still fails sometimes when the go-kart is on", and it was
+      // a units mistake rather than a logic one. `_maxPending` is a *count* of steps
+      // and what it wants to be is a stretch of *time*: left flat at 16 it buys 2.3
+      // seconds of unconfirmed walking and only 0.76 of a second of driving — three
+      // roster ticks. One late roster past that and the tile it names has already
+      // fallen off the front of the list, so a roster that was merely behind reads as
+      // a correction from nowhere, and the walk ends halfway across the office.
+      //
+      // Twenty steps of driving, then a roster reporting the *first* of them. At a
+      // walk that would already be out of the window; in a kart it must not be.
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.follow(route(40));
+      for (var i = 0; i < 20; i++) {
+        w.step();
+      }
+      expect(w.at, (x: 4 + collector.steps.length, y: 4));
+      final reached = w.at!;
+
+      w.noteRoster(_at(5, 4));
+
+      expect(w.at, reached, reason: 'a tile we claimed is still not a correction');
+      expect(w.onRoute, isTrue);
+    });
+
+    test('stopping gets out of the kart even with the latch still down', () {
+      // `stopArrowKeyMovement` sets WALKING whether or not shift is still held —
+      // standing still is walking, and an avatar parked in a kart is what everybody
+      // else in the space would keep seeing.
+      final w = build()
+        ..noteRoster(_at(4, 4))
+        ..boost = true;
+      w.follow(route(30));
+      w.release();
+
+      expect(w.gait, Gait.walking);
+      expect(w.boost, isTrue, reason: 'but the latch itself survives');
     });
   });
 }

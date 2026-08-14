@@ -107,6 +107,49 @@ void main() {
     });
   });
 
+  group('the run cycle and the go-kart', () {
+    test('running is the four frames after each walk', () {
+      // `run-s` 36–39, `run-w` 44–47, `run-n` 52–55, `run-e` 60–63 — each sitting
+      // directly after its own walk cycle in the same row of the sheet.
+      expect(avatarFrame(facing: Facing.south, pose: Pose.running, tick: 0), 36);
+      expect(avatarFrame(facing: Facing.west, pose: Pose.running, tick: 1), 45);
+      expect(avatarFrame(facing: Facing.north, pose: Pose.running, tick: 2), 54);
+      expect(avatarFrame(facing: Facing.east, pose: Pose.running, tick: 3), 63);
+    });
+
+    test('the run and the walk share a rate', () {
+      final run = avatarAnimation(facing: Facing.south, pose: Pose.running);
+      final walk = avatarAnimation(facing: Facing.south, pose: Pose.walking);
+      // The legs are on Phaser's clock and the tiles are on `getMoveInterval`, so a
+      // runner covers two tiles per frame and a kart three. The cycle is the same.
+      expect(run.fps, walk.fps);
+      expect(run.loop, isTrue);
+    });
+
+    test('the kart sheet starts east, where the avatar sheet starts south', () {
+      // `{"idle-e":[0], "idle-s":[4], "idle-w":[8], "idle-n":[12]}` — a different
+      // order from the body's, which is the sort of thing that silently draws
+      // everybody's kart pointing the wrong way.
+      expect(goKartAnimation(facing: Facing.east, moving: false).frames, [0]);
+      expect(goKartAnimation(facing: Facing.south, moving: false).frames, [4]);
+      expect(goKartAnimation(facing: Facing.west, moving: false).frames, [8]);
+      expect(goKartAnimation(facing: Facing.north, moving: false).frames, [12]);
+    });
+
+    test('a moving kart is four frames from its own parked one', () {
+      expect(goKartAnimation(facing: Facing.south).frames, [4, 5, 6, 7]);
+      expect(goKartAnimation(facing: Facing.north).frames, [12, 13, 14, 15]);
+      expect(goKartAnimation(facing: Facing.east).fps, 7);
+    });
+
+    test('a kart is one tile, not two', () {
+      // 512×32: sixteen frames in a row, and square — it goes *under* a body rather
+      // than around one, which is why it is not the avatar's 32×64.
+      expect(goKartFrameSize, 32);
+      expect(goKartUrl, contains('gokart-spritesheet'));
+    });
+  });
+
   group('animations', () {
     test('the walk cycle runs at seven frames a second and loops', () {
       // `{loop:true,frameRate:7,sequence:[32,35],useSequenceAsRange:true}`. Seven is

@@ -303,6 +303,40 @@ void main() {
       expect(map.walkable, contains(3 * 20 + 3));
     });
 
+    test('an area carries the identifier id, which is not its own id', () {
+      // The one that matters for desks. `SpaceUser.deskId` is a one-to-one at
+      // `MapEntityIdentifier`, so a desk is found by matching `stableId`; matching
+      // `id` compiles, reads correctly, and finds nobody's desk on a live space.
+      final b = _base();
+      b.apply('MapArea', _add({
+        'id': 'area-1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 2,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(2, 2),
+        'mapAreaType': 'Desk',
+        'mapEntityIdentifierId': 'ident-1',
+      }));
+      b.apply('MapArea', _add({
+        'id': 'area-2',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 6,
+        'relativeY': 2,
+        'dimensionsInTiles': _dims(2, 2),
+        'mapAreaType': 'Desk',
+      }));
+
+      final rooms = b.forFloor('floor-1')!.rooms;
+      expect(rooms.firstWhere((r) => r.id == 'area-1').stableId, 'ident-1');
+      expect(
+        rooms.firstWhere((r) => r.id == 'area-2').stableId,
+        isNull,
+        reason: 'an area with no identifier row is not a desk anybody can own',
+      );
+    });
+
     test('walls around a zone are the building, not a closed door', () {
       // The bug this fixes. "Walled means private" is Gather's own rule for audio
       // and the wrong rule for a floor plan: the measured office's main room is a
@@ -944,6 +978,88 @@ void main() {
       expect(tiles.first, (x: 5, y: 5), reason: 'the seat outranks proximity');
       expect(tiles[1], (x: 2, y: 2), reason: 'then the nearest standing tile');
       expect(tiles.length, 16, reason: 'the whole 4x4 room is walkable');
+    });
+
+    test('a blocked tile hands back the floor beside it', () {
+      // The bug this fixes, reported as "chairs are counted as unwalkable". They may
+      // well be: `blockedAtPosition` has no exemption for seats, so a chair carrying
+      // collision points is as impassable as a wall in Gather too. The difference is
+      // that Gather never refuses a click on one — `startPathMoveOnCurrentFloor`
+      // relocates the goal and walks you to the tile beside it.
+      final b = _base();
+      _variant(b, 'chair', [
+        [0, 0],
+      ], family: 'Chair');
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 6,
+        'relativeY': 4,
+        'catalogItemVariantId': 'chair',
+      }));
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.isWalkable(6, 4), isFalse, reason: 'the chair does block its tile');
+      final free = map.nearestFree(6, 4)!;
+      expect(free, isNot((x: 6, y: 4)));
+      expect((free.x - 6).abs() + (free.y - 4).abs(), 1, reason: 'and it is adjacent');
+    });
+
+    test('a relocation reaches past more than one tile of furniture', () {
+      // A chair in the middle of a desk cluster is not one tile from open floor, and
+      // a one-ring search was the reason tapping most of the office did nothing.
+      // `getNearestFreeTile` searches a box of 2, widened to 4 when starting a walk.
+      final b = _base();
+      _variant(b, 'block', [
+        for (var dx = -2; dx <= 2; dx++)
+          for (var dy = -2; dy <= 2; dy++) [dx, dy],
+      ]);
+      b.apply('MapObject', _add({
+        'id': 'o1',
+        'mapId': 'map-1',
+        'parentAreaId': 'base',
+        'relativeX': 8,
+        'relativeY': 5,
+        'catalogItemVariantId': 'block',
+      }));
+      final map = b.forFloor('floor-1')!;
+
+      expect(map.nearestFree(8, 5, radius: 2), isNull, reason: 'the default box is all furniture');
+      expect(map.nearestFree(8, 5), isNotNull, reason: 'the widened one is not');
+    });
+
+    test('a tile somebody is standing on hands back the one next to them', () {
+      final map = _base().forFloor('floor-1')!;
+      final free = map.nearestFree(6, 4, occupied: {4 * 20 + 6})!;
+
+      expect(free, isNot((x: 6, y: 4)));
+      expect((free.x - 6).abs() + (free.y - 4).abs(), 1);
+    });
+
+    test('a relocation does not wander into somebody else\'s desk', () {
+      // `isTileFreeForThisArea`. Being bumped off a tile is one thing; being bumped
+      // into a room you were not going to is another.
+      final b = _base();
+      area(b, id: 'desk', type: 'Desk', x: 5, y: 3, width: 3, height: 3,
+          walls: 'NewStyleNoWall');
+      final map = b.forFloor('floor-1')!;
+
+      // Standing just outside it, relocating must stay outside it.
+      final free = map.nearestFree(4, 4, occupied: {4 * 20 + 4})!;
+      expect(map.areaAt(free.x, free.y)?.id, isNot('desk'));
+    });
+
+    test('a relocation inside a room stays inside it', () {
+      // The other half of the same rule: a goal already in a desk relocates within
+      // that desk rather than being pushed out of the room you were aiming for.
+      final b = _base();
+      area(b, id: 'desk', type: 'Desk', x: 5, y: 3, width: 3, height: 3,
+          walls: 'NewStyleNoWall');
+      final map = b.forFloor('floor-1')!;
+
+      final free = map.nearestFree(6, 4, occupied: {4 * 20 + 6})!;
+      expect(map.areaAt(free.x, free.y)?.id, 'desk');
     });
 
     test('areaAt sees the desks that roomAt is built to skip', () {

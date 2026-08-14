@@ -827,6 +827,7 @@ Captured off the real client, or confirmed by probe:
 | `updateSubscription` | `['ModelSubscription', '<id>', {modelIds[]}]` | replaces that subscription's id list |
 | `move` | `['SpaceUser', id, {direction:'Up'\|'Down'\|'Left'\|'Right'}]` | **one tile per call** |
 | `teleport` | `['SpaceUser', id, {x, y, direction}]` | flat `x`/`y`; `floorId` optional |
+| `walk` / `run` / `drive` | `['SpaceUser', id]` | **two args.** Three actions rather than one with a number in it; each body is `this.speed = new Speed(WALKING\|RUNNING\|DRIVING)` |
 | `faceDirection` | `['SpaceUser', id, 'Down']` | **bare string.** Turns without stepping |
 | `setAvailability` | `['SpaceUser', id, {availability:'Active'\|'Busy'\|'Away'}]` | writes `userSetAvailability` |
 | `setCustomStatus` | `['SpaceUser', id, {text, emoji?, clearCondition?}]` | `clearCondition` is `{type:'DateTime', clearAt:<ext-1 DateTime>}` |
@@ -843,8 +844,24 @@ Probed and confirmed **not** to exist on `SpaceUser`: `moveTo`, `setPosition`,
 `{position:{x,y}}` — the coordinates must be flat, and `direction` is required even
 when teleporting.
 
+**Speed is three actions, and the go-kart is one of them.** There is no vehicle
+model on the wire, no ride action, and nothing anywhere that says "in a kart".
+`speed.modifier` is 1, 2 or 3, and `PlayerEntityRenderer` puts a kart under anybody
+who reaches 3 — `if (getSpeedModifier() === Speed.DRIVING) this.setVehicle({id:
+"goKart-for-speed-modifier"})`, over one shared 512×32 sheet at `GOKART_URL`. Nothing
+about *position* depends on it either: the pace is entirely in how often `move` is
+sent, at `getMoveInterval(m) = (1000/7) / m`. What the action buys is that
+`speed.modifier` is a synced field, so it is the only thing every other client in the
+space reads to pick the run cycle and to draw the kart. Which gait to be in is
+`calculateSpeedModifierForPathStarting` (walk to 13 tiles, run to 23, drive past
+that) and `calculateSpeedModifierForPathRemaining` (recomputed from what is *left*,
+never above the ceiling, so every route decelerates and the last six tiles of
+anything are walked; and a non-`isPublicWalkway` area forces a walk outright). The
+shift key is a separate door with none of those rules:
+`setSpeedModifier(shift ? DRIVING : WALKING)`.
+
 **The third argument is not always a map, and that is the trap.** Four of these
-send a bare value (`faceDirection` a string, `setHandRaised` a bool) and three
+send a bare value (`faceDirection` a string, `setHandRaised` a bool) and six
 send no third argument at all — their `args` is two elements long. Sending
 `{raised:true}` where the server wants `true` is a zod failure, and a zod failure
 executes nothing. A client that assumes the `move`/`teleport` shape will find that
@@ -1649,6 +1666,66 @@ misplaced: **Gather itself encodes one layer at a time** and flips `active` as
 consumers ask for more, with the server steering via `set-max-spatial-layer {layer,
 kind}`. Declaring three costs nothing; only active ones are encoded.
 
+### The video bubble over someone's head is drawn from the media plane alone
+
+There is **no game-socket field for "my camera is on"**. Checked against all three
+captures — 774 records of a real two-person call with a screen share included — and the
+only media-ish keys anywhere are `video`, `screen` and `highQualityScreenShare`, all of
+them inside SFU frames. No `micOn`, no `cameraOn`, no `isSharingScreen`, nothing on
+`SpaceUser`.
+
+So the bubble is not announced, it is *inferred*: every client learns who is publishing
+what from `consume-try`'s `producerIdMap` and draws the circle itself. The consequence
+for us is a happy one — **publishing video is the whole job.** Colleagues see your face
+over your avatar because their clients consume your video producer, with nothing extra
+sent on the game socket. The dormant `PlayerRef.micOn` / `.cameraOn` / `.screensharing`
+fields can therefore be filled from our own media state, but they are a local convenience
+and never something the wire tells us about anybody else.
+
+### `double-connected`, and what a phone can and cannot do about the desktop
+
+The SFU pushes `double-connected` when two connections claim one `srcId` — which is
+exactly what a phone and a desktop client signed into one account are, since `srcId` is
+the `UserAccount.id`.
+
+Gather's own client answers it with `reload()`, which tears the signalling down, calls
+`start()` again and runs `_reconcileProducedTracks` — **it republishes.** That matters:
+two clients both doing this would knock each other off in turn, indefinitely.
+
+**Nothing in the protocol drops another client.** There is no "take over" call in the
+twelve-plus measured methods; the takeover, if it happens, is the *server's* doing.
+So a client's only real choices are to hold what it has or to let go. This app holds —
+the phone in your hand is where you are — but stops after the third notice, because a
+third means the two ends are swapping the call back and forth rather than settling, and
+flapping audio is worse than a sentence explaining which app to quit.
+
+**Still unmeasured** (plan risk #1): whether the SFU replaces the older publisher, rejects
+the newer one, or forwards both. That needs two clients and a scratch space.
+
+### The server steers the sending quality: `set-max-spatial-layer`
+
+Server→client `{kind, layer}`, and the client's handler is one line:
+`_onProducerSpatialLayer({kind, layer})` → debounced → `producer.setMaxSpatialLayer(layer)`.
+mediasoup flips the encodings' `active` flags itself; there is no manual surgery.
+
+This is the other half of "declare three layers, activate one". Without handling it a
+client encodes the bottom layer forever, and a colleague watching full-screen never gets
+more than a quarter-resolution picture no matter how much bandwidth is going spare.
+
+### TURN rotation: `restart-ice`
+
+Also transcribed rather than guessed:
+
+```js
+const {iceParameters, iceServers} = await sendWithResponse('restart-ice',
+    {transportId, iceTransportRequestOptions});
+if (iceServers.length > 0) await transport.updateIceServers({iceServers});
+await transport.restartIce({iceParameters});
+```
+
+Guarded by an `isIceRestartPending` flag, and the servers go in *before* the restart.
+`TURN_CREDENTIAL_EXPIRY_S = 86400`, `TURN_REFRESH_INTERVAL_S = 14400`.
+
 ### Screen share is VP8, not H264
 
 Settled by capture. A real screen share produced
@@ -1799,7 +1876,7 @@ deleted mic/camera flags; the other three are still unused.
 | `followTargetId` | **yes** |
 | `userAccountId` | **yes** |
 | `clusterId` | no — was Gather's own "standing together" signal; dropped with proximity |
-| `deskId` | no |
+| `deskId` | no — but **the app reads it**: a `MapEntityIdentifier` id, matched against `MapArea.mapEntityIdentifierId` to find the desk. It is what "back to my desk" walks to, and `isAtOwnDesk` is `currentMapArea?.stableId_USE_THIS_INSTEAD_OF_ID === deskId` |
 | `shouldBeInClusterWithFollowTarget` | no |
 | `connected` | **yes** |
 | `isIdle` | **yes** |
@@ -1826,12 +1903,11 @@ deleted mic/camera flags; the other three are still unused.
 | `position__x` | **yes** |
 | `position__y` | **yes** |
 | `direction__value` | no |
-| `speed__modifier` | no |
+| `speed__modifier` | no — but **the app reads it**: 1, 2 or 3, and the only thing that says somebody is in a go-kart |
 | `userSetAvailability__value` | no |
 
 The bridge consumes 8 of 37, plus `Space.name`. Unused fields that look
-immediately useful: `deskId`
-(which desk someone is at), `handRaisedAt`, `activeApp`, `activeCustomStatusId` /
+immediately useful: `handRaisedAt`, `activeApp`, `activeCustomStatusId` /
 `activeUserGeneratedStatusId` (custom status), `profilePictureId`, `aiSummary`,
 `currentTargetMeetingAreaId`.
 

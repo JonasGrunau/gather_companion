@@ -1,0 +1,244 @@
+/// Who the call listens to, and when it is told.
+///
+/// The join signal is Gather's own `clusterId` rather than a reimplementation of
+/// its twelve-stage proximity pipeline — the server already computes the bubble
+/// and publishes it, so this asserts the bridge between that and the media
+/// plane, including the identity swap the two planes force.
+library;
+
+import 'dart:async';
+
+import 'package:fake_async/fake_async.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_client/gather_client.dart';
+import 'package:gather_companion/src/app_state.dart';
+import 'package:gather_companion/src/media/call.dart';
+
+class FakeCall implements Call {
+  final List<Set<String>> told = [];
+  final List<Set<String>> shownTo = [];
+  final _states = StreamController<CallState>.broadcast();
+
+  @override
+  Future<void> setVisibleTo(Set<String> srcIds) async => shownTo.add(srcIds);
+
+  @override
+  CallState get state => const CallState();
+
+  @override
+  Stream<CallState> get states => _states.stream;
+
+  @override
+  Future<void> setListeningTo(Set<String> srcIds) async => told.add(srcIds);
+
+  @override
+  Future<String?> setMicOn(bool on) async => null;
+
+  @override
+  Future<String?> setCameraOn(bool on) async => null;
+
+  @override
+  Future<void> switchCamera() async {}
+
+  @override
+  Future<void> hangUp() async {}
+
+  @override
+  Future<void> dispose() async => _states.close();
+}
+
+void main() {
+  /// A fake clock, not a real one.
+  ///
+  /// These tests are entirely about *when* something is delivered, and the first
+  /// draft spent eight seconds of wall time sleeping through the debounces. That
+  /// is slow, and worse, it made the whole suite likelier to flake under parallel
+  /// load — a timing test that steals a worker for eight seconds is a timing test
+  /// that breaks somebody else's. `fakeAsync` moves the clock instead.
+  void withClock(void Function(FakeAsync clock) body) =>
+      fakeAsync((clock) {
+        body(clock);
+        // Drain anything still pending, so a stray timer cannot outlive the test
+        // and fire into a disposed AppState.
+        clock.elapse(const Duration(seconds: 5));
+      });
+
+  /// Past the join debounce.
+  void settle(FakeAsync clock) {
+    clock.elapse(const Duration(milliseconds: 1700));
+    clock.flushMicrotasks();
+  }
+
+  RosterRow row(String id, {String? cluster, String? account}) => RosterRow(
+        id: id,
+        name: id,
+        clusterIdKnown: true,
+        clusterId: cluster,
+        userAccountId: account,
+        connected: true,
+      );
+
+  /// An [AppState] with a call attached and nothing else running.
+  ({AppState state, FakeCall call}) wired() {
+    final call = FakeCall();
+    final state = AppState()..debugAttachCall(call);
+    addTearDown(state.dispose);
+    return (state: state, call: call);
+  }
+
+  test('the cluster becomes the subscription, in UserAccount ids', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+        row('elsewhere', cluster: 'c2', account: 'acct-elsewhere'),
+      ]));
+      settle(clock);
+
+      // Their `UserAccount.id`, not their `SpaceUser.id` — the media plane is
+      // keyed on the other one, and asking the router about a SpaceUser returns
+      // a stream that does not exist, silently.
+      expect(call.told, [
+        {'acct-them'}
+      ]);
+    });
+  });
+
+  test('somebody with no UserAccount id yet is skipped, not guessed at', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1'),
+      ]));
+      settle(clock);
+
+      // Nothing at all, rather than an empty subscription: the desired set never
+      // changed from the empty one we started with, so there is nothing to say.
+      // They are picked up on whichever later roster carries their account id.
+      expect(call.told, isEmpty);
+    });
+  });
+
+  test('a cluster that has not changed is not re-sent', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      final roster = Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]);
+      state.debugApplyRoster(roster);
+      settle(clock);
+      // A second roster carrying the same conversation. Positions change four
+      // times a second; the subscription must not.
+      state.debugApplyRoster(roster);
+      settle(clock);
+
+      expect(call.told, hasLength(1));
+    });
+  });
+
+  test('walking past a group does not open a call with them', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      // In and straight out again, faster than the join debounce.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      clock.elapse(const Duration(milliseconds: 200));
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      settle(clock);
+
+      // One delivery, and it is the empty one. The transient membership never
+      // reached the SFU, which is the whole point of the debounce.
+      expect(call.told, [<String>{}]);
+    });
+  });
+
+  test('leaving is delivered faster than joining', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      settle(clock);
+      expect(call.told, hasLength(1));
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', account: 'acct-me'),
+        row('them', cluster: 'c1', account: 'acct-them'),
+      ]));
+      // Shorter than the join debounce and longer than the leave one. Still
+      // hearing a conversation you have walked away from is the worse failure,
+      // so the way out is quicker than the way in.
+      clock.elapse(const Duration(milliseconds: 900));
+      clock.flushMicrotasks();
+
+      expect(call.told, [
+        {'acct-them'},
+        <String>{},
+      ]);
+    });
+  });
+
+  test('everybody in range is allowed to see us, not just the conversation', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: const [
+        RosterRow(
+            id: 'me', x: 0, y: 0, floorId: 'f1', connected: true,
+            userAccountId: 'acct-me', clusterIdKnown: true, clusterId: 'c1'),
+        RosterRow(
+            id: 'talking', x: 1, y: 0, floorId: 'f1', connected: true,
+            userAccountId: 'acct-talking', clusterIdKnown: true, clusterId: 'c1'),
+        RosterRow(
+            id: 'watching', x: 5, y: 0, floorId: 'f1', connected: true,
+            userAccountId: 'acct-watching', clusterIdKnown: true),
+      ]));
+      settle(clock);
+
+      // The bug: `consume-allow` is what permits anybody to consume us, so
+      // allowing only the conversation meant the person standing beside you
+      // could never see your camera over your avatar.
+      expect(call.shownTo.last, {'acct-talking', 'acct-watching'});
+      // And it is still only the conversation we ask to *hear*.
+      expect(call.told.last, {'acct-talking'});
+    });
+  });
+
+  test('the allow list is sent without waiting for a debounce', () {
+    withClock((clock) {
+      final (:state, :call) = wired();
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: const [
+        RosterRow(
+            id: 'me', x: 0, y: 0, floorId: 'f1', connected: true,
+            userAccountId: 'acct-me'),
+        RosterRow(
+            id: 'near', x: 2, y: 0, floorId: 'f1', connected: true,
+            userAccountId: 'acct-near'),
+      ]));
+      clock.flushMicrotasks();
+
+      // A permission costs nothing to send and being late with it shows as an
+      // empty circle over your head, so this one does not wait like the
+      // subscription does.
+      expect(call.shownTo, [
+        {'acct-near'}
+      ]);
+      expect(call.told, isEmpty);
+    });
+  });
+}

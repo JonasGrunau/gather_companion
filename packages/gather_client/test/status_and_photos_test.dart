@@ -193,4 +193,48 @@ void main() {
       expect(rowFor(reader, 'ada')?.profilePictureId, 'new');
     });
   });
+
+  group('the desk id', () {
+    test('is carried when a desk is claimed and null when it is not', () {
+      // Most of an office has one and plenty of people never claim one, so "no
+      // desk" is an absent field rather than an empty string — and it is what
+      // decides whether the phone offers a way back to one at all.
+      reader.ingest(chunk([
+        add('SpaceUser', {'id': 'ada', 'name': 'Ada', 'deskId': 'desk-1'}),
+        add('SpaceUser', {'id': 'bram', 'name': 'Bram'}),
+      ]));
+
+      expect(rowFor(reader, 'ada')?.deskId, 'desk-1');
+      expect(rowFor(reader, 'bram')?.deskId, isNull);
+    });
+
+    test('being reassigned, and being unassigned, both arrive as field patches',
+        () {
+      // A desk manager can move you or take your desk away while you are sitting
+      // at it. Tracking the field rather than reading it once is what makes the
+      // button follow; a null patch is a real value here and not a missing key.
+      reader.ingest(chunk([
+        add('SpaceUser', {'id': 'ada', 'name': 'Ada', 'deskId': 'desk-1'}),
+      ]));
+
+      Map<String, Object?> patch(Object? data) => {
+            'type': 'DeltaState',
+            'patches': [
+              {
+                'op': 'replace',
+                'model': 'SpaceUser',
+                'id': 'ada',
+                'path': '/deskId',
+                'data': data,
+              },
+            ],
+          };
+
+      reader.ingest(patch('desk-2'));
+      expect(rowFor(reader, 'ada')?.deskId, 'desk-2');
+
+      reader.ingest(patch(null));
+      expect(rowFor(reader, 'ada')?.deskId, isNull);
+    });
+  });
 }

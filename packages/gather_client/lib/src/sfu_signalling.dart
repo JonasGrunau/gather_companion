@@ -51,6 +51,49 @@ const gatherSfuRouter = 'wss://router.v2.gather.town';
 /// Socket.IO's own path. Gather does not customise it.
 const _socketIoPath = '/socket.io/';
 
+/// Splits a Gather SFU address into what `socket_io_client` actually wants.
+///
+/// **The address the router hands out is not a URL you can connect to.** It
+/// arrives as `wss://sfu-v2.<region>….prod.aws.gather.town:443/ip-10-206-194-73`,
+/// and both halves after the host are traps:
+///
+///  * **The `/ip-…` segment is a path prefix, not a namespace.** Handed to
+///    `socket_io_client` whole, it is read as the Socket.IO *namespace* and the
+///    request goes to `/socket.io/` at the root — which the node answers with a
+///    plain HTTP response, so the upgrade never happens. The desktop client
+///    connects to `/ip-10-206-194-73/socket.io/`, measured; the prefix belongs in
+///    the `path` option.
+///  * **`wss://` with an explicit `:443` yields port 0.** `socket_io_client`
+///    fills in a default port for `http`/`https` and does not recognise `ws`/`wss`,
+///    so the explicit port survives into a URI it then mangles — the failure
+///    reads `Connection to 'https://…:0/socket.io/…' was not upgraded to
+///    websocket`. Handing it `https://` and letting it supply 443 is what the
+///    library expects.
+///
+/// The router's own address has neither problem, which is exactly why this went
+/// unnoticed until the first node connection: `wss://router.v2.gather.town` has no
+/// port and no path, so it survived being passed through raw.
+({String origin, String path}) splitSfuAddress(String address) {
+  final uri = Uri.parse(address);
+  final scheme = switch (uri.scheme) {
+    'wss' => 'https',
+    'ws' => 'http',
+    final other => other,
+  };
+
+  // Only a non-default port is worth keeping. 443 on wss is what the router
+  // states and what the client drops.
+  final port = uri.hasPort && uri.port != 443 && uri.port != 80 && uri.port != 0
+      ? ':${uri.port}'
+      : '';
+
+  final prefix = uri.path.replaceAll(RegExp(r'/+$'), '');
+  return (
+    origin: '$scheme://${uri.host}$port',
+    path: prefix.isEmpty ? _socketIoPath : '$prefix$_socketIoPath',
+  );
+}
+
 /// Calls whose arguments are sent bare, with no `{wsSequenceNumber, zodData}`.
 ///
 /// Measured, not assumed: `get-addr` and `unsubscribe` went out as plain
@@ -59,6 +102,13 @@ const _socketIoPath = '/socket.io/';
 const _bareMethods = {'get-addr', 'unsubscribe', 'reassign', 'addrs'};
 
 const _defaultTimeout = Duration(seconds: 15);
+
+/// How long [SfuSignalling.start] waits for the handshake before giving up.
+///
+/// Shorter than [_defaultTimeout] on purpose: this one is in front of a person
+/// who has just tapped *unmute*, and ten seconds of a dead button is long past
+/// the point where they tap it again.
+const _connectTimeout = Duration(seconds: 10);
 const _maxBackoff = Duration(seconds: 30);
 
 /// Something the server said without being asked.
@@ -156,6 +206,9 @@ class SfuSignalling {
   bool _connected = false;
   int _sequence = 0;
 
+  /// Completed the moment the socket is usable — see [start].
+  Completer<void>? _ready;
+
   /// Frames the server sent that this client does not recognise.
   ///
   /// Counted rather than dropped, for the same reason `GameProtocolReader.stats()`
@@ -173,16 +226,55 @@ class SfuSignalling {
   bool get connected => _connected;
   String get url => _url;
 
-  /// Opens the socket and authenticates. Safe to call again after a failure.
-  Future<void> start() async {
+  /// Opens the socket, authenticates, and **waits until it is actually usable**.
+  ///
+  /// The waiting is the whole point, and its absence was a real bug: `_open()`
+  /// ends at `socket.connect()`, which only *starts* the handshake, so a `start()`
+  /// that awaited `_open()` alone resolved a full round trip before the socket
+  /// could carry anything. The caller then did the natural thing — asked its first
+  /// question — and got `not connected`, followed a moment later by the connection
+  /// succeeding. Every first call failed and every retry worked, which is exactly
+  /// the shape of bug that gets misread as the server being flaky.
+  ///
+  /// Throws [SfuException] on timeout rather than resolving, because a caller that
+  /// cannot tell "connected" from "gave up" will publish into a void.
+  /// Transient failures keep retrying underneath; a rejected credential does not,
+  /// and surfaces here.
+  Future<void> start({Duration timeout = _connectTimeout}) async {
     _stopped = false;
+    if (_connected) return;
+
+    // A second caller joins the first attempt rather than starting another.
+    // Overwriting `_ready` would strand whoever was already waiting on a
+    // completer nothing completes any more — they would sit there until their
+    // own timeout while the connection they wanted succeeded around them.
+    final inFlight = _ready;
+    if (inFlight != null && !inFlight.isCompleted) {
+      return inFlight.future.timeout(
+        timeout,
+        onTimeout: () => throw SfuException('$_url did not answer in '
+            '${timeout.inSeconds}s'),
+      );
+    }
+
+    // Recreated per attempt, and never left completed-with-error without a
+    // listener: `start()` awaits it on the same turn it is made.
+    final ready = _ready = Completer<void>();
     await _open();
+    if (_stopped) return;
+
+    return ready.future.timeout(
+      timeout,
+      onTimeout: () => throw SfuException('$_url did not answer in '
+          '${timeout.inSeconds}s'),
+    );
   }
 
   Future<void> stop() async {
     _stopped = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _settleReady(SfuException('$_url was closed while connecting'));
     _teardown();
   }
 
@@ -268,25 +360,41 @@ class SfuSignalling {
     } on GatherAuthException catch (error) {
       _setStatus(false, 'Gather sign-in failed: ${error.message}',
           needsPairing: error.permanent);
-      if (!error.permanent) _scheduleRetry();
+      // A revoked credential will not fix itself, so stop the caller waiting out
+      // the full timeout for an answer that is never coming. A transient one
+      // keeps retrying and `start()` waits, which is the right shape for a
+      // signal that dropped in a lift.
+      if (error.permanent) {
+        _settleReady(SfuException('Gather sign-in failed: ${error.message}'));
+      } else {
+        _scheduleRetry();
+      }
       return;
     }
     if (_stopped) return;
 
-    final options = io.OptionBuilder()
-        .setPath(_socketIoPath)
+    final address = splitSfuAddress(_url);
+
+    final builder = io.OptionBuilder()
+        .setPath(address.path)
         // Websocket only. Gather never polls, and allowing the polling fallback
         // would send the credential over a series of HTTP requests instead.
         .setTransports(['websocket'])
         .disableAutoConnect()
         .disableReconnection()
-        .setAuth({'spaceId': _spaceId, 'token': token})
-        .setQuery({'sessionId': _sessionId ?? _newSessionId()})
-        .build();
+        .setAuth({'spaceId': _spaceId, 'token': token});
+
+    // Only the media nodes carry one. The router's connection in the capture is
+    // a bare `/socket.io/?EIO=4&transport=websocket` — no `sessionId` — and
+    // sending one there would be inventing traffic Gather does not send.
+    if (address.path != _socketIoPath) {
+      builder.setQuery({'sessionId': _sessionId ?? _newSessionId()});
+    }
+    final options = builder.build();
 
     final io.Socket socket;
     try {
-      socket = _connect(_url, options);
+      socket = _connect(address.origin, options);
     } on Object catch (error) {
       _setStatus(false, 'could not build the SFU socket: $error');
       _scheduleRetry();
@@ -300,6 +408,7 @@ class SfuSignalling {
       _backoff = const Duration(seconds: 1);
       _setStatus(true, 'connected');
       _log('sfu: connected to $_url');
+      _settleReady();
     });
 
     socket.onConnectError((Object? error) {
@@ -307,6 +416,12 @@ class SfuSignalling {
       // A rejected credential arrives here rather than as a close code.
       _setStatus(false, 'SFU refused the connection: $error');
       _connected = false;
+      // Tell the caller now instead of leaving them to the timeout. A refusal is
+      // an *answer* — the server is up and said no — and ten silent seconds
+      // before the same news is ten seconds of a button doing nothing. The
+      // background retry continues regardless, because the "no" may be about a
+      // token that is about to be refreshed rather than about us.
+      _settleReady(SfuException('$_url refused the connection: $error'));
       _scheduleRetry();
     });
 
@@ -328,6 +443,23 @@ class SfuSignalling {
 
     socket.connect();
     _setStatus(false, 'connecting');
+  }
+
+  /// Wakes whoever is inside [start].
+  ///
+  /// Completing a future with an error that nobody is listening to is reported as
+  /// an unhandled exception, so this only ever completes the completer `start()`
+  /// is already awaiting, and only once. `stop()` settles it too — otherwise
+  /// closing a socket mid-connect leaves the caller waiting for a handshake that
+  /// has been abandoned.
+  void _settleReady([Object? error]) {
+    final ready = _ready;
+    if (ready == null || ready.isCompleted) return;
+    if (error == null) {
+      ready.complete();
+    } else {
+      ready.completeError(error);
+    }
   }
 
   void _teardown() {

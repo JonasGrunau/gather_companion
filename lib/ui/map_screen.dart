@@ -1,6 +1,11 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+// For `kDoubleTapTimeout` and `kDoubleTapSlop`: this file counts the double tap
+// itself, and borrowing Flutter's own figures is what keeps it feeling like every
+// other double tap on the phone. See [_PlanState._onTap].
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart';
@@ -341,13 +346,55 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     return (x: x, y: y);
   }
 
+  /// Where the first tap of a possible pair landed, and the window it has to close in.
+  ///
+  /// Only ever set between the two halves of a double tap.
+  Offset? _firstTap;
+  Timer? _tapWindow;
+
+  /// What was selected before the tap that is currently provisional.
+  ///
+  /// A double tap is a zoom, not a selection, so the second half of one has to undo
+  /// what the first half did rather than leaving a reticle on whatever the pinch
+  /// happened to centre on.
+  ({int x, int y, SpaceRoom? room})? _beforeTap;
+
   /// A tap picks somewhere to go, or picks nothing.
   ///
   /// The desktop client does this on *hover*, which is a thing a phone does not have,
   /// and moves on the double click. Splitting it into a tap and a button is the touch
   /// version of the same two beats: the reticle says what you are pointing at before
   /// anything happens to your avatar.
-  void _onTap(Offset point, double base) {
+  ///
+  /// ## Why the double tap is counted here
+  ///
+  /// Flutter's arena cannot give both an instant single tap and a double tap on the
+  /// same detector, because deciding that a tap was *single* means waiting to see
+  /// whether a second one arrives. The way out is that the two gestures here do not
+  /// actually conflict: selecting is free, instant and reversible, so the first tap
+  /// can simply do it and the second can take it back on its way to zooming. That is
+  /// not true of the desktop client, where the double click *moves you* and guessing
+  /// wrong would walk somebody across the office — which is exactly why it waits and
+  /// this does not.
+  void _onTap(Offset point, double base, Size viewport, Size child) {
+    final second = _firstTap;
+    _tapWindow?.cancel();
+    _firstTap = null;
+    if (second != null && (point - second).distance <= kDoubleTapSlop) {
+      _tapped = point;
+      // Put back whatever the first of the pair displaced. Usually null, and either
+      // way not the tile somebody was aiming a pinch at.
+      setState(() => _selected = _beforeTap);
+      _onDoubleTap(viewport, child);
+      return;
+    }
+    // A [Timer] rather than a clock, so a widget test that pumps past the window
+    // actually closes it — `tester.pump` moves fake time and leaves `DateTime.now`
+    // exactly where it was.
+    _firstTap = point;
+    _tapWindow = Timer(kDoubleTapTimeout, () => _firstTap = null);
+    _beforeTap = _selected;
+
     final map = widget.map;
     final at = _tileAt(point, base);
     if (at == null) {
@@ -413,21 +460,14 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// map — and collapses to nothing once a tile is bigger than a fingertip.
   ({int x, int y})? _walkableNear(SpaceMap map, ({int x, int y}) at, double base) {
     if (map.isWalkable(at.x, at.y)) return at;
+    // Gather's own floor, not a zoom-derived one. `getNearestFreeTile` searches a box
+    // of 2 by default and `startPathMoveOnCurrentFloor` widens it to 4 — a chair in
+    // the middle of a desk cluster is more than one tile from open floor, and a
+    // one-ring search zoomed in was refusing to select most of the furniture in the
+    // office. The zoom only ever widens this; it may not narrow it.
     final onGlass = artTileSize * base * _view.value.getMaxScaleOnAxis();
-    final radius = (_thumb / onGlass).ceil().clamp(0, _maxSnap);
-    for (var ring = 1; ring <= radius; ring++) {
-      ({int x, int y})? best;
-      for (var dy = -ring; dy <= ring; dy++) {
-        for (var dx = -ring; dx <= ring; dx++) {
-          if (dx.abs() != ring && dy.abs() != ring) continue;
-          final x = at.x + dx, y = at.y + dy;
-          if (!map.isWalkable(x, y)) continue;
-          best ??= (x: x, y: y);
-        }
-      }
-      if (best != null) return best;
-    }
-    return null;
+    final radius = (_thumb / onGlass).ceil().clamp(_minSnap, _maxSnap);
+    return map.nearestFree(at.x, at.y, radius: radius);
   }
 
   /// Set off, or call off the walk that is already running.
@@ -455,8 +495,13 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// this is a radius and that is a diameter.
   static const _thumb = 22.0;
 
-  /// However far out the map is, a tap does not mean a tile three rooms away.
-  static const _maxSnap = 3;
+  /// `getNearestFreeTile`'s own default box. However far *in* the map is zoomed, a
+  /// tap on a desk still means the floor beside it.
+  static const _minSnap = 2;
+
+  /// `startPathMoveOnCurrentFloor`'s widened box, and the ceiling here too: however
+  /// far out the map is, a tap does not mean a tile in the next room.
+  static const _maxSnap = 4;
 
   @override
   void initState() {
@@ -469,6 +514,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _tapWindow?.cancel();
     _motion.dispose();
     _zoom.dispose();
     _view.dispose();
@@ -532,7 +578,14 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     // asking for them is a set difference on every build and a no-op once they land.
     // Their own request, so that superseding the office's does not disturb them and
     // somebody walking off the floor stops being fetched.
-    cache.prefetch([for (final person in people) ?person.avatarUrl], group: ArtRequest.avatars);
+    // The kart rides along in the same request, and only once somebody is actually in
+    // one: it is a single 512×32 sheet shared by the whole office, so fetching it is
+    // cheap, but fetching it in a space where nobody ever drives is a request for
+    // nothing. Once landed it stays, and the second kart of the session is instant.
+    cache.prefetch([
+      for (final person in people) ?person.avatarUrl,
+      if (people.any((person) => person.gait == Gait.driving)) goKartUrl,
+    ], group: ArtRequest.avatars);
 
     // Somebody who has asked the system to stop moving things gets the tiles the
     // wire reports, with no walk between them — which is what the desktop client
@@ -563,13 +616,13 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               // The whole floor at once, pinchable and pannable. A map you cannot get
               // closer to is decoration, so the ceiling is 20x.
               return GestureDetector(
-                onDoubleTapDown: (details) => _tapped = details.localPosition,
-                onDoubleTap: () => _onDoubleTap(viewport, child),
-                // Flutter holds a single tap until the double-tap window closes, so
-                // the reticle lands a beat after the finger. That is the price of
-                // keeping double-tap-to-zoom, and on a select-then-confirm gesture it
-                // is a price worth paying: nothing has happened to the avatar yet.
-                onTapUp: (details) => _onTap(details.localPosition, base),
+                // Deliberately *only* a tap recognizer. A [GestureDetector] carrying
+                // `onDoubleTap` as well holds every single tap until the double-tap
+                // window closes, which put a third of a second between the finger and
+                // the reticle and read as the map being slow. The double tap is
+                // counted by hand in [_onTap] instead — see there for why that is
+                // sound rather than a reimplementation of the arena.
+                onTapUp: (details) => _onTap(details.localPosition, base, viewport, child),
                 child: InteractiveViewer(
                   transformationController: _view,
                   // Sized here, so the viewer must not stretch it back to the
@@ -629,6 +682,9 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
             child: SafeArea(
               top: false,
               child: Center(
+                // The pad is where the shift key actually belongs — driving a held
+                // direction is the gesture Gather binds it to — and it needs nothing
+                // here to get it: the latch lives on [Walk] and a press reads it.
                 child: DPad(onPress: state.walk, onRelease: state.stopWalking),
               ),
             ),
@@ -648,11 +704,21 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
             child: SafeArea(
               top: false,
               child: Center(
-                child: _GoTo(
-                  room: _selected?.room,
-                  walking: state.onRoute,
-                  onGo: _go,
-                  onClear: () => setState(() => _selected = null),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Up for the whole walk as well as before it. Shift is a modifier
+                    // on movement rather than a property of a journey, so pressing it
+                    // mid-route takes the kart there and then — see [Walk.boost].
+                    _Kart(on: state.boost, onChanged: (on) => state.boost = on),
+                    const SizedBox(width: 8),
+                    _GoTo(
+                      room: _selected?.room,
+                      walking: state.onRoute,
+                      onGo: _go,
+                      onClear: () => setState(() => _selected = null),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -664,6 +730,61 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
 /// Somewhere to go, and the way to call it off again.
 ///
+/// The go-kart, as a phone can reach it.
+///
+/// On the desktop there are two entirely separate doors to driving and this is the
+/// second one. The first — how far away the destination is — needs no control at all
+/// and already works: [Walk.follow] takes the kart for anything past 23 tiles, on
+/// Gather's own numbers, whether or not this is lit. The other is the shift key held
+/// down while the arrow keys walk you, and a phone has no shift key and, with the
+/// D-pad shelved, nothing to hold it against.
+///
+/// So it latches rather than being held. That is the only liberty taken — what it
+/// *means* is the desktop's meaning exactly: while it is on you drive, whatever the
+/// distance and whichever room you are crossing. It was briefly a ceiling on the
+/// automatic gait instead, which sounds like the same thing and is not: the
+/// deceleration then took the kart away again after about a fifth of a second, which
+/// is a feature that looks broken.
+class _Kart extends StatelessWidget {
+  const _Kart({required this.on, required this.onChanged});
+
+  final bool on;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Semantics(
+      toggled: on,
+      button: true,
+      label: 'Take the go-kart',
+      child: Material(
+        color: Colors.transparent,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(t.radius + 4),
+          child: Container(
+            color: on ? t.brand : t.card,
+            child: InkWell(
+              onTap: () {
+                HapticFeedback.selectionClick();
+                onChanged(!on);
+              },
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Icon(
+                  Icons.sports_motorsports_rounded,
+                  size: 18,
+                  color: on ? t.primaryForeground : t.mutedForeground,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// One control with two states rather than two controls: while a walk is running the
 /// only thing anybody wants from this corner of the screen is to stop it, and the
 /// desktop client says the same thing the same way — no confirmation before the walk,
@@ -813,8 +934,10 @@ class _Legend extends StatelessWidget {
             ? 'The furniture is still arriving — ${art.awaiting} '
                   '${art.awaiting == 1 ? 'piece' : 'pieces'}'
             : 'Drawing the office — ${cache.loaded} of ${cache.wanted}';
+        // Centred, so it shares an axis with the D-pad above it rather than
+        // hanging off one corner while the controls sit in the middle.
         return Align(
-          alignment: Alignment.bottomLeft,
+          alignment: Alignment.bottomCenter,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: BoxDecoration(
@@ -1131,6 +1254,62 @@ class _OfficePainter extends CustomPainter {
               ..filterQuality = FilterQuality.none
               ..color = const Color(0xFFFFFFFF).withValues(alpha: alpha.clamp(0.0, 1.0))),
     );
+
+    if (person.gait == Gait.driving) {
+      _paintKart(canvas, person, posture, paint, at, now, alpha: alpha, scale: scale);
+    }
+  }
+
+  /// The go-kart, over the body rather than under it.
+  ///
+  /// `bringToTop(this.vehicleImage)` — a kart is drawn in front of the legs it hides,
+  /// which is the whole trick that makes a 32×32 sprite read as something being sat
+  /// in. It sits on the body's *own* tile:
+  ///
+  /// ```js
+  /// this.vehicleImage.x = this.avatar.x;
+  /// this.vehicleImage.y = this.avatar.y - this.defaultAvatarOffsetY;   // +32
+  /// ```
+  ///
+  /// which is the avatar's origin undone — the sprite hangs a tile high, the kart
+  /// does not.
+  ///
+  /// Nothing is drawn when the sheet has not landed yet. It is one 512×32 image for
+  /// the whole office, fetched the first time anybody drives, so the gap is a frame
+  /// or two on the first kart of the session and never again — and a missing kart is
+  /// a person running, which is what they are.
+  void _paintKart(
+    Canvas canvas,
+    MapPerson person,
+    ({Pose pose, Facing facing}) posture,
+    Paint paint,
+    Offset at,
+    Duration now, {
+    double alpha = 1,
+    double scale = 1,
+  }) {
+    final sheet = cache[goKartUrl];
+    if (sheet == null) return;
+
+    final moving = motion?.walking(person, now) ?? false;
+    final frame = goKartAnimation(facing: posture.facing, moving: moving)
+        .frameAt(motion?.phaseOf(person, now) ?? Duration.zero);
+
+    // Grown about its own feet, as the body is: the kart's bottom edge is the bottom
+    // of the tile, so a kart appearing does not shunt the avatar off the floor.
+    final size = goKartFrameSize * scale;
+    final floor = at.dy * _tile + avatarOffsetY + avatarFrameHeight;
+    canvas.drawImageRect(
+      sheet,
+      Rect.fromLTWH((frame * goKartFrameSize).toDouble(), 0, goKartFrameSize.toDouble(), goKartFrameSize.toDouble()),
+      Rect.fromLTWH(at.dx * _tile + (goKartFrameSize - size) / 2, floor - size, size, size),
+      alpha >= 1
+          ? paint
+          : (Paint()
+              ..isAntiAlias = false
+              ..filterQuality = FilterQuality.none
+              ..color = const Color(0xFFFFFFFF).withValues(alpha: alpha.clamp(0.0, 1.0))),
+    );
   }
 
   /// What somebody is doing and which way they are pointing.
@@ -1152,7 +1331,9 @@ class _OfficePainter extends CustomPainter {
   ({Pose pose, Facing facing}) _posture(MapPerson person, Duration now) {
     final facing = Facing.of(person.direction);
     if (motion?.walking(person, now) ?? false) {
-      return (pose: Pose.walking, facing: facing);
+      // `(getSpeedModifier() > 1 ? "run-" : "walk-")`, and note there is no third
+      // cycle: somebody driving runs, and the kart drawn over them is what says so.
+      return (pose: person.gait == Gait.walking ? Pose.walking : Pose.running, facing: facing);
     }
     final x = person.x.round();
     final y = person.y.round();
