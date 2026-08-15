@@ -19,9 +19,9 @@ you change something here, look at the JS twin named in the table.
 | File | Twin | What it is |
 |---|---|---|
 | `msgpack.dart` | `bridge/lib/msgpack.js` | Decoder for everything Gather sends, incl. 5 ext types. Shallow encoder for the 5 frames we send. |
-| `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, plus `MeetingWatch` for invites and knocks. |
+| `game_protocol.dart` | `bridge/lib/game-protocol.js` | `GameProtocolReader` — patch fold over 6 of ~49 models, **plus `DeltaState.events[]`**, **plus `actionReturns[]`**, plus `MeetingWatch` for invites and knocks. All three arrays matter and two of them arrive in frames whose `patches` array is empty, which is exactly how each went unread in turn: an event changes no state, and a *refused* action changes no state either. `ActionResult` + `describeActionError` are the second half; `lastSequence` is the server's counter, which the heartbeat echoes back. `_senderOf` tries all three names an event can give its sender (`senderId`, `senderUserId`, `senderSpaceUserId`) — they route on `targetUserIds` regardless, so getting it wrong is a wave from nobody rather than a wave that never came. |
 | `gather_auth.dart` | `bridge/lib/gather-auth.js` (half) | `GatherAuth` — Firebase token exchange, `recent-spaces`. No IndexedDB half: the phone is *given* a refresh token at pairing. |
-| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, `setGait`, backoff, `describeClose()`, and the `_silenceLimit` deaf-socket watchdog. The watchdog and the close-code wording are ports and must not drift: `SILENCE_LIMIT_MS` / `_silenceLimit`, `describeClose` on both sides. |
+| `direct_collector.dart` | `bridge/lib/direct.js` | `DirectCollector` — handshake, `enterSpace`, heartbeat, 250ms roster coalescing, `teleport`, `move`, `setGait`, `setActive`, backoff, `describeClose()`, and the `_silenceLimit` deaf-socket watchdog. The watchdog and the close-code wording are ports and must not drift: `SILENCE_LIMIT_MS` / `_silenceLimit`, `describeClose` on both sides. **The heartbeat deliberately does not match the bridge's**: it carries `origin: 'Server'` and the echoed `sequenceNumber`, which is what the desktop client sends — see the note below. Every action is sent through `_actionFrame`, which files its `txnId` in `_awaiting` so the ack can be paired back to a name; refusals come out on `refusals` as `ActionRefused`. |
 | `presence_tracker.dart` | `bridge/lib/presence.js` | The fold → `PresenceSnapshot` + `GatherEvent`s. Owns the wave cooldown. |
 | `activity_feed.dart` | *(no counterpart)* | `ActivityFeed` + the `ActivityItem` hierarchy — Gather's own activity feed, over **REST**, not the socket. `GET /chat/activity-feed` answers `application/x.gather.msgpack`, so `msgpackDecode` reads it and `GatherHttp.getBytes` exists because `getJson` would mangle it. The body is normalised like a state dump: id lists per kind plus a model store, so `parseActivityFeed` is a set of joins — a wave's actor is on `ChatMessageMetadata`, not on the message, and read state is `ActivityEventSubscription.readAt`, not on the event. There is no pagination; every query param is ignored. `markRead` is **JSON** (the response is still msgpack — the endpoint is not symmetric), names the *event* id rather than the subscription that carries `readAt`, sends one request per item because no batch form exists, and is a **toggle** with no `read: true` — so filtering to unread items is correctness, not an optimisation, or "mark all read" un-reads most of the list. All four were guessed wrong before being captured off the desktop client; the shapes are in `../../../docs/gather-api.md#marking-activity-read`. **Waves and activity events are measured; the mention, reaction and reply joins are not** — no space available had one, so each degrades to `UnknownActivity` rather than throwing. The bridge has no counterpart because push already covers what it would use this for. |
 | `sfu_signalling.dart` | *(no counterpart)* | `SfuSignalling` — the media plane's Socket.IO transport: CONNECT auth, ack-keyed `sendWithResponse`, the `{wsSequenceNumber, zodData}` envelope, server-push notifications, backoff. The bridge will never speak to the SFU. |
@@ -47,7 +47,37 @@ you change something here, look at the JS twin named in the table.
   (explicitly cleared). `RosterRow.followTargetKnown` carries the distinction; without
   it the app renders a confident "nobody is following you" out of missing data.
   `clusterId` is the second such column and `clusterIdKnown` is its flag — the
-  stakes there are opening a call with nobody in it, or never opening one.
+  stakes there are opening a call with nobody in it, or never opening one. The trap
+  reaches **REST as well**, because those bodies are the same msgpack:
+  `ActivityEventSubscription.readAt` is unset-as-undefined, so `readAt != null`
+  answers *true* for an unread row and reports the whole feed as read. Test the
+  value, never the absence of null — `activity_feed.dart` reads the timestamp.
+- **A refused action is indistinguishable from a slow network unless you read
+  `actionReturns`.** Arguments are validated *before* the action runs, so a bad one
+  executes nothing: no patch, no event, no socket error, no close. Sending returns
+  `ok` because the bytes went out — that is all `ok` has ever meant here — and the
+  verdict arrives later, keyed by `txnId`, in a frame whose `patches` array is
+  empty. `_awaiting` is what puts a name back on it, and it is cleared per connect,
+  because pairing a fresh ack with a previous socket's action would put the wrong
+  sentence in front of somebody. This channel is *why* `_act` can stay
+  fire-and-forget: nothing waits, and nothing is silently lost either.
+- **The heartbeat's `origin` reads backwards, and its `sequenceNumber` is not
+  ours.** The frame the client *sends* says `origin: 'Server'`; the one it receives
+  says `'Client'`. And `sequenceNumber` echoes the highest the *server* has sent —
+  it reports what we have seen, not what we have sent. Both were measured off two
+  live desktop clients on 2026-08-14 and both are the opposite of the obvious guess,
+  so `bridge/lib/direct.js`, which still sends the older shape, is **wrong here and
+  this file is right** — the second sanctioned divergence, alongside `enterSpace`.
+  `msgpack_test.dart` keeps the bridge's bytes as a codec fixture under
+  `bridgeHeartbeat`; the frame this client actually sends is asserted in
+  `direct_collector_test.dart` instead.
+- **`reportActivity` has two halves and the second one is easy to forget.** It is
+  also the only action addressed to `Connection` with a `null` id rather than to our
+  own `SpaceUser` — sending it the usual way is a schema failure, which executes
+  nothing. The handshake reports `true`; `AppState` reports `false` when the app is
+  backgrounded and `true` again on resume. Without the `false`, `Connection.isActive`
+  stays true for the life of the socket and a phone in a pocket goes on telling
+  colleagues somebody is at their desk.
 - **`enterSpace` is sent here, and only here.** It puts an avatar in the room and
   permanently increments `numTimesEnteredSpace`, so it is not free — but the app
   publishes media, and a thing that publishes is present. `DirectCollector` sends

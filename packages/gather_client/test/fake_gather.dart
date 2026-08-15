@@ -109,6 +109,31 @@ class FakeConnection {
         'actionReturns': <Object?>[],
         'events': events,
       });
+
+  /// Refuse the last action of [action], the way the real gateway does.
+  ///
+  /// The refusal is addressed by `txnId`, so the transaction has to be looked up in
+  /// what the client actually sent — which is the point: pairing an answer back to
+  /// the question is the whole job of the code under test. Answers arrive with an
+  /// **empty** `patches` array, because a refused action changes nothing.
+  void refuse(String action, Object? error) {
+    final sent = received.lastWhere(
+      (frame) => frame['action'] == action,
+      orElse: () => throw StateError('the client never sent $action'),
+    );
+    send({
+      'type': 'DeltaState',
+      'sequenceNumber': 4,
+      'patches': <Object?>[],
+      'actionReturns': [
+        {
+          'connectionId': 'conn-1',
+          'txnId': sent['txnId'],
+          'result': {'type': 'Error', 'error': error},
+        },
+      ],
+    });
+  }
 }
 
 class FakeGatherServer {

@@ -79,12 +79,23 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
     // connection every time — a second of "Reconnecting" for nothing, which is
     // most of what made the link look unreliable.
     if (lifecycle == AppLifecycleState.resumed) {
+      // Before the link check, so it goes out on the socket we still hold. If
+      // `verifyLink` does reconnect, the handshake reports active again anyway.
+      unawaited(_state.setActive(true));
       unawaited(_state.verifyLink());
       // A separate question with a separate answer: the computer may have gone to
       // sleep, come back, or had its push credentials set up while we were away.
       // Nothing else re-asks, so a stale "can wake this app" would sit there for the
       // rest of the session.
       unawaited(_state.refreshPushReach());
+    }
+    // The other half of `reportActivity`, and the half that was missing: without it
+    // `Connection.isActive` stays true for as long as the socket does, and a phone
+    // in a pocket goes on telling colleagues somebody is at their desk. `paused` is
+    // the state that means backgrounded on both platforms; `inactive` fires for a
+    // pulled-down notification banner and would be a lie.
+    if (lifecycle == AppLifecycleState.paused) {
+      unawaited(_state.setActive(false));
     }
   }
 

@@ -548,6 +548,144 @@ void main() {
     });
   });
 
+  group('what the server made of it', () {
+    /// A collector that has connected, been named by the dump, and entered.
+    Future<({DirectCollector c, FakeConnection conn})> ready() async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      await pumpEventQueue();
+      return (c: c, conn: conn);
+    }
+
+    test('a refusal is reported, and names the action it answers', () async {
+      // The action returned `ok` — the bytes went out — and then did not happen.
+      // Nothing about the state would ever say so: validation runs before the
+      // action, so there is no patch, no error on the socket, and no close.
+      final (:c, :conn) = await ready();
+      final refused = c.refusals.first;
+
+      expect(c.setAvailability('Busy').ok, isTrue);
+      await pumpEventQueue();
+      conn.refuse('setAvailability', 'Cannot set availability while deactivated');
+
+      final refusal = await refused.timeout(const Duration(seconds: 5));
+      expect(refusal.action, 'setAvailability');
+      expect(refusal.message, 'Cannot set availability while deactivated');
+    });
+
+    test('a zod refusal arrives as the field that was wrong', () async {
+      final (:c, :conn) = await ready();
+      final refused = c.refusals.first;
+
+      c.setCustomStatus(text: 'x' * 5000);
+      await pumpEventQueue();
+      conn.refuse(
+        'setCustomStatus',
+        '[{"code":"too_big","path":["text"],"message":"String must contain at most 80 character(s)"}]',
+      );
+
+      final refusal = await refused.timeout(const Duration(seconds: 5));
+      expect(refusal.message, 'text: String must contain at most 80 character(s)');
+    });
+
+    test('a success is not reported as anything', () async {
+      final (:c, :conn) = await ready();
+      final refusals = <ActionRefused>[];
+      final sub = c.refusals.listen(refusals.add);
+
+      c.leaveCluster();
+      await pumpEventQueue();
+      final sent = conn.received.lastWhere((f) => f['action'] == 'leaveCluster');
+      conn.send({
+        'type': 'DeltaState',
+        'patches': <Object?>[],
+        'actionReturns': [
+          {
+            'txnId': sent['txnId'],
+            'result': {'type': 'Success', 'value': null},
+          },
+        ],
+      });
+      await pumpEventQueue();
+
+      expect(refusals, isEmpty);
+      await sub.cancel();
+    });
+
+    test('an ack for a transaction from a previous socket names nothing', () async {
+      // Transactions belong to a connection. Carrying them across a reconnect would
+      // pair a fresh ack with a stale action name, which is worse than saying
+      // nothing — it would put the wrong sentence in front of somebody.
+      final (:c, :conn) = await ready();
+      final refusals = <ActionRefused>[];
+      final sub = c.refusals.listen(refusals.add);
+
+      conn.send({
+        'type': 'DeltaState',
+        'patches': <Object?>[],
+        'actionReturns': [
+          {
+            'txnId': 'a-transaction-from-nowhere',
+            'result': {'type': 'Error', 'error': 'no'},
+          },
+        ],
+      });
+      await pumpEventQueue();
+
+      expect(refusals.single.action, 'that');
+      expect(refusals.single.message, 'no');
+      await sub.cancel();
+    });
+  });
+
+  group('saying whether anyone is there', () {
+    test('the heartbeat carries the desktop client\'s own shape', () async {
+      // Both fields read backwards, and both were measured off two live clients
+      // rather than reasoned about: the frame the client *sends* says
+      // `origin: "Server"`, and its `sequenceNumber` echoes the highest the server
+      // has sent rather than counting our own.
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      c.sendHeartbeatNow();
+      await pumpEventQueue();
+
+      final beat = conn.received.lastWhere((f) => f['type'] == 'Heartbeat');
+      expect(beat['origin'], 'Server');
+      expect(beat['sequenceNumber'], c.reader.lastSequence);
+      expect(beat['timestamp'], isA<int>());
+    });
+
+    test('reportActivity addresses Connection with a null id, not our avatar', () async {
+      // The one action here that is not about `SpaceUser`. Sending it against our
+      // own row would be a schema failure, which executes nothing and says nothing.
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      await pumpEventQueue();
+
+      expect(c.setActive(false).ok, isTrue);
+      await pumpEventQueue();
+
+      final sent = conn.received.lastWhere((f) => f['action'] == 'reportActivity');
+      expect(sent['args'], [
+        'Connection',
+        null,
+        {'isActive': false},
+      ]);
+    });
+
+    test('going quiet needs no avatar, only a socket', () async {
+      // Deliberately different from every other action: `reportActivity` is about
+      // the connection, so it must work in the window before the dump has named us.
+      final c = build();
+      expect(c.setActive(false).ok, isFalse, reason: 'no socket at all');
+      expect(c.setActive(false).detail, contains('not connected'));
+    });
+  });
+
   group('close codes', () {
     // 387 lines of `direct: game socket error` over six days on the bridge, all of
     // them one of the first two cases, neither of them a fault. The code was

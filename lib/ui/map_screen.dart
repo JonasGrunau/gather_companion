@@ -778,25 +778,26 @@ class _Kart extends StatelessWidget {
       toggled: on,
       button: true,
       label: 'Take the go-kart',
+      // The shape belongs to the [Material] and not to a clip inside it. Ink is
+      // painted by the nearest Material ancestor, in that Material's own box, so a
+      // `ClipRRect` *below* it never sees the splash: the tap ripple spread past the
+      // corners and out over the floor. Giving the Material the colour, the radius
+      // and a `clipBehavior` puts the ripple inside the button it belongs to.
       child: Material(
-        color: Colors.transparent,
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(t.radius + 4),
-          child: Container(
-            color: on ? t.brand : t.card,
-            child: InkWell(
-              onTap: () {
-                HapticFeedback.selectionClick();
-                onChanged(!on);
-              },
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Icon(
-                  Icons.sports_motorsports_rounded,
-                  size: 18,
-                  color: on ? t.primaryForeground : t.mutedForeground,
-                ),
-              ),
+        color: on ? t.brand : t.card,
+        borderRadius: BorderRadius.circular(t.radius + 4),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () {
+            HapticFeedback.selectionClick();
+            onChanged(!on);
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Icon(
+              Icons.sports_motorsports_rounded,
+              size: 18,
+              color: on ? t.primaryForeground : t.mutedForeground,
             ),
           ),
         ),
@@ -1355,6 +1356,11 @@ class _OfficePainter extends CustomPainter {
       // cycle: somebody driving runs, and the kart drawn over them is what says so.
       return (pose: person.gait == Gait.walking ? Pose.walking : Pose.running, facing: facing);
     }
+    // Below moving and above everything else, which is the client's own order:
+    // `updateMoveStateVisuals` asks moving first, and dancing replaces the idle it
+    // would otherwise fall through to rather than layering over it the way speaking
+    // does. Nobody dances sitting down.
+    if (person.dancing) return (pose: Pose.dancing, facing: facing);
     final x = person.x.round();
     final y = person.y.round();
     if (map.isSeat(x, y)) {

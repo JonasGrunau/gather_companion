@@ -48,6 +48,8 @@
 /// plus `SpaceUser.userAccountId` gives a second, slower route.
 library;
 
+import 'dart:convert';
+
 import 'avatar.dart';
 import 'space_map.dart';
 
@@ -122,6 +124,12 @@ const _trackedFields = {
   'connected',
   'isIdle',
   'speaking',
+  // Whether they are dancing, which is the one pose that is *only* knowable from
+  // the wire. Sitting is derived from the tile and talking from `speaking`, but
+  // nothing about a position says somebody pressed the dance key — so without this
+  // field the sheet's dance cycle (frames 12–15) can never be selected and a
+  // dancing colleague renders as standing perfectly still.
+  'dancing',
   'clusterId',
   'userAccountId',
   // Which way somebody is facing. Only the map cares, and only since it started
@@ -182,6 +190,69 @@ class BusEvent {
   String toString() => 'BusEvent($name from $senderId -> $targetUserIds)';
 }
 
+/// The server's verdict on one action we sent, off `actionReturns[]`.
+///
+/// Actions are request/response over the same socket, keyed by the `txnId` the
+/// client generated:
+///
+/// ```jsonc
+/// {connectionId, txnId, result: {type: 'Success', value: '1fdcb187-…'}}
+/// {connectionId, txnId, result: {type: 'Error',   error: '<prose or zod JSON>'}}
+/// ```
+///
+/// Reading these is the only way to learn that something did not happen.
+/// Validation runs before the action does, so a wrong-shaped argument executes
+/// nothing and produces no patch — and a client that watches only patches cannot
+/// tell that apart from a slow network. Acks are private to the socket that sent
+/// the action, so every one of these is ours.
+class ActionResult {
+  const ActionResult({required this.txnId, required this.ok, this.error, this.value});
+
+  final String txnId;
+  final bool ok;
+
+  /// What the server said, when it said no. Either a readable sentence
+  /// (*"Cannot wave at yourself"*) or a JSON zod issue list. Left raw here;
+  /// [describeActionError] turns it into something to show a person.
+  final String? error;
+
+  /// `result.value` on a success, which for most actions is the row's id.
+  final Object? value;
+
+  @override
+  String toString() => 'ActionResult($txnId, ${ok ? 'Success' : 'Error: $error'})';
+}
+
+/// Turns a server refusal into one sentence.
+///
+/// Two flavours arrive, and the difference is worth keeping: business rules come
+/// back as prose and are already the right thing to show, while schema violations
+/// come back as a zod issue list — a JSON array whose entries carry `message` and
+/// a `path`. The first issue is the useful one; the rest are usually the same
+/// mistake seen from other angles.
+String describeActionError(String? error) {
+  final raw = error?.trim() ?? '';
+  if (raw.isEmpty) return 'Gather refused it without saying why';
+  if (!raw.startsWith('[') && !raw.startsWith('{')) return raw;
+
+  final Object? decoded;
+  try {
+    decoded = jsonDecode(raw);
+  } on Object {
+    return raw;
+  }
+  final issues = decoded is List ? decoded : (decoded is Map ? [decoded] : const []);
+  for (final issue in issues) {
+    if (issue is! Map) continue;
+    final message = issue['message'];
+    if (message is! String || message.isEmpty) continue;
+    final path = issue['path'];
+    final field = path is List ? path.whereType<Object>().join('.') : '';
+    return field.isEmpty ? message : '$field: $message';
+  }
+  return raw;
+}
+
 /// One person in the space, as far as a state dump plus deltas can tell.
 class RosterRow {
   const RosterRow({
@@ -192,6 +263,7 @@ class RosterRow {
     this.floorId,
     this.connected,
     this.speaking,
+    this.dancing,
     this.followTargetKnown = false,
     this.followTargetId,
     this.clusterIdKnown = false,
@@ -214,6 +286,11 @@ class RosterRow {
   final String? floorId;
   final bool? connected;
   final bool? speaking;
+
+  /// Whether they are dancing. Null before the field has ever arrived, which the
+  /// map reads as "not dancing" — the same way it reads a missing `direction` as
+  /// south.
+  final bool? dancing;
 
   /// Whether `followTargetId` was present on the row at all.
   ///
@@ -409,6 +486,7 @@ class _Row {
   bool? connected;
   bool? isIdle;
   bool? speaking;
+  bool? dancing;
   bool? isBot;
   String? kind;
   String? userAccountId;
@@ -508,10 +586,23 @@ class GameProtocolReader {
   /// answer keeps its meaning — a wave changes no state at all.
   final List<BusEvent> _pending = [];
 
+  /// Action verdicts waiting to be drained, oldest first.
+  final List<ActionResult> _results = [];
+
+  /// The highest `sequenceNumber` the server has sent us.
+  ///
+  /// Strictly increasing across a connection, and what the client's own outgoing
+  /// heartbeat reports back: measured 2026-08-14, the desktop client's
+  /// `Heartbeat.sequenceNumber` ran 121 → 178 while the server's ran 124 → 178, so
+  /// it is echoing the last sequence it has seen rather than counting its own
+  /// sends. Null until the first `FullStateChunk` or `DeltaState` arrives.
+  int? lastSequence;
+
   final Map<String, int> _frameTypes = {};
   int _unknownFrames = 0;
   int _patchCount = 0;
   int _busEvents = 0;
+  int _actionErrors = 0;
 
   int get userCount => _users.length;
 
@@ -520,6 +611,14 @@ class GameProtocolReader {
     if (_pending.isEmpty) return const [];
     final out = List<BusEvent>.of(_pending);
     _pending.clear();
+    return out;
+  }
+
+  /// Hands over the queued action verdicts and forgets them.
+  List<ActionResult> takeResults() {
+    if (_results.isEmpty) return const [];
+    final out = List<ActionResult>.of(_results);
+    _results.clear();
     return out;
   }
 
@@ -537,6 +636,8 @@ class GameProtocolReader {
         'spaceId': spaceId,
         'patches': _patchCount,
         'busEvents': _busEvents,
+        'actionErrors': _actionErrors,
+        'sequence': lastSequence,
         'unknownFrames': _unknownFrames,
         'frameTypes': (_frameTypes.entries.toList()
               ..sort((a, b) => b.value.compareTo(a.value)))
@@ -553,8 +654,17 @@ class GameProtocolReader {
     final type = frame['type'] is String ? frame['type'] as String : '(untyped)';
     _frameTypes[type] = (_frameTypes[type] ?? 0) + 1;
 
-    // Heartbeats are the bulk of the traffic and carry nothing.
+    // Heartbeats are the bulk of the traffic and carry nothing. Their own
+    // `sequenceNumber` is absent — only the state envelopes carry it — so this
+    // returns before the sequence is read, deliberately.
     if (type == 'Heartbeat') return false;
+
+    // The server's own counter, strictly increasing, which our heartbeat reports
+    // back. Read from every state envelope rather than only the dump.
+    final sequence = frame['sequenceNumber'];
+    if (sequence is int && (lastSequence == null || sequence > lastSequence!)) {
+      lastSequence = sequence;
+    }
 
     // Before the patches, because a wave arrives in a frame whose `patches` array
     // is empty — which is exactly how it went unnoticed for so long.
@@ -562,6 +672,15 @@ class GameProtocolReader {
     for (final event in bus) {
       _pending.add(event);
       _busEvents++;
+    }
+
+    // The same trap one field over: an action that was *refused* produces no patch
+    // at all, so a frame can carry nothing but `actionReturns` and would otherwise
+    // fall through to `_unknownFrames` exactly as the event bus used to.
+    final acks = _collectActionResults(frame);
+    for (final result in acks) {
+      _results.add(result);
+      if (!result.ok) _actionErrors++;
     }
 
     // The dump and the deltas are read separately, because for anything
@@ -574,9 +693,9 @@ class GameProtocolReader {
     final patches = [...dump, ...deltas];
     if (patches.isEmpty) {
       // Frames that legitimately carry no model state (Authenticate, Subscribe,
-      // SpaceStatus, …) — but a frame we *did* understand as an interaction is not
-      // unrecognised.
-      if (bus.isEmpty) _unknownFrames++;
+      // SpaceStatus, …) — but a frame we *did* understand as an interaction or as
+      // the answer to something we sent is not unrecognised.
+      if (bus.isEmpty && acks.isEmpty) _unknownFrames++;
       return false;
     }
 
@@ -866,6 +985,9 @@ class GameProtocolReader {
     if (data.containsKey('speaking')) {
       set(row.speaking, _asBool(data['speaking']), (v) => row.speaking = v);
     }
+    if (data.containsKey('dancing')) {
+      set(row.dancing, _asBool(data['dancing']), (v) => row.dancing = v);
+    }
     if (data.containsKey('isBot')) {
       set(row.isBot, _asBool(data['isBot']), (v) => row.isBot = v);
     }
@@ -1040,6 +1162,7 @@ class GameProtocolReader {
         floorId: row.floorId,
         connected: row.gone ? false : row.connected,
         speaking: row.speaking,
+        dancing: row.dancing,
         followTargetKnown: row.followTargetKnown,
         followTargetId: row.followTargetId,
         clusterIdKnown: row.clusterIdKnown,
@@ -1211,13 +1334,81 @@ List<BusEvent> _collectBusEvents(Map<String, Object?> frame) {
 
     out.add(BusEvent(
       name: name,
-      senderId: _nullableString(payload['senderId']),
+      senderId: _senderOf(payload),
       sentTime: _asIsoString(payload['sentTime']),
+      // `targetUserIds` is a JS `Set`, which is msgpack ext-2 and decodes to a
+      // list. Absent means the event was not addressed to anybody in particular —
+      // the schemas type it `union([undefined(), set(zodUuid)])` — so an empty list
+      // here reads as "not aimed at me", which is the safe way round for anything
+      // that would otherwise notify the whole space.
       targetUserIds: targets is List ? targets.whereType<String>().toList() : const [],
       payload: payload,
     ));
   }
   return out;
+}
+
+/// Who sent an event, under whichever of three names this one uses.
+///
+/// The field is not stable across event types and the inconsistency is silent,
+/// because every one of them also carries `targetUserIds` — so an event keyed on
+/// the wrong name still routes to the right person and merely arrives with nobody
+/// attached to it. Observed: `WaveEvent` says `senderId`, `EmoteEvent` says
+/// `senderUserId`, `ConfettiThrown` says `senderSpaceUserId`. All three hold a
+/// `SpaceUser` id.
+String? _senderOf(Map<String, Object?> payload) =>
+    _nullableString(payload['senderId']) ??
+    _nullableString(payload['senderUserId']) ??
+    _nullableString(payload['senderSpaceUserId']);
+
+/// Pulls our own actions' verdicts out of `actionReturns[]`.
+///
+/// Acknowledgements are strictly private to the socket that sent the action —
+/// measured across two clients, 52 acks and 7 acks, with no cross-contamination in
+/// either direction — so everything in this array is an answer to something we
+/// sent, and there is no need to filter by `connectionId`.
+List<ActionResult> _collectActionResults(Map<String, Object?> frame) {
+  final list = frame['actionReturns'];
+  if (list is! List) return const [];
+
+  final out = <ActionResult>[];
+  for (final entry in list) {
+    if (entry is! Map<String, Object?>) continue;
+    final txnId = _nullableString(entry['txnId']);
+    if (txnId == null) continue;
+    final result = entry['result'];
+    final type = result is Map<String, Object?> ? result['type'] : null;
+    // Asked positively. An unrecognised `type` is not a success, and treating it as
+    // one is how a refusal would go back to being invisible.
+    final ok = type == 'Success';
+    out.add(ActionResult(
+      txnId: txnId,
+      ok: ok,
+      error: ok || result is! Map<String, Object?>
+          ? null
+          : _errorText(result['error']) ?? _errorText(result['message']),
+      value: ok && result is Map<String, Object?> ? result['value'] : null,
+    ));
+  }
+  return out;
+}
+
+/// The error field as a string, however it arrived.
+///
+/// Observed as a string — prose, or a JSON zod list already serialised into one —
+/// but a server that ever sends the issue list as a real array should not come out
+/// as an empty refusal, so a structure is re-encoded rather than dropped.
+/// [describeActionError] parses either back.
+String? _errorText(Object? value) {
+  if (value is String) return value.trim().isEmpty ? null : value;
+  if (value is List || value is Map) {
+    try {
+      return jsonEncode(value);
+    } on Object {
+      return '$value';
+    }
+  }
+  return null;
 }
 
 String? _asIsoString(Object? value) {

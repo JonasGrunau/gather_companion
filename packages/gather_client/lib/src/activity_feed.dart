@@ -477,7 +477,15 @@ List<ActivityItem> parseActivityFeed(Map<String, Object?> body) {
     if (subscription == null) continue;
     final eventId = _string(subscription['activityEventId']);
     final event = events[eventId ?? ''];
-    final isRead = subscription['readAt'] != null;
+    // Asked by *reading the timestamp*, not by testing against null. This body is
+    // msgpack, and an unset optional column on this protocol arrives as ext-4
+    // **undefined** rather than nil — every `undefined` in the observed state dump
+    // (`clusterId`, `handRaisedAt`, `Connection.lastActiveAt`) is that same
+    // encoding. `msgpackDecode` maps it to the `msgpackUndefined` sentinel, which
+    // is not null, so `readAt != null` would call every unread item read: a badge
+    // stuck at zero, and `markRead` with nothing left to send. The same trap
+    // `_MeetingWatch` documents one file over.
+    final isRead = _time(subscription['readAt']) != null;
     // The subscription is per-person and the event is shared, so the subscription
     // is what carries "when did this reach me" as well as whether it was read.
     final at = _time(event?['createdAt']) ?? _time(subscription['createdAt']);

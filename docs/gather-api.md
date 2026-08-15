@@ -527,8 +527,19 @@ waver. `ChatMessageMetadata.metadata` is where it actually lives:
 | `OnboardingDesk` | 1 | none — `isGlobal: true` |
 
 **Read state is on the subscription, not the event.** `ActivityEventSubscription` is
-`{id, spaceUserId, activityEventId, readAt, …}` and `readAt: null` means unread — 11
-of 16 in the measured space.
+`{id, spaceUserId, activityEventId, readAt, …}` and an unset `readAt` means unread —
+11 of 16 in the measured space.
+
+**Unset is msgpack `undefined`, not `null`, and the difference decides the
+feature.** Written as `null` here until 2026-08-15, which is the sort of shorthand
+that reads as harmless and is not: this body is msgpack, and every optional column
+observed on this protocol arrives as **ext-4 undefined** rather than nil —
+`SpaceUser.clusterId`, `SpaceUser.handRaisedAt`, `Connection.lastActiveAt`, all of
+them. A decoder that keeps the two apart, as it must (see
+[the `followTargetId` case](#the-game-socket)), will not answer `!= null` the way
+you expect: **`readAt != null` reports every unread item as read**, which is a badge
+frozen at zero and a "mark read" call with nothing left to send. Test the timestamp
+itself, not the absence of null.
 
 ### Marking activity read
 
@@ -598,7 +609,7 @@ session:
 Authenticate -> ConnectToSpace -> Subscribe -> SpaceStatus
   -> FullStateChunk xN     (initial dump, ~1500 patches, ~45 models, ONCE per connection)
   -> DeltaState / Action   (everything after)
-  -> Heartbeat             (~1/s, the bulk of traffic)
+  -> Heartbeat             (median 4.6s, the bulk of traffic)
 ```
 
 ### Frame types and envelopes
@@ -610,11 +621,27 @@ Observed server→client, all msgpack over binary frames:
 | `SpaceStatus` | `warmInGatewayServer`, `warmInLogicServer` |
 | `FullStateChunk` | `fullStatePatches[]`, `actionReturns[]`, `events[]`, `optimisticAckTxnIds[]`, `chunkConfig`, `sequenceNumber` |
 | `DeltaState` | `patches[]`, `actionReturns[]`, `events[]`, `optimisticAckTxnIds[]`, `sequenceNumber` |
-| `Heartbeat` | `timestamp`, `origin: 'Server'` |
+| `Heartbeat` | `timestamp`, `origin: 'Client'` |
 
-The client heartbeats the same shape back with `origin: 'Client'`, roughly once a
-second. `sequenceNumber` is Gather's own and unrelated to the bridge's `seq`.
-`optimisticAckTxnIds` acknowledges client-predicted actions.
+**Corrected 2026-08-15.** This row said `origin: 'Server'` and the paragraph below
+it said the client answers with `origin: 'Client'` — both backwards. The
+two-client capture of 2026-08-14 settles it: the frame the client **sends** carries
+`origin: "Server"` and the frame it **receives** carries `origin: "Client"`.
+Whatever the field denotes, it is not the sender, and nothing should read direction
+off it — take that from the frame. See
+[`observed-wire-protocol.md`](protocol/observed-wire-protocol.md#two-gotchas-worth-knowing).
+
+The client's outgoing heartbeat also carries a **`sequenceNumber`**, which the
+received ones do not, and it is not a count of our own sends: it echoes the highest
+`sequenceNumber` the *server* has sent, so it reports what we have seen. Measured,
+the desktop's ran 121 → 178 while the server's ran 124 → 178. Server
+`sequenceNumber` is strictly increasing and is the resync anchor; it is Gather's own
+and unrelated to the bridge's `seq`. Cadence is a median 4.6 s, not the ~1 s this
+document used to claim.
+
+`optimisticAckTxnIds` acknowledges client-predicted actions, and `actionReturns[]`
+carries the verdict — **including the refusals, which appear on no other channel**.
+See [Actions — the write API](#actions-the-write-api).
 
 ### Confirmed live, 2026-08-06
 
@@ -798,6 +825,26 @@ client-generated `txnId`:
 So actions are request/response over the same socket, and failures are addressable
 per transaction rather than being connection-wide.
 
+**`actionReturns` is the only place a refusal appears, and a client that ignores it
+cannot tell a refusal from a slow network.** Worth stating flatly, because every
+instinct here is wrong: a schema violation is rejected *before* the action runs, so
+nothing executes, no patch arrives, no event is published, no error is raised on the
+socket and the connection is not closed. The observable difference between "your
+status was set" and "your status was rejected for being 4,000 characters long" is
+one entry in an array that most frames leave empty. Add to that the fact that
+**acknowledgements are private to the originating socket** — measured across two
+clients, 52 acks and 7 acks with no cross-contamination — and everything in this
+array is an answer to something you sent, so there is nothing to filter by
+`connectionId`.
+
+The trap has the same shape as the [event bus](#the-game-socket-is-a-state-channel-and-an-event-bus)
+one, and for the same reason: a frame carrying only an acknowledgement has an
+**empty `patches` array**, so a reader that dispatches on patches drops it whole.
+`packages/gather_client/lib/src/game_protocol.dart` reads all three arrays —
+`patches`, `events`, `actionReturns` — and `direct_collector.dart` pairs each
+verdict back to the action that earned it, since the wire names only the
+transaction.
+
 ### The server tells you the API if you ask wrong
 
 This is the most useful thing in this document. The action vocabulary is **not**
@@ -934,8 +981,11 @@ fan-out out for itself. It comes back on the event bus as `EmoteEvent`, whose
 `targetUserIds` includes the sender, so you receive your own.
 
 **`EmoteEvent` names its sender `senderUserId`, not `senderId`.** `WaveEvent` uses
-`senderId`. A reader that keys on one loses the sender of the other, silently,
-because both carry `targetUserIds` and so still route correctly.
+`senderId`, and `ConfettiThrown` a third name again, `senderSpaceUserId` — all
+three holding a `SpaceUser` id. A reader that keys on one loses the sender of the
+others, silently, because every one of them also carries `targetUserIds` and so
+still routes correctly: the symptom is a wave from nobody, not a wave that never
+arrives. `game_protocol.dart`'s `_senderOf` tries all three.
 
 All of the above except `startSpeaking`/`stopSpeaking`/`updateTargetMeetingArea`
 are implemented in `packages/gather_client/lib/src/direct_collector.dart` and

@@ -226,7 +226,12 @@ void main() {
       );
     });
 
-    test('direction varies, because always facing Down is a tell', () {
+    test('each hop faces the way it travelled, not a direction picked at random', () {
+      // `teleport` requires a direction even though a hop passes through no tiles,
+      // and what the client puts there is the heading it derived from the vector —
+      // `MoveController.teleport` calls `positionToDirectionIgnoringAxis(goal)`. This
+      // used to send a random one of the four, which landed every hop looking
+      // somewhere the body had not come from.
       var roll = 0.0;
       final p = party = PartyMode(
         collector: () => collector,
@@ -238,6 +243,16 @@ void main() {
         p.tick();
       }
 
+      expect(collector.hops, isNotEmpty);
+      for (final hop in collector.hops) {
+        expect(
+          hop.direction,
+          headingTo(fromX: 20, fromY: 20, toX: hop.x.round(), toY: hop.y.round()),
+          reason: 'hop to ${hop.x},${hop.y} from 20,20',
+        );
+      }
+      // And it still varies, which was the point of the test this replaces: hops go
+      // all over the floor, so the headings do too.
       expect(collector.hops.map((h) => h.direction).toSet().length, greaterThan(1));
     });
   });

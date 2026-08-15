@@ -75,6 +75,39 @@ void main() {
       expect(wave.canMarkRead, isFalse);
     });
 
+    test('an unread readAt is undefined, not null, and still reads as unread', () {
+      // The trap this file exists to keep shut. Bodies here are msgpack, and an
+      // unset optional column on this protocol arrives as ext-4 **undefined** —
+      // every `undefined` in the observed state dump is that encoding, and
+      // `msgpackDecode` maps it to a sentinel that is emphatically not null. A
+      // `readAt != null` test therefore calls every unread item read: badge stuck at
+      // zero, and `markRead` with nothing left to send.
+      //
+      // Built as a decoded map rather than through [feedBytes], because the encoder
+      // drops undefined keys on the way out by design — msgpack_test.dart is where
+      // ext-4 decoding itself is pinned.
+      final items = parseActivityFeed({
+        'activityFeed': {
+          'activityEventSubscriptionIds': ['s1'],
+        },
+        'serializedModels': {
+          'ActivityEventSubscription': [
+            {'id': 's1', 'activityEventId': 'e1', 'readAt': msgpackUndefined},
+          ],
+          'ActivityEvent': [
+            {
+              'id': 'e1',
+              'createdAt': '2026-07-20T10:08:59.101Z',
+              'metadata': {'type': activityOnboardingChat},
+            },
+          ],
+        },
+      });
+
+      expect(items.single.isRead, isFalse);
+      expect(items.single.canMarkRead, isTrue);
+    });
+
     test('joins a subscription to its event and reads unread off readAt', () {
       final items = parseActivityFeed(
         msgpackDecode(feedBytes(

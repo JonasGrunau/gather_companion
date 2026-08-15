@@ -18,6 +18,7 @@ class MapPerson {
     required this.y,
     required this.isFollowingMe,
     required this.speaking,
+    this.dancing = false,
     this.avatarUrl,
     this.direction,
     this.gait = Gait.walking,
@@ -42,6 +43,13 @@ class MapPerson {
   final bool isFollowingMe;
 
   final bool speaking;
+
+  /// `SpaceUser.dancing`, which is the one pose nothing else can be derived from.
+  ///
+  /// Sitting comes from the tile and talking from `speaking`, but no coordinate
+  /// says somebody pressed the dance key — so this field is the whole of it, and
+  /// without it the sheet's dance cycle can never be drawn.
+  final bool dancing;
 
   /// Their avatar spritesheet — 72 frames of 32×64, composited by Gather's own
   /// sprite service. Null for anybody whose outfit never arrived, which is normal:

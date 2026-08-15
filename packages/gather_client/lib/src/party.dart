@@ -100,9 +100,6 @@ const safeTilesDefault = 5;
 /// is the difference between a feature and a hazard.
 const maxPartyDuration = Duration(minutes: 15);
 
-/// Faced at random, because always looking Down is a tell.
-const _directions = ['Up', 'Down', 'Left', 'Right'];
-
 /// How often a running party says how it is going.
 ///
 /// Separate from `changes`, and much cheaper. A change means the answer to "is this
@@ -353,9 +350,22 @@ class PartyMode {
       return;
     }
 
-    final tile = _pick(safe.tiles, safe.me!);
-    final direction = _directions[(_random() * _directions.length).floor() % _directions.length];
-    final sent = collector.teleport(x: tile.x, y: tile.y, direction: direction);
+    final me = safe.me!;
+    final tile = _pick(safe.tiles, me);
+    // The way we travelled, which is what the client puts there:
+    // `MoveController.teleport` derives it with `positionToDirectionIgnoringAxis`
+    // rather than sending a constant. A random facing is what this used to send,
+    // and it made every hop land looking somewhere the body had not come from.
+    final sent = collector.teleport(
+      x: tile.x,
+      y: tile.y,
+      direction: headingTo(
+        fromX: (me.x ?? tile.x).round(),
+        fromY: (me.y ?? tile.y).round(),
+        toX: tile.x.round(),
+        toY: tile.y.round(),
+      ),
+    );
     if (!sent.ok) {
       _setDetail(sent.detail ?? 'could not reach Gather');
       return;

@@ -21,12 +21,21 @@ import 'dart:typed_data';
 import 'package:gather_client/gather_client.dart';
 import 'package:test/test.dart';
 
-/// Frames the collector actually sends, with the bytes the bridge sends for them.
+/// Frames on this protocol, with the bytes the bridge's JS encoder emits for them.
+///
+/// These pin the **codec**, not the vocabulary: what is being asserted is that two
+/// implementations of msgpack agree byte for byte. `bridgeHeartbeat` is the one
+/// entry whose value the collector no longer sends — the 2026-08-14 two-client
+/// capture showed the desktop client's outgoing heartbeat carrying
+/// `origin: 'Server'` and a `sequenceNumber` echoing the server's, and this client
+/// follows the capture. The bridge still sends the older shape, so its bytes stay
+/// here as a codec fixture; the frame the collector actually sends is asserted in
+/// `direct_collector_test.dart`, against a fake server that decodes it.
 const _jsBytes = <String, String>{
   'subscribe': '81a474797065a9537562736372696265',
   'connect': '82a474797065ae436f6e6e656374546f5370616365a773706163654964d92435'
       '383464323762332d626563302d346137362d386231372d396166343539333934636337',
-  'heartbeat': '83a474797065a9486561727462656174a974696d657374616d70d30000019f'
+  'bridgeHeartbeat': '83a474797065a9486561727462656174a974696d657374616d70d30000019f'
       'd5e54400a66f726967696ea6436c69656e74',
   'load': '84a474797065a6416374696f6ea574786e4964d92431313131313131312d32323232'
       '2d333333332d343434342d353535353535353535353535a6616374696f6ead6c6f616453'
@@ -46,7 +55,7 @@ const _jsBytes = <String, String>{
 final _values = <String, Object?>{
   'subscribe': {'type': 'Subscribe'},
   'connect': {'type': 'ConnectToSpace', 'spaceId': '584d27b3-bec0-4a76-8b17-9af459394cc7'},
-  'heartbeat': {'type': 'Heartbeat', 'timestamp': 1786000000000, 'origin': 'Client'},
+  'bridgeHeartbeat': {'type': 'Heartbeat', 'timestamp': 1786000000000, 'origin': 'Client'},
   'load': {
     'type': 'Action',
     'txnId': '11111111-2222-3333-4444-555555555555',

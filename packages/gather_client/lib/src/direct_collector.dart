@@ -92,6 +92,35 @@ const _maxBackoff = Duration(seconds: 30);
 const _connectionTarget = 'OfficeView';
 const _clientPlatform = 'Desktop';
 
+/// How many outstanding actions to remember for the sake of naming a refusal.
+///
+/// Acks are prompt and 1:1, so in practice this holds one or two entries — a
+/// held-down D-pad at go-kart pace is 21 actions a second and every one of them is
+/// answered within a frame or two. The cap is a backstop against a server that
+/// stops acknowledging, which would otherwise grow this map for the life of the
+/// connection.
+const _maxAwaitingActions = 128;
+
+/// An action the server refused, named.
+///
+/// The whole reason this type exists: a refused action produces **no patch**, and
+/// validation runs before the action does — so a wrong argument executes nothing,
+/// changes nothing, and says nothing on any channel a patch-watching client reads.
+/// The only evidence is `actionReturns`, and it names the transaction rather than
+/// the action, so the two have to be paired up on this side.
+class ActionRefused {
+  const ActionRefused({required this.action, required this.message});
+
+  /// The action's own id — `setCustomStatus`, `teleport`, `enterSpace`.
+  final String action;
+
+  /// One sentence, already unwrapped from a zod issue list where it was one.
+  final String message;
+
+  @override
+  String toString() => 'ActionRefused($action: $message)';
+}
+
 /// Whether the collector is holding state, and what to say if not.
 class CollectorStatus {
   const CollectorStatus({required this.healthy, this.detail, this.needsPairing = false});
@@ -167,9 +196,13 @@ class DirectCollector {
   /// When a frame last arrived. The watchdog's whole state — see [_silenceLimit].
   DateTime? _lastFrameAt;
 
+  /// txnId -> the action it was, so an ack can be named. Cleared per connect.
+  final Map<String, String> _awaiting = {};
+
   final _rosters = StreamController<Roster>.broadcast();
   final _interactions = StreamController<BusEvent>.broadcast();
   final _statuses = StreamController<CollectorStatus>.broadcast();
+  final _refusals = StreamController<ActionRefused>.broadcast();
 
   /// The roster, coalesced. One event per change worth rendering.
   Stream<Roster> get rosters => _rosters.stream;
@@ -177,6 +210,14 @@ class DirectCollector {
   /// Waves and the rest of Gather's event bus, published the moment they arrive.
   Stream<BusEvent> get interactions => _interactions.stream;
   Stream<CollectorStatus> get statuses => _statuses.stream;
+
+  /// Actions the server would not run.
+  ///
+  /// Separate from [statuses] because it is not about the connection: the socket is
+  /// perfectly healthy and one thing we asked for did not happen. Broadcast and
+  /// unbuffered — a refusal is news, and nothing is owed delivery if nobody is
+  /// listening.
+  Stream<ActionRefused> get refusals => _refusals.stream;
 
   bool get healthy => _healthy;
   String? get detail => _lastDetail;
@@ -233,6 +274,7 @@ class DirectCollector {
     await _rosters.close();
     await _interactions.close();
     await _statuses.close();
+    await _refusals.close();
   }
 
   /// Reconnects, which is all a resync is here: the server replays the full state
@@ -425,6 +467,20 @@ class DirectCollector {
   /// the default.
   static const _nothing = Object();
 
+  /// Says whether the person is actually at the phone.
+  ///
+  /// `reportActivity` is the only action here addressed to `Connection` rather than
+  /// to `SpaceUser`, and it takes a `null` id — the gateway knows which connection
+  /// is asking. Gather's own client sends it on every idle and focus change; this
+  /// one sends it when the app goes to the background and comes back, which is the
+  /// same question a phone can answer.
+  ///
+  /// Without the `false` half, `Connection.isActive` stays true for as long as the
+  /// socket does, and a phone in a pocket goes on claiming somebody is at their
+  /// desk.
+  ({bool ok, String? detail}) setActive(bool active) =>
+      _send('reportActivity', model: 'Connection', id: null, args: {'isActive': active});
+
   /// One action against our own `SpaceUser` row, on the socket we already hold.
   ///
   /// [args] is the third element of the `args` tuple, and it is deliberately
@@ -434,6 +490,12 @@ class DirectCollector {
   /// pass nothing at all — their `args` is two elements long, not three. Sending a
   /// map where the server wants a bool is a schema failure, so the shape is the
   /// caller's to state.
+  ///
+  /// The socket is checked before the identity, and the order is the point rather
+  /// than an accident: with neither, "not connected to Gather" is the fact worth
+  /// telling somebody, and "do not know which avatar is ours yet" is a detail about
+  /// a connection that does not exist. [_send] repeats the first check for the
+  /// callers that skip this one.
   ({bool ok, String? detail}) _act(String action, [Object? args = _nothing]) {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) {
@@ -443,20 +505,68 @@ class DirectCollector {
     if (self == null) {
       return (ok: false, detail: 'do not know which avatar is ours yet');
     }
+    return _send(action, model: 'SpaceUser', id: self, args: args);
+  }
+
+  /// One action on any model, on the socket we already hold.
+  ///
+  /// Still fire-and-forget in the sense that nothing here waits: the answer arrives
+  /// on `actionReturns` and comes out on [refusals] if it was a refusal. What the
+  /// `ok` below reports is only whether the bytes went out, which is why the two
+  /// channels both exist — a `true` here means "asked", not "done".
+  ({bool ok, String? detail}) _send(
+    String action, {
+    required String model,
+    required String? id,
+    Object? args = _nothing,
+  }) {
+    final ws = _ws;
+    if (ws == null || ws.readyState != WebSocket.open) {
+      return (ok: false, detail: 'not connected to Gather');
+    }
 
     try {
-      ws.add(msgpackEncode({
-        'type': 'Action',
-        'txnId': _txnId(),
-        'action': action,
-        // `null` is a legitimate third argument, so absence is its own sentinel
-        // rather than null — a two-element tuple is what the server was observed
-        // to receive for these, and padding it with null is a different frame.
-        'args': ['SpaceUser', self, if (!identical(args, _nothing)) args],
-      }));
+      ws.add(msgpackEncode(_actionFrame(action, model: model, id: id, args: args)));
       return (ok: true, detail: null);
     } on Object catch (error) {
       return (ok: false, detail: '$error');
+    }
+  }
+
+  /// An `Action` frame, with its transaction remembered so the ack can be named.
+  Map<String, Object?> _actionFrame(
+    String action, {
+    required String model,
+    required String? id,
+    Object? args = _nothing,
+  }) {
+    final txnId = _txnId();
+    // Bounded: a server that stops acknowledging must not turn this into a leak.
+    // Insertion-ordered, so the oldest unanswered transaction is the one to drop.
+    if (_awaiting.length >= _maxAwaitingActions) {
+      _awaiting.remove(_awaiting.keys.first);
+    }
+    _awaiting[txnId] = action;
+    return {
+      'type': 'Action',
+      'txnId': txnId,
+      'action': action,
+      // `null` is a legitimate third argument, so absence is its own sentinel
+      // rather than null — a two-element tuple is what the server was observed
+      // to receive for these, and padding it with null is a different frame.
+      'args': [model, id, if (!identical(args, _nothing)) args],
+    };
+  }
+
+  /// Pairs each verdict with the action it answers, and reports the refusals.
+  void _drainResults() {
+    for (final result in reader.takeResults()) {
+      final action = _awaiting.remove(result.txnId);
+      if (result.ok) continue;
+      final message = describeActionError(result.error);
+      _log('direct: Gather refused ${action ?? 'an action'} — $message');
+      if (_refusals.isClosed) continue;
+      _refusals.add(ActionRefused(action: action ?? 'that', message: message));
     }
   }
 
@@ -571,6 +681,9 @@ class DirectCollector {
     reader = GameProtocolReader(log: _log)..authUserId = authUserId;
     _frames = 0;
     _lastFrameAt = null;
+    // Transactions belong to a socket. Carrying them over would pair a new
+    // connection's ack with an old connection's action name.
+    _awaiting.clear();
 
     final url = '$_socketUrl?spaceId=${Uri.encodeQueryComponent(resolvedSpace)}'
         '&authUserId=${Uri.encodeQueryComponent(authUserId ?? '')}';
@@ -673,16 +786,12 @@ class DirectCollector {
         },
         {'type': 'ConnectToSpace', 'spaceId': space},
         {'type': 'Subscribe'},
-        {
-          'type': 'Action',
-          'txnId': _txnId(),
-          'action': 'loadSpaceUser',
-          'args': [
-            'SpaceUser',
-            null,
-            {'connectionTarget': _connectionTarget, 'clientPlatform': _clientPlatform},
-          ],
-        },
+        _actionFrame(
+          'loadSpaceUser',
+          model: 'SpaceUser',
+          id: null,
+          args: {'connectionTarget': _connectionTarget, 'clientPlatform': _clientPlatform},
+        ),
         if (spaceUserId != null) ..._enterFrames(spaceUserId),
       ];
 
@@ -692,22 +801,13 @@ class DirectCollector {
   /// claiming to be active, but a participant that never reports goes idle and
   /// stops looking present to the people it is talking to.
   List<Map<String, Object?>> _enterFrames(String spaceUserId) => [
-        {
-          'type': 'Action',
-          'txnId': _txnId(),
-          'action': 'enterSpace',
-          'args': ['SpaceUser', spaceUserId],
-        },
-        {
-          'type': 'Action',
-          'txnId': _txnId(),
-          'action': 'reportActivity',
-          'args': [
-            'Connection',
-            null,
-            {'isActive': true},
-          ],
-        },
+        _actionFrame('enterSpace', model: 'SpaceUser', id: spaceUserId),
+        _actionFrame(
+          'reportActivity',
+          model: 'Connection',
+          id: null,
+          args: {'isActive': true},
+        ),
       ];
 
   /// Enters late, when the handshake could not.
@@ -758,6 +858,21 @@ class DirectCollector {
     return true;
   }
 
+  /// The client's heartbeat, in the desktop client's own shape.
+  ///
+  /// Two things about it read backwards and both were measured rather than
+  /// reasoned about (2026-08-14, two live clients):
+  ///
+  ///  - **`origin` is not the sender.** The frame the client *sends* carries
+  ///    `origin: 'Server'`, and the frame it receives carries `origin: 'Client'`.
+  ///    Whatever the field denotes, it is not direction — take that from the frame.
+  ///  - **`sequenceNumber` is not our own count.** It echoes the highest sequence
+  ///    the *server* has sent us: the desktop's ran 121 → 178 while the server's ran
+  ///    124 → 178. It is the resync anchor, so reporting our own send count would be
+  ///    telling Gather something untrue about what we have seen.
+  ///
+  /// Omitted before the first state envelope arrives, because there is genuinely no
+  /// sequence to report yet and zero is a claim rather than an absence.
   void _heartbeat() {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) return;
@@ -765,12 +880,20 @@ class DirectCollector {
       ws.add(msgpackEncode({
         'type': 'Heartbeat',
         'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'origin': 'Client',
+        'sequenceNumber': ?reader.lastSequence,
+        'origin': 'Server',
       }));
     } on Object {
       // A failed heartbeat means the socket is going; `onDone` handles it.
     }
   }
+
+  /// Sends one heartbeat immediately.
+  ///
+  /// Public only so a test can assert the frame's shape without waiting out
+  /// [_heartbeatInterval] — the timer set up in [_openConnection] is the sole
+  /// production caller, and nothing in the app has any reason to beat by hand.
+  void sendHeartbeatNow() => _heartbeat();
 
   void _onFrame(Object? data) {
     if (data is! List<int>) return; // Text on this socket would not be ours.
@@ -792,6 +915,10 @@ class DirectCollector {
     // The state dump is what names us, so this is the first moment the late path
     // can enter. Cheap to ask: it returns immediately once done.
     _maybeEnter();
+
+    // What the server made of what we asked for. Before the interactions, so a
+    // refusal is on its way out ahead of any state that arrived with it.
+    _drainResults();
 
     // Interactions go out at once rather than waiting for the publish window.
     // Coalescing exists because nobody needs every intermediate position; a wave is

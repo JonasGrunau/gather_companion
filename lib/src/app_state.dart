@@ -254,6 +254,7 @@ class AppState extends ChangeNotifier {
       y: y.toDouble(),
       isFollowingMe: false,
       speaking: _snapshot.players.any((p) => p.id == me.id && p.speaking),
+      dancing: me.dancing == true,
       avatarUrl: _collector?.avatarUrlFor(me.id),
       direction: me.direction,
       // Mine off [Walk] and not off the row. The gait changes twice inside a single
@@ -300,6 +301,7 @@ class AppState extends ChangeNotifier {
           y: y.toDouble(),
           isFollowingMe: followers.contains(row.id),
           speaking: speaking.contains(row.id),
+          dancing: row.dancing == true,
           avatarUrl: _collector?.avatarUrlFor(row.id),
           direction: row.direction,
           gait: gaitOf(row.speed),
@@ -368,8 +370,9 @@ class AppState extends ChangeNotifier {
           // Pairing worked; the bridge simply has no Gather session to give. Say so
           // rather than landing on a feed that can never fill.
           notifyListeners();
-          return 'Paired with $name, but it has no Gather session yet. '
-              'Run `npx gather-app-bridge adopt` on the computer, then pair again.';
+          return 'Paired with $name, but it has no Gather session to give. '
+              'Sign in to Gather on the computer, then pair again — pairing is '
+              'what reads the session across.';
         }
 
         _credentials = gather;
@@ -1311,6 +1314,69 @@ class AppState extends ChangeNotifier {
   @visibleForTesting
   void debugNoteEvent(BusEvent event) => _noteRefusal(event);
 
+  /// Gather declining to *run* something, as opposed to declining to let us in.
+  ///
+  /// The other half of the same silence. `_noteRefusal` handles the permission gate
+  /// inside `setPosition`, which publishes an event; this handles the layer above
+  /// it, where an action never ran at all — a bad enum, a status past its length
+  /// limit, a permission the account does not hold. Validation happens *before* the
+  /// action, so nothing executes and no patch arrives: the only evidence is
+  /// `actionReturns`, and without reading it the app would go on telling somebody
+  /// their status was set.
+  ///
+  /// Deduplicated, because the actions most likely to be refused are the ones sent
+  /// in bursts. A held D-pad is seven steps a second and a go-kart twenty-one; if
+  /// the server starts refusing `move`, one sentence is the news and the next two
+  /// hundred are noise.
+  void _noteActionRefused(ActionRefused refusal) {
+    final key = '${refusal.action}:${refusal.message}';
+    final now = DateTime.now();
+    final last = _refusedAt[key];
+    if (last != null && now.difference(last) < _refusalCooldown) return;
+    _refusedAt[key] = now;
+    // Cheap to bound: without this, a long session refusing many different things
+    // would keep every one of them forever.
+    if (_refusedAt.length > 32) _refusedAt.remove(_refusedAt.keys.first);
+
+    _notices.add('${_refusalSubject(refusal.action)}: ${refusal.message}');
+  }
+
+  final Map<String, DateTime> _refusedAt = {};
+  static const _refusalCooldown = Duration(seconds: 10);
+
+  /// What to call the thing that did not happen, in the user's terms.
+  ///
+  /// Falls back to the action's own id, which is not lovely but is honest and
+  /// searchable — better than swallowing a refusal for an action nobody has written
+  /// a phrase for yet.
+  static String _refusalSubject(String action) => switch (action) {
+        'setAvailability' => 'Gather would not change your availability',
+        'setCustomStatus' || 'clearCustomStatus' => 'Gather would not change your status',
+        'broadcastEmote' => 'Gather would not send that',
+        'leaveCluster' => 'Gather would not leave the conversation',
+        'teleport' || 'move' => 'Gather would not move you',
+        'walk' || 'run' || 'drive' => 'Gather would not change your pace',
+        'enterSpace' => 'Gather would not let you into the space',
+        'loadSpaceUser' => 'Gather would not load your avatar',
+        'reportActivity' => 'Gather would not record your activity',
+        _ => 'Gather refused $action',
+      };
+
+  /// Test seam: the action-refusal path without a socket to produce one.
+  @visibleForTesting
+  void debugNoteRefusal(ActionRefused refusal) => _noteActionRefused(refusal);
+
+  /// Tells Gather whether the person is actually at their phone.
+  ///
+  /// `reportActivity` used to be sent exactly once, at the handshake, saying
+  /// `true` — so `Connection.isActive` stayed true for the life of the socket and a
+  /// backgrounded phone went on claiming somebody was there. The desktop client
+  /// reports on every idle and focus change; the phone's equivalent is the
+  /// lifecycle, which is where this is called from.
+  Future<void> setActive(bool active) async {
+    _collector?.setActive(active);
+  }
+
   /// A wave off the socket, shown before the next fetch confirms it.
   void _noteActivity(BusEvent event) {
     if (event.name != 'WaveEvent') return;
@@ -1396,6 +1462,7 @@ class AppState extends ChangeNotifier {
           _onFold(_tracker.applyInteraction(event));
         }),
       )
+      ..add(collector.refusals.listen(_noteActionRefused))
       ..add(collector.statuses.listen(_onCollectorStatus))
       ..add(party.changes.listen(_onPartyChanged))
       ..add(party.progress.listen(_onPartyProgress))

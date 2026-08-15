@@ -894,4 +894,141 @@ void main() {
       expect(find.text('Boardroom is locked.'), findsOneWidget);
     });
   });
+
+  group('dancing', () {
+    /// The one pose that cannot be derived from anything else on the screen.
+    ///
+    /// Sitting comes from the tile under the body and talking from `speaking`, but
+    /// no coordinate says somebody pressed the dance key. The field was on the wire
+    /// and the sheet has had the cycle (frames 12–15 at 7fps) all along; what was
+    /// missing was the six inches of pipe between them, so a dancing colleague
+    /// rendered as standing perfectly still.
+    AppState danced({required bool me, required bool them}) {
+      final state = AppState();
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        RosterRow(
+            id: 'me',
+            name: 'Me',
+            x: 1,
+            y: 1,
+            floorId: 'f1',
+            connected: true,
+            availability: 'Active',
+            dancing: me),
+        RosterRow(
+            id: 'ada',
+            name: 'Ada',
+            x: 2,
+            y: 1,
+            floorId: 'f1',
+            connected: true,
+            availability: 'Active',
+            dancing: them),
+      ]));
+      return state;
+    }
+
+    test('reaches the map for somebody else', () {
+      final state = danced(me: false, them: true);
+      addTearDown(state.dispose);
+      expect(state.peopleOnMap.single.dancing, isTrue);
+    });
+
+    test('and for me', () {
+      final state = danced(me: true, them: false);
+      addTearDown(state.dispose);
+      expect(state.mePerson?.dancing, isTrue);
+      expect(state.peopleOnMap.single.dancing, isFalse);
+    });
+
+    test('is false, not null, for a row that has never carried the field', () {
+      final state = AppState();
+      addTearDown(state.dispose);
+      state.debugApplyRoster(const Roster(selfId: 'me', rows: [
+        RosterRow(id: 'me', name: 'Me', x: 1, y: 1, floorId: 'f1', connected: true),
+        RosterRow(
+            id: 'ada', name: 'Ada', x: 2, y: 1, floorId: 'f1', connected: true,
+            availability: 'Active'),
+      ]));
+
+      expect(state.mePerson?.dancing, isFalse);
+      expect(state.peopleOnMap.single.dancing, isFalse);
+    });
+  });
+
+  group('an action Gather would not run', () {
+    /// The other half of the same silence.
+    ///
+    /// `UserIsNotPermittedToEnter…` above is the permission gate *inside* the move —
+    /// the action ran, returned `Success`, and refused to write a position. This is
+    /// the layer above it, where the action never ran at all: arguments are
+    /// validated first, so a bad one executes nothing, produces no patch, and
+    /// publishes no event. The only evidence is `actionReturns`, and until it was
+    /// read the app went on telling people their status had been set.
+    test('is said out loud, in terms of the thing that did not happen', () async {
+      final state = AppState();
+      addTearDown(state.dispose);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteRefusal(const ActionRefused(
+        action: 'setCustomStatus',
+        message: 'text: String must contain at most 80 character(s)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, [
+        'Gather would not change your status: '
+            'text: String must contain at most 80 character(s)',
+      ]);
+    });
+
+    test('an action nobody has written a phrase for still gets through', () async {
+      // Naming it badly beats swallowing it. The action id is at least searchable.
+      final state = AppState();
+      addTearDown(state.dispose);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteRefusal(const ActionRefused(action: 'claimDesk', message: 'Taken'));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, ['Gather refused claimDesk: Taken']);
+    });
+
+    test('a burst of the same refusal is one sentence, not two hundred', () async {
+      // The actions most likely to be refused are the ones sent in bursts: a held
+      // D-pad is seven steps a second and a go-kart twenty-one. If the server starts
+      // refusing `move`, the first one is the news.
+      final state = AppState();
+      addTearDown(state.dispose);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      for (var i = 0; i < 20; i++) {
+        state.debugNoteRefusal(const ActionRefused(action: 'move', message: 'nope'));
+      }
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, ['Gather would not move you: nope']);
+    });
+
+    test('but a different refusal is different news', () async {
+      final state = AppState();
+      addTearDown(state.dispose);
+      final said = <String>[];
+      final sub = state.notices.listen(said.add);
+      addTearDown(sub.cancel);
+
+      state.debugNoteRefusal(const ActionRefused(action: 'move', message: 'nope'));
+      state.debugNoteRefusal(const ActionRefused(action: 'move', message: 'still nope'));
+      state.debugNoteRefusal(const ActionRefused(action: 'broadcastEmote', message: 'nope'));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(said, hasLength(3));
+    });
+  });
 }
