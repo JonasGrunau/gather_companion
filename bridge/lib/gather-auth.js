@@ -152,17 +152,17 @@ export async function adoptDesktopSession({ log = () => {} } = {}) {
     tried.add(token);
     try {
       const session = await exchange(token);
+      const uid = session.uid ?? uidFromIdToken(session.idToken);
       const config = readConfig();
       writeConfig({
         ...config,
-        gather: {
-          refreshToken: session.refreshToken,
-          idToken: session.idToken,
-          uid: session.uid ?? uidFromIdToken(session.idToken),
-        },
+        gather: { refreshToken: session.refreshToken, idToken: session.idToken, uid },
       });
       log(`gather auth: adopted the desktop session from ${file}`);
-      return { uid: session.uid ?? uidFromIdToken(session.idToken), file };
+      // The email comes back for one reason: to say out loud *which* account was
+      // adopted. A uid prefix cannot be recognised, and this bridge has already
+      // once switched accounts without anybody noticing.
+      return { uid, email: emailFromIdToken(session.idToken), file };
     } catch (error) {
       reasons.push(`${file}: ${error.message}`);
     }
@@ -170,9 +170,111 @@ export async function adoptDesktopSession({ log = () => {} } = {}) {
   throw new Error(`every stored session was rejected (${reasons.join('; ')})`);
 }
 
-/** True when we hold a refresh token, without touching the network. */
+/**
+ * The session `pair` hands over: whichever one the desktop client is signed into
+ * *now*.
+ *
+ * Adoption was written as a one-off setup step, and the stored copy treated as
+ * permanent. That held right until the desktop client signed into a second
+ * account, which revokes the first one's refresh token. From then on the bridge
+ * held a corpse and could not tell: [hasGatherSession] still said yes,
+ * `/pair/claim` still handed it over, and the phone got `TOKEN_EXPIRED`, decided
+ * the only fix was to pair again, and was handed the same dead token — a loop
+ * with no way out from the phone's end.
+ *
+ * So pairing re-reads the desktop client every time, which is also the behaviour
+ * to want for its own sake: the account you last used on the Mac is the account
+ * your phone gets, with nothing to remember.
+ *
+ * The stored session is the fallback, never the source, and only when it still
+ * works. Preferring it over a *missing* desktop session keeps `pair` working on a
+ * Mac where GatherV2 has since been deleted; never preferring it over a present
+ * one is what "last used" means.
+ */
+export async function refreshSessionForPairing({
+  log = () => {},
+  adopt = adoptDesktopSession,
+  read = readConfig,
+  write = writeConfig,
+  verify = exchange,
+} = {}) {
+  const before = read().gather ?? null;
+  const previousUid = before?.uid ?? uidFromIdToken(before?.idToken);
+
+  try {
+    const { uid, email, file } = await adopt({ log });
+    return {
+      uid,
+      email,
+      file,
+      source: 'desktop',
+      previousUid,
+      switched: Boolean(previousUid) && uid !== previousUid,
+    };
+  } catch (error) {
+    if (!before?.refreshToken) throw error;
+
+    let session;
+    try {
+      session = await verify(before.refreshToken);
+    } catch (dead) {
+      // Both ways out are blocked, and they are two different repairs — one is
+      // "sign in to GatherV2", the other is "that session was revoked" — so the
+      // message carries both rather than only the one we tried last.
+      throw new Error(
+        `${error.message}; and the session already stored is dead too (${dead.message})`,
+      );
+    }
+
+    const uid = session.uid ?? previousUid ?? uidFromIdToken(session.idToken);
+    write({
+      ...read(),
+      gather: { refreshToken: session.refreshToken, idToken: session.idToken, uid },
+    });
+    log('gather auth: kept the stored session — the desktop client offered none');
+    return {
+      uid,
+      email: emailFromIdToken(session.idToken),
+      source: 'stored',
+      previousUid,
+      switched: false,
+      detail: error.message,
+    };
+  }
+}
+
+/**
+ * Forgets the adopted Gather session.
+ *
+ * The way out of a wrong account without hand-editing JSON, and the counterpart
+ * to adoption now that adoption happens on its own at every pairing.
+ *
+ * What it cannot do is reach the copy already on the phone: that refresh token
+ * sits in the phone's keychain and only pairing again replaces it. So this ends
+ * the *bridge's* access, not the phone's, and the caller should say so rather
+ * than implying a sign-out everywhere.
+ */
+export function signOutGather({ read = readConfig, write = writeConfig } = {}) {
+  const { gather, ...rest } = read();
+  write(rest);
+  return {
+    hadSession: typeof gather?.refreshToken === 'string' && gather.refreshToken.length > 0,
+    uid: gather?.uid ?? uidFromIdToken(gather?.idToken),
+    email: emailFromIdToken(gather?.idToken),
+  };
+}
+
+/**
+ * True when we hold a refresh token, without touching the network.
+ *
+ * "Hold one", not "have a working one" — the two came apart badly once, so
+ * anything reporting to a human should verify rather than call this. It is the
+ * right check only where a network round trip would be wrong: a status line that
+ * must stay instant, or a guard before bothering to try at all.
+ */
 export function hasGatherSession() {
-  return typeof readConfig().gather?.refreshToken === 'string';
+  const token = readConfig().gather?.refreshToken;
+  return typeof token === 'string' && token.length > 0;
 }
 
 /**
@@ -195,6 +297,13 @@ export function hasGatherSession() {
  *
  * Returns null when no session has been adopted, so pairing can say so plainly
  * rather than handing over a phone that will never connect.
+ *
+ * Reads the config and does not verify it, which is safe only because of when it
+ * runs: `pair` calls [refreshSessionForPairing] before a code is ever issued, so
+ * by the time a phone claims one the stored session has just been proved live.
+ * Verifying here instead would put a network round trip inside the one
+ * unauthenticated route, where a slow or hostile network becomes a way to hold the
+ * handler open.
  */
 export function gatherSessionForHandover() {
   const gather = readConfig().gather;
@@ -267,6 +376,18 @@ export async function recentSpaces(options) {
 /** Firebase puts the uid in the ID token; no API call needed. */
 export function uidFromIdToken(idToken) {
   return claimsOf(idToken)?.user_id ?? claimsOf(idToken)?.sub ?? null;
+}
+
+/**
+ * The account's email address, likewise straight out of the token.
+ *
+ * Only ever for showing a human which identity is in play. Nothing routes on it —
+ * the uid is the identity — but "grunau@safenow.de" is recognisable at a glance
+ * and `RY4VoMwW…` is not, which is the whole difference between noticing that the
+ * account changed and not noticing for two days.
+ */
+export function emailFromIdToken(idToken) {
+  return claimsOf(idToken)?.email ?? null;
 }
 
 function expiryOf(idToken) {

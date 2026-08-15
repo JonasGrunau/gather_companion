@@ -7,7 +7,15 @@ import { join } from 'node:path';
 import { flagValue, parseCommand, parsePort } from '../lib/cli-args.js';
 import { DesktopNotificationReader } from '../lib/desktop-notifications.js';
 import { FcmSender, readServiceAccount } from '../lib/fcm.js';
-import { adoptDesktopSession, gatherUid, hasGatherSession } from '../lib/gather-auth.js';
+import {
+  adoptDesktopSession,
+  emailFromIdToken,
+  gatherUid,
+  getIdToken,
+  hasGatherSession,
+  refreshSessionForPairing,
+  signOutGather,
+} from '../lib/gather-auth.js';
 import * as launchd from '../lib/launchd.js';
 import { pairPayload } from '../lib/pairing.js';
 import { PushRegistry } from '../lib/push.js';
@@ -75,6 +83,8 @@ async function main() {
       return cmdToken();
     case 'adopt':
       return cmdAdopt();
+    case 'logout':
+      return cmdLogout();
     case 'doctor':
       return cmdDoctor();
     case 'resync':
@@ -212,9 +222,13 @@ async function cmdStatus() {
   line('installed', state.installed ? green('yes') : red('no'));
   line('running', state.running ? green(`yes (pid ${state.pid})`) : red('no'));
   line('answering', up ? green(`yes on :${port}`) : red(`no on :${port}`));
+  // "stored", not "adopted", and never green: this is the offline check, and it
+  // cannot tell a live session from a revoked one. It read `adopted` in green
+  // directly above a socket line saying `TOKEN_EXPIRED` for two days. The verdict
+  // belongs to the socket line below, or to `doctor`, which asks Google.
   line(
     'gather session',
-    hasGatherSession() ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : red('not adopted'),
+    hasGatherSession() ? dim(`stored (${String(gatherUid()).slice(0, 8)}…)`) : red('not adopted'),
   );
 
   if (up) {
@@ -266,14 +280,17 @@ function cmdToken() {
  *
  * One read, then independence: refresh tokens are long-lived, so from here on the
  * bridge mints its own and needs neither the desktop client nor a debug port.
- * This is the one setup step there is — nothing else works without it.
+ *
+ * Rarely needed by hand now that `pair` does the same read every time it hands a
+ * phone a credential. What is left for it is the case with no phone in it: the
+ * daemon's own connection, after signing into a different account on the Mac.
  */
 async function cmdAdopt() {
   console.log('');
   try {
-    const { uid, file } = await adoptDesktopSession({ log: () => {} });
+    const { uid, email, file } = await adoptDesktopSession({ log: () => {} });
     console.log(`  ${green('Adopted your Gather session.')}`);
-    console.log(`  ${dim(`account ${String(uid).slice(0, 8)}… · read from ${file}`)}`);
+    console.log(`  ${dim(`account ${email ?? `${String(uid).slice(0, 8)}…`} · read from ${file}`)}`);
     console.log('');
     console.log('  The bridge connects to Gather directly, as an observer: it reads');
     console.log('  the whole space — names, positions, who is following you — without');
@@ -291,9 +308,65 @@ async function cmdAdopt() {
   }
 }
 
+/**
+ * Forgets the Gather session this bridge holds.
+ *
+ * The reset for the mess that has no other exit: a stored account that is the
+ * wrong one, or a session that was revoked and keeps being handed out. After this
+ * the bridge knows nothing, and `pair` starts again from whatever the desktop app
+ * is signed into.
+ *
+ * Deliberately not a full reset. The pairing token stays, so registered phones
+ * keep receiving push and do not have to be set up from scratch to fix an account
+ * mix-up — and the copy already on the phone is out of reach either way, which the
+ * last line says rather than leaving someone to assume otherwise.
+ */
+async function cmdLogout() {
+  const { hadSession, uid, email } = signOutGather();
+
+  console.log('');
+  if (!hadSession) {
+    console.log(`  ${dim('No Gather session was stored.')}`);
+    console.log('');
+    return;
+  }
+  console.log(`  ${green('Forgot the Gather session.')}`);
+  console.log(`  ${dim(`was ${email ?? `${String(uid).slice(0, 8)}…`}`)}`);
+
+  // The daemon reads the config every time it mints a token, so it cannot
+  // authenticate any more — but the socket it already opened stays up and
+  // authenticated until something closes it. Ask it to, rather than leaving a
+  // live connection behind a command that says the opposite.
+  const port = resolvePort();
+  const token = readConfig().token;
+  if (token && (await pingBridge(port))) await getJson(port, '/resync', token);
+
+  console.log('');
+  console.log(`  Get one back:  ${bold(`${INVOKE} pair`)}`);
+  console.log(dim('  which reads whichever account the desktop app is signed into,'));
+  console.log(dim('  and hands the phone a fresh copy. The phone keeps the old one'));
+  console.log(dim('  until it does — nothing here can reach its keychain.'));
+  console.log('');
+}
+
 async function cmdDoctor() {
   const space = readGatherSpace();
-  const adopted = hasGatherSession();
+
+  // Asks Google rather than asking the config file. A refresh token dies when the
+  // account signs in somewhere else, and nothing local changes when it does — so
+  // the offline check answered "adopted" for a revoked session while every part of
+  // the system that used it failed. A diagnostic is exactly the place to spend a
+  // round trip on the difference.
+  let session = null;
+  let rejected = null;
+  if (hasGatherSession()) {
+    try {
+      session = emailFromIdToken(await getIdToken()) ?? `${String(gatherUid()).slice(0, 8)}…`;
+    } catch (error) {
+      rejected = error.message;
+    }
+  }
+  const adopted = session !== null;
 
   console.log('');
   console.log(`  ${bold('Gather bridge — doctor')}`);
@@ -305,7 +378,11 @@ async function cmdDoctor() {
   line('last space', space.spaceId ?? dim('unknown'));
   line(
     'gather session',
-    adopted ? green(`adopted (${String(gatherUid()).slice(0, 8)}…)`) : red('not adopted'),
+    adopted
+      ? green(`live (${session})`)
+      : rejected
+        ? red(`rejected — ${rejected}`)
+        : red('not adopted'),
   );
   console.log('');
 
@@ -313,8 +390,14 @@ async function cmdDoctor() {
     console.log(red('  The bridge cannot see anything yet.'));
     console.log('  It talks to Gather as you, so it needs your session.');
     console.log('');
+    if (rejected) {
+      console.log(dim('  It held one, and Google will not honour it any more. That happens'));
+      console.log(dim('  when the account signs in elsewhere, changes password, or is signed'));
+      console.log(dim('  out everywhere — nothing on this machine can revive it.'));
+      console.log('');
+    }
     console.log(`    1. Sign in to the GatherV2 desktop app.`);
-    console.log(`    2. Run ${bold(`${INVOKE} adopt`)}.`);
+    console.log(`    2. Run ${bold(`${INVOKE} pair`)} — it adopts that session and hands it over.`);
     console.log('');
     console.log(dim('  That reads the refresh token the desktop client already stored and'));
     console.log(dim('  keeps a copy in ~/.gather-app-bridge.json (mode 0600). After that'));
@@ -376,6 +459,11 @@ async function cmdResync() {
  * ways in are offered — the QR for the camera, the code and address underneath
  * for a phone whose camera was refused, a terminal too small to draw the symbol,
  * or an ssh session that mangles half-block characters.
+ *
+ * Pairing is also when the bridge re-reads the desktop client's session, because
+ * this is the one moment a credential crosses to the phone and a dead one cannot
+ * be repaired from the phone's end — it can only ask to pair again, which is where
+ * it already is. See `refreshSessionForPairing`.
  */
 async function cmdPair() {
   const port = resolvePort();
@@ -384,15 +472,44 @@ async function cmdPair() {
     throw new Error(`The bridge is not running on :${port}.\n  Start it first: ${INVOKE}`);
   }
 
+  let session;
+  try {
+    session = await refreshSessionForPairing();
+  } catch (error) {
+    // Refusing to pair beats pairing successfully with nothing to hand over: the
+    // phone would connect, say "signed out", and offer pairing as the fix.
+    throw new Error(
+      `No live Gather session to give the phone.\n  ${error.message}\n` +
+        `  Sign in to the GatherV2 desktop app, then run ${INVOKE} pair again.`,
+    );
+  }
+
   const offer = await getJson(port, '/pair/offer', token);
   if (!offer?.code) throw new Error('The bridge would not issue a pairing code.');
+
+  // Switching accounts leaves the daemon's own socket authenticated as the old
+  // one until it reconnects, which would have it watching a space the phone is
+  // not in.
+  if (session.switched) await getJson(port, '/resync', token);
 
   const host = offer.addresses?.[0] ?? '127.0.0.1';
   const payload = pairPayload({ host, port: offer.port ?? port, code: offer.code });
 
+  const who = session.email ?? `${String(session.uid).slice(0, 8)}…`;
   console.log('');
   console.log(`  ${bold('Pair your phone')}`);
   console.log(`  ${'─'.repeat(56)}`);
+  // Named, not implied: this is the identity about to cross to the phone, and the
+  // failure it prevents is a silent one — a session adopted for a different
+  // account looks exactly like a working one until the phone says it is signed out.
+  console.log(
+    session.switched
+      ? `  ${yellow(`Signing the phone in as ${who}`)} ${dim('— the account on this Mac changed.')}`
+      : `  ${dim(`Signing the phone in as ${who}.`)}`,
+  );
+  if (session.source === 'stored') {
+    console.log(`  ${dim('Kept from before — the desktop app offered nothing newer.')}`);
+  }
   console.log('');
   for (const row of renderQr(payload, { indent: '      ' })) console.log(row);
   console.log('');
@@ -851,7 +968,8 @@ function usage() {
     ${INVOKE} run                run in the foreground (no launchd)
     ${INVOKE} status             is it alive, and who is around
     ${INVOKE} pair               show a QR square for the phone to scan
-    ${INVOKE} adopt              reuse your signed-in Gather session (best fidelity)
+    ${INVOKE} adopt              re-read the Gather session the desktop app is using
+    ${INVOKE} logout             forget it again (pair to get a new one)
     ${INVOKE} doctor             what can it see, and how to see more
     ${INVOKE} resync             force a full state resync
     ${INVOKE} logs [-f]          daemon log

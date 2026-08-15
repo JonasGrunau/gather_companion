@@ -13,7 +13,11 @@ crashes and sleep.
 socket (`packages/gather_client`), so this daemon is down to two jobs:
 
 1. **Pairing.** `/pair/claim` hands the phone the bridge token *and the Gather
-   session*, which is the only moment the phone can be given one.
+   session*, which is the only moment the phone can be given one. Because it is
+   the only moment, `pair` re-reads the desktop client's session first
+   (`refreshSessionForPairing`) and refuses to issue a code without a live one — a
+   dead credential cannot be repaired from the phone's end, which can only ask to
+   pair again, which is where it already is. `logout` is the way back out.
 2. **Push.** Something has to be awake when the app is not, notice a follow or a
    wave, and hand it to FCM. That is the whole reason this still connects to
    Gather at all.
