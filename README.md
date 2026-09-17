@@ -4,7 +4,7 @@
 
 # Gather Companion
 
-**Know when someone starts following you in your live Gather V2 session.**
+**Your Gather V2 office, on your phone: see who is around, walk over, and get a push when somebody follows you or waves.**
 
 [![npm](https://img.shields.io/npm/v/gather-app-bridge?label=gather-app-bridge)](https://www.npmjs.com/package/gather-app-bridge)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -12,7 +12,8 @@
 [![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](bridge/)
 
 *Not affiliated with Gather.* A third-party companion that connects to Gather V2
-with your own session, from your own computer, and tells your phone what it sees.
+with your own session — from your phone, and from your computer for the moments
+the phone is asleep.
 
 </div>
 
@@ -22,8 +23,8 @@ with your own session, from your own computer, and tells your phone what it sees
 
 | | what it is | where it runs |
 |---|---|---|
-| 📱 `lib/`, `ios/` | **Gather Companion** — a Flutter app that connects to Gather itself and shows who is following you, who waved, and what happened | your **phone** |
-| 📦 `packages/gather_client/` | Gather V2's protocol in pure Dart: msgpack, the game socket, the presence fold | inside the **app** |
+| 📱 `lib/`, `ios/`, `android/` | **Gather Companion** — a Flutter app that connects to Gather itself: the office in Gather's own artwork, your avatar under your thumb, your mic and camera, and who is following you | your **phone** |
+| 📦 `packages/gather_client/` | Gather V2's protocol in pure Dart: msgpack, the game socket, the presence fold, the floor plan, walking, the SFU's signalling | inside the **app** |
 | 🖥️ `bridge/` | `npx gather-app-bridge` — a zero-dependency daemon that pairs your phone and wakes it while the app is closed | your **computer** |
 
 **The phone talks to Gather directly.** Pairing hands it your Gather session, and
@@ -44,8 +45,8 @@ push them.
        │    Gather Companion     │   │    gather-app-bridge    │
        │       ← your phone      │   │      ← your computer    │
        │                         │   │          :7799          │
-       │  follows · waves · chat │   │  watches while the app  │
-       │  meetings · party mode  │   │  is closed, and pushes  │
+       │  the office · calls     │   │  watches while the app  │
+       │  follows · party mode   │   │  is closed, and pushes  │
        └─────────────────────────┘   └────────────┬────────────┘
                     ▲                             │
                     │                             │
@@ -61,8 +62,8 @@ drive the same avatar without disturbing each other — measured, not assumed.
 
 They differ in what they do once connected. **The bridge only ever reads**: it
 never sends `enterSpace`, so it never appears in the room. **The app enters**,
-because it is on its way to carrying a real call, and something that publishes
-audio and video is present whether or not it admits it.
+because it carries a real call, and something that publishes audio and video is
+present whether or not it admits it.
 
 ---
 
@@ -77,9 +78,8 @@ npx gather-app-bridge
 That installs it as a background service — starts at login, restarts if it dies,
 survives sleep.
 
-**2.** Let it into Gather. **Do this before pairing** — pairing is what hands the
-session to your phone, so a phone paired first gets nothing to connect with and
-has to be paired again:
+**2.** Let it into Gather. The daemon refuses to start without a session, and
+pairing is what hands that session to your phone:
 
 ```sh
 npx gather-app-bridge adopt
@@ -102,8 +102,10 @@ code and address are printed underneath for a phone whose camera is refused.
 Two things cross at this moment: a token scoped to this bridge on this LAN, which
 is only used to tell it where to send pushes, and **your Gather session**, which
 is what lets the phone read presence on its own afterwards. The app puts the
-second in the iOS keychain. If the bridge has no session yet, the app says so
-rather than pairing into a feed that can never fill.
+second in the platform keychain. `pair` re-reads the session from the desktop
+app first — whichever account it is signed into *right now* — and refuses to
+draw a code without a live one, rather than pairing a phone into a feed that can
+never fill.
 
 **4.** Check what it can actually see:
 
@@ -136,7 +138,7 @@ coordinates for party mode.
 **The bridge stops there** and stays invisible, with `Connection.entered: false`.
 **The app goes on to send `enterSpace`**, and follows it with `reportActivity` so
 it does not sit in the room looking idle. That is the honest position for a client
-heading towards two-way audio and video: you cannot be in a call and not be in the
+carrying two-way audio and video: you cannot be in a call and not be in the
 room. It costs one thing worth knowing — `numTimesEnteredSpace` is a permanent
 counter on your own profile and increments once per entering connection.
 
@@ -164,7 +166,9 @@ Protocol details, the REST surface, and what is still unverified:
   live 111-person space was the most frequent update of any kind
 - ✋ **waves, with the name of whoever sent one** — off Gather's own event bus
 - 📅 **meeting invites**, and **somebody knocking on a meeting** you are in
-- 💬 chat messages
+- 🎉 **reactions**, off the same event bus — every press its own emoji in the air
+- 💬 **mentions, thread replies and reactions** from Gather's own activity feed,
+  read over REST, so it is full after a weekend the phone spent asleep
 
 **What this deliberately does not do:** ❌ tell you who is standing next to you.
 It used to. Being near somebody says nothing about whether they want you — people
@@ -223,7 +227,7 @@ phone is not, and sends through Firebase Cloud Messaging:
 | wave | ✅ | rare, deliberate, always means somebody wants you |
 | someone follows you | ✅ | rare and unambiguous |
 | meeting invite | ✅ | scheduled and time-bound |
-| someone knocking on your meeting | ✅ | the only one with a deadline — measured gap between the knock and the answer was two seconds |
+| someone knocking on your meeting | ✅ *intended* | the only one with a deadline — measured gap between the knock and the answer was two seconds. Detected and reported on the socket, but **not in `PUSH_DEFAULTS` yet**, so it does not push until `push.kinds."meeting join request": true` is set |
 | event reminder | ✅ | scheduled and time-bound |
 
 All of them are deliberate acts by a person, which is the whole bar — and why
@@ -324,9 +328,8 @@ npx gather-app-bridge push test
 
 ## 🪩 Party mode
 
-The one control in the app, and the only thing in this project that *writes* to
-Gather. Switch it on and the bridge teleports your avatar to a random tile four
-times a second until you switch it off.
+The switch on the settings tab. Turn it on and the app teleports your avatar to
+a random tile four times a second until you turn it off.
 
 Two things make that less trivial than picking coordinates.
 
@@ -493,6 +496,7 @@ npx gather-app-bridge run            run in the foreground instead
 npx gather-app-bridge status         is it alive, and who is around right now
 npx gather-app-bridge pair           show a QR square for the phone to scan
 npx gather-app-bridge adopt          reuse your Gather session (required, once)
+npx gather-app-bridge logout         forget it again (pair to get a new one)
 npx gather-app-bridge doctor         what can it see, and how to see more
 npx gather-app-bridge resync         force a full state resync
 npx gather-app-bridge logs -f        follow the daemon log
@@ -530,7 +534,7 @@ Three layers sit between interception and publication:
 | dropped where | what gets dropped |
 |---|---|
 | `PresenceTracker` | anything that is not a *state change*, and everything that is not about following: the whole space walking around, plus voice activity, which is recorded in state but never announced — `speaking` toggles every few seconds while somebody talks |
-| `GameProtocolReader` | 43 of ~47 models — calendar events, chat metadata, catalog items, map areas, GitHub PRs. Only `SpaceUser`, `Connection`, `UserAccount` and `Space` are kept |
+| `GameProtocolReader` | 41 of ~47 models — calendar events, chat metadata, catalog items, map areas, GitHub PRs. Only `SpaceUser`, `Connection`, `UserAccount`, `Space`, `MeetingParticipant` and `MeetingJoinRequest` are kept. (The app's own reader in `packages/gather_client` keeps the map models too, because it draws them) |
 | the collector | heartbeats, bots, recording clients |
 
 That filtering is deliberate — a feed that announced every flicker of voice
@@ -538,7 +542,7 @@ activity would be useless — but it means the published stream understates what
 available. `--raw` subscribes to the firehose before the tracker sees it. Frames
 marked `kind: "raw"` rather than `kind: "event"`.
 
-For what is being decoded but *discarded entirely* (the other 43 models, frame
+For what is being decoded but *discarded entirely* (the other 41 models, frame
 type counts), look at `stats` in `GET /collectors`.
 
 ### ♾️ Staying up
@@ -586,8 +590,8 @@ The app uses exactly one of these — `POST /push/register` — on attach, on re
 and whenever Firebase rotates its token. That one call is also how the app knows
 whether the computer is reachable and able to send: it is idempotent by design and
 its reply carries `sending`, so there is nothing to poll and no separate probe. The
-rest are the operator surface that `gather-bridge watch`, `replay`, `resync` and
-`doctor` are built on; they go dormant when nothing is attached.
+rest are the operator surface that `gather-app-bridge watch`, `replay`, `resync`
+and `doctor` are built on; they go dormant when nothing is attached.
 
 | endpoint | what |
 |---|---|
@@ -600,6 +604,7 @@ rest are the operator surface that `gather-bridge watch`, `replay`, `resync` and
 | `GET /resync` | force a full state resync (reconnects the game socket) |
 | `POST /push/register` | phone hands over `{token, platform, installId}` (idempotent, keyed on `installId`); replies `{ok, devices, sending}` |
 | `GET /pair/offer` | mint a pairing code (used by `pair`) |
+| `GET /pair/status` | is a code pending, and has it been claimed (what `pair` blocks on) |
 | `GET /pair/claim?code=` | **no token** — trade a code for the bridge token *and your Gather session*, once |
 
 Every event carries `type`, `at`, `source` (`gather` \| `log` \| `bridge`) and
@@ -688,8 +693,11 @@ personal device installs.
 
 **Build notes worth knowing:**
 
-- 📐 **iOS 15.5 minimum**, required by `mobile_scanner`. The same package needs
-  Android 5.0 / API 21 and camera permission in the manifest.
+- 📐 **iOS 15.5 minimum**, required by `mobile_scanner`. **Android 7.0 / API 24**,
+  set explicitly in `android/app/build.gradle.kts` because
+  `flutter_local_notifications` needs 24 and `flutter_webrtc` needs 21 — stated
+  there so a Flutter upgrade cannot lower the default and fail the build somewhere
+  less obvious. Camera and microphone permissions are in the manifest.
 - 📦 **Swift Package Manager, not CocoaPods** on the iOS side. `mobile_scanner`
   7.x is a Swift package, and leaving the old CocoaPods integration in place
   breaks the build with a misleading *"missing expected TARGET_BUILD_DIR"*. If you
@@ -729,9 +737,9 @@ one daemon on one LAN, and it is now **your Gather identity**, because that is
 what lets the phone read presence without the computer. The protections are
 unchanged and still the right ones — no code exists until you run `pair`, single
 use, fifteen minutes, eight wrong guesses and it is gone — but the stakes are
-higher, and the app stores what it receives in the iOS keychain
-(`first_unlock_this_device`) rather than in a preferences plist that device
-backups would include.
+higher, and the app stores what it receives in the platform keychain — on iOS
+`first_unlock_this_device`, on Android the Keystore-backed store — rather than in
+preferences that device backups would include.
 
 The alphabet excludes `0`, `1`, `I`, `L` and `O`, so there is nothing to misread.
 A character outside it is refused rather than guessed at — pairing on a
@@ -765,31 +773,36 @@ while they are speaking, all off the client's own animation table. Turn animatio
 in your system settings and everybody stands on their tile, which is exactly what the
 desktop client does with that setting.
 
-**And you can walk.** A translucent pad sits across the bottom of the map: hold a
-quarter to walk that way, roll your thumb to the next one to turn a corner without
-stopping, slide back to the middle to stand still. It is one gesture rather than four
-buttons for exactly that reason — four buttons make going round a corner a stutter,
-because you have to lift, find the next one, and press again.
+**And you can walk.** Tap the floor and a *Go here* pill appears; tap it and you walk
+there. The split is Gather's own — on the desktop a single click only highlights and a
+double click moves — so a tap and a button are the two beats of that gesture with a
+phone's missing hover put back. Which of the two a tap means is transcribed too: the
+main floor, the lobby and a team's corner select a *tile*, while a meeting room, a desk
+or a coworking area selects the whole *room*, because "go to the Boardroom" is what
+somebody means. A tap on furniture is forgiven and hands back the nearest free tile,
+which is what tapping a chair depends on. A shut door is refused from both ends: the
+tap asks Gather's own `canBeEnteredBy`, and if the server still says no — it refuses a
+walk into a locked room by publishing an event to you alone and sending no patch — the
+screen turns that into the same sentence. Latch the go-kart and the walk becomes a
+drive. There is also a D-pad, currently shelved behind one constant (`kShowDPad`):
+tapping turned out to be the better phone gesture, and the pad's plumbing and tests
+stay live in case it comes back.
 
-Getting that right needed two things Gather does not hand you. The first is that
-**`move` checks nothing**: its entire body on the model is `position += delta`, so
-whether a step is legal is decided on the client or nowhere, and a pad that sends
+Getting any of that right needed two things Gather does not hand you. The first is
+that **`move` checks nothing**: its entire body on the model is `position += delta`, so
+whether a step is legal is decided on the client or nowhere, and a client that sends
 steps blind walks you through the desks and out into the void around the office. So
 the wall rule was read out of the client bundle the same way the rest of the floor
 plan was — walls are *lines between tiles*, not tiles, which is why you can stand on
 one and why a doorway is a gap in a line rather than a hole in a wall.
 
-The second is that **the wire is always two steps behind your thumb**. Positions are
+The second is that **the wire is always two steps behind you**. Positions are
 coalesced at a quarter of a second and a walk runs at seven tiles a second, so a step
 judged against the roster's idea of where you are is judged against where you were two
 steps ago — into the first wall you meet. So the phone keeps its own count of which
 tile you are on and lets the roster correct it: a position it never claimed to be
 heading for wins outright, which is what makes it safe to drive one avatar from the
-pad, the desktop client and party mode at the same time.
-
-No arrow is ever greyed out. An earlier version dimmed the ones that led into a wall
-and it read as a fault — the arrows flickered as you walked past doorways. You find a
-wall the way you find one in any game: by walking into it and stopping.
+phone, the desktop client and party mode at the same time.
 
 **None of that art is bundled, and Gather ships no tileset.** The client resolves one
 image per floor texture, per wall piece and per furniture variant and fetches each on
@@ -811,11 +824,43 @@ people who had gone home — so the map drew eleven bodies into an office holdin
 three. Presence is the pair: connected *and* `userSetAvailability` not `Offline`.
 Availability alone is no better, because people close the app without touching it.
 
-### 📋 What the main screen shows
+### 📋 What the screens show
 
-Who is following you, which of them is talking, and whether the party is on. That
-is the whole screen, and all of it is *now* — read from the live Gather socket, not
-from history.
+Three tabs on a floating rail: **Activity**, **Office**, **Settings**, opening on
+Activity. The office is the map above; who is following you sits in its app bar as a
+pill beside the head count, absent when nobody is — zero is the permanent normal
+state, and a pill saying so all day is furniture. Settings holds the connection, the
+party switch, the mic and camera check, and whether the paired computer can still
+wake the app. Everything live is *now* — read from the Gather socket, not from
+history.
+
+### 🎙️ Gather's controls, on the phone
+
+Across the bottom of the office sits Gather's own control bar, adapted: you (tap it
+for Active / Busy / Away and your status line, both read back off the roster), your
+**microphone**, your **camera**, the eight **reactions**, and **one door** — back to
+your desk when you are away from it, out of the conversation when you are in one.
+Those are one button because they are one intention, and one button on the desktop.
+Screen-share is deliberately absent; there is nothing on a phone worth sharing.
+
+Mic and camera drive a real capture session and publish to Gather's SFU, the same
+mediasoup media plane the desktop client uses, with Gather's own three-layer
+simulcast declared and the server steering which layer is sent. Whoever is standing
+near you shows up as faces on a call screen, everybody the SFU is sending plus your
+own camera. The SFU is connected on the first publish rather than at join, because a
+companion app is in a pocket far more often than it is used to talk. Mute is two
+things on purpose: a device mute, which is what makes iOS drop its recording
+indicator, and a `produce-pause`, which is what makes a colleague's client draw the
+crossed-out microphone. Doing only one lies in one direction or the other.
+
+The desktop's full publish path was captured from a real two-person call on
+2026-09-17 and is written up in `docs/protocol/observed-wire-protocol.md`. The fixes
+that capture prompted on the phone side have **not yet been verified on a device**;
+until they are, read the call feature as built and measured against the desktop,
+not as proven end to end. Gather's server refuses a malformed frame by staying
+silent rather than answering, which is what made this slow to find.
+
+### 📜 Gather's activity feed
 
 There used to be a scrolling activity feed underneath, kept by the app itself. It was
 worth having when the bridge kept a 500-event ring on a computer that was awake all
@@ -864,21 +909,25 @@ since GitHub strips the CSS that would otherwise round it.
 ### 🔔 Notifications, honestly
 
 Local notifications fire while the app is running — foreground, or the short
-window the OS allows after backgrounding. Once the OS suspends the app the
-WebSocket is gone and nothing can be delivered until you open it again, at which
-point the bridge replays everything missed, so the *log* stays complete even
-though the *alerts* do not. Waking a locked phone would need a push service driven
-from the computer, which means a developer account and push credentials on each
-platform.
+window the OS allows after backgrounding. Once the OS suspends the app its Gather
+socket is gone. Everything after that is the push path described
+[above](#-notifications-and-reaching-a-phone-that-is-asleep): the bridge on your
+computer notices, and FCM wakes the phone. No computer awake, no push — that is
+the one thing a laptop being the sender cannot get around.
 
 ---
 
 ## 🧪 Tests
 
 ```sh
-npm test          # bridge: parser, msgpack, protocol, end-to-end over a real WS
-flutter analyze && flutter test
+npm test                                        # bridge: parser, msgpack, protocol, end-to-end over a real WS
+(cd packages/gather_client && dart pub get && dart test)   # the Gather protocol in Dart: the only coverage it has
+flutter analyze && flutter test                 # the app
 ```
+
+The middle one is easy to forget and CI runs it as a gate: a root `flutter pub get`
+does not resolve a path package's dev dependencies, so without its own `dart test`
+those suites do not run at all.
 
 The parser tests use log lines copied verbatim from a real
 `~/Library/Logs/GatherV2/main.log`, and `replay` re-checks the regexes against a
@@ -892,35 +941,41 @@ npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 
 ## 🏷️ Releasing
 
-One tag ships both halves. Bump the version in `package.json`, commit, then:
+One tag ships all of it. Bump the version in `package.json`, commit, then:
 
 ```sh
-git tag -a v0.2.0 -m "gather-app-bridge 0.2.0"
+git tag -a v0.12.0 -m "gather-app-bridge 0.12.0"
 git push --tags
 ```
 
-`.github/workflows/publish.yml` runs the bridge tests and `flutter analyze`/
-`flutter test` as a gate, then — only if both are green — publishes
-`gather-app-bridge` to npm and uploads a signed build to TestFlight. The tag is
-the version for both: `v0.2.0` becomes `0.2.0` on npm and `0.2.0` in App Store
-Connect, with the workflow's run number as the build number. **`version:` in
-`pubspec.yaml` is not read by a release** — it only affects a local
+`.github/workflows/publish.yml` runs the bridge tests, the Gather client's
+`dart test` and `flutter analyze`/`flutter test` as a gate, then — only if all of
+it is green — publishes `gather-app-bridge` to npm, uploads a signed build to
+TestFlight, and builds the three per-ABI **Android APKs** and attaches them to a
+GitHub release on the tag. The tag is the version for all three: `v0.12.0`
+becomes `0.12.0` on npm, `0.12.0` in App Store Connect and in the APK names, with
+the workflow's run number as the build number on both phones. A tag that
+disagrees with `package.json` fails the gate before anything ships. **`version:`
+in `pubspec.yaml` is not read by a release** — it only affects a local
 `flutter run`.
 
 A failed run can be re-run from the Actions tab, or re-dispatched with
-`gh workflow run publish.yml`; npm skips a version that already shipped, and a
-re-run gets a fresh build number, so neither half objects to going twice.
+`gh workflow run publish.yml`; npm skips a version that already shipped, a re-run
+gets a fresh build number, and the APKs are uploaded with `--clobber`, so nothing
+objects to going twice.
 
 **Things worth knowing before touching any of this:**
 
 - 📛 **The workflow file must stay `publish.yml`.** npm's trusted-publisher entry
   matches the file *path*, not the workflow's `name:`. Renaming it fails the
   publish with `404 … package not found`, which reads like a missing package.
-- 🔑 **Six repository secrets.** npm needs none — it authenticates with OIDC.
-  The app needs the App Store Connect key for the upload (`ASC_KEY_ID`,
-  `ASC_ISSUER_ID`, `ASC_KEY_P8`) and its signing assets
-  (`APPLE_DIST_CERT_P12` — base64 of a `.p12`, `APPLE_DIST_CERT_PASSWORD`,
-  `APPLE_PROVISIONING_PROFILE` — base64 of a `.mobileprovision`).
+- 🔑 **Six repository secrets.** npm needs none — it authenticates with OIDC —
+  and Android needs none either, since the APKs are debug-signed and attached
+  with the workflow's own token. The iOS half needs the App Store Connect key
+  for the upload (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`) and its signing
+  assets (`APPLE_DIST_CERT_P12` — base64 of a `.p12`,
+  `APPLE_DIST_CERT_PASSWORD`, `APPLE_PROVISIONING_PROFILE` — base64 of a
+  `.mobileprovision`).
 - ✍️ **Signing is manual, on purpose.** Automatic signing wants to update the
   Xcode-managed profile during export, which is a *cloud signing* operation, and
   an App Store Connect API key is never permitted to do one — it fails with
@@ -966,10 +1021,12 @@ re-run gets a fresh build number, so neither half objects to going twice.
   change rarely; the msgpack framing and patch envelope are internal and could
   change with any deploy. `bridge.status` events tell the app when a collector goes
   quiet, so drift shows up as a visibly degraded state rather than silence.
-- 🚩 **Waves depend on a log line Gather never promised to keep.** The one thing
-  still scraped is `IPC Event: SHOW_NOTIFICATION`, written by the Electron main
-  process. If Gather changes it, `npx gather-app-bridge replay` on a log you know
-  contained a wave will report zero and say so. Presence is unaffected — it comes
+- 🚩 **Event reminders depend on a log line Gather never promised to keep.** The
+  one thing still scraped is `IPC Event: SHOW_NOTIFICATION`, written by the
+  Electron main process, and only for `event reminder`; waves and meeting invites
+  come off the socket and are ignored in the log so they are not reported twice.
+  If Gather changes the line, `npx gather-app-bridge replay` on a log you know
+  contained one will report zero and say so. Presence is unaffected — it comes
   from the protocol, not the log.
 - ✍️ **The bridge writes to the socket; the app writes more.** This used to say
   "read-only", and then "the bridge does write", and both are now too simple.
@@ -978,11 +1035,14 @@ re-run gets a fresh build number, so neither half objects to going twice.
   ten seconds. It mutates no game state — no move, chat, follow or setting — and it
   never sends `enterSpace`, so no avatar appears.
   *The app* additionally sends `enterSpace` and `reportActivity`, so it **is**
-  present in the room, and it moves your avatar: `teleport` for party mode and
-  `move` for the D-pad. What it still never does is speak for anyone but you: same
-  account, same `SpaceUser`, your own credential, no fabricated second identity. The desktop client itself is never
-  modified — `app.asar` integrity validation is enabled, so patching it is not
-  possible anyway.
+  present in the room, and it acts as you: `teleport` for party mode, `move` for
+  walking, `setAvailability` and `setCustomStatus` from the status sheet,
+  `broadcastEmote` for reactions, `leaveCluster` for the door, and it publishes
+  audio and video to the SFU. Over REST it marks activity-feed items read. What
+  it still never does is speak for anyone but you: same account, same
+  `SpaceUser`, your own credential, no fabricated second identity. The desktop
+  client itself is never modified — `app.asar` integrity validation is enabled,
+  so patching it is not possible anyway.
 - 🔑 **The bridge stores a Gather credential.** `adopt` copies a Firebase refresh
   token out of the desktop client's IndexedDB into `~/.gather-app-bridge.json` at
   `0600` — the same file and permissions as the pairing token. It is your own
