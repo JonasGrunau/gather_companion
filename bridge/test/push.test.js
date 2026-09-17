@@ -342,6 +342,19 @@ test('config overrides the default reasons without losing the rest', () => {
   assert.equal(kinds['meeting invite'], true, 'unmentioned reasons keep their default');
 });
 
+test('every kind describe() can produce is on by default', () => {
+  // A kind that describe() words but PUSH_DEFAULTS omits is silently never sent —
+  // which is exactly what happened to knocks. Keep the two lists in step.
+  const kinds = memoryRegistry().kinds();
+  const produced = [
+    describe({ type: 'follow.started', targetIsSelf: true, followerId: 'p1' }).kind,
+    ...['wave', 'meeting invite', 'meeting join request', 'event reminder'].map(
+      (notificationType) => describe({ type: 'notification.shown', notificationType }).kind,
+    ),
+  ];
+  for (const kind of produced) assert.equal(kinds[kind], true, `${kind} is off by default`);
+});
+
 test('a reinstalled app replaces its own entry rather than leaving a dead one', () => {
   // The bug this exists for: a reinstall mints a new FCM token, so keying on the
   // token left the previous install's token in the list. FCM answers 200 for it,

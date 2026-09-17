@@ -227,7 +227,7 @@ phone is not, and sends through Firebase Cloud Messaging:
 | wave | ✅ | rare, deliberate, always means somebody wants you |
 | someone follows you | ✅ | rare and unambiguous |
 | meeting invite | ✅ | scheduled and time-bound |
-| someone knocking on your meeting | ✅ *intended* | the only one with a deadline — measured gap between the knock and the answer was two seconds. Detected and reported on the socket, but **not in `PUSH_DEFAULTS` yet**, so it does not push until `push.kinds."meeting join request": true` is set |
+| someone knocking on your meeting | ✅ | the only one with a deadline — measured gap between the knock and the answer was two seconds |
 | event reminder | ✅ | scheduled and time-bound |
 
 All of them are deliberate acts by a person, which is the whole bar — and why

@@ -35,6 +35,9 @@ import { readConfig, writeConfig } from './paths.js';
 export const PUSH_DEFAULTS = Object.freeze({
   wave: true,
   'meeting invite': true,
+  // Absent from this list for a while, so a knock was detected, described and then
+  // dropped one line later — `kinds()[kind]` is undefined for a kind nobody named.
+  'meeting join request': true,
   'event reminder': true,
   follow: true,
 });
