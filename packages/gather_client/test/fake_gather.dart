@@ -110,17 +110,41 @@ class FakeConnection {
         'events': events,
       });
 
+  /// The client's most recent [action] frame, once it has actually arrived.
+  ///
+  /// [received] is filled from a real socket, so "the client called the method"
+  /// and "this server has the bytes" are two different moments and no amount of
+  /// draining microtasks closes the gap — `pumpEventQueue` does not wait for a
+  /// localhost round trip. A 5 kB `setCustomStatus` frame lost that race on a
+  /// loaded CI runner while the small frames on either side of it did not, which
+  /// is the shape of flake that only ever fails where nobody is looking.
+  ///
+  /// Polled rather than slept on. A fixed delay is the same bug with a wider
+  /// margin: it is still a guess about somebody else's scheduler, and it costs
+  /// that guess on every green run. This returns the moment the frame lands.
+  ///
+  /// [key] is `type` for the frames that have no `action` — the heartbeat.
+  Future<Map<String, Object?>> waitFor(String action, {String key = 'action'}) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (true) {
+      for (var i = received.length - 1; i >= 0; i--) {
+        if (received[i][key] == action) return received[i];
+      }
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('the client never sent $action');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+  }
+
   /// Refuse the last action of [action], the way the real gateway does.
   ///
   /// The refusal is addressed by `txnId`, so the transaction has to be looked up in
   /// what the client actually sent — which is the point: pairing an answer back to
   /// the question is the whole job of the code under test. Answers arrive with an
   /// **empty** `patches` array, because a refused action changes nothing.
-  void refuse(String action, Object? error) {
-    final sent = received.lastWhere(
-      (frame) => frame['action'] == action,
-      orElse: () => throw StateError('the client never sent $action'),
-    );
+  Future<void> refuse(String action, Object? error) async {
+    final sent = await waitFor(action);
     send({
       'type': 'DeltaState',
       'sequenceNumber': 4,

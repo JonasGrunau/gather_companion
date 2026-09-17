@@ -214,7 +214,7 @@ void main() {
       expect(c.teleport(x: 65, y: 38).ok, isTrue);
       await Future<void>.delayed(const Duration(milliseconds: 200));
 
-      final sent = conn.received.lastWhere((f) => f['action'] == 'teleport');
+      final sent = await conn.waitFor('teleport');
       final args = sent['args'] as List<Object?>;
       expect(args[0], 'SpaceUser');
       expect(args[1], 'me-1');
@@ -230,7 +230,7 @@ void main() {
       expect(c.setGait(Gait.driving).ok, isTrue);
       await Future<void>.delayed(const Duration(milliseconds: 200));
 
-      final sent = conn.received.lastWhere((f) => f['action'] == 'drive');
+      final sent = await conn.waitFor('drive');
       // Three separate actions rather than one with a number in it, and each takes
       // nothing — so the tuple is two long, not three padded with null.
       expect(sent['args'], ['SpaceUser', 'me-1']);
@@ -269,13 +269,16 @@ void main() {
     }
 
     /// The last frame the fake received for [action], once it has had time to land.
+    /// The frame the client sent, waited for rather than slept past.
+    ///
+    /// This was a flat 200 ms delay, which is a guess about how fast somebody
+    /// else's machine is — paid in full on every green run and still not enough
+    /// on a loaded one. See [FakeConnection.waitFor].
     Future<Map<Object?, Object?>> lastFrame(
       FakeConnection conn,
       String action,
-    ) async {
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-      return conn.received.lastWhere((f) => f['action'] == action);
-    }
+    ) =>
+        conn.waitFor(action);
 
     test('setAvailability names the state, and refuses one Gather cannot be set to',
         () async {
@@ -582,7 +585,7 @@ void main() {
 
       expect(c.setAvailability('Busy').ok, isTrue);
       await pumpEventQueue();
-      conn.refuse('setAvailability', 'Cannot set availability while deactivated');
+      await conn.refuse('setAvailability', 'Cannot set availability while deactivated');
 
       final refusal = await refused.timeout(const Duration(seconds: 5));
       expect(refusal.action, 'setAvailability');
@@ -595,7 +598,7 @@ void main() {
 
       c.setCustomStatus(text: 'x' * 5000);
       await pumpEventQueue();
-      conn.refuse(
+      await conn.refuse(
         'setCustomStatus',
         '[{"code":"too_big","path":["text"],"message":"String must contain at most 80 character(s)"}]',
       );
@@ -611,7 +614,7 @@ void main() {
 
       c.leaveCluster();
       await pumpEventQueue();
-      final sent = conn.received.lastWhere((f) => f['action'] == 'leaveCluster');
+      final sent = await conn.waitFor('leaveCluster');
       conn.send({
         'type': 'DeltaState',
         'patches': <Object?>[],
@@ -667,7 +670,7 @@ void main() {
       c.sendHeartbeatNow();
       await pumpEventQueue();
 
-      final beat = conn.received.lastWhere((f) => f['type'] == 'Heartbeat');
+      final beat = await conn.waitFor('Heartbeat', key: 'type');
       expect(beat['origin'], 'Server');
       expect(beat['sequenceNumber'], c.reader.lastSequence);
       expect(beat['timestamp'], isA<int>());
@@ -684,7 +687,7 @@ void main() {
       expect(c.setActive(false).ok, isTrue);
       await pumpEventQueue();
 
-      final sent = conn.received.lastWhere((f) => f['action'] == 'reportActivity');
+      final sent = await conn.waitFor('reportActivity');
       expect(sent['args'], [
         'Connection',
         null,

@@ -53,6 +53,12 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # Gather's own default avatar — the grey ghost everybody without an outfit is
+    # drawn as. The desktop client embeds it in its bundle as a data URI rather than
+    # serving it, so there is no URL to fetch; this is that PNG, byte for byte.
+    # See `lib/src/art_cache.dart` (`ghostAvatarUrl`).
+    - assets/avatar-ghost.png
 
 # A patched copy of the mediasoup client, and the app does not work without it.
 #
