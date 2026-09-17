@@ -325,3 +325,100 @@ jobs:
             build/ios/ipa/*.log
           retention-days: 7
           if-no-files-found: ignore
+
+  # The third half, and the odd one out: this produces a *file*, not a store
+  # submission. npm and TestFlight are both places a release lands and cannot be
+  # taken back from, which is why the gate above exists to keep them in step. An
+  # APK that fails to build leaves nothing inconsistent behind it, so it hangs off
+  # the same gate without the other two having to wait on it.
+  android:
+    needs: test
+    # Ubuntu, unlike everything else here. `test` is on macOS because the bridge
+    # drives launchd and reads macOS log paths, and the iOS job needs Xcode. An
+    # APK needs neither, and this runner is both faster and a fraction of the
+    # minutes. The Android SDK is already on the image.
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Replaces the workflow-level block for this job alone, which is why it is
+      # narrower than it looks: it drops the `id-token: write` that only npm
+      # needs, and adds the write that attaching a release asset takes.
+      contents: write
+
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+      # versionCode. The same run number the iOS build uses for CFBundleVersion,
+      # so one release is one number whichever half you are looking at.
+      BUILD_NUMBER: ${{ github.run_number }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # JVM 17, matching `compileOptions` in android/app/build.gradle.kts. Pinned
+      # rather than inherited from the runner image, for the reason Flutter and
+      # Xcode are pinned: a release should not be built with whatever toolchain
+      # happened to arrive that morning.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.5'
+          channel: stable
+          cache: true
+
+      # Per ABI rather than one fat APK. The combined build is 107 MB because it
+      # carries three copies of the WebRTC native library; arm64 alone — which is
+      # every phone anybody is going to install this on — is 37 MB.
+      #
+      # The version arrives on the command line for the same reason it does on the
+      # iOS side: `version:` in pubspec.yaml is inert, and a release does not edit
+      # files.
+      - name: Build the APKs
+        run: |
+          flutter build apk --release --split-per-abi \
+            --build-name="$VERSION" \
+            --build-number="$BUILD_NUMBER"
+
+      # Named for the person about to download one, rather than left as
+      # `app-arm64-v8a-release.apk` — which says nothing about which app or which
+      # version, and is the same filename for every release ever cut.
+      - name: Name them after the release
+        run: |
+          mkdir -p build/apk
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            src="build/app/outputs/flutter-apk/app-$abi-release.apk"
+            [ -f "$src" ] || continue
+            cp "$src" "build/apk/gather-companion-$VERSION-$abi.apk"
+          done
+          ls -lh build/apk
+
+      - name: Keep the APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gather_companion-android-${{ needs.test.outputs.version }}-${{ github.run_number }}
+          path: build/apk/*.apk
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Attached to a GitHub release as well, because a workflow artifact needs an
+      # account with access to this repository and the person being sent an APK
+      # has neither. This is the only place the project publishes a file somebody
+      # can just download.
+      #
+      # `create ... || true` then `upload --clobber`, so re-running a release
+      # replaces the files rather than failing on a release that already exists —
+      # the same re-runnability `workflow_dispatch` exists for.
+      - name: Attach them to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag || echo "::notice::release exists already; uploading into it"
+          gh release upload "$GITHUB_REF_NAME" build/apk/*.apk --clobber

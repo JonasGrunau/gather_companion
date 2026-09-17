@@ -646,6 +646,14 @@ line for the reason the release workflow does the same: `version:` in
 `pubspec.yaml` is inert and a build should not have to edit a file to say what it
 is.
 
+**A release builds these for you.** Tagging `vX.Y.Z` runs the same command on CI
+and attaches all three APKs to the GitHub release, named
+`gather-companion-<version>-<abi>.apk`. That is the link to send somebody: a
+workflow artifact needs a GitHub account with access to this repository, and the
+person being handed an APK has neither. The Android job is the one half of a
+release that produces a file rather than a store submission, so it hangs off the
+same test gate as npm and TestFlight without those two waiting on it.
+
 - 🔑 **Release builds are signed with the debug key**, which is Flutter's default
   and is left alone deliberately. A debug-signed release APK installs and runs
   like any other; what it cannot do is upgrade over a differently-signed copy, or
