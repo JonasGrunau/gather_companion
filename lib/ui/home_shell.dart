@@ -70,7 +70,7 @@ extension _TabView on _Tab {
 
   String get label => switch (this) {
         _Tab.activity => 'Activity',
-        _Tab.map => 'The office',
+        _Tab.map => 'Office',
         _Tab.settings => 'Settings',
       };
 }
@@ -113,11 +113,19 @@ class _HomeShellState extends State<HomeShell> {
 
     return Scaffold(
       backgroundColor: t.background,
+      // The keyboard never resizes the shell. Nothing in a tab takes text — the one
+      // field reachable from here is the status sheet, which lifts itself — and a
+      // resize shrank the office's viewport under the sheet, rescaling the floor
+      // mid-animation and leaving the strip behind the keyboard black.
+      resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
           MediaQuery(
             data: mq.copyWith(
               padding: mq.padding.copyWith(bottom: mq.padding.bottom + kRailInset),
+              // And see `resizeToAvoidBottomInset`: a tab's own `Scaffold` would
+              // otherwise do the resize this one just declined to.
+              viewInsets: mq.viewInsets.copyWith(bottom: 0),
             ),
             child: IndexedStack(
               index: _tab.index,
@@ -202,29 +210,10 @@ class _Inset extends StatelessWidget {
 /// they read as one control surface with a section that comes and goes — which is
 /// what they are.
 ///
-/// ## Why the whole dock is one width
-///
-/// [IntrinsicWidth] over a stretched column: the column takes the width of its
-/// widest row, and every other row is stretched to match. So the navigation is
-/// exactly as wide as the controls above it, its three destinations dividing
-/// that width between them as equal segments. Left to themselves the two rows
-/// would be different widths and the join would have a visible step in it.
-///
-/// The widest row is usually neither of them: [kRailMinWidth] puts a floor
-/// under the island. Without it the nav row alone measured 180 points — a pill
-/// lost at the bottom of the screen — and the island lurched sideways every
-/// time the control row came or went. With it, both rows spread across the same
-/// steady width, and only a control row that genuinely outgrows the floor (the
-/// camera flip and the leave door together) widens the island past it.
-///
-/// ## Why it grows and shrinks rather than sliding
-///
-/// The controls belong to the office, and the first version slid them down behind
-/// the rail on the way out. Attached, there is nothing to slide behind: the honest
-/// motion for a section of one object leaving is for the object to close up over
-/// it. [AnimatedSize] anchored at the bottom does that, so the dock settles onto
-/// the navigation row and lifts back off it. Same for the reaction tray, which is
-/// a third row and pushes the dock upwards rather than floating over it.
+/// The island itself — its one width, its floor of [kRailMinWidth], and the way it
+/// closes up over a row that leaves — is [DockIsland], which the call screen uses
+/// too. The navigation is exactly as wide as the controls above it because the
+/// island stretches every row to its widest.
 ///
 /// The controls cannot live *inside* the map tab, which is where they belong
 /// conceptually: an `IndexedStack` stops painting a tab the moment it is not
@@ -247,86 +236,45 @@ class _Dock extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
 
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.only(bottom: kRailGap),
-        child: Center(
-          child: Container(
+    return DockIsland(
+      children: [
+        if (showingControls)
+          DecoratedBox(
             decoration: BoxDecoration(
-              // Solid, unlike the legend it otherwise copies. The legend is a
-              // hint that sits over floor and is allowed to let the floor
-              // through; this is navigation, it sits wherever the office
-              // happens to be busiest, and at 0.92 the desks and chairs came
-              // through it and read as dirt on the glass. Floating is the shape
-              // and the gap underneath, not the translucency.
-              color: t.card,
-              border: Border.all(color: t.border),
-              borderRadius: BorderRadius.circular(t.radius + 10),
+              border: Border(bottom: BorderSide(color: t.border)),
             ),
-            // So a row on its way out is clipped by the island's own corners
-            // rather than spilling past them mid-animation.
-            clipBehavior: Clip.antiAlias,
-            child: AnimatedSize(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.bottomCenter,
-              child: IntrinsicWidth(
-                // The floor under the island's width — see [kRailMinWidth].
-                // Inside the IntrinsicWidth, so a control row that genuinely
-                // outgrows the floor can still widen the whole dock.
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(minWidth: kRailMinWidth),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (showingControls)
-                        DecoratedBox(
-                          decoration: BoxDecoration(
-                            border: Border(bottom: BorderSide(color: t.border)),
-                          ),
-                          child: ListenableBuilder(
-                            // Outside the `IndexedStack`, so it has no listener of
-                            // its own — the mute button has to redraw when the call
-                            // state changes and when a roster moves us in or out of
-                            // a conversation.
-                            listenable: state,
-                            builder: (context, _) => ControlBar(state: state),
-                          ),
-                        ),
-                      SizedBox(
-                        height: kRailHeight,
-                        // Equal thirds rather than `spaceEvenly`: three fixed-width
-                        // plates spread across the widened island floated in it as
-                        // three loose pills, with the bar's fill showing as dead
-                        // space around each one. Segments own the width instead.
-                        child: Padding(
-                          // The one breathing distance: 6 between a plate and the
-                          // island's edge, and 6 between neighbouring plates — the
-                          // gaps below, not per-item padding, so the edges do not
-                          // end up wider than the seams.
-                          padding: const EdgeInsets.all(6),
-                          child: Row(
-                            children: [
-                              for (final tab in _Tab.values) ...[
-                                if (tab != _Tab.values.first) const SizedBox(width: 6),
-                                Expanded(
-                                  child: _NavItem(tab: tab, selected: selected, onSelect: onSelect),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
+            child: ListenableBuilder(
+              // Outside the `IndexedStack`, so it has no listener of its own —
+              // the mute button has to redraw when the call state changes and
+              // when a roster moves us in or out of a conversation.
+              listenable: state,
+              builder: (context, _) => ControlBar(state: state),
+            ),
+          ),
+        SizedBox(
+          height: kRailHeight,
+          // Equal thirds rather than `spaceEvenly`: three fixed-width plates
+          // spread across the widened island floated in it as three loose pills,
+          // with the bar's fill showing as dead space around each one. Segments
+          // own the width instead.
+          child: Padding(
+            // The one breathing distance: 6 between a plate and the island's
+            // edge, and 6 between neighbouring plates — the gaps below, not
+            // per-item padding, so the edges do not end up wider than the seams.
+            padding: const EdgeInsets.all(6),
+            child: Row(
+              children: [
+                for (final tab in _Tab.values) ...[
+                  if (tab != _Tab.values.first) const SizedBox(width: 6),
+                  Expanded(
+                    child: _NavItem(tab: tab, selected: selected, onSelect: onSelect),
                   ),
-                ),
-              ),
+                ],
+              ],
             ),
           ),
         ),
-      ),
+      ],
     );
   }
 }

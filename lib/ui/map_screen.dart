@@ -15,6 +15,7 @@ import '../src/art_cache.dart';
 import '../src/map_motion.dart';
 import '../src/map_person.dart';
 import '../theme/gather_theme.dart';
+import 'call_screen.dart';
 import 'dpad.dart';
 
 /// The office, drawn — with Gather's own artwork.
@@ -105,7 +106,34 @@ class _MapScreenState extends State<MapScreen> {
       ),
       // Deliberately not wrapped in SafeArea: the floor runs under the home
       // indicator, which is what "fullscreen" has to mean for something you pan.
-      body: map == null ? _Waiting(connected: widget.state.link.isLive) : _Plan(state: widget.state, map: map, art: _art, cache: _cache),
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: map == null ? _Waiting(connected: widget.state.link.isLive) : _Plan(state: widget.state, map: map, art: _art, cache: _cache),
+          ),
+          // Over the floor rather than taking a strip off the top of it, the way the
+          // dock floats over the bottom: a call starting must not rescale the office
+          // under somebody's thumb.
+          Positioned(
+            left: 0,
+            right: 0,
+            top: 0,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 240),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) => FadeTransition(
+                opacity: animation,
+                child: SlideTransition(
+                  position: Tween(begin: const Offset(0, -0.25), end: Offset.zero).animate(animation),
+                  child: child,
+                ),
+              ),
+              child: widget.state.inCall ? CallBanner(key: const ValueKey('call'), state: widget.state) : const SizedBox.shrink(),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -527,6 +555,104 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(content: Text(notice)));
     });
+    _followRequests = widget.state.followMe.listen((_) {
+      // Claimed, so the latch below does not ride the same walk a second time
+      // when this screen is rebuilt.
+      widget.state.takeFollowRequest();
+      _startFollowing();
+    });
+    // A desk walk asked for while this screen did not exist — from the call
+    // screen, whose dock carries the same button, or from another tab. Deferred
+    // one frame because following needs a layout that has not happened yet:
+    // [_followFrame] gives up on an empty child, so starting it here would start
+    // and immediately stop.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && widget.state.takeFollowRequest()) _startFollowing();
+    });
+  }
+
+  // ---- riding along ----------------------------------------------------------
+
+  StreamSubscription<void>? _followRequests;
+
+  /// Keeps the camera on my own avatar for the length of a walk — see
+  /// [AppState.followMe] for which walks ask for it.
+  ///
+  /// Its own ticker rather than a listener on [MapMotion]: the motion clock stops
+  /// the moment nobody is moving, which would strand the camera partway through
+  /// catching up with somebody who has already sat down.
+  late final _follow = createTicker(_followFrame);
+  Duration _followLast = Duration.zero;
+  double _followZoom = _openingZoom;
+
+  /// The last layout, for a ticker that runs between builds.
+  Size _viewport = Size.zero;
+  Size _child = Size.zero;
+  double _base = 1;
+
+  /// How much of the bottom of the floor is under the dock, so "centred on me"
+  /// means the middle of the office you can see and not the middle of the glass.
+  double _covered = 0;
+
+  void _startFollowing() {
+    if (!mounted) return;
+    _zoom.stop();
+    // Close enough to see yourself walking. Somebody already zoomed further in
+    // keeps their zoom; somebody looking at the whole floor is brought in to
+    // where a walk is something you can watch.
+    _followZoom = math.max(_view.value.getMaxScaleOnAxis(), _openingZoom);
+    _followLast = Duration.zero;
+    _follow
+      ..stop()
+      ..start();
+  }
+
+  void _stopFollowing() {
+    if (_follow.isActive) _follow.stop();
+  }
+
+  /// Eases the view towards me, and lets go once I have arrived and it has caught up.
+  ///
+  /// Eased rather than pinned: the avatar is usually off screen when the desk button
+  /// is pressed, and snapping the view to it would be a cut, not a camera. The
+  /// easing is exponential in real time, so a dropped frame does not change where
+  /// the view ends up — only how many frames it takes to get there.
+  void _followFrame(Duration elapsed) {
+    final me = widget.state.mePerson;
+    if (me == null || _child.isEmpty) return _stopFollowing();
+    final now = _motion.now;
+    final at = _motion.positionOf(me, now);
+    final target = framedOn(
+      at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base + _covered / 2 / _followZoom),
+      viewport: _viewport,
+      child: _child,
+      zoom: _followZoom,
+    );
+
+    final dt = (elapsed - _followLast).inMicroseconds / Duration.microsecondsPerSecond;
+    _followLast = elapsed;
+    final k = 1 - math.exp(-dt / 0.12);
+
+    // Scale and translation eased separately. Both ends satisfy [framedOn]'s clamp,
+    // and that clamp is linear in the scale, so every point between them does too.
+    final from = _view.value;
+    final fromScale = from.getMaxScaleOnAxis();
+    final toScale = target.getMaxScaleOnAxis();
+    final fromT = from.getTranslation();
+    final toT = target.getTranslation();
+    final scale = fromScale + (toScale - fromScale) * k;
+    final dx = fromT.x + (toT.x - fromT.x) * k;
+    final dy = fromT.y + (toT.y - fromT.y) * k;
+    _view.value = Matrix4.identity()
+      ..translateByDouble(dx, dy, 0, 1)
+      ..scaleByDouble(scale, scale, scale, 1);
+
+    // Not in the first moments: the request lands before the roster has moved me,
+    // and a walk that has not started looks exactly like one that has finished.
+    if (elapsed < const Duration(milliseconds: 600)) return;
+    final arrived = !widget.state.onRoute && !_motion.walking(me, now);
+    final caughtUp = (toT.x - dx).abs() < 0.5 && (toT.y - dy).abs() < 0.5 && (toScale - scale).abs() < 0.005;
+    if (arrived && caughtUp) _stopFollowing();
   }
 
   StreamSubscription<String>? _notices;
@@ -534,6 +660,8 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   @override
   void dispose() {
     unawaited(_notices?.cancel());
+    unawaited(_followRequests?.cancel());
+    _follow.dispose();
     _tapWindow?.cancel();
     _motion.dispose();
     _zoom.dispose();
@@ -572,6 +700,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// walking to a meeting is the one that gets used. It is also the only one of the
   /// two the iOS Simulator can do without holding a modifier key down.
   void _onDoubleTap(Size viewport, Size child) {
+    _stopFollowing();
     final current = _view.value.getMaxScaleOnAxis();
     final target = framedOn(
       // The tap is in viewport coordinates; the point under it is wherever the
@@ -617,6 +746,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     // sequence number and `noteTeleport` ignores one it has already drawn.
     _motion.noteTeleport(state.lastTeleport);
     _motion.update(people);
+    _covered = MediaQuery.paddingOf(context).bottom;
 
     return Stack(
       children: [
@@ -631,6 +761,9 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               // the screen in either direction is a map you can drag the void into.
               final base = math.max(viewport.height / (map.height * artTileSize), viewport.width / (map.width * artTileSize));
               final child = Size(map.width * artTileSize * base, map.height * artTileSize * base);
+              _viewport = viewport;
+              _child = child;
+              _base = base;
               _centreOnMe(viewport, child, base, people);
 
               // The whole floor at once, pinchable and pannable. A map you cannot get
@@ -645,6 +778,8 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                 onTapUp: (details) => _onTap(details.localPosition, base, viewport, child),
                 child: InteractiveViewer(
                   transformationController: _view,
+                  // A finger on the floor takes the camera back.
+                  onInteractionStart: (_) => _stopFollowing(),
                   // Sized here, so the viewer must not stretch it back to the
                   // viewport and undo the cover-the-screen decision above.
                   constrained: false,
@@ -724,21 +859,32 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
             child: SafeArea(
               top: false,
               child: Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Up for the whole walk as well as before it. Shift is a modifier
-                    // on movement rather than a property of a journey, so pressing it
-                    // mid-route takes the kart there and then — see [Walk.boost].
-                    _Kart(on: state.boost, onChanged: (on) => state.boost = on),
-                    const SizedBox(width: 8),
-                    _GoTo(
-                      room: _selected?.room,
-                      walking: state.onRoute,
-                      onGo: _go,
-                      onClear: () => setState(() => _selected = null),
-                    ),
-                  ],
+                // The pill sets the height and the kart takes it, square. The two
+                // were each sized by their own padding and came out two points
+                // apart — the pill's line of text is taller than the kart's glyph —
+                // which is exactly the kind of near-miss that reads as a mistake.
+                child: IntrinsicHeight(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Up for the whole walk as well as before it. Shift is a
+                      // modifier on movement rather than a property of a journey, so
+                      // pressing it mid-route takes the kart there and then — see
+                      // [Walk.boost].
+                      AspectRatio(
+                        aspectRatio: 1,
+                        child: _Kart(on: state.boost, onChanged: (on) => state.boost = on),
+                      ),
+                      const SizedBox(width: 8),
+                      _GoTo(
+                        room: _selected?.room,
+                        walking: state.onRoute,
+                        onGo: _go,
+                        onClear: () => setState(() => _selected = null),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

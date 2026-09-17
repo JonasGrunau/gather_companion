@@ -13,8 +13,10 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
+import 'package:gather_companion/src/reactions.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
+import 'package:gather_companion/ui/person_avatar.dart';
 
 import 'fake_call.dart';
 
@@ -37,6 +39,230 @@ void main() {
     }
     return state;
   }
+
+  group('the banner says who you are with', () {
+    test('in every size of call, named or not', () {
+      String both(List<String?> people) {
+        final (:title, :subtitle) = callBannerText(people);
+        return '$title / $subtitle';
+      }
+
+      expect(both(['Ada Lovelace']), 'In a call with Ada / Tap to see Ada');
+      expect(both([null]), 'In a call with someone / Tap to see them');
+      expect(both(['Ada Lovelace', 'Grace Hopper']), 'In a call with Ada and Grace / Tap to see everyone');
+      expect(both(['Ada', null]), 'In a call with Ada and someone else / Tap to see everyone');
+      expect(both([null, 'Ada']), 'In a call with Ada and someone else / Tap to see everyone',
+          reason: 'the named lead, whatever order the wire sent them in');
+      expect(both([null, null]), 'In a call with 2 people / Tap to see everyone');
+      expect(both(['Ada', 'Grace', 'Katherine']), 'In a call with Ada and 2 others / Tap to see everyone');
+      expect(both([null, 'Grace', null, 'Dorothy', 'Mary']), 'In a call with Grace and 4 others / Tap to see everyone');
+      expect(both([null, null, null]), 'In a call with 3 people / Tap to see everyone');
+    });
+
+    Future<void> banner(WidgetTester tester, AppState state) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(body: CallBanner(state: state)),
+      ));
+      await tester.pump();
+    }
+
+    RosterRow person(String id, String? name, {String? cluster = 'c1', String? account}) =>
+        RosterRow(id: id, name: name, clusterId: cluster, userAccountId: account);
+
+    const me = RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1');
+    const alone = RosterRow(id: 'me', name: 'Jonas', clusterId: 'solo');
+
+    /// A state as Gather and the SFU would leave it — no seams for who is in the
+    /// conversation, so the banner is read off the same roster the app reads.
+    AppState configured({CallState call = const CallState(), required List<RosterRow> rows}) =>
+        AppState()
+          ..debugCall = call
+          ..debugApplyRoster(Roster(selfId: 'me', rows: rows));
+
+    /// The cluster debounce is a real timer once anybody carries an account id.
+    Future<void> settle(WidgetTester tester) => tester.pump(const Duration(seconds: 2));
+
+    testWidgets('leads with a call glyph in a circle, not with faces', (tester) async {
+      await banner(tester, configured(rows: [me, person('ada', 'Ada'), person('grace', 'Grace')]));
+
+      expect(find.byIcon(Icons.call_rounded), findsOneWidget);
+      expect(find.byType(PersonAvatar), findsNothing);
+      final mark = tester.widget<Container>(
+        find.ancestor(of: find.byIcon(Icons.call_rounded), matching: find.byType(Container)).first,
+      );
+      expect((mark.decoration! as BoxDecoration).shape, BoxShape.circle);
+    });
+
+    testWidgets('one person, from the conversation alone', (tester) async {
+      final state = configured(rows: [me, person('ada', 'Ada Lovelace')]);
+      expect(state.inCall, isTrue);
+      await banner(tester, state);
+
+      expect(find.text('In a call with Ada'), findsOneWidget);
+      expect(find.text('Tap to see Ada'), findsOneWidget);
+    });
+
+    testWidgets('two and more, from the conversation alone', (tester) async {
+      await banner(tester, configured(rows: [me, person('ada', 'Ada'), person('grace', 'Grace')]));
+      expect(find.text('In a call with Ada and Grace'), findsOneWidget);
+
+      await banner(tester, configured(rows: [
+        me,
+        person('ada', 'Ada'),
+        person('grace', 'Grace'),
+        person('kat', 'Katherine'),
+        person('dot', 'Dorothy'),
+        // Standing in another conversation, so not in this call.
+        person('mary', 'Mary', cluster: 'c2'),
+      ]));
+      expect(find.text('In a call with Ada and 3 others'), findsOneWidget);
+    });
+
+    testWidgets('one person, from the media plane alone', (tester) async {
+      // Somebody the SFU is sending while the cluster has already let go — the
+      // half second at the end of a conversation.
+      final state = configured(
+        call: const CallState(participants: [CallParticipant(srcId: 'acc-ada', hasAudio: true)]),
+        rows: [alone, person('ada', 'Ada', cluster: null, account: 'acc-ada')],
+      );
+      expect(state.inCall, isTrue);
+      await banner(tester, state);
+      await settle(tester);
+
+      expect(find.text('In a call with Ada'), findsOneWidget);
+    });
+
+    testWidgets('several people, from the media plane alone', (tester) async {
+      await banner(
+        tester,
+        configured(
+          call: const CallState(participants: [
+            CallParticipant(srcId: 'acc-ada', hasAudio: true),
+            CallParticipant(srcId: 'acc-grace', hasVideo: true),
+            CallParticipant(srcId: 'acc-kat'),
+          ]),
+          rows: [
+            alone,
+            person('ada', 'Ada', cluster: null, account: 'acc-ada'),
+            person('grace', 'Grace', cluster: null, account: 'acc-grace'),
+            person('kat', 'Katherine', cluster: null, account: 'acc-kat'),
+          ],
+        ),
+      );
+      await settle(tester);
+
+      expect(find.text('In a call with Ada and 2 others'), findsOneWidget);
+    });
+
+    testWidgets('somebody on both planes is counted once', (tester) async {
+      await banner(
+        tester,
+        configured(
+          call: const CallState(participants: [CallParticipant(srcId: 'acc-ada', hasAudio: true)]),
+          rows: [
+            me,
+            person('ada', 'Ada', account: 'acc-ada'),
+            // In the conversation with everything off, so never a participant.
+            person('grace', 'Grace', account: 'acc-grace'),
+          ],
+        ),
+      );
+      await settle(tester);
+
+      expect(find.text('In a call with Ada and Grace'), findsOneWidget);
+    });
+
+    testWidgets('somebody the roster cannot name yet', (tester) async {
+      await banner(
+        tester,
+        configured(
+          call: const CallState(participants: [CallParticipant(srcId: 'acc-new', hasAudio: true)]),
+          rows: [alone],
+        ),
+      );
+      expect(find.text('In a call with someone'), findsOneWidget);
+      expect(find.text('Tap to see them'), findsOneWidget);
+
+      await banner(
+        tester,
+        configured(
+          call: const CallState(participants: [CallParticipant(srcId: 'acc-new', hasAudio: true)]),
+          rows: [me, person('ada', 'Ada')],
+        ),
+      );
+      expect(find.text('In a call with Ada and someone else'), findsOneWidget);
+    });
+
+    testWidgets('it follows the call as people come and go', (tester) async {
+      final state = configured(rows: [me, person('ada', 'Ada')]);
+      await banner(tester, state);
+      expect(find.text('In a call with Ada'), findsOneWidget);
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('ada', 'Ada'), person('grace', 'Grace')]));
+      await tester.pump();
+      expect(find.text('In a call with Ada and Grace'), findsOneWidget);
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('grace', 'Grace')]));
+      await tester.pump();
+      expect(find.text('In a call with Grace'), findsOneWidget);
+
+      state.debugApplyRoster(const Roster(selfId: 'me', rows: [alone]));
+      expect(state.inCall, isFalse, reason: 'and there is no call left to have a banner for');
+    });
+
+    testWidgets('the screen it opens shows the same people', (tester) async {
+      // Somebody in the conversation with nothing published gets a tile, rather
+      // than the screen saying "Nobody else here" under a banner that named them.
+      await show(tester, configured(rows: [me, person('ada', 'Ada')]));
+
+      expect(find.text('Ada'), findsOneWidget);
+      expect(find.text('1 other person'), findsOneWidget);
+      expect(find.textContaining('Nobody is in this conversation yet'), findsNothing);
+    });
+  });
+
+  testWidgets('the first face starts directly under the header, however many there are',
+      (tester) async {
+    for (final count in [1, 2, 3]) {
+      await show(
+        tester,
+        stateWith(
+          CallState(participants: [
+            for (var i = 0; i < count; i++) CallParticipant(srcId: 'account-$i', hasAudio: true),
+          ]),
+          rows: [
+            for (var i = 0; i < count; i++) RosterRow(id: 'space-$i', name: 'Person $i', userAccountId: 'account-$i'),
+          ],
+        ),
+      );
+
+      final header = tester.getRect(find.byTooltip('Back'));
+      final headerBottom = tester.getBottomLeft(find.ancestor(of: find.byTooltip('Back'), matching: find.byType(Padding)).first).dy;
+      final first = tester.getRect(find.byType(TileFrame).first);
+      expect(first.top, headerBottom, reason: '$count on screen');
+      expect(first.top, greaterThan(header.bottom));
+    }
+  });
+
+  testWidgets('the mute pip is exactly as tall as the name beside it', (tester) async {
+    await show(
+      tester,
+      stateWith(
+        const CallState(participants: [
+          CallParticipant(srcId: 'account-1', hasAudio: true, audioPaused: true),
+        ]),
+        rows: const [RosterRow(id: 'space-1', name: 'Mira', userAccountId: 'account-1')],
+      ),
+    );
+
+    Rect plate(Finder inside) =>
+        tester.getRect(find.ancestor(of: inside, matching: find.byType(DecoratedBox)).first);
+    final name = plate(find.text('Mira'));
+    final muted = plate(find.byIcon(Icons.mic_off));
+    expect(muted.height, name.height);
+    expect(muted.top, name.top);
+  });
 
   testWidgets('an empty call says so rather than showing a blank screen',
       (tester) async {
@@ -195,5 +421,143 @@ void main() {
     // No live call behind this state, so there is no stream to pick — the point
     // is that the tile carries the flag the layout reads.
     expect(tile.stream, isNull);
+  });
+
+  group('reactions and the speaking ring', () {
+    const me = RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', connected: true);
+    const luca = RosterRow(
+      id: 'luca',
+      name: 'Luca',
+      clusterId: 'c1',
+      userAccountId: 'account-luca',
+      connected: true,
+      speaking: true,
+    );
+
+    test('somebody talking is drawn talking, and nobody else is', () {
+      final state = stateWith(
+        const CallState(participants: [CallParticipant(srcId: 'account-luca', hasAudio: true)]),
+        rows: [me, luca],
+      );
+
+      final tile = tilesFor(state).single;
+      expect(tile.label, 'Luca');
+      expect(tile.speaking, isTrue, reason: "off the roster's own `speaking`");
+    });
+
+    testWidgets('our own tile speaks from our own microphone', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(
+        const CallState(media: LocalMediaState(capturing: true, audioEnabled: true)),
+        rows: [me],
+      )..debugAttachCall(call);
+      addTearDown(state.dispose);
+
+      expect(tilesFor(state).single.speaking, isFalse);
+
+      call.speak(true);
+      await tester.pump();
+
+      // Not from the roster. Gather echoes `speaking` back within a beat, and a
+      // beat of lag on your *own* face reads as the app being slow.
+      final self = tilesFor(state).single;
+      expect(self.isSelf, isTrue);
+      expect(self.speaking, isTrue);
+    });
+
+    testWidgets('the ring is painted over the video, not behind it', (tester) async {
+      Future<BoxDecoration> ringOf(bool speaking) async {
+        await tester.pumpWidget(MaterialApp(
+          theme: buildGatherTheme(),
+          home: Scaffold(
+            body: Center(
+              child: SizedBox(
+                width: 200,
+                height: 150,
+                child: TileFrame(
+                  tile: CallTile(
+                    id: 'luca',
+                    label: 'Luca',
+                    isSelf: false,
+                    videoLive: true,
+                    muted: false,
+                    sharingScreen: false,
+                    speaking: speaking,
+                  ),
+                  // Stands in for the platform view: opaque, and filling the
+                  // tile, which is exactly what hid the ring.
+                  video: const ColoredBox(color: Color(0xFFFFFFFF)),
+                ),
+              ),
+            ),
+          ),
+        ));
+        await tester.pumpAndSettle();
+        final box = tester.widget<AnimatedContainer>(find.byType(AnimatedContainer).first);
+        return box.foregroundDecoration! as BoxDecoration;
+      }
+
+      final t = buildGatherTheme().extension<GatherTokens>()!;
+
+      // In the *foreground*. A background decoration is painted before the
+      // child, and the child here is a full-bleed video — so the ring was drawn
+      // and then covered, on every tile with a camera on.
+      expect((await ringOf(true)).border!.top.color, t.ok);
+      expect((await ringOf(true)).border!.top.width, 3);
+
+      final quiet = await ringOf(false);
+      expect(quiet.border!.top.color, t.border);
+      expect(quiet.border!.top.width, 1);
+    });
+
+    testWidgets('reactions land on the tile of whoever sent them', (tester) async {
+      final state = stateWith(
+        const CallState(participants: [CallParticipant(srcId: 'account-luca', hasAudio: true)]),
+        rows: [me, luca],
+      );
+      addTearDown(state.dispose);
+
+      state.reactions.note('luca', '🎉');
+      await tester.pump(const Duration(milliseconds: 300));
+      state.reactions.note('luca', '🔥');
+
+      // Both, in press order. A second tap adds to what is in the air rather
+      // than replacing it — three claps are three claps.
+      expect([for (final f in tilesFor(state).single.reactions) f.emote], ['🎉', '🔥']);
+
+      await tester.pump(reactionLinger);
+      expect(tilesFor(state).single.reactions, isEmpty,
+          reason: 'nothing on the wire ever says a reaction ended');
+    });
+
+    testWidgets('it is drawn over the face, and only while it lasts',
+        (tester) async {
+      final state = stateWith(
+        const CallState(participants: [CallParticipant(srcId: 'account-luca', hasAudio: true)]),
+        rows: [me, luca],
+      );
+      addTearDown(state.dispose);
+      await show(tester, state);
+
+      expect(find.text('🎉'), findsNothing);
+
+      state.reactions.note('luca', '🎉');
+      await tester.pump();
+      expect(find.text('🎉'), findsOneWidget);
+
+      // A second press while the first is still climbing draws a second emoji,
+      // and leaves the first where it was.
+      await tester.pump(const Duration(milliseconds: 400));
+      state.reactions.note('luca', '🎉');
+      await tester.pump();
+      expect(find.text('🎉'), findsNWidgets(2));
+
+      // The screen listens to the store as well as to the state — the expiry
+      // arrives on a timer, with no roster and no tap behind it, so a screen
+      // rebuilding only on `AppState` would leave the emoji up for good.
+      await tester.pump(reactionLinger);
+      await tester.pump();
+      expect(find.text('🎉'), findsNothing);
+    });
   });
 }

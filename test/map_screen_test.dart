@@ -500,6 +500,18 @@ void main() {
       expect(state.boost, isFalse, reason: 'and unlatches again');
     });
 
+    testWidgets('the kart is exactly as tall as the pill beside it, and square',
+        (tester) async {
+      await tester.pumpWidget(wrap(ready()));
+      await tester.pump();
+      await tapFloor(tester);
+
+      final plate = tester.getSize(find.ancestor(of: kart, matching: find.byType(Material)).first);
+      final pill = tester.getSize(find.ancestor(of: find.text('Go here'), matching: find.byType(ClipRRect)).first);
+      expect(plate.height, pill.height);
+      expect(plate.width, plate.height);
+    });
+
     testWidgets('the kart stays up for the whole walk', (tester) async {
       // Because it still does something: shift is a modifier on movement, not a
       // property of a journey, so latching it mid-route takes the kart there and then.

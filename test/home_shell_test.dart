@@ -12,19 +12,33 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/activity_screen.dart';
+import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
 import 'package:gather_companion/ui/settings_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
+extension<T> on T {
+  T also(void Function(T) f) {
+    f(this);
+    return this;
+  }
+}
+
 void main() {
-  AppState connected() => AppState()
+  AppState connected({Roster? roster}) => AppState()
     ..debugApplyLink(const LinkStatus(LinkState.live))
+    // Before the snapshot: folding a roster replaces it, and the activity tab would
+    // lose the space it was fetched for and sit breathing its skeleton forever.
+    ..also((state) {
+      if (roster != null) state.debugApplyRoster(roster);
+    })
     ..debugApplySnapshot(PresenceSnapshot(
       self: const SelfState(spaceId: 'space-1', spaceName: 'HQ'),
       players: const [],
@@ -42,6 +56,105 @@ void main() {
           builder: (context, _) => HomeShell(state: state, onUnpair: onUnpair ?? () {}),
         ),
       );
+
+  group('in a call', () {
+    /// In a conversation with [names], the way the roster says so.
+    AppState talkingWith(List<String> names) => connected(
+          roster: Roster(selfId: 'me', rows: [
+            const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1'),
+            for (final name in names) RosterRow(id: name, name: name, clusterId: 'c1'),
+          ]),
+        );
+
+    Future<void> toOffice(WidgetTester tester, AppState state) async {
+      await tester.pumpWidget(wrap(state));
+      await tester.tap(find.byTooltip('Office'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a banner says so on the office, and only there', (tester) async {
+      final state = talkingWith(['Ada Lovelace', 'Grace Hopper']);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallBanner), findsNothing, reason: 'not over the activity tab');
+
+      await tester.tap(find.byTooltip('Office'));
+      await tester.pumpAndSettle();
+      expect(find.text('In a call with Ada and Grace'), findsOneWidget);
+      expect(find.text('Tap to see everyone'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Settings'));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallBanner), findsNothing, reason: 'nor over settings');
+    });
+
+    testWidgets('it sits under the title bar, over the floor, in an even margin', (tester) async {
+      await toOffice(tester, talkingWith(['Ada']));
+
+      final bar = tester.getRect(find.byType(AppBar));
+      final plate = tester.getRect(find.descendant(of: find.byType(CallBanner), matching: find.byType(Material)).first);
+      final screen = tester.getRect(find.byType(HomeShell));
+      final top = plate.top - bar.bottom;
+      expect(top, greaterThan(0));
+      expect(plate.left - screen.left, top, reason: 'the same gap at the side as on top');
+      expect(screen.right - plate.right, top);
+    });
+
+    testWidgets('it is the dock\'s colour, not a blue of its own', (tester) async {
+      await toOffice(tester, talkingWith(['Ada']));
+
+      final plate = tester.widget<Material>(find.descendant(of: find.byType(CallBanner), matching: find.byType(Material)).first);
+      expect(plate.color, tester.element(find.byType(CallBanner)).tokens.card);
+    });
+
+    testWidgets('it arrives with a conversation and leaves with it', (tester) async {
+      final state = connected();
+      await toOffice(tester, state);
+      expect(find.byType(CallBanner), findsNothing);
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: const [
+        RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1'),
+        RosterRow(id: 'ada', name: 'Ada', clusterId: 'c1'),
+      ]));
+      await tester.pumpAndSettle();
+      expect(find.text('In a call with Ada'), findsOneWidget);
+
+      state.debugApplyRoster(Roster(selfId: 'me', rows: const [
+        RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1'),
+        RosterRow(id: 'ada', name: 'Ada', clusterId: 'c2'),
+      ]));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallBanner), findsNothing);
+    });
+
+    testWidgets('there is no banner without one', (tester) async {
+      await toOffice(tester, connected());
+      expect(find.byType(CallBanner), findsNothing);
+    });
+
+    testWidgets('names one person, and counts past two', (tester) async {
+      await toOffice(tester, talkingWith(['Ada Lovelace']));
+      expect(find.text('In a call with Ada'), findsOneWidget);
+      expect(find.text('Tap to see Ada'), findsOneWidget);
+
+      await toOffice(tester, talkingWith(['Ada', 'Grace', 'Katherine', 'Dorothy']));
+      expect(find.text('In a call with Ada and 3 others'), findsOneWidget);
+    });
+
+    testWidgets('the banner opens the faces, which carry the controls and no tabs',
+        (tester) async {
+      await toOffice(tester, talkingWith(['Ada']));
+
+      await tester.tap(find.byType(CallBanner));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CallScreen), findsOneWidget);
+      expect(find.byTooltip('Unmute'), findsOneWidget);
+      expect(find.byTooltip('Activity'), findsNothing);
+      expect(find.byTooltip('Office'), findsNothing);
+      expect(find.byTooltip('Settings'), findsNothing);
+    });
+  });
 
   testWidgets('activity is what the app opens on', (tester) async {
     await tester.pumpWidget(wrap(connected()));
@@ -63,7 +176,7 @@ void main() {
 
     expect(find.byType(ControlBar), findsNothing, reason: 'not on the activity tab');
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pumpAndSettle();
     expect(find.byType(ControlBar), findsOneWidget);
     expect(find.byTooltip('Your status'), findsOneWidget);
@@ -73,7 +186,7 @@ void main() {
     expect(find.byType(ControlBar), findsNothing);
     // And the rail is still there, which is the difference between a section
     // closing up and the whole dock leaving.
-    expect(find.byTooltip('The office'), findsOneWidget);
+    expect(find.byTooltip('Office'), findsOneWidget);
   });
 
   testWidgets('every destination on the rail goes somewhere', (tester) async {
@@ -84,7 +197,7 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pump();
     expect(find.textContaining('Reading the floor plan'), findsOneWidget);
     expect(find.textContaining('Waves and meeting notes'), findsNothing);
@@ -108,7 +221,7 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pump();
     final before = tester.state(find.byType(MapScreen));
 
@@ -118,7 +231,7 @@ void main() {
     expect(find.byType(MapScreen), findsNothing);
     expect(find.byType(MapScreen, skipOffstage: false), findsOneWidget);
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pump();
 
     expect(identical(tester.state(find.byType(MapScreen, skipOffstage: false)), before), isTrue);
@@ -134,7 +247,7 @@ void main() {
     expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isTrue);
     expect(TickerMode.valuesOf(tester.element(find.byType(MapScreen, skipOffstage: false))).enabled, isFalse);
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pump();
 
     expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isFalse);
@@ -164,7 +277,7 @@ void main() {
     expect(identical(feeding(), state), isTrue,
         reason: 'off the map tab, only presence should rebuild it');
 
-    await tester.tap(find.byTooltip('The office'));
+    await tester.tap(find.byTooltip('Office'));
     await tester.pump();
 
     expect(identical(feeding(), state), isFalse,

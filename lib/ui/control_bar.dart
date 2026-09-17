@@ -10,14 +10,20 @@
 ///
 /// ## What is here, and what is deliberately not
 ///
-/// Gather's bar also carries a screen-share button and a door marked *leave*.
-/// Neither survives the trip to a phone. There is nothing on a phone worth
-/// sharing a window of, and leaving is worse than useless here: the socket this
-/// app holds **is** the presence everything else in it reports, so a door out of
-/// the space would switch the product off. What replaces the door is
-/// `leaveCluster` — stepping out of the conversation you are in without walking
-/// away from it — which is a real thing on the wire and the one people actually
-/// want on a phone.
+/// Gather's bar also carries a screen-share button. It does not survive the trip
+/// to a phone: there is nothing on a phone worth sharing a window of.
+///
+/// Gather's door does survive, and it is **one** door, as it is on the desktop.
+/// This bar briefly had three ways out — a desk button, a *leave* button beside it
+/// while you were in a conversation, and a third meaning for that leave button on
+/// the call screen — and three buttons for one intention is two too many. There is
+/// one door now, [_doorButton], drawn with the `logout` glyph — a door with the
+/// way out marked on it — and what it does depends on
+/// where you are: in a conversation it leaves it and walks you home; away from
+/// your desk it walks you home; at your desk with nobody around it is dim, because
+/// you are already where the door leads. It never leaves the *space*: the socket
+/// this app holds **is** the presence everything else in it reports, so a door out
+/// of the space would switch the product off.
 ///
 /// The two chevrons beside Gather's microphone and camera open device pickers.
 /// A phone has one microphone and two cameras, and the second is a button rather
@@ -33,19 +39,21 @@
 /// other resting icon is, and [GatherTokens.brand] marks the two controls that are
 /// actually broadcasting.
 ///
-/// Red is spent instead on the desk, where it says something no glyph can: you are
-/// not where the office has you filed. The D-pad's rule — pressed is a step of
-/// opacity, never a different paint — is about a control being *pushed*, and still
-/// holds for the press itself.
+/// Red is spent instead on the door, where it says something no glyph can: there
+/// is somewhere you are not — you are in a conversation, or you are not where the
+/// office has you filed. The D-pad's rule — pressed is a step of opacity, never a
+/// different paint — is about a control being *pushed*, and still holds for the
+/// press itself.
 ///
-/// The desk is also the one control here that is ever greyed out, against the
+/// The door is also the one control here that is ever greyed out, against the
 /// standing rule that a button which can do nothing is absent rather than dimmed.
-/// The rule is right for the others: the conversation button appears when there is
-/// a conversation to leave and is gone when there is not, and its absence costs the
-/// reader nothing. Being at your own desk is different. It is the answer to "where
-/// am I", it is the state a person opens the bar to check, and a button that has
-/// vanished cannot tell anybody they have arrived. So the desk is absent only when
-/// Gather has given you no desk at all, and dim when you are already sitting at it.
+/// The rule is right for the others: the camera flip appears when there is a
+/// camera to flip and is gone when there is not, and its absence costs the reader
+/// nothing. Being at your own desk is different. It is the answer to "where am I",
+/// it is the state a person opens the bar to check, and a button that has vanished
+/// cannot tell anybody they have arrived. So the door is absent only when Gather
+/// has given you no desk *and* there is no conversation to leave, and dim when you
+/// are already sitting at your desk with nobody around you.
 library;
 
 import 'package:flutter/material.dart';
@@ -86,10 +94,90 @@ const double _barHeight = 56;
 /// permanent floor for it would cost the office a strip all day.
 const double kControlBarInset = _barHeight + 1;
 
+/// The room a screen leaves at the bottom for a [DockIsland] holding only the
+/// control row — the call screen's version of `kRailInset`, built the same way:
+/// the row, the island's border, the gap under it and the same eight of air.
+const double kControlDockInset = _barHeight + 2 + kRailGap + 8;
+
+/// The floating island the dock's rows sit in.
+///
+/// Shared by the shell, which stacks the controls over the navigation, and by the
+/// call screen, which carries the controls alone. One island and not two lookalikes,
+/// so the bar you mute from on the faces is visibly the bar you mute from on the map.
+///
+/// ## Why the whole island is one width
+///
+/// [IntrinsicWidth] over a stretched column: the column takes the width of its
+/// widest row, and every other row is stretched to match. Left to themselves the rows
+/// would be different widths and the join would have a visible step in it.
+/// [kRailMinWidth] puts a floor under that, so the island does not lurch sideways as
+/// rows come and go.
+///
+/// ## Why it grows and shrinks rather than sliding
+///
+/// A row of one object leaving is honestly drawn as the object closing up over it.
+/// [AnimatedSize] anchored at the bottom does that, and the reaction tray, which is a
+/// row too, pushes the island upwards rather than floating over it.
+class DockIsland extends StatelessWidget {
+  const DockIsland({super.key, required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: kRailGap),
+        child: Center(
+          child: Container(
+            decoration: BoxDecoration(
+              // Solid, unlike the legend it otherwise copies. The legend is a
+              // hint that sits over floor and is allowed to let the floor
+              // through; this is navigation, it sits wherever the office
+              // happens to be busiest, and at 0.92 the desks and chairs came
+              // through it and read as dirt on the glass.
+              color: t.card,
+              border: Border.all(color: t.border),
+              borderRadius: BorderRadius.circular(t.radius + 10),
+            ),
+            // So a row on its way out is clipped by the island's own corners
+            // rather than spilling past them mid-animation.
+            clipBehavior: Clip.antiAlias,
+            child: AnimatedSize(
+              duration: const Duration(milliseconds: 260),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.bottomCenter,
+              child: IntrinsicWidth(
+                // Inside the IntrinsicWidth, so a control row that genuinely
+                // outgrows the floor can still widen the whole island.
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: kRailMinWidth),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: children,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ControlBar extends StatefulWidget {
-  const ControlBar({super.key, required this.state});
+  const ControlBar({super.key, required this.state, this.onCallScreen = false});
 
   final AppState state;
+
+  /// Whether this bar is already sitting on the faces, where a button leading to
+  /// them would open the screen on top of itself.
+  final bool onCallScreen;
 
   @override
   State<ControlBar> createState() => _ControlBarState();
@@ -110,18 +198,64 @@ class _ControlBarState extends State<ControlBar> {
       ..showSnackBar(SnackBar(content: Text(failed)));
   }
 
+  /// What the door does: leave the conversation, head back to your desk, and
+  /// close the faces if they were open. Each only when there is one to do.
+  ///
+  /// Leaving and walking are one press because leaving alone is not actually a
+  /// way out. Gather forms conversations by proximity, so stepping out of one
+  /// while still standing in the middle of it is an invitation to be put straight
+  /// back in — `leaveCluster` buys a few seconds, not a departure. Walking away is
+  /// what ends it, and your own desk is the one place the app already knows how to
+  /// send you. That is also what the desktop's door does, and one door doing the
+  /// same thing in both clients is worth more than a phone-only distinction
+  /// between leaving and going home.
+  ///
+  /// The walk is not conditional on the leave having worked. If Gather refused it,
+  /// the walk is still the better answer — and arriving at your desk leaves the
+  /// cluster by itself. Without a desk, the leave is all there is to do, and
+  /// without a conversation the walk is.
+  ///
+  /// Popping last, and only on the way out of the call screen, so the map is the
+  /// thing on screen while the walk happens — which is the point of asking for it.
+  /// The desk walk raises a follow request that the office claims when it appears,
+  /// so the camera rides along even though it was not built when the button was
+  /// pressed.
+  Future<void> _leave() async {
+    final state = widget.state;
+    final navigator = Navigator.of(context);
+
+    if (state.inHuddle) {
+      await _run(state.leaveHuddle);
+      if (!mounted) return;
+    }
+    if (state.myDesk != null && !state.atMyDesk) {
+      await _run(state.goToMyDesk);
+      if (!mounted) return;
+    }
+    if (widget.onCallScreen && navigator.canPop()) navigator.pop();
+  }
+
   void _toggleTray() {
     HapticFeedback.selectionClick();
     setState(() => _tray = !_tray);
   }
 
+  /// Sends one and leaves the tray open.
+  ///
+  /// It used to close behind every pick, which made a second reaction — the 👏👏👏
+  /// people actually send — a reopen per clap. The tray is a toggle now: open until
+  /// the React button is pressed again.
+  ///
+  /// `sendEmoteLocalFirst`, so it appears on your own tile at the moment of the
+  /// press. Gather does echo our own emotes back to us, but over the network,
+  /// and the one reaction that should never wait for a round trip is the one
+  /// whose button is still under your thumb.
   Future<void> _send(String emote) async {
     HapticFeedback.selectionClick();
-    setState(() => _tray = false);
-    await _run(() => widget.state.sendEmote(emote));
+    await _run(() => widget.state.sendEmoteLocalFirst(emote));
   }
 
-  /// The way back to your own desk, in the three states it has.
+  /// The one door out, in the four states it has.
   ///
   /// Gather's own toolbar button, transcribed — the shape of it is not ours:
   ///
@@ -130,19 +264,41 @@ class _ControlBarState extends State<ControlBar> {
   /// disabled: currentUserAtDesk
   /// ```
   ///
+  /// with the conversation folded in, so that the same door reads *leave* while
+  /// you are in one. What it says is what it will do: leave the conversation,
+  /// walk back to your desk, or nothing because you are already there.
+  ///
   /// The desktop offers to *claim* a desk when you have none. This cannot: claiming
-  /// one is a guided flow over a map you cannot edit from a phone. So the branch
-  /// this app keeps is the other one, and no desk means no button — dimming it
-  /// would tell somebody who has never had a desk that they are sitting at it.
-  Widget _deskButton(BuildContext context, AppState state) {
-    if (state.myDesk == null) return const SizedBox.shrink();
-    final atDesk = state.atMyDesk;
+  /// one is a guided flow over a map you cannot edit from a phone. So with no desk
+  /// the door exists only while there is a conversation to leave — dimming it would
+  /// tell somebody who has never had a desk that they are sitting at it.
+  Widget _doorButton(BuildContext context, AppState state) {
+    final hasDesk = state.myDesk != null;
+    final inHuddle = state.inHuddle;
+    if (!hasDesk && !inHuddle) return const SizedBox.shrink();
+    final home = hasDesk && state.atMyDesk && !inHuddle;
 
-    return _BarButton(
-      icon: Icons.meeting_room_rounded,
-      label: atDesk ? 'You are at your desk' : 'Back to my desk',
-      tint: atDesk ? null : context.tokens.danger,
-      onTap: atDesk ? null : () => _run(state.goToMyDesk),
+    // The hairline travels with the door rather than sitting in the bar's own
+    // row, so it exists exactly when the door does: a rule with nothing after it
+    // would be a group with no members.
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const _Rule(),
+        _BarButton(
+          icon: Icons.logout_rounded,
+          label: inHuddle
+              ? 'Leave the conversation'
+              : home
+                  ? 'You are at your desk'
+                  : 'Back to my desk',
+          // Red whenever pressing it goes somewhere. It was briefly two buttons
+          // and two reds — one for the desk, one for the conversation — and
+          // folding them settles which red the bar has: the door's.
+          tint: home ? null : context.tokens.danger,
+          onTap: home ? null : _leave,
+        ),
+      ],
     );
   }
 
@@ -160,8 +316,8 @@ class _ControlBarState extends State<ControlBar> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         // A row of the same island rather than a thing floating over it: the tray
-        // pushes the dock upwards when it opens and lets it back down when a
-        // reaction is picked, so nothing ever overlaps anything.
+        // pushes the dock upwards when it opens and lets it back down when the
+        // React button closes it, so nothing ever overlaps anything.
         AnimatedSize(
           duration: const Duration(milliseconds: 220),
           curve: Curves.easeOutCubic,
@@ -192,31 +348,28 @@ class _ControlBarState extends State<ControlBar> {
                 tint: call.cameraOn ? t.brand : t.mutedForeground,
                 onTap: () => _run(() => state.setCameraOn(!call.cameraOn)),
               ),
-              // Only once there is a camera running to flip. Absent rather than
-              // dimmed, like everything else here.
-              if (call.cameraOn)
+              // Only on the faces, and only once there is a camera running to flip.
+              // Flipping is something you do while looking at your own picture;
+              // over the map there is no picture, so the button was a guess at
+              // which way the camera now faced. Absent rather than dimmed, like
+              // everything else here.
+              if (call.cameraOn && widget.onCallScreen)
                 _BarButton(
                   icon: Icons.cameraswitch_rounded,
                   label: 'Switch camera',
                   onTap: state.switchCamera,
                 ),
-              // The way to the faces — including your own. The camera being on
-              // is enough: turning it on and having nowhere to see the picture
-              // reads as the camera not working, which is exactly how this was
-              // first reported. A route rather than a panel, because an
-              // `RTCVideoRenderer` that is off-screen still decodes, so the
-              // surface should not exist while nobody is looking at it.
-              if (call.hasCompany || call.cameraOn)
+              // The way to your own picture while nobody else is in the call.
+              // Turning the camera on and having nowhere to see it reads as the
+              // camera not working, which is exactly how this was first
+              // reported. In a call the banner across the top of the shell is
+              // the way to the faces instead, so this goes — two doors to one
+              // room, one of them in the bar you are trying to mute from.
+              if (call.cameraOn && !state.inCall && !widget.onCallScreen)
                 _BarButton(
                   icon: Icons.groups_rounded,
-                  label: call.hasCompany
-                      ? 'See the conversation'
-                      : 'See your camera',
-                  onTap: () => Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => CallScreen(state: state),
-                    ),
-                  ),
+                  label: 'See your camera',
+                  onTap: () => openCallScreen(context, state),
                 ),
               const _Rule(),
               _BarButton(
@@ -229,19 +382,12 @@ class _ControlBarState extends State<ControlBar> {
               // — movement must not wake the whole tree — and this is the one
               // control in the bar whose answer changes as you walk. Without it the
               // button stays red under the thumb that pressed it until something
-              // unrelated happens to rebuild the bar.
+              // unrelated happens to rebuild the bar. A conversation starting or
+              // ending does notify, so that half of its answer needs no listener.
               ListenableBuilder(
                 listenable: state.positions,
-                builder: (context, _) => _deskButton(context, state),
+                builder: (context, _) => _doorButton(context, state),
               ),
-              if (state.inHuddle) ...[
-                const _Rule(),
-                _BarButton(
-                  icon: Icons.logout_rounded,
-                  label: 'Leave the conversation',
-                  onTap: () => _run(state.leaveHuddle),
-                ),
-              ],
             ],
           ),
         ),
@@ -382,8 +528,9 @@ class _BarButton extends StatelessWidget {
   }
 }
 
-/// The hairline between groups. Three of them would be clutter; two is what turns
-/// six glyphs into "me", "my hardware" and "the room".
+/// The hairline between groups: "me", "my hardware", "the room", and the door out
+/// of it. The last one is drawn by [_ControlBarState._doorButton] itself, so it
+/// comes and goes with the door.
 class _Rule extends StatelessWidget {
   const _Rule();
 

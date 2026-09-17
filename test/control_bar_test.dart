@@ -7,9 +7,11 @@
 /// rather than as a tap that did nothing, which is the whole contract
 /// `setPartyMode` established and everything here follows.
 ///
-/// The desk is the one documented exception to the first rule, so it is tested as
-/// an exception: absent when there is no desk, dim when you are already at it, and
-/// inert rather than quietly failing while it is dim.
+/// The door is the one documented exception to the first rule, so it is tested as
+/// an exception: absent when there is no desk and nothing to leave, dim when you
+/// are already at your desk with nobody around, and inert rather than quietly
+/// failing while it is dim. It is also *one* button — the desk walk and leaving a
+/// conversation used to be two, and the tests here hold them together.
 library;
 
 import 'package:flutter/material.dart';
@@ -17,6 +19,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
+import 'package:gather_companion/src/media/call.dart';
+import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/control_bar.dart';
 
@@ -129,6 +133,49 @@ void main() {
     );
   });
 
+  testWidgets('leaving the conversation is the door, red wherever the bar is drawn',
+      (tester) async {
+    final state = connected()..debugHuddle = ['Ada'];
+    Icon leaveIcon() => tester
+        .widget<Icon>(find.descendant(of: find.byTooltip('Leave the conversation'), matching: find.byType(Icon)));
+    Color? leaveColour() => leaveIcon().color;
+
+    // Over the map as well as on the faces, and the same glyph the desk walk has
+    // — it is the same button. This used to be a second button beside the desk's,
+    // which made three ways out across the two screens.
+    await tester.pumpWidget(wrap(state));
+    await tester.pumpAndSettle();
+    final t = tester.element(find.byTooltip('Leave the conversation')).tokens;
+    expect(leaveColour(), t.danger);
+    expect(leaveIcon().icon, Icons.logout_rounded);
+    expect(find.byIcon(Icons.logout_rounded), findsOneWidget, reason: 'one door, not two');
+
+    await tester.pumpWidget(MaterialApp(
+      theme: buildGatherTheme(),
+      home: Scaffold(body: Align(alignment: Alignment.bottomCenter, child: ControlBar(state: state, onCallScreen: true))),
+    ));
+    await tester.pumpAndSettle();
+    expect(leaveColour(), t.danger);
+  });
+
+  testWidgets('the camera flip lives on the call screen, not over the map',
+      (tester) async {
+    final state = connected()
+      ..debugCall = const CallState(
+        media: LocalMediaState(capturing: true, videoEnabled: true, videoTrackId: 'v1'),
+      );
+
+    await tester.pumpWidget(wrap(state));
+    expect(find.byTooltip('Turn the camera off'), findsOneWidget, reason: 'the camera is on');
+    expect(find.byTooltip('Switch camera'), findsNothing);
+
+    await tester.pumpWidget(MaterialApp(
+      theme: buildGatherTheme(),
+      home: Scaffold(body: Align(alignment: Alignment.bottomCenter, child: ControlBar(state: state, onCallScreen: true))),
+    ));
+    expect(find.byTooltip('Switch camera'), findsOneWidget);
+  });
+
   testWidgets('leaving the conversation appears with one and goes with it',
       (tester) async {
     // The rosters differ by who is in them rather than only by the seam, because
@@ -153,6 +200,26 @@ void main() {
     expect(find.byTooltip('Leave the conversation'), findsNothing);
   });
 
+  testWidgets('your own camera has a button until there is a call to see instead',
+      (tester) async {
+    // In a call the banner across the top of the shell is the way to the faces, so
+    // the bar stops carrying a second door to the same room.
+    final state = connected()
+      ..debugCall = const CallState(
+        media: LocalMediaState(capturing: true, videoEnabled: true, videoTrackId: 'v1'),
+      );
+    await tester.pumpWidget(wrap(state));
+    expect(find.byTooltip('See your camera'), findsOneWidget);
+
+    state.debugHuddle = ['Ada'];
+    state.debugApplyRoster(Roster(
+      selfId: 'me',
+      rows: [_row('me', name: 'Jonas'), _row('ada', name: 'Ada')],
+    ));
+    await tester.pump();
+    expect(find.byTooltip('See your camera'), findsNothing);
+  });
+
   group('back to my desk', () {
     /// Paired, on a floor with a desk, standing wherever [at] says.
     AppState atDesk({String? deskId, required int x, required int y}) => AppState()
@@ -167,10 +234,27 @@ void main() {
       await tester.pumpWidget(wrap(atDesk(x: 5, y: 5)));
 
       expect(
-        find.byIcon(Icons.meeting_room_rounded),
+        find.byIcon(Icons.logout_rounded),
         findsNothing,
         reason: 'dimming it would tell them they are sitting at a desk they '
             'have never had',
+      );
+    });
+
+    testWidgets('reads leave while you are in a conversation at your own desk',
+        (tester) async {
+      // Somebody walked up to you. The door is not dim — there is something to
+      // leave — and it says so rather than claiming you are away from your desk.
+      final state = atDesk(deskId: 'desk-1', x: 11, y: 10)..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      final button = find.byTooltip('Leave the conversation');
+      expect(button, findsOneWidget);
+      expect(find.byTooltip('You are at your desk'), findsNothing);
+      expect(
+        tester.widget<Icon>(find.descendant(of: button, matching: find.byType(Icon))).color,
+        tester.element(button).tokens.danger,
       );
     });
 
@@ -267,7 +351,7 @@ void main() {
       expect(tester.getSize(find.byType(ControlBar)).width, shut);
     });
 
-    testWidgets('picking one closes the tray and says so when it cannot send',
+    testWidgets('picking one keeps the tray open and says so when it cannot send',
         (tester) async {
       // No collector, so the send is refused — which is exactly what proves the
       // button is wired to `AppState` rather than only to `setState`.
@@ -278,8 +362,28 @@ void main() {
       await tester.tap(find.text('🎉'));
       await tester.pumpAndSettle();
 
-      expect(find.text('🎉'), findsNothing, reason: 'the tray closes behind a pick');
+      expect(find.text('🎉'), findsOneWidget, reason: 'open for the next one');
       expect(find.text('Not connected to Gather.'), findsOneWidget);
+    });
+
+    testWidgets('only the React button closes it again', (tester) async {
+      await tester.pumpWidget(wrap(connected()));
+      await tester.tap(find.byTooltip('React'));
+      await tester.pumpAndSettle();
+
+      for (final emote in ['👏', '👏', '🔥']) {
+        await tester.tap(find.text(emote));
+        await tester.pumpAndSettle();
+        expect(find.text('🎉'), findsOneWidget, reason: 'still open after $emote');
+      }
+
+      // Every send here is refused, and the refusal's snack bar lands over the
+      // bar in a window this small.
+      tester.state<ScaffoldMessengerState>(find.byType(ScaffoldMessenger)).removeCurrentSnackBar();
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('React'));
+      await tester.pumpAndSettle();
+      expect(find.text('🎉'), findsNothing);
     });
   });
 
@@ -311,6 +415,92 @@ void main() {
       expect(find.text('Not connected to Gather.'), findsOneWidget);
     });
 
+    testWidgets('follows the roster while it is open, not only when tapped',
+        (tester) async {
+      // The sheet is its own route. It used to redraw only when something inside it
+      // was pressed, so the patch confirming a new state landed unseen and the
+      // chip lit up on the *next* tap.
+      final state = connected(availability: 'Active');
+      await tester.pumpWidget(wrap(state));
+      await tester.tap(find.byTooltip('Your status'));
+      await tester.pumpAndSettle();
+      expect(find.text('Busy'), findsOneWidget);
+
+      state.debugApplyRoster(Roster(
+        selfId: 'me',
+        rows: [_row('me', name: 'Jonas', availability: 'Busy')],
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('Busy'), findsNWidgets(2), reason: 'named under the name as well');
+    });
+
+    testWidgets('busy is orange, and not the red of something gone wrong',
+        (tester) async {
+      const t = GatherTokens.dark;
+      expect(availabilityColor(t, 'Busy'), t.busy);
+      expect(t.busy, isNot(t.danger));
+      expect(t.busy, isNot(availabilityColor(t, 'Focused')));
+    });
+
+    testWidgets('the sheet is painted all the way down behind the keyboard', (tester) async {
+      // The keyboard's height used to be a margin under the sheet, which left a
+      // see-through strip: the map showed behind the keyboard.
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(wrap(connected()));
+      await tester.tap(find.byTooltip('Your status'));
+      await tester.pumpAndSettle();
+
+      tester.view.viewInsets = const FakeViewPadding(bottom: 900);
+      await tester.pumpAndSettle();
+
+      final t = tester.element(find.text('Update your status')).tokens;
+      final sheet = find.byWidgetPredicate(
+        (widget) => widget is Container && widget.decoration is BoxDecoration && (widget.decoration! as BoxDecoration).color == t.popover,
+      );
+      final screen = tester.view.physicalSize / tester.view.devicePixelRatio;
+      expect(tester.getRect(sheet).bottom, screen.height);
+      expect(
+        tester.getRect(find.text('Update your status')).bottom,
+        lessThan(screen.height - 900 / tester.view.devicePixelRatio),
+        reason: 'and the field itself still sits above the keyboard',
+      );
+    });
+
+    testWidgets('the emoji plate sits the same distance from the top, bottom and left of the field',
+        (tester) async {
+      await tester.pumpWidget(wrap(connected()));
+      await tester.tap(find.byTooltip('Your status'));
+      await tester.pumpAndSettle();
+
+      final field = tester.getRect(find.byType(InputDecorator));
+      final plate = tester.getRect(find.descendant(
+        of: find.bySemanticsLabel('Pick an emoji'),
+        matching: find.byType(Material),
+      ).first);
+      final left = plate.left - field.left;
+      expect(left, greaterThan(0));
+      expect(plate.top - field.top, closeTo(left, 0.5));
+      expect(field.bottom - plate.bottom, closeTo(left, 0.5));
+    });
+
+    testWidgets('the emoji opens as a row in the sheet and closes behind a pick',
+        (tester) async {
+      await tester.pumpWidget(wrap(connected()));
+      await tester.tap(find.byTooltip('Your status'));
+      await tester.pumpAndSettle();
+      expect(find.text('🎧'), findsNothing);
+
+      await tester.tap(find.bySemanticsLabel('Pick an emoji'));
+      await tester.pumpAndSettle();
+      expect(find.text('🎧'), findsOneWidget);
+      expect(find.byType(PopupMenuItem<String?>), findsNothing);
+
+      await tester.tap(find.text('🌴'));
+      await tester.pumpAndSettle();
+      expect(find.text('🎧'), findsNothing, reason: 'the row closes behind a pick');
+      expect(find.text('🌴'), findsOneWidget, reason: 'and the pick sits in the field');
+    });
+
     testWidgets('there is nothing to clear until something has been set',
         (tester) async {
       await tester.pumpWidget(wrap(connected()));
@@ -318,6 +508,92 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Clear it'), findsNothing);
+    });
+  });
+
+  testWidgets('leaving from the faces closes them and heads for the desk',
+      (tester) async {
+    final state = connected()..debugHuddle = ['Ada'];
+    final pops = <String>[];
+
+    // A route over a route, because the call screen is pushed over the shell and
+    // the whole point of this button is that it takes you back.
+    await tester.pumpWidget(MaterialApp(
+      theme: buildGatherTheme(),
+      home: Builder(
+        builder: (context) => Scaffold(
+          body: Center(
+            child: ElevatedButton(
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+                builder: (_) => Scaffold(
+                  body: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: ControlBar(state: state, onCallScreen: true),
+                  ),
+                ),
+              )).then((_) => pops.add('popped')),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    ));
+
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('Leave the conversation'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Leave the conversation'));
+    await tester.pumpAndSettle();
+
+    // Back to the office, because the walk to the desk is the thing you now want
+    // to watch — and the map is what follows it. Staying on a call screen that
+    // is about to empty would hide the only part of this with anything to see.
+    expect(pops, ['popped']);
+    expect(find.byTooltip('Leave the conversation'), findsNothing);
+  });
+
+  testWidgets('the same door over the map leaves without popping anything',
+      (tester) async {
+    // No navigator to pop and none wanted: over the office the walk home is
+    // already on screen. Without a desk there is no walk either, so the leave is
+    // all the door does — and it is refused here, because there is no socket.
+    final state = connected()..debugHuddle = ['Ada'];
+    await tester.pumpWidget(wrap(state));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Leave the conversation'));
+    await tester.pumpAndSettle();
+
+    expect(find.byTooltip('Leave the conversation'), findsOneWidget);
+    expect(find.text('Not connected to Gather.'), findsOneWidget);
+  });
+
+  group('the camera riding along', () {
+    test('a fresh desk walk is claimed once and only once', () {
+      final state = AppState()..debugRequestFollow();
+      addTearDown(state.dispose);
+
+      expect(state.takeFollowRequest(), isTrue);
+      // Two maps must not both ride the same walk, and a request left lying
+      // around is one that fires on the next mount.
+      expect(state.takeFollowRequest(), isFalse);
+    });
+
+    test('nothing pending is nothing to follow', () {
+      final state = AppState();
+      addTearDown(state.dispose);
+
+      expect(state.takeFollowRequest(), isFalse);
+    });
+
+    test('a walk that finished long ago is not chased', () {
+      final state = AppState()..debugRequestFollow(ago: const Duration(minutes: 10));
+      addTearDown(state.dispose);
+
+      // Opening the map later should show you the office, not jerk the camera
+      // onto a desk you walked to before lunch.
+      expect(state.takeFollowRequest(), isFalse);
     });
   });
 }

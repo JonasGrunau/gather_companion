@@ -11,6 +11,7 @@ import 'media/call.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
+import 'reactions.dart';
 import 'settings.dart';
 
 /// Everything the UI reads. One object, so the whole app is a single
@@ -253,7 +254,9 @@ class AppState extends ChangeNotifier {
       x: x.toDouble(),
       y: y.toDouble(),
       isFollowingMe: false,
-      speaking: _snapshot.players.any((p) => p.id == me.id && p.speaking),
+      // Ours, not the roster's. See [amSpeaking] — the roster agrees a beat
+      // later, and a beat is visible on your own avatar.
+      speaking: _amSpeaking,
       dancing: me.dancing == true,
       avatarUrl: _collector?.avatarUrlFor(me.id),
       direction: me.direction,
@@ -282,10 +285,6 @@ class AppState extends ChangeNotifier {
       for (final p in _snapshot.players)
         if (p.isFollowingMe) p.id,
     };
-    final speaking = {
-      for (final p in _snapshot.players)
-        if (p.speaking) p.id,
-    };
     final out = <MapPerson>[];
     for (final row in roster.rows) {
       if (row.id == roster.selfId) continue;
@@ -300,7 +299,14 @@ class AppState extends ChangeNotifier {
           x: x.toDouble(),
           y: y.toDouble(),
           isFollowingMe: followers.contains(row.id),
-          speaking: speaking.contains(row.id),
+          // Off the roster row, not off the presence snapshot. The snapshot is
+          // only rebuilt when the fold reports a state change, and the tracker
+          // deliberately does *not* report one for `speaking` unless that person
+          // is following you — a guard written when followers were the only
+          // people this app drew. It now draws the whole floor, so reading
+          // `speaking` from there left everybody permanently silent. The map
+          // repaints on `positions` every roster anyway, so this costs nothing.
+          speaking: row.speaking == true,
           dancing: row.dancing == true,
           avatarUrl: _collector?.avatarUrlFor(row.id),
           direction: row.direction,
@@ -443,6 +449,36 @@ class AppState extends ChangeNotifier {
 
   bool get inHuddle => huddle.isNotEmpty;
 
+  /// The rows behind [huddle], for a screen that needs to put a face to a name and
+  /// match it against the media plane rather than only print it.
+  List<RosterRow> get huddleRows => _roster?.myCluster ?? const [];
+
+  /// My availability and status line as the tree last heard about them.
+  ({String? availability, String? text, String? emoji})? _mine;
+
+  /// Wakes the tree when my own availability or status line changes.
+  ///
+  /// The presence tracker judges everybody else's rows and deliberately not mine, so
+  /// a roster confirming "you are Busy now" folded to no change at all. Nothing
+  /// listening to this notifier heard it: the status sheet lit the new chip only when
+  /// a second tap happened to redraw it, and the dot on the dock's avatar waited for
+  /// some unrelated socket frame. Compared by value rather than by row, because the
+  /// row is a new object on every roster.
+  void _noteMine() {
+    final row = _myRow();
+    final status = row?.status;
+    final mine = (availability: row?.availability, text: status?.text, emoji: status?.emoji);
+    if (mine == _mine) return;
+    _mine = mine;
+    notifyListeners();
+  }
+
+  /// Whether I am in a call: a conversation Gather has put me in, or anybody the
+  /// media plane is actually sending me. Either alone is enough — the cluster
+  /// lands before the SFU has negotiated anyone, and a peer can still be heard for
+  /// the half second after the cluster lets go.
+  bool get inCall => inHuddle || call.hasCompany;
+
   /// Test seam, as [debugCanWalk]: a huddle takes two people standing close
   /// enough for Gather to have decided they are talking.
   @visibleForTesting
@@ -584,6 +620,81 @@ class AppState extends ChangeNotifier {
     return _sent(collector.broadcastEmote(emote), 'Could not send that.');
   }
 
+  /// Who is reacting right now, and with what.
+  ///
+  /// A [Listenable] of its own rather than folded into this one. Reactions
+  /// expire on a timer, so the notification that takes one down arrives with no
+  /// roster and no tap behind it — and a screen that does not draw them has no
+  /// reason to rebuild for it. The call screen merges this in; nothing else
+  /// listens.
+  final Reactions reactions = Reactions();
+
+  /// Throws an emoji over the room, and shows it here at once.
+  ///
+  /// The echo does come back — `EmoteEvent` names the sender in its own
+  /// `targetUserIds` — but it comes back over the network, and the one reaction
+  /// on screen that should never be waited for is your own.
+  Future<String?> sendEmoteLocalFirst(String emote) async {
+    final me = _collector?.selfId;
+    if (me != null) reactions.note(me, emote);
+    return sendEmote(emote);
+  }
+
+  /// Who in the conversation is talking, so their ring can be redrawn.
+  ///
+  /// The call screen rebuilds on [notifyListeners] and on nothing else — unlike
+  /// the map, which rides the `positions` ticker four times a second. And an
+  /// ordinary roster does not notify: the presence fold only does so when
+  /// something it considers a state change happened, and voice activity
+  /// deliberately is not one. That guard is right in general — a measured space
+  /// held 111 rows and `speaking` was the single most frequent patch of any kind,
+  /// so rebuilding the tree for a stranger three rooms away clearing their throat
+  /// is exactly the wrong trade — but it left every face in the call ringed at
+  /// whatever it happened to be when something else last woke the screen.
+  ///
+  /// So the question is asked narrowly: only people in the conversation we are
+  /// in, which is the set the call draws and is bounded by the size of a huddle
+  /// rather than by the size of the space.
+  void _noteSpeakers(Roster roster) {
+    final mine = _myRow()?.clusterId;
+    final speakers = <String>{
+      if (mine != null)
+        for (final row in roster.rows)
+          if (row.id != roster.selfId && row.clusterId == mine && row.speaking == true)
+            row.id,
+    };
+    if (setEquals(speakers, _speakers)) return;
+    _speakers = speakers;
+    notifyListeners();
+  }
+
+  Set<String> _speakers = const {};
+
+  /// Whether *we* are talking, measured from our own microphone.
+  ///
+  /// Read here rather than off the roster, even though the roster carries it
+  /// back within a beat. The round trip is Gather's, and watching your own ring
+  /// light up a moment after you start a sentence is the kind of lag that reads
+  /// as the app being slow rather than as the network being a network. Everybody
+  /// else's speaking still comes from the roster, because for them it is the only
+  /// source there is.
+  bool get amSpeaking => _amSpeaking;
+  bool _amSpeaking = false;
+
+  /// Puts the voice-activity detector's answer on the game socket.
+  ///
+  /// This is the whole of the speaking ring. `SpaceUser.speaking` is set by these
+  /// two actions and by nothing else — publishing audio to the SFU does not touch
+  /// it — so before this existed the phone was audible in the room and drawn as
+  /// silent on every screen in it.
+  void _noteSpeaking(bool speaking) {
+    if (speaking == _amSpeaking) return;
+    _amSpeaking = speaking;
+    // Locally first. The ring on this phone should not wait for Gather to agree.
+    notifyListeners();
+    _collector?.setSpeaking(speaking);
+  }
+
   /// Steps out of the conversation without walking away from it.
   Future<String?> leaveHuddle() async {
     final collector = _collector;
@@ -610,8 +721,15 @@ class AppState extends ChangeNotifier {
 
   /// Test seam: installs a call without going through [_callOrNull], which wants
   /// a credential, a space and an account id that a suite has no way to produce.
+  ///
+  /// Subscribes to the same streams the real path does. A seam that attached the
+  /// object without its wiring would let every one of these tests pass against a
+  /// call nothing was listening to.
   @visibleForTesting
-  void debugAttachCall(Call call) => _call = call;
+  void debugAttachCall(Call call) {
+    _call = call;
+    _subs.add(call.speaking.listen(_noteSpeaking));
+  }
 
   /// Test seam: the call state a screen renders, with no media layer behind it.
   ///
@@ -681,6 +799,7 @@ class AppState extends ChangeNotifier {
 
     final call = _call = build(auth, spaceId, srcId);
     _subs.add(call.states.listen((_) => notifyListeners()));
+    _subs.add(call.speaking.listen(_noteSpeaking));
 
     // Hand it the room as it stands. The call is built on the first tap, long
     // after the rosters that worked out who is nearby, and without this it would
@@ -777,7 +896,25 @@ class AppState extends ChangeNotifier {
   ///    thing a debounce protects against — negotiating transports for passers-by
   ///    — does not apply: nothing is negotiated by allowing someone.
   void _noteNeighbours(Roster roster) {
-    final wanted = <String>{for (final row in roster.nearby) ?row.userAccountId};
+    final wanted = <String>{
+      for (final row in roster.nearby) ?row.userAccountId,
+      // The conversation, unconditionally, on top of whoever is geometrically
+      // in range.
+      //
+      // `nearby` needs coordinates and a floor on *both* rows to say yes;
+      // `myCluster` needs only a shared `clusterId`. So a roster that has told
+      // us who we are talking to but not yet where anybody is standing produces
+      // an empty allow list — and an empty allow list means `consume-allow` is
+      // never sent, which means the SFU answers every colleague with
+      // `consume-not-allowed` and nobody hears us however well we publish. That
+      // is not hypothetical: it is what the phone did on 2026-09-17, publishing
+      // audio into a void while the cluster was perfectly well known.
+      //
+      // Being in somebody's conversation is a strictly stronger claim than
+      // standing near them, so this can only ever widen the set, and widening it
+      // is cheap — allowing somebody negotiates nothing.
+      for (final row in roster.myCluster) ?row.userAccountId,
+    };
     if (wanted.length == _visibleTo.length && _visibleTo.containsAll(wanted)) {
       return;
     }
@@ -1081,10 +1218,17 @@ class AppState extends ChangeNotifier {
   Future<String?> goToMyDesk() async {
     final desk = myDesk;
     if (desk == null) return 'Gather has not given you a desk.';
-    return goToRoom(
+    final failed = await goToRoom(
       desk,
       toward: (x: desk.x + desk.width ~/ 2, y: desk.y + desk.height ~/ 2),
     );
+    if (failed == null) {
+      // Both: the stream for a map that is already up, the latch for one that is
+      // about to be. See [takeFollowRequest].
+      _followWanted = DateTime.now();
+      if (!_followMe.isClosed) _followMe.add(null);
+    }
+    return failed;
   }
 
   /// How many of a room's tiles to try before giving up on it.
@@ -1252,6 +1396,44 @@ class AppState extends ChangeNotifier {
   Stream<String> get notices => _notices.stream;
   final _notices = StreamController<String>.broadcast();
 
+  /// A walk the office should keep the camera on until it arrives.
+  ///
+  /// The desk button lives in the dock and sends you somewhere that is usually off
+  /// screen, so the map is asked to ride along rather than leaving you to hunt for
+  /// yourself. A tapped tile needs none of this — it was on screen to be tapped.
+  /// Broadcast, like [notices]: a walk nobody is watching is owed nothing.
+  Stream<void> get followMe => _followMe.stream;
+  final _followMe = StreamController<void>.broadcast();
+
+  /// The same request, latched, for a map that was not there to hear it.
+  ///
+  /// The dock is on the call screen too, and the office is not built while that
+  /// route is up — so "a walk nobody is watching is owed nothing" quietly became
+  /// "the desk walk you start from the faces is never followed". It is the case
+  /// that most wants following, because it is the one where you are not looking
+  /// at the map when you ask.
+  ///
+  /// A timestamp rather than a flag: a request is only worth honouring while the
+  /// walk it belongs to is still happening. Opening the map ten minutes later
+  /// should show you the office, not jerk the camera onto your own desk for a
+  /// journey that finished long ago.
+  DateTime? _followWanted;
+
+  /// Claims a pending follow, if there is one and it is still fresh.
+  ///
+  /// Taking it rather than reading it: two maps must not both ride the same
+  /// walk, and a request left lying around is one that fires on the next mount.
+  bool takeFollowRequest() {
+    final at = _followWanted;
+    _followWanted = null;
+    return at != null && DateTime.now().difference(at) < const Duration(seconds: 10);
+  }
+
+  /// Test seam: raises the latch without the walk stack a real desk trip needs.
+  @visibleForTesting
+  void debugRequestFollow({Duration ago = Duration.zero}) =>
+      _followWanted = DateTime.now().subtract(ago);
+
   /// Gather refusing to let us in somewhere, which arrives as an event and no patch.
   ///
   /// `isPermittedToMoveTo` is the second gate in `setPosition` and it refuses `move`
@@ -1310,9 +1492,16 @@ class AppState extends ChangeNotifier {
     return 'That room is locked.';
   }
 
-  /// Test seam: the refusal path without a socket to deliver it. See [_noteRefusal].
+  /// Test seam: the event bus without a socket to deliver it.
+  ///
+  /// The same handlers the live subscription runs, in the same order, minus the
+  /// fold — which needs a tracker that has seen a roster. See [_noteReaction] and
+  /// [_noteRefusal].
   @visibleForTesting
-  void debugNoteEvent(BusEvent event) => _noteRefusal(event);
+  void debugNoteEvent(BusEvent event) {
+    _noteReaction(event);
+    _noteRefusal(event);
+  }
 
   /// Gather declining to *run* something, as opposed to declining to let us in.
   ///
@@ -1353,6 +1542,7 @@ class AppState extends ChangeNotifier {
         'setAvailability' => 'Gather would not change your availability',
         'setCustomStatus' || 'clearCustomStatus' => 'Gather would not change your status',
         'broadcastEmote' => 'Gather would not send that',
+        'startSpeaking' || 'stopSpeaking' => 'Gather would not show that you are talking',
         'leaveCluster' => 'Gather would not leave the conversation',
         'teleport' || 'move' => 'Gather would not move you',
         'walk' || 'run' || 'drive' => 'Gather would not change your pace',
@@ -1375,6 +1565,26 @@ class AppState extends ChangeNotifier {
   /// lifecycle, which is where this is called from.
   Future<void> setActive(bool active) async {
     _collector?.setActive(active);
+  }
+
+  /// Somebody threw an emoji. Ours included.
+  ///
+  /// `EmoteEvent` addresses itself to everyone in range **and to the sender**, so
+  /// no special case is needed to see our own — [sendEmoteLocalFirst] draws it
+  /// early rather than differently, and this refreshes it when the echo lands.
+  ///
+  /// The emoji is read under two names. Gather's own action sends `emote`, which
+  /// is what has been observed coming back; `emoji` is what the *status* actions
+  /// on the same socket call the same kind of value, and accepting both costs a
+  /// line and removes a way for this to go silently blank.
+  void _noteReaction(BusEvent event) {
+    if (event.name != 'EmoteEvent') return;
+    final who = event.senderId;
+    if (who == null) return;
+    final payload = event.payload;
+    final emote = payload['emote'] ?? payload['emoji'];
+    if (emote is! String || emote.isEmpty) return;
+    reactions.note(who, emote);
   }
 
   /// A wave off the socket, shown before the next fetch confirms it.
@@ -1449,8 +1659,10 @@ class AppState extends ChangeNotifier {
           // state actually moved, so this is "the map changed", not a clock.
           _positions.tick();
           _noteCluster(roster);
+          _noteSpeakers(roster);
           final out = _tracker.applyRoster(roster);
           _onFold(out);
+          _noteMine();
         }),
       )
       ..add(
@@ -1458,6 +1670,7 @@ class AppState extends ChangeNotifier {
           // Before the fold, so a wave is on the list by the time the notification
           // it produces wakes the screen that shows it.
           _noteActivity(event);
+          _noteReaction(event);
           _noteRefusal(event);
           _onFold(_tracker.applyInteraction(event));
         }),
@@ -1506,6 +1719,11 @@ class AppState extends ChangeNotifier {
     // A hop belongs to the connection that made it. Kept across a reconnect it would
     // teleport a body on the first frame after the map came back.
     _lastTeleport = null;
+    // The room's reactions belong to the room, and so does whether we were in
+    // the middle of a sentence when the socket went. Both would otherwise be
+    // inherited by whoever pairs this phone next.
+    reactions.clear();
+    _amSpeaking = false;
 
     for (final sub in subs) {
       await sub.cancel();
@@ -1654,7 +1872,9 @@ class AppState extends ChangeNotifier {
     // Same order as the real listener, and not a shortened version of it: a seam
     // that skips a step is a seam that passes while the app does the wrong thing.
     _noteCluster(roster);
+    _noteSpeakers(roster);
     _onFold(_tracker.applyRoster(roster));
+    _noteMine();
   }
 
   /// Feeds a feed in as though Gather had answered, so the activity screen can be
@@ -1716,6 +1936,7 @@ class AppState extends ChangeNotifier {
   void dispose() {
     _positions.dispose();
     unawaited(_notices.close());
+    unawaited(_followMe.close());
     // A face resolved a millisecond before the app closed would otherwise
     // notify a disposed notifier, which throws.
     _faceNotice?.cancel();
@@ -1725,6 +1946,10 @@ class AppState extends ChangeNotifier {
     _clusterDebounce?.cancel();
     _clusterDebounce = null;
     unawaited(_detach());
+    // After `_detach`, which clears it: a `ChangeNotifier` notified after it has
+    // been disposed throws, and `_detach` reaches that line before its first
+    // await.
+    reactions.dispose();
     // Outside `_detach` on purpose: token rotation is about this device, not about any
     // one connection, so it must survive a reconnect and only end with the app.
     _pushRefresh?.cancel();

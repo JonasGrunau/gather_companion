@@ -31,6 +31,7 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
     required this.brandTint,
     required this.ok,
     required this.warn,
+    required this.busy,
     required this.danger,
     required this.radius,
   });
@@ -67,6 +68,11 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
 
   final Color ok;
   final Color warn;
+
+  /// The Busy dot. Orange, and its own step rather than [warn] or [danger]: red
+  /// read as an error sitting over somebody's head, and [warn] is already the
+  /// Focused dot, so reusing it would make the two states indistinguishable.
+  final Color busy;
   final Color danger;
 
   final double radius;
@@ -91,6 +97,7 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
     brandTint: Color(0xFFC2CEFB),
     ok: Color(0xFF3FBF87),
     warn: Color(0xFFE0A22F),
+    busy: Color(0xFFF0803C),
     danger: Color(0xFFE2585F),
     radius: 12,
   );
@@ -114,6 +121,7 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
     Color? brandTint,
     Color? ok,
     Color? warn,
+    Color? busy,
     Color? danger,
     double? radius,
   }) {
@@ -135,6 +143,7 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
       brandTint: brandTint ?? this.brandTint,
       ok: ok ?? this.ok,
       warn: warn ?? this.warn,
+      busy: busy ?? this.busy,
       danger: danger ?? this.danger,
       radius: radius ?? this.radius,
     );
@@ -161,6 +170,7 @@ class GatherTokens extends ThemeExtension<GatherTokens> {
       brandTint: Color.lerp(brandTint, other.brandTint, t)!,
       ok: Color.lerp(ok, other.ok, t)!,
       warn: Color.lerp(warn, other.warn, t)!,
+      busy: Color.lerp(busy, other.busy, t)!,
       danger: Color.lerp(danger, other.danger, t)!,
       radius: radius + (other.radius - radius) * t,
     );
@@ -287,7 +297,7 @@ ThemeData buildGatherTheme() {
 /// nothing offline is ever drawn, so reaching the fallback means the field was
 /// absent, not that the person is away.
 Color availabilityColor(GatherTokens t, String? availability) => switch (availability) {
-  'Busy' => t.danger,
+  'Busy' => t.busy,
   'Focused' || 'FocusedCoworking' => t.warn,
   'Away' => t.faint,
   _ => t.ok,
