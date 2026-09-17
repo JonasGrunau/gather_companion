@@ -628,10 +628,38 @@ the home-screen label, which the launcher clips to about ten characters:
 app introduces itself properly once opened.
 
 Nothing in `lib/` is platform-specific: it is plain Flutter over an HTTP and
-WebSocket contract, so the same code targets phones and desktops. Only the iOS
-runner is scaffolded so far — `flutter create --platforms=android,windows,linux .`
-at the repository root adds the rest, and the icon generator needs a matching output path
-per platform.
+WebSocket contract, so the same code targets phones and desktops. **iOS and
+Android** are scaffolded; `flutter create --platforms=windows,linux .` at the
+repository root adds the desktops, and the icon generator needs a matching output
+path per platform.
+
+Android builds and installs, and it has not been run on a device by anybody yet
+— read the list below as what is *known* rather than what was found:
+
+```sh
+flutter build apk --release --split-per-abi --build-name=<version> --build-number=<n>
+```
+
+Per-ABI because the fat APK is 107 MB and the arm64 one — which is every phone
+anybody is going to hand this to — is 37 MB. The version is passed on the command
+line for the reason the release workflow does the same: `version:` in
+`pubspec.yaml` is inert and a build should not have to edit a file to say what it
+is.
+
+- 🔑 **Release builds are signed with the debug key**, which is Flutter's default
+  and is left alone deliberately. A debug-signed release APK installs and runs
+  like any other; what it cannot do is upgrade over a differently-signed copy, or
+  go to Play. Both are decisions for when there is a store listing to make them
+  for — until then a keystore is a secret with nowhere to live.
+- 🔔 **Push does not work**, and cannot until there is a `google-services.json`.
+  `Firebase.initializeApp()` throws without one; `main.dart` catches it, so the
+  app runs and everything except a phone woken from the background works. The
+  local notifications that fire while the app is running are fine.
+- 🎙️ **Mute is only half of itself.** `MicrophoneMuteMode.voiceProcessing` is
+  Darwin-only, so on Android the device-level mute in `webrtc_media_engine.dart`
+  may be a no-op. `produce-pause` still runs, so the room still sees you muted and
+  stops receiving audio — but the platform recording indicator is Android's own
+  business and this app does not yet have an opinion about it.
 
 ```sh
 flutter run -d <device>

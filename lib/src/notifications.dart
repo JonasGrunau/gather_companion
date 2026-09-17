@@ -50,10 +50,31 @@ class Notifier {
         requestBadgePermission: false,
         requestSoundPermission: false,
       ),
+      // Not optional on Android, and not merely for completeness: `initialize`
+      // throws outright if the platform it is running on has no settings here,
+      // so leaving it out is not "no notifications on Android" but a crash at
+      // launch. The icon is the launcher's, which is what a notification without
+      // its own artwork should look like.
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     );
     await _plugin.initialize(settings);
     _ready = true;
   }
+
+  /// The one channel, declared here so Android has somewhere to put these.
+  ///
+  /// Android groups notifications by channel and lets people silence one without
+  /// silencing the app, so the split that matters to a person is the one to
+  /// make. There is only one kind here — somebody did something deliberate that
+  /// is worth interrupting you for — so there is one channel, and the settings
+  /// screen's two switches stay this app's business rather than the system's.
+  static const _android = AndroidNotificationDetails(
+    'gather_companion.people',
+    'People',
+    channelDescription: 'Someone followed you, waved, or invited you to a meeting.',
+    importance: Importance.high,
+    priority: Priority.high,
+  );
 
   /// Asks for permission explicitly, so the prompt appears when the user has
   /// just paired and understands why it is being asked.
@@ -62,6 +83,12 @@ class Notifier {
     await _plugin
         .resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>()
         ?.requestPermissions(alert: true, badge: true, sound: true);
+    // Android 13 and up. Below that, holding the permission in the manifest is
+    // the whole of it and this resolves to nothing — which is why it is asked
+    // rather than gated on a version check.
+    await _plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
   }
 
   /// Decides whether an event deserves an alert, and shows it.
@@ -87,6 +114,7 @@ class Notifier {
       body,
       const NotificationDetails(
         iOS: DarwinNotificationDetails(presentAlert: true, presentSound: true),
+        android: _android,
       ),
     );
   }
