@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "929574555874",
+    "project_id": "gather-companion",
+    "storage_bucket": "gather-companion.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:929574555874:android:0c66645729f8c2af528ebb",
+        "android_client_info": {
+          "package_name": "com.jonasgrunau.gather_companion"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC05MgZ09BXgday8EcEdkXUAgZsNoHr7R8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

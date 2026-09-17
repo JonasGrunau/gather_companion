@@ -633,8 +633,8 @@ Android** are scaffolded; `flutter create --platforms=windows,linux .` at the
 repository root adds the desktops, and the icon generator needs a matching output
 path per platform.
 
-Android builds and installs, and it has not been run on a device by anybody yet
-— read the list below as what is *known* rather than what was found:
+Android builds and installs. It has not been run on a device by anybody yet, so
+read the list below as what is *known* rather than what was found:
 
 ```sh
 flutter build apk --release --split-per-abi --build-name=<version> --build-number=<n>
@@ -651,15 +651,24 @@ is.
   like any other; what it cannot do is upgrade over a differently-signed copy, or
   go to Play. Both are decisions for when there is a store listing to make them
   for — until then a keystore is a secret with nowhere to live.
-- 🔔 **Push does not work**, and cannot until there is a `google-services.json`.
-  `Firebase.initializeApp()` throws without one; `main.dart` catches it, so the
-  app runs and everything except a phone woken from the background works. The
-  local notifications that fire while the app is running are fine.
-- 🎙️ **Mute is only half of itself.** `MicrophoneMuteMode.voiceProcessing` is
-  Darwin-only, so on Android the device-level mute in `webrtc_media_engine.dart`
-  may be a no-op. `produce-pause` still runs, so the room still sees you muted and
-  stops receiving audio — but the platform recording indicator is Android's own
-  business and this app does not yet have an opinion about it.
+- 🔔 **Push is wired up.** `android/app/google-services.json` registers
+  `com.jonasgrunau.gather_companion` against the same `gather-companion` Firebase
+  project and the same sender id as iOS, so the bridge's existing credentials
+  reach it with no second setup. It is committed, like the iOS plist beside it:
+  both are client configuration and identify the app to Google rather than
+  authenticating anybody to it. The `com.google.gms.google-services` Gradle plugin
+  is what turns that file into resources — without it `Firebase.initializeApp()`
+  throws at launch however correct the JSON is, because nothing compiled it into
+  anything the runtime can see.
+- 🎙️ **Mute works, the *mode* does not.** `setMicrophoneMuted` and
+  `isMicrophoneMuted` both reach the Android audio device module, so the two-sided
+  mute in `webrtc_media_engine.dart` behaves as written. What is Darwin-only is
+  `setMicrophoneMuteMode`: Android answers `notImplemented`, the call throws, and
+  the engine catches and logs it. The cost is the thing that mode was chosen for —
+  Apple's muted-talker detection, and an indicator that goes out while you are
+  muted. Android keeps recording with the samples discarded, so its privacy
+  indicator stays lit. Stopping capture outright would fix that and make unmuting
+  slow, which is the trade iOS declined too.
 
 ```sh
 flutter run -d <device>

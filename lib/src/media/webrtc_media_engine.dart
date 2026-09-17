@@ -114,7 +114,14 @@ class WebrtcMediaEngine implements CaptureEngine {
     // today, but a default that changes underneath us would silently swap the
     // platform mute sound and muted-talker detection for neither, and nothing
     // would fail — it would just quietly stop behaving as documented above.
-    // A no-op on platforms that do not support it.
+    //
+    // Android answers `notImplemented`, so this throws rather than doing nothing,
+    // and is caught below. Only the *mode* is Darwin-only: `setMicrophoneMuted`
+    // and `isMicrophoneMuted` both reach Android's audio device module, so
+    // everything else in this file behaves the same on both. What Android does
+    // not give back is the indicator going out while muted — it keeps recording
+    // and discards the samples — which is the one thing the mode above was
+    // chosen for.
     try {
       await Helper.setMicrophoneMuteMode(MicrophoneMuteMode.voiceProcessing);
     } on Object catch (error) {
