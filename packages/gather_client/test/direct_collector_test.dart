@@ -613,7 +613,6 @@ void main() {
       final sub = c.refusals.listen(refusals.add);
 
       c.leaveCluster();
-      await pumpEventQueue();
       final sent = await conn.waitFor('leaveCluster');
       conn.send({
         'type': 'DeltaState',
@@ -625,9 +624,18 @@ void main() {
           },
         ],
       });
-      await pumpEventQueue();
 
-      expect(refusals, isEmpty);
+      // A refusal for something else, sent afterwards down the same socket and
+      // waited for. Frames arrive in order, so this one landing proves the
+      // success above was decoded and deliberately said nothing — where
+      // `expect(refusals, isEmpty)` after a `pumpEventQueue` would pass just as
+      // happily against a success that had not arrived yet, which is a test that
+      // cannot fail rather than a test that passes.
+      c.setAvailability('Busy');
+      await conn.refuse('setAvailability', 'no');
+      await c.refusals.first.timeout(const Duration(seconds: 5));
+
+      expect(refusals.map((r) => r.action), ['setAvailability']);
       await sub.cancel();
     });
 
@@ -636,8 +644,12 @@ void main() {
       // pair a fresh ack with a stale action name, which is worse than saying
       // nothing — it would put the wrong sentence in front of somebody.
       final (:c, :conn) = await ready();
-      final refusals = <ActionRefused>[];
-      final sub = c.refusals.listen(refusals.add);
+      // Taken before the frame goes out, and awaited after — the idiom the
+      // refusal tests above use. `pumpEventQueue` was here instead, and it does
+      // not wait for the server's frame to cross a real socket and be decoded:
+      // it drains microtasks. That passed on this machine and failed on CI, and
+      // it cost a release.
+      final refused = c.refusals.first;
 
       conn.send({
         'type': 'DeltaState',
@@ -649,11 +661,10 @@ void main() {
           },
         ],
       });
-      await pumpEventQueue();
 
-      expect(refusals.single.action, 'that');
-      expect(refusals.single.message, 'no');
-      await sub.cancel();
+      final refusal = await refused.timeout(const Duration(seconds: 5));
+      expect(refusal.action, 'that');
+      expect(refusal.message, 'no');
     });
   });
 
