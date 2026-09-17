@@ -53,7 +53,8 @@ class MapPerson {
 
   /// Their avatar spritesheet — 72 frames of 32×64, composited by Gather's own
   /// sprite service. Null for anybody whose outfit never arrived, which is normal:
-  /// 66 of 111 people in the measured dump had one. They keep the dot.
+  /// 66 of 111 people in the measured dump had one. The rest are drawn as Gather's
+  /// ghost, the same as the desktop client draws them.
   final String? avatarUrl;
 
   /// `Up`, `Down`, `Left`, `Right`, or null — which frame of the sheet to draw.

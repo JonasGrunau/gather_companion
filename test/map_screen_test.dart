@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
+import 'package:gather_companion/src/art_cache.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/dpad.dart';
@@ -110,6 +111,30 @@ void main() {
     await tester.tapAt(const Offset(400, 300));
     await tester.pump();
   }
+
+  testWidgets('the ghost ships in the bundle and is a real 72-frame sheet', (tester) async {
+    // Gather's default avatar, copied out of the desktop client's bundle. The
+    // painter reads it out of the art cache under an asset key, so this is the one
+    // place the pubspec entry, the asset scheme and the file's dimensions are
+    // checked together — a misnamed asset would otherwise be a silent pin.
+    final cache = ArtCache();
+    addTearDown(cache.dispose);
+    // Everything under `runAsync`: the bundle read and the decode are real I/O,
+    // which the fake-async zone a widget test runs in would otherwise hold forever.
+    // Waited on the image itself rather than `settled`, which is only recounted on
+    // the cache's coalescing timer.
+    await tester.runAsync(() async {
+      cache.prefetch([ghostAvatarUrl], group: ArtRequest.avatars);
+      for (var i = 0; i < 400 && cache[ghostAvatarUrl] == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    });
+
+    final ghost = cache[ghostAvatarUrl];
+    expect(ghost, isNotNull);
+    expect(ghost!.width, 72 * avatarFrameWidth);
+    expect(ghost.height, avatarFrameHeight);
+  });
 
   testWidgets('a connected app with no map yet says it is still reading one', (tester) async {
     final state = AppState()..debugApplyLink(const LinkStatus(LinkState.live));

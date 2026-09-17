@@ -773,7 +773,7 @@ class GameProtocolReader {
   ///
   /// Null is normal rather than exceptional: only 66 of 111 people in the measured
   /// dump had a `SpaceUserOutfit` row at all, and somebody with no outfit has no
-  /// sprite to ask for. The map falls back to a dot.
+  /// sprite to ask for. The map draws them as the ghost, as the client does.
   String? avatarUrlFor(String spaceUserId) {
     final outfit = _outfits[spaceUserId];
     if (outfit == null) return null;

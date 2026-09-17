@@ -561,6 +561,45 @@ void main() {
       }
     });
 
+    test('somebody with no outfit is drawn as the ghost, not a pin', () async {
+      // The ghost is the client's default sheet, and a guest never leaves it. It is
+      // served out of the app bundle under an asset key, which the fetch seam
+      // answers here like any other URL; the frame arithmetic is the same, so a
+      // ghost facing north lands on frame 18 just as a dressed body does.
+      final art = _art();
+      final sheet = await _sheet();
+      final cache = ArtCache(fetch: (url) async => url == ghostAvatarUrl ? sheet : _colours(url));
+      cache.prefetch([...art.urls, ghostAvatarUrl]);
+      for (var i = 0; i < 200 && !cache.settled; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(cache.failed, 0);
+
+      final image = await _paint(art, cache, people: [
+        const MapPerson(id: 'g', label: 'Guest', x: 4, y: 2, isFollowingMe: false, speaking: false, direction: 'Up'),
+      ]);
+      final pixels = (await image.toByteData())!;
+      final pixel = pixels.at(image.width, 4, 2);
+      expect(pixel.b * 255, closeTo(200, 1), reason: 'the ghost sheet, not a coloured pin');
+      expect(pixel.r * 255, closeTo(18, 1), reason: 'facing north on the same animation table');
+    });
+
+    test('the ghost is asked for from the bundle, not the network or the disk', () async {
+      // The one key the cache must never put on the wire or in its directory. With
+      // no fetch override the asset path is the bundle's: under a widget binding
+      // that decodes, and without one it is retired — either way it settles at
+      // once, which a socket with an eight-second connect timeout would not, and
+      // either way nothing is written next to the furniture.
+      final cache = ArtCache();
+      addTearDown(cache.dispose);
+      cache.prefetch([ghostAvatarUrl], group: ArtRequest.avatars);
+      for (var i = 0; i < 200 && !cache.settled; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(cache.settled, isTrue);
+      expect(await File('${Directory.systemTemp.path}/gather-art/${ghostAvatarUrl.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')}').exists(), isFalse);
+    });
+
     Future<double> paintSeated({String? chair, String? facing}) async {
       final art = _art();
       final map = _seatedMap(orientation: chair);
@@ -613,7 +652,10 @@ void main() {
       expect(await paintSeated(facing: 'Up'), closeTo(21, 1));
     });
 
-    test('somebody with no outfit keeps the dot', () async {
+    test('somebody with no outfit keeps the pin until the ghost has decoded', () async {
+      // The ghost is asked for alongside the avatars, and this cache was never
+      // asked for it — the frame or two before it lands, in effect. A body must
+      // still be visible in that window.
       final art = _art();
       final image = await _paint(art, await _loaded(art), people: [
         const MapPerson(
@@ -868,10 +910,19 @@ void main() {
     /// about to fail anyway, and a suite sharing a machine with another one takes
     /// far longer per poll than the delay asks for — which is how the first version
     /// of these flaked.
-    Future<void> until(bool Function() done) async {
-      for (var i = 0; i < 2000 && !done(); i++) {
+    /// Waits for [done], and **throws if it never comes**.
+    ///
+    /// It used to give up quietly after 2000 goes and let the test carry on, so
+    /// a cache that had stalled failed as `Expected: <1> Actual: <0>` — a
+    /// wrong-looking count rather than the hang it actually was. That cost a
+    /// release: the stall was real (see `ArtCache._wakeForRetry`) and this was
+    /// the message it hid behind.
+    Future<void> until(bool Function() done, {String what = 'the cache'}) async {
+      for (var i = 0; i < 2000; i++) {
+        if (done()) return;
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
+      throw StateError('$what never got there — it is stuck, not slow');
     }
 
     test('an outage delays the office rather than losing it', () async {

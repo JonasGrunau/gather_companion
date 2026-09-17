@@ -731,8 +731,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     // one: it is a single 512×32 sheet shared by the whole office, so fetching it is
     // cheap, but fetching it in a space where nobody ever drives is a request for
     // nothing. Once landed it stays, and the second kart of the session is instant.
+    // The ghost rides along the same way, once somebody without an outfit is on the
+    // floor: it comes out of the app bundle rather than the network, so asking for
+    // it costs a decode and nothing else.
     cache.prefetch([
       for (final person in people) ?person.avatarUrl,
+      if (people.any((person) => person.avatarUrl == null)) ghostAvatarUrl,
       if (people.any((person) => person.gait == Gait.driving)) goKartUrl,
     ], group: ArtRequest.avatars);
 
@@ -1366,13 +1370,20 @@ class _OfficePainter extends CustomPainter {
     }
   }
 
-  /// Somebody, as their own avatar when we have one and as a pin when we do not.
+  /// Somebody, as their own avatar when we have one and as Gather's ghost when we
+  /// do not.
   ///
   /// The sheet is 72 frames of 32×64 in a row and the frame is chosen the way the
   /// client chooses it — `idle-s` is frame 0, `idle-n` 18, `idle-w` 9, `idle-e` 23 —
   /// so people face the way they are actually facing. Sprites hang a tile above
   /// their own tile, which is `defaultAvatarOffsetY = -32` in the client and is what
   /// puts the feet on the floor rather than the head.
+  ///
+  /// Somebody with no outfit — a guest, typically — is not a special case here. The
+  /// client draws them on its default sheet, the grey ghost, and never swaps it out;
+  /// this does the same with [ghostAvatarUrl], which is that sheet, so a ghost
+  /// faces, walks, sits and dances exactly as a dressed body does. The coloured pin
+  /// only remains for the frame or two before the ghost has decoded.
   ///
   /// Nothing is drawn around a body — no ring, no shadow. Gather draws people as
   /// people, and "which one is me" is answered by the name plate above the head
@@ -1381,11 +1392,11 @@ class _OfficePainter extends CustomPainter {
   /// A body arriving fades and grows into place; the one it left behind dissolves at
   /// full size. See `../src/map_motion.dart`.
   void _paintPerson(Canvas canvas, MapPerson person, Paint paint, Offset at, Duration now, {double alpha = 1, double scale = 1}) {
-    final sheet = person.avatarUrl == null ? null : cache[person.avatarUrl!];
+    final sheet = cache[person.avatarUrl ?? ghostAvatarUrl];
 
     if (sheet == null) {
-      // The fallback, for anybody whose outfit never arrived. Not a ring around a
-      // body — a stand-in for one.
+      // The fallback, for a sheet that has not landed yet. Not a ring around a body
+      // — a stand-in for one.
       final middle = Offset((at.dx + 0.5) * _tile, (at.dy + 0.5) * _tile);
       final colour = person.isMe
           ? tokens.brand

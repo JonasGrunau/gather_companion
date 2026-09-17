@@ -3,6 +3,18 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show rootBundle;
+
+/// The ghost: Gather's default avatar, drawn for anybody without an outfit.
+///
+/// The desktop client creates every avatar sprite on this sheet and only swaps the
+/// outfit in once `hashOutfit` can name one — a guest, or a member who has never
+/// opened the outfit picker, stays a ghost. It is 72 frames of 32×64 like every
+/// other sheet, so the same animation table drives it. The client embeds the PNG in
+/// its bundle as a data URI rather than serving it, which is why this is an app
+/// asset under an [assetScheme] key rather than a URL: the cache serves it from the
+/// bundle and the painter looks it up exactly as it would a sprite-service sheet.
+const ghostAvatarUrl = '${ArtCache.assetScheme}assets/avatar-ghost.png';
 
 /// What a set of URLs was asked for, so a caller can *replace* its last request
 /// rather than only add to it.
@@ -85,6 +97,13 @@ class ArtCache extends ChangeNotifier {
   }
 
   static const _concurrency = 8;
+
+  /// Keys under this prefix name a Flutter asset rather than a URL: the rest is the
+  /// asset path as `pubspec.yaml` lists it. Read from the bundle, never from the
+  /// network and never from the disk cache, since the bundle *is* a disk cache. The
+  /// test seam ([_fetch]) still replaces it, so a painter test can hand over known
+  /// pixels for an asset the same way it does for a sprite.
+  static const assetScheme = 'asset:';
 
   /// How long to sit on "another image arrived" before repainting. Long enough to
   /// batch a burst, short enough that the map visibly fills in.
@@ -238,11 +257,37 @@ class ArtCache extends ChangeNotifier {
   ///
   /// Without this a retry never happens: [_pump] is driven by a load finishing or by
   /// [prefetch] finding something new, and a queue where everything left is sitting
-  /// out a backoff has neither. Only *future* waits are armed — anything already due
-  /// was either just taken by the loop above or is waiting on a slot, and a slot
-  /// freeing re-pumps on its own. Arming a zero-length timer for those would spin.
+  /// out a backoff has neither.
+  ///
+  /// **Anything already due is pumped rather than skipped**, and that is a fix
+  /// rather than a nicety. This used to arm only *future* waits, reasoning that
+  /// something already due had either just been taken by [_pump]'s loop or was
+  /// waiting on a slot that would re-pump when it freed. Both halves are true
+  /// only at the same instant. [_pump] reads the clock when it calls [_next] and
+  /// this reads it again a moment later, and an image can cross from "not due"
+  /// to "due" inside that gap — a short backoff crosses it easily. Neither side
+  /// then owns it: the loop did not take it, no slot is going to free, and no
+  /// timer is armed. The image sits there forever, neither loaded nor given up
+  /// on, so the cache never settles and the legend never stops saying the office
+  /// is still being drawn. It cost a release: `map_art_test` had been failing
+  /// about one run in twenty on exactly this, and read as a wrong count rather
+  /// than as a hang.
+  ///
+  /// Asked through [_next] rather than recomputed here, so this cannot drift
+  /// from what [_pump] would actually take — and it cannot spin, because a free
+  /// slot plus a due image means the next [_pump] makes progress.
   void _wakeForRetry() {
     if (_disposed) return;
+
+    if (_inFlight.length < _concurrency && _next() != null) {
+      _waking?.cancel();
+      _waking = Timer(Duration.zero, () {
+        _waking = null;
+        if (!_disposed) unawaited(_pump());
+      });
+      return;
+    }
+
     final now = _clock.elapsed;
     Duration? soonest;
     for (final url in _wanted) {
@@ -264,12 +309,15 @@ class ArtCache extends ChangeNotifier {
     File? file;
     try {
       final override = _fetch;
-      file = override == null ? await _fileFor(url) : null;
+      final asset = url.startsWith(assetScheme);
+      file = override == null && !asset ? await _fileFor(url) : null;
       var bytes = await _readCached(file);
       final cached = bytes != null;
-      bytes ??= override == null
-          ? await _download(url, file).timeout(_deadline)
-          : await override(url);
+      bytes ??= override != null
+          ? await override(url)
+          : asset
+              ? await _asset(url)
+              : await _download(url, file).timeout(_deadline);
       if (bytes == null) {
         // Answered, and not with an image: a 404, or an empty body. Another go
         // gets the same answer, so this is the hole in the floor.
@@ -337,6 +385,13 @@ class ArtCache extends ChangeNotifier {
   /// Record a failure that is an answer, or the last of [_tries] goes: no more.
   void _retire(String url) =>
       _lapsed[url] = _Lapse(tries: (_lapsed[url]?.tries ?? 0) + 1, readyAt: null);
+
+  /// An [assetScheme] key, read from the bundle. A missing asset is a build error
+  /// rather than a network condition, so it is left to throw and be retired.
+  Future<Uint8List?> _asset(String url) async {
+    final data = await rootBundle.load(url.substring(assetScheme.length));
+    return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  }
 
   Future<Uint8List?> _readCached(File? file) async {
     if (file == null || !await file.exists()) return null;
