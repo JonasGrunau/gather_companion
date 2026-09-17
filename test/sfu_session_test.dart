@@ -257,6 +257,61 @@ void main() {
       expect(rig.device.transports.first.producers.single.closed, isFalse);
     });
 
+    test('nothing is produced until the transport has a peer connection',
+        () async {
+      await rig.session.start();
+
+      // The window the real library leaves open: `Transport`'s constructor calls
+      // `handler.run()` without awaiting it, so for a few milliseconds the
+      // transport exists with `_pc == null`. A `produce()` inside that window
+      // reaches `_pc!` and throws a null check that `FlexQueue` swallows whole —
+      // no log, nothing sent, and twenty seconds of silence before `publish`
+      // gives up. Holding the handler reproduces it exactly.
+      rig.device.holdNewHandlers = true;
+
+      var settled = false;
+      final publishing = rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio)
+          .then((_) => settled = true);
+
+      await pumpEventQueue();
+      final transport = rig.device.transports
+          .firstWhere((t) => t.producerCallback != null);
+      expect(
+        transport.encodingsByTag.containsKey('audio'),
+        isFalse,
+        reason: 'produced before the peer connection existed',
+      );
+      expect(settled, isFalse);
+
+      transport.handler.release();
+      await publishing;
+      expect(rig.session.publishing(SfuTag.audio), isTrue);
+    });
+
+    test('a microphone is published with no encodings, and a camera with '
+        'three that each name a scalability mode', () async {
+      await rig.session.start();
+      await rig.session.publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      await rig.session.publish(FakeTrack('video'), FakeStream(), tag: SfuTag.video);
+
+      final encodings = rig.device.transports.first.encodingsByTag;
+
+      // Audio must be empty. `flutter_webrtc` gives every encoding a
+      // `scaleResolutionDownBy` and a `numTemporalLayers` before it reaches
+      // libwebrtc, which rejects both on an audio transceiver — so one encoding
+      // here is an `addTransceiver` that throws where nobody can see it, and a
+      // microphone that never publishes. Measured 2026-09-17.
+      expect(encodings['audio'], isEmpty);
+
+      // Video keeps its simulcast layers, and every one of them has to name a
+      // scalability mode: the handler reads `encodings.first.scalabilityMode!`.
+      expect(encodings['video'], hasLength(3));
+      for (final encoding in encodings['video']!) {
+        expect(encoding.scalabilityMode, isNotNull);
+      }
+    });
+
     test('three double-connected notices stand us down for good', () async {
       await rig.session.start();
       await rig.session.publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
@@ -350,20 +405,60 @@ void main() {
       expect(rig.node().argsFor('consume-set-spatial')?['spatialLayer'], 0);
     });
 
-    test('the conversation is named, nulls included', () async {
+    test('the conversation is named, with "" and never null', () async {
+      // Measured 2026-09-17: a null in either field gets no ack at all — zod
+      // rejects it and the server says nothing — while "" is what the desktop
+      // sends for a missing value and is acked with `[]`.
       await rig.session.start();
       rig.node().drain();
 
       rig.session.setConversation(clusterId: 'bubble-1');
       await settle();
       expect(rig.node().argsFor('set-player-conversation-metadata'),
-          {'meetingId': null, 'clusterId': 'bubble-1'});
+          {'meetingId': '', 'clusterId': 'bubble-1'});
 
       rig.node().drain();
       rig.session.setConversation(clusterId: null);
       await settle();
       expect(rig.node().argsFor('set-player-conversation-metadata'),
-          {'meetingId': null, 'clusterId': null});
+          {'meetingId': '', 'clusterId': ''});
+    });
+
+    test('a colleague who joined muted is resumed on the server when they unmute',
+        () async {
+      // A consumer is built paused on the server, and `consume` answering
+      // `producerPaused: true` means nobody sent `consume-resume` for it. When
+      // the producer comes back the server-side switch still has to be flipped,
+      // or the colleague unmutes and stays silent here. The desktop sends
+      // `consume-resume` at exactly this point (captured 2026-09-17).
+      await rig.session.start();
+      await rig.session.subscribe(them);
+      rig.node().answer(
+          'consume',
+          (args) => {
+                'id': 'consumer-${args['srcId']}-${args['tag']}',
+                'producerId': rig.producerIds['${args['srcId']}|${args['tag']}'],
+                'producerPaused': true,
+                'rtpParameters': Rig.rtpParameters,
+              });
+
+      rig.announce(them, {'audio': 'p-audio'});
+      await settle();
+      expect(rig.node().has('consume-created'), isTrue);
+      expect(rig.node().has('consume-resume'), isFalse,
+          reason: 'a paused producer is not resumed on arrival');
+      expect(rig.session.remotes.single.paused, contains(SfuTag.audio));
+
+      rig.node().drain();
+      rig.node().push('producer-resumed', {'srcId': them, 'tag': 'audio'});
+      await settle();
+      expect(rig.node().argsFor('consume-resume'), {
+        'srcId': them,
+        'srcStreamId': spaceId,
+        'tag': 'audio',
+        'consumerId': 'consumer-$them-audio',
+      });
+      expect(rig.session.remotes.single.paused, isNot(contains(SfuTag.audio)));
     });
   });
 }

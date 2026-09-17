@@ -433,7 +433,7 @@ class SfuSession {
 
     final reply = await node.sendWithResponse(
       'transport-create',
-      {'direction': 'send', 'iceTransportRequestOptions': <String, Object?>{}},
+      {'direction': 'send', 'iceTransportRequestOptions': _iceTransportOptions},
     );
     _checkTransportReply(reply, 'send');
 
@@ -505,22 +505,49 @@ class SfuSession {
       }
     });
 
+    // Whether media is actually flowing, which nothing else in this file can
+    // tell you.
+    //
+    // A producer the server has accepted and left unpaused still carries no
+    // sound if ICE never completed: the signalling all succeeds, the colleague's
+    // client draws you as unmuted, and the room hears silence. That is a
+    // genuinely different failure from anything on the socket, and without this
+    // line it is invisible from the logs.
+    transport.on('connectionstatechange', (Map data) {
+      _log('sfu: send transport is ${data['connectionState']}');
+    });
+
+    // Nothing may produce on this until the handler has built its peer
+    // connection.
+    //
+    // `Transport`'s constructor starts `handler.run()` and does not wait for it:
+    // it is declared `void ... async`, so `createSendTransport` returns while the
+    // RTCPeerConnection is still null. The first `produce()` then reaches
+    // `_pc!.addTransceiver` a millisecond later and throws a null check, which
+    // `FlexQueue` swallows whole — no log, nothing on the wire, and [publish]
+    // waiting out its own twenty seconds before saying "timed out". The second
+    // produce always worked, because by then `run()` had finished. That is the
+    // bug that made the microphone look dead while the camera looked merely slow
+    // (measured 2026-09-17, `build/call-capture/media8.log`).
+    await transport.handler.ready;
+
     _sendTransport = transport;
     return transport;
   }
 
-  /// The one thing in this file no capture has ever confirmed.
+  /// Measured at last, 2026-09-17: a `probe-sfu.mjs reload` during a live call
+  /// caught `transport-create` in both directions. The request is
+  /// `{direction, iceTransportRequestOptions}` and the reply is the standard
+  /// mediasoup `{id, iceParameters, iceCandidates, dtlsParameters}` plus
+  /// Gather's `iceServers` (Cloudflare STUN/TURN with per-session credentials),
+  /// `iceTransportPolicy` and `appData` — exactly what this checks for. See
+  /// `docs/protocol/observed-wire-protocol.md`, "Publishing".
   ///
-  /// `transport-create` appears in no transcript — the probes attached at space
-  /// join, after the desktop had already built its transports, and
-  /// `docs/protocol/observed-wire-protocol.md` records the produce path as never
-  /// having run. So the request arguments and this reply are the *standard
-  /// mediasoup* shape, assumed, and everything downstream hangs off them.
-  ///
-  /// If that assumption is ever wrong, this is where it should say so. The
-  /// alternative was a bare `reply['id'] as String`, which fails as a cast error
-  /// naming neither the message nor the assumption, three frames deep in a
-  /// callback, and reads on a device log like a bug in the WebRTC plugin.
+  /// The check stays, because a shape change is still where a future Gather
+  /// release would break this app first. The alternative was a bare
+  /// `reply['id'] as String`, which fails as a cast error naming neither the
+  /// message nor the assumption, three frames deep in a callback, and reads on
+  /// a device log like a bug in the WebRTC plugin.
   void _checkTransportReply(Map<String, Object?> reply, String direction) {
     const required = ['id', 'iceParameters', 'iceCandidates', 'dtlsParameters'];
     final missing = [
@@ -587,6 +614,8 @@ class SfuSession {
             ? 'screen'
             : (tag == SfuTag.audio ? 'mic' : 'webcam'),
         appData: {'tag': tag.wire},
+        // Video only, and that is a hard constraint rather than a preference.
+        // See [_videoEncodings]; a microphone must be given *nothing* here.
         encodings: tag == SfuTag.audio
             ? const <ms.RtpEncodingParameters>[]
             : _videoEncodings,
@@ -604,9 +633,82 @@ class SfuSession {
       );
       _producers[tag] = producer;
       _log('sfu: publishing ${tag.wire} as ${producer.id}');
+      _reportOutboundRtp(tag, producer);
     } finally {
       _pendingProducer = null;
     }
+  }
+
+  /// Says out loud, once, what the microphone and the sender are actually doing.
+  ///
+  /// The signalling can be perfect — producer accepted, never paused, the
+  /// colleague's client drawing you unmuted — while the room hears silence,
+  /// because "the server knows about this track" and "this microphone can hear
+  /// anything" are different claims and neither appears on the socket.
+  ///
+  /// **Each report is named.** `getStats()` on a producer returns stats for the
+  /// whole peer connection, so the `candidate-pair` and `transport` rows carry
+  /// the *combined* byte counts of every track on it. Reading those as if they
+  /// were this producer's is how a silent microphone came to look like healthy
+  /// speech on 2026-09-17: the number being admired was the camera's.
+  ///
+  /// `audioLevel` on the `media-source` row is the one that settles it. It is
+  /// the signal coming off the microphone, before any of this: zero there means
+  /// the device is handing us silence and nothing further down can fix it.
+  void _reportOutboundRtp(SfuTag tag, ms.Producer producer) {
+    Future<void>.delayed(const Duration(seconds: 5), () async {
+      if (_producers[tag] != producer) return;
+      try {
+        final stats = await producer.getStats();
+        for (final report in (stats as List? ?? const [])) {
+          final type = '${(report as dynamic).type}';
+          final values = _map((report as dynamic).values);
+          if (type == 'media-source' && values['kind'] == 'audio') {
+            _log('sfu: the microphone is at level ${values['audioLevel']} '
+                '(energy ${values['totalAudioEnergy']})');
+          }
+          if (type == 'outbound-rtp' && values['kind'] == tag.wire) {
+            _log('sfu: ${tag.wire} outbound-rtp — ${values['packetsSent']} '
+                'packets, ${values['bytesSent']} bytes');
+          }
+        }
+      } on Object catch (error) {
+        _log('sfu: could not read ${tag.wire} stats: $error');
+      }
+    });
+  }
+
+  /// How loud the microphone is right now, 0 to 1, or null if it cannot say.
+  ///
+  /// The `media-source` row, which is the signal coming *off the device* —
+  /// before encoding, before the producer, before the wire. That is the right
+  /// one for voice activity: `outbound-rtp` goes quiet under Opus DTX whether
+  /// the room is silent or the network is, and an `inbound-rtp` audio level is
+  /// somebody else's voice.
+  ///
+  /// Null rather than zero when there is no producer or the platform refuses the
+  /// call, because "not measured" and "silent" lead somewhere different: the
+  /// voice-activity detector holds its answer across a missing sample and would
+  /// drop it on a zero.
+  Future<double?> microphoneLevel() async {
+    final producer = _producers[SfuTag.audio];
+    if (producer == null) return null;
+    try {
+      final stats = await producer.getStats();
+      for (final report in (stats as List? ?? const [])) {
+        if ('${(report as dynamic).type}' != 'media-source') continue;
+        final values = _map((report as dynamic).values);
+        if (values['kind'] != 'audio') continue;
+        final level = values['audioLevel'];
+        if (level is num) return level.toDouble();
+      }
+    } on Object {
+      // Polled several times a second; a platform that will not answer must not
+      // fill the log with one line per attempt. The caller reads null as "no
+      // sample", which is what this is.
+      return null;
+    }
+    return null;
   }
 
   /// Whether we currently have a producer for [tag].
@@ -688,10 +790,18 @@ class SfuSession {
   /// Which conversation we are publishing into, as the SFU understands it.
   ///
   /// `set-player-conversation-metadata {meetingId, clusterId}` is in the measured
-  /// method table and the desktop client sends it whenever the bubble changes.
-  /// What the server *does* with it is not measured — grouping for recording and
-  /// for the meeting views are both plausible — so this is sent because the real
-  /// client sends it, and its failure is logged rather than raised.
+  /// method table and the desktop client sends it whenever the bubble changes —
+  /// captured 2026-09-17: on joining, *before* the first `produce`, and again
+  /// with `clusterId: ""` on leaving. What the server *does* with it is not
+  /// measured — grouping for recording and for the meeting views are both
+  /// plausible — so this is sent because the real client sends it, and its
+  /// failure is logged rather than raised.
+  ///
+  /// **Both fields are strings, never null.** The desktop sends `""` for a
+  /// missing value, and the schema probe of 2026-09-17 showed why: a `null` in
+  /// either field gets no ack at all — zod rejects it and the server says
+  /// nothing — so every earlier build of this app was timing out here and
+  /// leaving the SFU with no idea which conversation the phone was in.
   void setConversation({String? clusterId, String? meetingId}) {
     if (clusterId == _clusterId && meetingId == _meetingId) return;
     _clusterId = clusterId;
@@ -707,8 +817,8 @@ class SfuSession {
     if (node == null) return;
     unawaited(
       node.sendWithResponse('set-player-conversation-metadata', {
-        'meetingId': _meetingId,
-        'clusterId': _clusterId,
+        'meetingId': _meetingId ?? '',
+        'clusterId': _clusterId ?? '',
       }).then(
         (_) {},
         onError: (Object error) =>
@@ -955,6 +1065,21 @@ class SfuSession {
           consumer.pause();
         } else {
           consumer.resume();
+          // The server-side consumer is a separate switch from the producer,
+          // and it was built paused. A `consume` answered `producerPaused: true`
+          // — somebody who joined muted — never had `consume-resume` sent for
+          // it, so flipping only our end here would leave the SFU holding the
+          // packets: the colleague unmutes and stays silent on this phone.
+          // Captured 2026-09-17: the desktop sends `consume-resume` at exactly
+          // this point, and the ack for one already flowing is a harmless `[]`.
+          final url = _peerNode[srcId];
+          final node = url == null ? null : _nodes[url];
+          node?.emit('consume-resume', {
+            'srcId': srcId,
+            'srcStreamId': _spaceId,
+            'tag': tag.wire,
+            'consumerId': consumer.id,
+          });
         }
         _publishRemotes();
 
@@ -1202,8 +1327,9 @@ class SfuSession {
         kind: tag == SfuTag.audio
             ? RTCRtpMediaType.RTCRtpMediaTypeAudio
             : RTCRtpMediaType.RTCRtpMediaTypeVideo,
-        rtpParameters:
-            ms.RtpParameters.fromMap(_map(reply['rtpParameters'])),
+        rtpParameters: ms.RtpParameters.fromMap(
+          _withRtcpDefaults(_map(reply['rtpParameters'])),
+        ),
         appData: {'srcId': srcId, 'tag': tag.wire},
         accept: () {},
       );
@@ -1233,6 +1359,12 @@ class SfuSession {
           'consumerId': consumer.id,
         });
         consumer.resume();
+      } else {
+        // They are muted. Say so locally, so the tile draws the crossed-out
+        // microphone from the first frame rather than after their next toggle;
+        // the server side is left alone until `producer-resumed`, which is
+        // where the desktop sends its `consume-resume` (captured 2026-09-17).
+        consumer.pause();
       }
       _log('sfu: consuming ${tag.wire} from $srcId');
     } finally {
@@ -1263,7 +1395,7 @@ class SfuSession {
 
     final reply = await node.sendWithResponse(
       'transport-create',
-      {'direction': 'recv', 'iceTransportRequestOptions': <String, Object?>{}},
+      {'direction': 'recv', 'iceTransportRequestOptions': _iceTransportOptions},
     );
     _checkTransportReply(reply, 'recv');
 
@@ -1298,6 +1430,17 @@ class SfuSession {
         }
       }
     });
+
+    transport.on('connectionstatechange', (Map data) {
+      _log('sfu: recv transport is ${data['connectionState']}');
+    });
+
+    // The same race as the send transport, and only luck has been hiding it:
+    // `_consume` asks the server for the consumer first, and that round trip has
+    // so far given `run()` enough time to finish. A faster node, or a reply
+    // already in flight, and `consume()` would reach `_pc!` just as `produce()`
+    // did — with the same silent twenty-second hang.
+    await transport.handler.ready;
 
     return _recvTransports[url] = transport;
   }
@@ -1560,6 +1703,54 @@ class SfuSession {
 /// Declaring all three anyway is what lets somebody on a desktop, looking at you
 /// full-screen, get a better picture without a renegotiation. Declaring one would
 /// have capped every viewer at a quarter-resolution thumbnail forever.
+/// What the desktop asks for when it creates a transport, captured 2026-09-17.
+///
+/// The schema probe the same day showed the server accepts `{}` and a missing
+/// field just as happily, so this is not what stood between the phone and a
+/// call. It is sent anyway because `trafficAccelerator` names the ICE path the
+/// reply is built for — the reply's `appData` echoes it — and a phone on a
+/// mobile network wants the same candidates the desktop gets, not a variant
+/// nobody has tested.
+const _iceTransportOptions = <String, Object?>{
+  'forceTurn': false,
+  'trafficAccelerator': 'GlobalAccelerator',
+};
+
+/// One encoding for the microphone, as the desktop declares it: DTX on and a
+/// 24 kbit/s ceiling. `codecOptions` sets the same DTX in the SDP; this is the
+/// half that reaches the `produce` request's `encodings`, which the desktop's
+/// carries and an empty list would leave to the plugin's defaults.
+/// **A microphone gets no encodings at all, and that is not an oversight.**
+///
+/// `flutter_webrtc`'s `mapToEncoding` builds every `RTCRtpEncodingParameters`
+/// with `scaleResolutionDownBy = 1.0` and `numTemporalLayers = 1` already set,
+/// unconditionally, whatever the track's kind is. libwebrtc rejects both of
+/// those on an *audio* transceiver, so handing `produce()` any non-empty
+/// `encodings` for a microphone makes `addTransceiver` throw — and mediasoup's
+/// `FlexQueue` swallows that exception, printing it under `kDebugMode` only and
+/// calling an error callback `produce()` never passes. Nothing reaches the wire,
+/// nothing reaches the log, and [publish] times out twenty seconds later with no
+/// cause attached. The mute button simply never worked.
+///
+/// This was measured, not reasoned about: with an audio encoding present the
+/// trace shows `transport-create` acked and then silence — no `transport-connect`
+/// and no `produce` — because the throw lands before `_setupTransport`
+/// (`build/call-capture/media2.log`, 2026-09-17).
+///
+/// Opus DTX and in-band FEC are not lost by this. They are negotiated through
+/// `codecOptions` at the [publish] call site, which is where they belong: they
+/// are `fmtp` parameters in the SDP, not properties of a sender encoding.
+///
+/// The desktop's own audio `produce` does carry `{ssrc, active, dtx, maxBitrate}`,
+/// but those are what the *browser* reports from a sender it already built. They
+/// are not an input Gather requires, and copying them into a request was the
+/// mistake this comment exists to prevent repeating.
+///
+/// Video is different and must keep its encodings: simulcast is the whole point
+/// there, and `scaleResolutionDownBy` is legal on a video transceiver. Note the
+/// `scalabilityMode` on every entry below is also load-bearing —
+/// `UnifiedPlanHandler.send` reads `encodings.first.scalabilityMode!`, a bare
+/// null assertion, for any non-empty list.
 final _videoEncodings = [
   ms.RtpEncodingParameters(
     rid: 'r0',
@@ -1589,6 +1780,30 @@ final _videoEncodings = [
 
 Map<String, dynamic> _map(Object? value) =>
     value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
+
+/// Fills in the RTCP fields Gather leaves out, because the client cannot survive
+/// their absence.
+///
+/// `RtcpParameters.fromMap` passes `map['reducedSize']` straight into a
+/// **non-nullable** `bool` parameter — one that already declares a default of
+/// `true`. So a missing key is not defaulted, it is a `TypeError`:
+/// `type 'Null' is not a subtype of type 'bool'`. Gather answers `consume` with
+/// `rtcp: {"cname": "…"}` and nothing else, so every single consume threw before
+/// a track was ever built. That is the whole reason nobody could be heard or
+/// seen on the phone, and it looked like a media bug rather than a parsing one
+/// because the failure arrived as a type error from inside a library
+/// (captured 2026-09-17, `build/call-capture/media.log`).
+///
+/// The values are not a guess. mediasoup's own comment on the field is
+/// "mediasoup assumes reducedSize to always be true", and RTCP-mux is what the
+/// SFU negotiates for every transport it hands out. These are the values the
+/// library would have used had it honoured its own defaults.
+Map<String, dynamic> _withRtcpDefaults(Map<String, dynamic> rtpParameters) {
+  final rtcp = _map(rtpParameters['rtcp']);
+  rtcp['reducedSize'] ??= true;
+  rtcp['mux'] ??= true;
+  return {...rtpParameters, 'rtcp': rtcp};
+}
 
 /// Gather sends TURN credentials with the transport, and refreshes them through
 /// `restart-ice` rather than through any REST route.

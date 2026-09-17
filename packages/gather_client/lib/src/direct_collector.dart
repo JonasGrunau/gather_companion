@@ -446,6 +446,27 @@ class DirectCollector {
   ({bool ok, String? detail}) setHandRaised(bool raised) =>
       _act('setHandRaised', raised);
 
+  /// Says whether we are talking. This is the speaking ring.
+  ///
+  /// Two actions rather than one flag, and neither takes an argument —
+  /// `startSpeaking` and `stopSpeaking` both declare an empty schema, so they are
+  /// two-element `args` like [leaveCluster] and not `setSpeaking(true)`. They
+  /// write `SpaceUser.speaking`, which is the field every other client already
+  /// reads to draw the border round a talking person and to pick the talking
+  /// animation for their avatar.
+  ///
+  /// **Nothing else sets it.** Publishing audio to the SFU does not: the media
+  /// plane and the game socket are separate, and the server does not join them
+  /// up. A client that never sends these is perfectly audible and permanently
+  /// drawn as silent — which is what this one did until the voice-activity
+  /// detector in the app started calling it.
+  ///
+  /// Sent on every change rather than on a timer, so the cost is the number of
+  /// times somebody starts and stops talking. The rate limiting that matters
+  /// belongs upstream, in the detector's hold, and not here.
+  ({bool ok, String? detail}) setSpeaking(bool speaking) =>
+      _act(speaking ? 'startSpeaking' : 'stopSpeaking');
+
   /// Steps out of the huddle without walking away from it.
   ///
   /// Gather forms conversations by proximity and remembers them in `clusterId`, so

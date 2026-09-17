@@ -60,6 +60,17 @@ class Rig {
     return session.dispose();
   }
 
+  /// The microphone producer the session actually built, for a test that wants
+  /// to make it loud.
+  FakeProducer? get micProducer {
+    for (final transport in device.transports) {
+      for (final producer in transport.producers) {
+        if (producer.tag == 'audio') return producer;
+      }
+    }
+    return null;
+  }
+
   FakeSignalling get router => sockets[routerUrl]!;
   FakeSignalling node([String url = nodeA]) => sockets[url]!;
 
@@ -138,11 +149,23 @@ class Rig {
     'iceLite': false,
   };
 
+  /// Shaped like Gather's, which means **`rtcp` carries only a `cname`**.
+  ///
+  /// This used to also say `mux` and `reducedSize`, and that politeness is what
+  /// hid a bug that broke every call: `RtcpParameters.fromMap` feeds
+  /// `map['reducedSize']` into a non-nullable `bool`, so the real server's
+  /// `{"cname": "…"}` threw a `TypeError` and no remote track was ever built,
+  /// while the suite stayed green against a fake that answered more fully than
+  /// the thing it stood for. A fake may be smaller than the real server. It may
+  /// not be more generous than it.
+  ///
+  /// Measured against the live SFU on 2026-09-17; see
+  /// `docs/protocol/observed-wire-protocol.md`.
   static const rtpParameters = {
     'codecs': <Map<String, Object?>>[],
     'headerExtensions': <Map<String, Object?>>[],
     'encodings': <Map<String, Object?>>[],
-    'rtcp': {'cname': 'fake', 'mux': true, 'reducedSize': true},
+    'rtcp': {'cname': 'fake'},
   };
 }
 

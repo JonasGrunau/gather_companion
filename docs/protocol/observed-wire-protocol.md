@@ -443,6 +443,144 @@ Observations that matter:
 - The codec list is mediasoup `routerRtpCapabilities`, audio Opus 48 kHz stereo
   first.
 
+## SFU socket — publishing (captured 2026-09-17)
+
+A second capture, `probe-sfu.mjs reload` on the desktop client followed by a
+real two-person video call with mic and camera toggled once each. This is the
+run the earlier sections said was still missing: it carries `transport-create`
+in both directions, `produce` for audio and video, and the leave sequence.
+Redacted transcript kept out of the repo (8 MB); the frames below are quoted
+from it with credentials, fingerprints and addresses already replaced.
+
+**Startup, before any call.** The client connects to its node the moment it has
+an address, builds *both* transports and publishes at once — a paused
+microphone and, with the camera on, video. Being in a call is not what opens the
+media plane; entering the space is.
+
+```
+→ get-rtp-capabilities      {wsSequenceNumber:1}
+← ack  {routerRtpCapabilities:{codecs:[opus 48k/2, VP8], headerExtensions:[…]}}
+→ transport-create          {direction:"send", iceTransportRequestOptions:{forceTurn:false, trafficAccelerator:"GlobalAccelerator"}}
+→ transport-create          {direction:"recv", iceTransportRequestOptions:{…same…}}
+← ack  {id, iceCandidates:[{udp host …}], iceParameters:{usernameFragment, password, iceLite:true},
+        dtlsParameters:{role:"auto", fingerprints:[sha-256, sha-224, sha-384, sha-512, sha-1]},
+        iceServers:[{urls:["stun:stun.cloudflare.com:3478"]},
+                    {urls:["turn:turn.cloudflare.com:3478?transport=udp", …, "turns:turn.cloudflare.com:443?transport=tcp"], username, credential},
+                    {urls:["turn:cf.turn.gather.town:3478?transport=udp", "…tcp"], username, credential}],
+        iceTransportPolicy:"all", appData:{trafficAccelerator:"GlobalAccelerator"}}
+→ transport-connect         {transportId, dtlsParameters:{role:"client", fingerprints:[{algorithm:"sha-256", value}]}}
+← ack  (empty)
+→ produce                   {transportId, tag:"audio", kind:"audio", rtpParameters:{…}, highQualityScreenShare:false}
+← ack  {id:"<producerId>"}
+→ produce-pause             {tag:"audio"}                      ← muted at startup
+→ produce                   {transportId, tag:"video", kind:"video", rtpParameters:{…}, highQualityScreenShare:true}
+← ack  {id:"<producerId>"}
+← set-max-spatial-layer     {layer:0, kind:"video"}
+```
+
+The audio `rtpParameters`: Opus 111, `{minptime:10, useinbandfec:1,
+sprop-stereo:0, usedtx:1}`, one encoding `{ssrc, active:true, dtx:true,
+maxBitrate:24000}`. The video `rtpParameters`: VP8 96, three simulcast encodings
+`r0/r1/r2` with `scalabilityMode:"L1T2"`, `scaleResolutionDownBy` 4/2/1,
+`maxBitrate` 120000/350000/1500000, `maxFramerate` 18/24/24 — and **only `r0`
+active**. The server raises the ceiling afterwards with `set-max-spatial-layer`
+(observed 0 → 1 → 2 within four seconds of a colleague opening the tile).
+`highQualityScreenShare` rides on every `produce`, `true` for the camera; the
+schema probe below showed it optional.
+
+**Joining a conversation.** Walking into the bubble produces no game-plane
+action of its own — the server forms the cluster from positions — but the media
+plane is told, and told *first*:
+
+```
+→ consume-allow                       {dstId:"<them>", allowed:true}      (already sent for everyone in range)
+→ set-player-conversation-metadata    {meetingId:"", clusterId:"<clusterId>"}
+→ produce                             {… tag:"audio" …}                    (a fresh producer, new mid)
+→ set-player-conversation-metadata    {meetingId:"", clusterId:"<clusterId>"}  (again, unchanged)
+→ produce-pause                       {tag:"audio"}
+→ consume-request                     {srcId:"<them>", srcStreamId, requested:true}
+← consume-not-allowed                 {srcId:"<them>", srcStreamId}       (they had not allowed us yet)
+← consume-try                         {srcId:"<them>", srcStreamId, producerIdMap:{}}
+→ produce                             {… tag:"video" …}
+← set-max-spatial-layer               {layer:0, kind:"video"}
+→ produce-resume                      {tag:"audio"}                        (unmute)
+```
+
+Note `meetingId:""` — the empty string, not null, not absent. The same run's
+schema probe (a hand-rolled socket.io client against the throwaway space)
+found that `{meetingId:null, clusterId:null}` and `{clusterId:""}` alone are
+**never acked at all** — zod rejects them and the server says nothing — while
+`{meetingId:"", clusterId:""}` and `{meetingId:"", clusterId:"<uuid>"}` are
+acked `[]`. Silence is the failure mode, exactly as elsewhere on this socket.
+
+**Receiving them.** Once they allowed us, `consume-try` re-arrives with a real
+`producerIdMap`, and each entry is consumed in turn:
+
+```
+← consume-try         {srcId, srcStreamId, producerIdMap:{audio:"<pid>"}}
+→ consume             {transportId:"<recv>", srcId, srcStreamId, tag:"audio", rtpCapabilities:{…device…}}
+← ack  {producerPaused:true, id:"<consumerId>", producerId, rtpParameters:{… mid:"22"}, kind:"audio"}
+→ consume-created     {srcId, srcStreamId, tag:"audio", consumerId}
+← ack  []
+← producer-resumed    {srcId, tag:"audio"}                   ← they unmuted
+← consume-try         {… producerIdMap:{audio:"<pid>", video:"<pid>"}}
+→ consume-resume      {srcId, srcStreamId, tag:"audio", consumerId}   ← NOW the audio consumer is resumed
+→ consume             {… tag:"video" …}
+← ack  {producerPaused:false, id, producerId, rtpParameters:{… encodings:[{ssrc, scalabilityMode:"L3T2", maxBitrate:1500000}]}, kind:"video"}
+→ consume-created     {… tag:"video" …}
+→ consume-set-spatial {srcId, srcStreamId, tag:"video", spatialLayer:0}
+→ consume-set-priority {srcStreamId, tag:"video", srcIds:["<them>"]}
+← ack  {result:[{srcId, priority:18}]}
+→ consume-set-priority {srcStreamId, tag:"screen", srcIds:["<them>"]}
+← ack  {result:[]}
+```
+
+Two things here are easy to get wrong. A consumer whose `consume` ack said
+`producerPaused:true` gets **no** `consume-resume` on creation; it gets one
+later, when the producer comes back. Skip that second step and the colleague
+unmutes into silence. And `consume-resume` on a consumer that is already
+flowing is acked `[]`, so sending it defensively costs nothing.
+
+**Toggling.** Mute is `produce-pause {tag:"audio"}`, unmute `produce-resume`.
+The camera is different: off is `produce-close {tag:"video"}`, on is a **fresh
+`produce`** with a new `mid` and a new producer id. The desktop never pauses
+video.
+
+**Leaving.** In this order, within 250 ms:
+
+```
+→ produce-pause                      {tag:"audio"}
+→ set-player-conversation-metadata   {meetingId:"", clusterId:""}
+→ produce-close                      {tag:"video"}
+→ produce-close                      {tag:"audio"}
+→ consume-pause                      {…each consumer…}
+← consume-close                      {srcId, tag, consumerId}          (server confirms each)
+→ consume-request                    {srcId, srcStreamId, requested:false}
+→ consume-allow                      {dstId, allowed:false}
+router → unsubscribe                 {srcId, srcStreamId}
+game   → teleport, leaveCluster, updateTargetMeetingArea {}
+```
+
+A `consume-pause` that races the server's own `consume-close` is acked
+`[{"error":"no such consumer","clientShouldRecover":true}]` — the one error
+shape seen on this socket. Errors are acks with an `error` key, not a separate
+event.
+
+**Server pushes seen during the call**, besides those above: `server-info`
+every 5 s (`{transport:{id, availableBitrate, bitrate}, producers:{a:[…],
+v:[…]}, consumers:{<srcId>:{a|v:{p:[…], c:[…]}}}}`), `client-ip-info {ip,
+vpnDetected}` once per transport, `producer-paused`/`producer-resumed` for
+every peer in range whether or not consumed, and one `disable-video` (payload
+not captured in a useful state — still unhandled, still logged).
+
+**Schema probe, same day.** `transport-create` is accepted with
+`iceTransportRequestOptions` set to `{}`, `{forceTurn:false}`, the desktop's
+full shape, or omitted; `produce` is accepted with or without
+`highQualityScreenShare` and does not reject unknown keys (not `.strict()`).
+Creating a second send transport on the same session made the first one
+disappear: `produce` against the earlier id answered `{"error":"no such
+transport"}`. One transport per direction per session.
+
 ## Timing
 
 | Thing | Value |
@@ -484,10 +622,13 @@ are a small sample of that catalogue.
 Gaps in this capture, stated so they are not mistaken for absences in the
 protocol:
 
-- **No media was published**, so `producerIdMap` was always `{}`, and the
-  produce/transport-create path never ran.
-- **No conversation was joined**, so `clusterId` stayed `undefined` and no
-  clustering traffic appeared.
+- **No media was published** in the 2026-08 session, so `producerIdMap` was
+  always `{}` there. Closed by the 2026-09-17 capture — see "SFU socket —
+  publishing" above.
+- **No conversation was joined** in the 2026-08 session. The 2026-09-17 capture
+  joined and left one; the media-plane half is above. The game-plane half is
+  still thin: joining produced no action of its own, leaving produced
+  `teleport`, `leaveCluster` and `updateTargetMeetingArea {}`.
 - **No action failed**, so `result.type` other than `Success` was never seen.
 - **Multi-chunk `FullStateChunk`** did not occur (`totalChunks: 1`).
 - `chat`, `screenshare`, `follow`, and `teleport` were not exercised.

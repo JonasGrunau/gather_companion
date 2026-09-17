@@ -335,8 +335,8 @@ Still unmapped, and stated so it is not mistaken for absence:
 - Permissions for the 110 actions that need arguments — requires synthesising
   valid arguments per action.
 - The 84 REST routes withheld by the safety rules.
-- The media publish path: no media was published, so `producerIdMap` stayed `{}`
-  and transport-create / produce never ran.
+- ~~The media publish path~~ — captured 2026-09-17 with `probe-sfu.mjs reload`
+  during a live call; see `observed-wire-protocol.md`, "SFU socket — publishing".
 - Clustering: no conversation was joined, so `clusterId` stayed `undefined`.
 - `chat`, `screenshare`, `follow` and `teleport` were never exercised.
 - Anything the server implements that no client calls. Nothing here would show it.

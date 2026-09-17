@@ -11,6 +11,9 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
+    # A patched copy of a pub package, vendored because the call does not work
+    # without the patches — see the note in pubspec.yaml. Not ours to lint.
+    - third_party/**
     # Swift Package Manager checks plugin sources out under build/, and the
     # analyzer would otherwise read *their* tests — firebase_messaging ships
     # mockito-generated files that do not compile against our pinned mockito.

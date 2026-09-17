@@ -10,6 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/media/live_call.dart';
 import 'package:gather_companion/src/media/sfu_session.dart';
+import 'package:gather_companion/src/media/voice_activity.dart';
 
 import 'fake_capture_engine.dart';
 import 'sfu_rig.dart';
@@ -30,6 +31,10 @@ void main() {
       srcId: me,
       engine: engine,
       buildSfu: () => rig.session,
+      // No hold, so a stop is visible on the next poll rather than a second
+      // later. What the real hold does is asserted in `voice_activity_test.dart`;
+      // what these want to know is whether the poll runs at all, and when.
+      voice: VoiceActivity(hold: Duration.zero),
     );
   });
 
@@ -65,6 +70,81 @@ void main() {
       expect(rig.node().argsFor('produce-pause'), {'tag': 'audio'});
       expect(rig.session.publishing(SfuTag.audio), isTrue,
           reason: 'closing it would make unmuting a fresh negotiation');
+    });
+  });
+
+  group('speaking', () {
+    // The poll interval, plus enough slack for the platform-channel round trip
+    // the fake is standing in for.
+    Future<void> poll() =>
+        Future<void>.delayed(const Duration(milliseconds: 280));
+
+    test('a live microphone with somebody talking into it says so', () async {
+      await call.setMicOn(true);
+      final said = <bool>[];
+      call.speaking.listen(said.add);
+
+      rig.micProducer!.level = 0.09;
+      await poll();
+
+      expect(said, [true]);
+      expect(call.isSpeaking, isTrue);
+
+      rig.micProducer!.level = 0.0004;
+      await poll();
+
+      expect(said, [true, false]);
+    });
+
+    test('a quiet room is never reported as talking', () async {
+      await call.setMicOn(true);
+      final said = <bool>[];
+      call.speaking.listen(said.add);
+
+      // The level measured on the phone in a silent room on 2026-09-17. The
+      // whole feature is worthless if this lights the ring.
+      rig.micProducer!.level = 0.00104;
+      await poll();
+      await poll();
+
+      expect(said, isEmpty);
+      expect(call.isSpeaking, isFalse);
+    });
+
+    test('muting stops it at once, and stops the polling with it', () async {
+      await call.setMicOn(true);
+      rig.micProducer!.level = 0.09;
+      await poll();
+      final said = <bool>[];
+      call.speaking.listen(said.add);
+
+      await call.setMicOn(false);
+      await settle();
+
+      // On the tap itself, not on the next poll and certainly not after the
+      // hold — either would leave a ring lit on everybody else's screen for
+      // somebody who has already pressed mute mid-sentence.
+      expect(said, [false]);
+      expect(call.isSpeaking, isFalse);
+
+      // And nothing starts it again while muted, however loud the room is: the
+      // producer is paused, so the level is not even read.
+      await poll();
+      await poll();
+      expect(said, [false]);
+    });
+
+    test('nothing is polled before the microphone is ever turned on', () async {
+      final said = <bool>[];
+      call.speaking.listen(said.add);
+
+      await call.setListeningTo({them});
+      await poll();
+
+      // A phone sitting in a conversation listening runs no timer and holds no
+      // microphone, which is the difference between this and a call app.
+      expect(said, isEmpty);
+      expect(rig.micProducer, isNull);
     });
   });
 
@@ -132,7 +212,7 @@ void main() {
       await settle();
 
       expect(rig.node().argsFor('set-player-conversation-metadata'),
-          {'meetingId': null, 'clusterId': 'bubble-1'});
+          {'meetingId': '', 'clusterId': 'bubble-1'});
     });
   });
 

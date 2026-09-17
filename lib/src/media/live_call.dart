@@ -42,6 +42,7 @@ import 'call.dart';
 import 'capture_engine.dart';
 import 'media_engine.dart';
 import 'sfu_session.dart';
+import 'voice_activity.dart';
 import 'webrtc_media_engine.dart';
 
 class LiveCall implements Call {
@@ -51,8 +52,10 @@ class LiveCall implements Call {
     required String srcId,
     CaptureEngine? engine,
     SfuSession Function()? buildSfu,
+    VoiceActivity? voice,
     void Function(String)? log,
-  })  : _log = log ?? _noop,
+  })  : _voice = voice ?? VoiceActivity(),
+        _log = log ?? _noop,
         _engine = engine ?? WebrtcMediaEngine(log: log),
         _buildSfu = buildSfu ??
             (() => SfuSession(
@@ -104,6 +107,22 @@ class LiveCall implements Call {
   final _states = StreamController<CallState>.broadcast();
   CallState _state = const CallState();
 
+  final _speaking = StreamController<bool>.broadcast();
+
+  /// The thresholds and the hold. Injectable so a test can ask about the
+  /// *plumbing* — that the poll starts on an unmuted publish and stops on a mute
+  /// — in one beat, instead of waiting out a hold tuned for human speech. The
+  /// tuning itself is asserted directly, in `voice_activity_test.dart`.
+  final VoiceActivity _voice;
+  Timer? _voicePoll;
+
+  /// Whether a sample is still in flight. `getStats` crosses a platform channel
+  /// and can take longer than the interval below, and without this a slow device
+  /// would queue samples behind each other and then answer them all at once —
+  /// which reads to [VoiceActivity] as a burst of identical measurements at the
+  /// wrong times.
+  bool _sampling = false;
+
   /// What the person has asked for, which is not the same as what is running.
   /// A tap that fails must not leave the button showing the state it failed to
   /// reach, and these are what the retry on the next tap is judged against.
@@ -119,6 +138,12 @@ class LiveCall implements Call {
 
   @override
   CallState get state => _state;
+
+  @override
+  Stream<bool> get speaking => _speaking.stream;
+
+  @override
+  bool get isSpeaking => _voice.speaking;
 
   /// The live capture, for the widget that draws the preview. Concrete on
   /// purpose — a `MediaStream` cannot cross [Call] without dragging the plugin
@@ -141,6 +166,15 @@ class LiveCall implements Call {
         await _engine.setAudioEnabled(true);
         final detail = await _publish(SfuTag.audio);
         await _republishOthers(SfuTag.audio);
+        // Again, now that there is a sender.
+        //
+        // `setMicrophoneMuted` drives the audio *device module*, not the track,
+        // and the module is only running once something is actually capturing
+        // for a peer connection. Unmuting before that can be applied to an
+        // engine that is then rebuilt underneath it, which leaves the producer
+        // live and the microphone silent — signalling all green, nothing
+        // audible. Idempotent, so it costs nothing when the first one took.
+        await _engine.setAudioEnabled(true);
         return detail;
       });
 
@@ -327,6 +361,10 @@ class LiveCall implements Call {
       return;
     }
     _visibleTo = Set.unmodifiable(srcIds);
+    // Worth a line of its own: an empty allow list is indistinguishable from a
+    // working call right up until nobody can hear you, and it leaves no trace on
+    // the wire — `consume-allow` is simply never sent.
+    _log('call: ${srcIds.length} may consume us${srcIds.isEmpty ? ' — nobody can hear us' : ''}');
     // Held whether or not a session exists, and replayed by `start()`. Somebody
     // can walk up to you long before you tap anything, and the allow list has to
     // be right at the moment the first track goes out — not one roster later.
@@ -471,7 +509,10 @@ class LiveCall implements Call {
     _sfu = null;
     _remoteStreams.clear();
     await _engine.dispose();
+    _voicePoll?.cancel();
+    _voicePoll = null;
     if (!_states.isClosed) await _states.close();
+    if (!_speaking.isClosed) await _speaking.close();
   }
 
   /// Runs [job] after everything already queued, and never lets one failure
@@ -488,5 +529,65 @@ class LiveCall implements Call {
   void _emit(CallState next) {
     _state = next;
     if (!_states.isClosed) _states.add(next);
+    // Every path that starts, pauses, resumes or drops the audio producer ends
+    // here, which is what makes this the one place the poll has to be kept in
+    // step with. Hooking the individual taps instead meant remembering to do it
+    // in `hangUp`, in the republish after a reconnect, and in the capture
+    // restart the camera forces — three places that each stop the microphone for
+    // reasons that have nothing to do with speaking.
+    _syncVoiceActivity();
+  }
+
+  /// How often the microphone level is read while somebody might be talking.
+  ///
+  /// Each poll is a `getStats` across the platform channel, so this is a cost
+  /// and not a free timer. 200 ms against [VoiceActivity]'s 900 ms hold gives
+  /// four or five samples inside the window that decides somebody has stopped —
+  /// enough that one slow or missing answer changes nothing.
+  static const _voiceInterval = Duration(milliseconds: 200);
+
+  /// Runs the poll exactly when there is a live, unpaused microphone.
+  ///
+  /// Both halves are load-bearing. Polling a paused producer would read the
+  /// device's own mute as silence and arrive at the right answer by luck; not
+  /// polling at all while muted is the *reason* it is the right answer, and it
+  /// also means a phone sitting on the map screen runs no timer.
+  void _syncVoiceActivity() {
+    final wanted = _wantMic && _state.publishingAudio;
+    if (wanted == (_voicePoll != null)) return;
+
+    if (!wanted) {
+      _voicePoll?.cancel();
+      _voicePoll = null;
+      // Immediately, without waiting out the hold. Somebody who presses mute
+      // mid-sentence should not keep a ring lit on everybody else's screen for
+      // another second, and the hold exists for pauses in speech rather than for
+      // decisions.
+      if (_voice.silence()) _emitSpeaking();
+      return;
+    }
+    _voicePoll = Timer.periodic(_voiceInterval, (_) => unawaited(_sample()));
+  }
+
+  Future<void> _sample() async {
+    if (_sampling) return;
+    _sampling = true;
+    try {
+      final level = await _sfu?.microphoneLevel();
+      if (_voice.note(level, DateTime.now())) _emitSpeaking();
+    } finally {
+      _sampling = false;
+    }
+  }
+
+  void _emitSpeaking() {
+    // Worth a line each way, and worth keeping. Whether the room can see you
+    // talking is the one claim in this app with no other evidence behind it:
+    // `startSpeaking` is acknowledged privately, writes a field this client
+    // never reads back for itself, and shows up as a ring on somebody else's
+    // screen. Two lines per sentence is a cheap price for being able to answer
+    // "did the phone ever say it was talking" without borrowing their laptop.
+    _log('call: ${_voice.speaking ? 'talking' : 'quiet'}');
+    if (!_speaking.isClosed) _speaking.add(_voice.speaking);
   }
 }

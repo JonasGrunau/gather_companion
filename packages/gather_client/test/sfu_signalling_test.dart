@@ -322,6 +322,26 @@ void main() {
       expect(await pending, isEmpty);
     });
 
+    test('an ack carrying an error is a refusal, with the reason kept', () async {
+      // Captured 2026-09-17: `consume-pause` on a consumer the server had
+      // already closed was acked `[{"error":"no such consumer",
+      // "clientShouldRecover":true}]`. Returned as a reply, the caller would
+      // fail one step later on a missing id and never see the reason.
+      final s = build();
+      final conn = await connected(s);
+
+      final pending = s.sendWithResponse('consume-pause', {'tag': 'audio'});
+      await conn.waitForFrames(1);
+      conn.ack(conn.received.single.ackId!,
+          {'error': 'no such consumer', 'clientShouldRecover': true});
+
+      await expectLater(
+        pending,
+        throwsA(isA<SfuException>()
+            .having((e) => e.toString(), 'message', contains('no such consumer'))),
+      );
+    });
+
     test('a call that is never answered fails instead of hanging', () async {
       // Gather goes silent rather than erroring, so a caller that cannot tell
       // "no" from "nothing" would hold a call open forever.

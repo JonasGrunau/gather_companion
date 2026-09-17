@@ -42,6 +42,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:socket_io_client/socket_io_client.dart' as io;
@@ -355,12 +356,31 @@ class SfuSignalling {
     // library can produce: none, one value, or one list when the ack carried
     // several.
     final completer = Completer<Map<String, Object?>>();
+    final envelope = _envelope(method, args);
+    // Traced rather than summarised, because this socket's failure mode is
+    // silence: when an ack never arrives the only evidence of *why* is the
+    // payload we sent, and by the time the timeout fires it is gone. Logging it
+    // at the moment of sending is what turns "producing audio timed out" into a
+    // diffable request.
+    _log('sfu: -> $method ${jsonEncode(envelope)}');
     try {
       socket.emitWithAck(
         method,
-        _envelope(method, args),
+        envelope,
         ack: ([Object? first, Object? second]) {
-          if (!completer.isCompleted) completer.complete(_asMap(first));
+          if (completer.isCompleted) return;
+          final reply = _asMap(first);
+          _log('sfu: <- $method ack ${jsonEncode(reply)}');
+          // A refusal is an ack too: `[{"error":"no such consumer",
+          // "clientShouldRecover":true}]`, captured 2026-09-17. Handing that
+          // back as a reply makes the caller fail one step later on a missing
+          // `id`, with the server's own reason already thrown away.
+          final error = reply['error'];
+          if (error is String && error.isNotEmpty) {
+            completer.completeError(SfuException('$method refused: $error'));
+            return;
+          }
+          completer.complete(reply);
         },
       );
     } on Object catch (error) {
@@ -379,8 +399,21 @@ class SfuSignalling {
   /// Says something without expecting an answer — `consume-allow`, `produce-close`.
   void emit(String method, [Map<String, Object?> args = const {}]) {
     final socket = _socket;
-    if (socket == null || !_connected) return;
-    socket.emit(method, _envelope(method, args));
+    // Logged even when it goes nowhere, because "we never sent it" and "we sent
+    // it into a closed socket" are different bugs that look identical
+    // afterwards.
+    if (socket == null || !_connected) {
+      _log('sfu: -x $method dropped, not connected');
+      return;
+    }
+    final envelope = _envelope(method, args);
+    // The fire-and-forget half of the protocol is not the unimportant half:
+    // `consume-allow` is what permits anybody to hear us at all, and
+    // `produce-pause` is mute. Tracing only `sendWithResponse` left those
+    // invisible, and an absent `consume-allow` then read as proof it was never
+    // sent when nothing had ever been looked at (2026-09-17).
+    _log('sfu: -> $method ${jsonEncode(envelope)}');
+    socket.emit(method, envelope);
   }
 
   /// `{wsSequenceNumber, zodData}`, or the bare payload for an exempt method.

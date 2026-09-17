@@ -441,10 +441,9 @@ packages:
   mediasfu_mediasoup_client:
     dependency: "direct main"
     description:
-      name: mediasfu_mediasoup_client
-      sha256: fabcc4d534a7b54e0063165f12310869d12c88cf84cc9b62ac6d86674ee3dd69
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/mediasfu_mediasoup_client"
+      relative: true
+    source: path
     version: "0.1.4"
   meta:
     dependency: transitive

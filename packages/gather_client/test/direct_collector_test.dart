@@ -330,6 +330,21 @@ void main() {
       expect((await lastFrame(conn, 'leaveCluster'))['args'], ['SpaceUser', 'me-1']);
     });
 
+    test('speaking is two actions with no arguments, not one flag', () async {
+      final (c, conn) = await connected();
+
+      // This is the speaking ring. `SpaceUser.speaking` is written by these two
+      // and by nothing else — publishing audio to the SFU does not touch it — so
+      // a client that never sends them is audible and drawn as silent.
+      expect(c.setSpeaking(true).ok, isTrue);
+      expect((await lastFrame(conn, 'startSpeaking'))['args'],
+          ['SpaceUser', 'me-1']);
+
+      expect(c.setSpeaking(false).ok, isTrue);
+      expect((await lastFrame(conn, 'stopSpeaking'))['args'],
+          ['SpaceUser', 'me-1']);
+    });
+
     test('setHandRaised sends a bare bool and faceDirection a bare string', () async {
       final (c, conn) = await connected();
 

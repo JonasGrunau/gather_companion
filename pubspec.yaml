@@ -53,3 +53,24 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+# A patched copy of the mediasoup client, and the app does not work without it.
+#
+# Three fixes, all found on a device on 2026-09-17 and all in the library rather
+# than in us:
+#
+#  * `HandlerInterface.ready` — `Transport`'s constructor starts `handler.run()`
+#    without awaiting it (`void ... async`), so it hands back a transport whose
+#    `RTCPeerConnection` is still null. The first `produce()` a millisecond later
+#    threw a null check and the microphone never published at all.
+#  * `FlexQueue` now reports the exceptions it catches. It printed them under
+#    `kDebugMode` only and called an error callback `produce()` never passes, so
+#    a task that threw vanished completely and the caller sat out its own
+#    twenty-second timeout with no cause attached. That is what made the above
+#    take three rounds on a device to find.
+#  * `HandlerInterface` is exported, so callers can name it and await `ready`.
+#
+# Worth upstreaming; until then this directory is part of the build.
+dependency_overrides:
+  mediasfu_mediasoup_client:
+    path: third_party/mediasfu_mediasoup_client

@@ -24,6 +24,22 @@ class FakeCall implements Call {
   final List<({List<String> srcIds, VideoQuality quality})> watching = [];
 
   final _states = StreamController<CallState>.broadcast();
+  final _speaking = StreamController<bool>.broadcast();
+
+  /// Drives the speaking stream, so a test can start and stop a sentence without
+  /// a microphone or a stats poll anywhere near it.
+  void speak(bool speaking) {
+    _isSpeaking = speaking;
+    _speaking.add(speaking);
+  }
+
+  bool _isSpeaking = false;
+
+  @override
+  Stream<bool> get speaking => _speaking.stream;
+
+  @override
+  bool get isSpeaking => _isSpeaking;
 
   @override
   Future<void> setVisibleTo(Set<String> srcIds) async => shownTo.add(srcIds);
@@ -61,5 +77,8 @@ class FakeCall implements Call {
   Future<void> hangUp() async {}
 
   @override
-  Future<void> dispose() async => _states.close();
+  Future<void> dispose() async {
+    await _states.close();
+    await _speaking.close();
+  }
 }

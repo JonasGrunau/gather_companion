@@ -881,7 +881,7 @@ Captured off the real client, or confirmed by probe:
 | `setCustomStatus` | `['SpaceUser', id, {text, emoji?, clearCondition?}]` | `clearCondition` is `{type:'DateTime', clearAt:<ext-1 DateTime>}` |
 | `clearCustomStatus` | `['SpaceUser', id]` | **two args** |
 | `setHandRaised` | `['SpaceUser', id, true]` | **bare bool** |
-| `startSpeaking` / `stopSpeaking` | `['SpaceUser', id]` | **two args.** Voice activity, not mute |
+| `startSpeaking` / `stopSpeaking` | `['SpaceUser', id]` | **two args.** Voice activity, not mute. **The client measures this itself** — see below |
 | `leaveCluster` | `['SpaceUser', id]` | **two args.** Leaves the conversation, stays put |
 | `broadcastEmote` | `['SpaceUser', id, {emote, count, ambientlyConnectedUserIds}]` | see below |
 | `updateTargetMeetingArea` | `['SpaceUser', id, {meetingAreaId, shouldBeInClusterWithOthersWithSameTargetMeetingArea?}]` | read out of the bundle, not off the wire — `MeetingFrontendRepo.joinMeeting` sends it after `getOrSetMeetingArea` assigns a room. This row said "seen with an empty payload only" until the client was read directly; the capture that produced that was of a join that carried no area. Both fields line up with `SpaceUser.currentTargetMeetingAreaId` and `shouldBeInClusterWithOthersWithSameTargetMeetingArea` in the state dump. |
@@ -2210,7 +2210,22 @@ Two things resisted, and the difference between them matters.
 client (`AUDIO_UPDATED`, `VIDEO_UPDATED`, `START_SCREEN_SHARE`) and appear in no
 Prisma model, no REST route and no delta patch. `SpaceUser.speaking` is the
 replacement and is arguably the better signal — it says who is *talking* rather
-than who has a mic enabled. Measured over three minutes on a live 111-person
+than who has a mic enabled.
+
+**But it is a signal every client has to produce for itself.** `speaking` is
+written by `startSpeaking` / `stopSpeaking` and by nothing else. The server does
+*not* derive it from the media plane: the SFU knows a producer exists and is
+unpaused, and it never tells the game server whether anybody is using it. The two
+planes are joined up only inside each client, by its own voice-activity
+detection.
+
+That is cheap to get wrong in a way nothing reports. A client that publishes
+audio perfectly and never sends these two actions is fully audible in the room
+and drawn as silent on every screen in it — no refusal, no error, no missing
+field. This app hit exactly that on 2026-09-17: the audio arrived on the desktop
+and the ring never lit. The fix is `lib/src/media/voice_activity.dart`, which
+thresholds `audioLevel` off the producer's own `media-source` stats and drives
+`DirectCollector.setSpeaking`. Measured over three minutes on a live 111-person
 space it was the single most frequent patch of any kind: **13 of 46 deltas**.
 
 The old parser could not really produce them anyway. Gather logs
@@ -2377,21 +2392,24 @@ positions, and `Authenticate` frames contain a live JWT.
 7. `unknownFrames` occasionally counts 1–2 server frames the interpreter does not
    recognise. Harmless for presence, unidentified.
 8. Delta envelope names were matched structurally, not against a labelled frame.
-9. **`transport-create` — request *and* response.** It appears in no capture at all:
-   both probes attached at space join, by which time the desktop had already built
-   its transports, and the second rig published no media so the produce path never
-   ran. Everything on the send and receive sides hangs off it, and the client here
-   sends `{direction, iceTransportRequestOptions}` and expects the standard
-   mediasoup `{id, iceParameters, iceCandidates, dtlsParameters}` plus Gather's
-   `iceServers` — assumed, not measured. `transport-connect` and `restart-ice` were
-   transcribed from the bundle rather than seen. A `probe-sfu.mjs reload` *during* a
-   live call is still the one measurement that settles all three, and it is the same
-   run that would settle the `sessionId` in #4.
-10. **What `set-player-conversation-metadata` is for.** The shape is measured
-    (`{meetingId, clusterId}`) and the desktop sends it on every cluster change, so
-    this client does too — but nothing observable changed when it did, so whether it
-    affects routing, recording or only telemetry is unknown.
+9. ~~**`transport-create` — request *and* response.**~~ Settled 2026-09-17 by a
+   `probe-sfu.mjs reload` during a live call: request
+   `{direction, iceTransportRequestOptions:{forceTurn, trafficAccelerator}}`,
+   reply the standard mediasoup `{id, iceParameters, iceCandidates,
+   dtlsParameters}` plus `iceServers`, `iceTransportPolicy` and `appData`.
+   `transport-connect` was seen too, `{transportId, dtlsParameters}`. `restart-ice`
+   still has not been. Full sequence in
+   `docs/protocol/observed-wire-protocol.md`, "SFU socket — publishing".
+10. **What `set-player-conversation-metadata` is for.** Still unknown *what* it
+    does, but the 2026-09-17 capture and schema probe settled *how*: both fields
+    are strings, `""` when absent, and a `null` in either is never acked. The
+    desktop sends it before the first `produce` on joining and with
+    `clusterId:""` on leaving.
 11. **`disable-video`, `move-off`, `consume-not-allowed` and `consume-connected`.**
-    Declared in the bundle's server→client set, never caught on the wire, payloads
-    unknown. This client logs them and acts on none of them; guessing at `move-off`
-    in particular risks a reconnection loop over a message nobody has seen.
+    Declared in the bundle's server→client set. Three were caught 2026-09-17:
+    `consume-not-allowed {srcId, srcStreamId}` (asked for somebody who has not
+    `consume-allow`ed us yet — the answer is to wait for their `consume-try`),
+    `consume-connected {srcId, isConnected}` (a peer's transport state, seen from
+    the schema probe), and one `disable-video` whose payload the redaction did not
+    preserve. `move-off` is still unseen. This client logs all four and acts on
+    none; guessing at `move-off` in particular risks a reconnection loop.

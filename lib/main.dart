@@ -6,26 +6,54 @@ import 'package:flutter/services.dart';
 
 import 'src/app_state.dart';
 import 'src/media/live_call.dart';
+import 'src/media/media_log.dart';
 import 'theme/gather_theme.dart';
 import 'ui/home_shell.dart';
 import 'ui/pair_screen.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  // No generated `firebase_options.dart`: on Apple platforms the SDK reads
-  // ios/Runner/GoogleService-Info.plist, which is the file the Firebase console
-  // hands out and the only place the config should live. One fewer generated
-  // file to drift.
+  // Everything, including the binding, inside the zone.
   //
-  // Wrapped because push is an enhancement, not a requirement. A missing or
-  // malformed plist must degrade to "no push" — the feed and follow detection
-  // both work without Firebase — rather than crash on launch.
-  try {
-    await Firebase.initializeApp();
-  } catch (error) {
-    debugPrint('firebase: not initialised, push disabled — $error');
-  }
-  runApp(const GatherCompanionApp());
+  // `WidgetsFlutterBinding.ensureInitialized()` captures `Zone.current` when it
+  // builds, and every gesture and platform-channel callback is then dispatched
+  // in *that* zone. Initialising it before `runZoned` therefore leaves the whole
+  // app running in the root zone: the tree is built inside our zone, but a
+  // button tap — and everything it calls — is not. The `print` hook below then
+  // sees library output from timers and socket callbacks while silently missing
+  // all of it from the publish path, which is the one place we were reading.
+  //
+  // That cost three rounds on a device: traces added inside mediasoup were
+  // executing and going nowhere, which reads exactly like code that never ran.
+  runZoned(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      // No generated `firebase_options.dart`: on Apple platforms the SDK reads
+      // ios/Runner/GoogleService-Info.plist, which is the file the Firebase
+      // console hands out and the only place the config should live. One fewer
+      // generated file to drift.
+      //
+      // Wrapped because push is an enhancement, not a requirement. A missing or
+      // malformed plist must degrade to "no push" — the feed and follow
+      // detection both work without Firebase — rather than crash on launch.
+      try {
+        await Firebase.initializeApp();
+      } catch (error) {
+        debugPrint('firebase: not initialised, push disabled — $error');
+      }
+      runApp(const GatherCompanionApp());
+    },
+    // Library failures arrive through `print` and nowhere else. mediasoup's
+    // `FlexQueue` catches every exception a queued task throws, prints it under
+    // `kDebugMode`, and calls an error callback `transport.produce()` never
+    // passes — so a `produce` that dies on the way to the wire surfaces twenty
+    // seconds later as a timeout with no cause attached.
+    zoneSpecification: ZoneSpecification(
+      print: (self, parent, zone, line) {
+        mediaLogToFile(line);
+        parent.print(zone, line);
+      },
+    ),
+  );
 }
 
 class GatherCompanionApp extends StatefulWidget {
@@ -46,7 +74,7 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
       auth: auth,
       spaceId: spaceId,
       srcId: srcId,
-      log: debugPrint,
+      log: mediaLog,
     ),
   );
 

@@ -29,6 +29,13 @@ class FakeDevice implements ms.Device {
 
   final List<FakeTransport> transports = [];
 
+  /// Hand out transports whose handler has not finished `run()` yet.
+  ///
+  /// The real `Transport` is constructed around a fire-and-forget
+  /// `handler.run()`, so it is briefly live with no peer connection. Set this
+  /// before the call under test to reproduce that window.
+  bool holdNewHandlers = false;
+
   /// Every `createSendTransport`/`createRecvTransport` call, in order.
   final List<({String direction, String id, List<RTCIceServer> iceServers})>
       created = [];
@@ -65,6 +72,7 @@ class FakeDevice implements ms.Device {
   }) {
     created.add((direction: 'send', id: id, iceServers: iceServers));
     final transport = FakeTransport(id: id, producerCallback: producerCallback);
+    if (holdNewHandlers) transport.handler.hold();
     transports.add(transport);
     return transport;
   }
@@ -94,6 +102,34 @@ class FakeDevice implements ms.Device {
   dynamic noSuchMethod(Invocation invocation) => null;
 }
 
+/// A handler that can be caught mid-`run()`.
+///
+/// `HandlerInterface.ready` exists because the real one is built by a
+/// fire-and-forget `void ... async run()`: the transport is handed out before
+/// its `RTCPeerConnection` exists. [hold] reproduces exactly that window, so a
+/// test can assert that nothing is produced inside it.
+class FakeHandler implements ms.HandlerInterface {
+  Completer<void>? _held;
+
+  /// Withholds readiness until [release] is called.
+  void hold() => _held ??= Completer<void>();
+
+  void release() {
+    final held = _held;
+    _held = null;
+    if (held != null && !held.isCompleted) held.complete();
+  }
+
+  @override
+  Future<void> get ready => _held?.future ?? Future<void>.value();
+
+  @override
+  void markReady() => release();
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
 class FakeTransport implements ms.Transport {
   FakeTransport({required this.id, this.producerCallback, this.consumerCallback});
 
@@ -111,12 +147,30 @@ class FakeTransport implements ms.Transport {
   int iceRestarts = 0;
   List<RTCIceServer> lastIceServers = const [];
 
+  /// The handler, and specifically whether it admits to being ready.
+  ///
+  /// The real `Transport` starts `handler.run()` without waiting for it, so for
+  /// a moment it exists with no peer connection behind it and anything that
+  /// produces throws a null check nobody sees. A fake that is *always* ready
+  /// cannot catch that, so this one can be told to wait — see
+  /// [FakeHandler.hold].
+  @override
+  final FakeHandler handler = FakeHandler();
+
   /// The handlers [SfuSession] registered, so a test can fire `connect` and
   /// `produce` the way a real transport would.
   final Map<String, Function> handlers = {};
 
   final List<FakeProducer> producers = [];
   final List<FakeConsumer> consumers = [];
+
+  /// What was asked for, per tag, so a test can assert on the encodings.
+  ///
+  /// The real handler reads `encodings.first.scalabilityMode!` whenever the list
+  /// is non-empty, so "which encodings did we hand it" is a question with a
+  /// twenty-second hang behind it. Recording them is what lets that be a test
+  /// rather than a device.
+  final Map<String, List<ms.RtpEncodingParameters>> encodingsByTag = {};
 
   @override
   void on(String event, Function handler) => handlers[event] = handler;
@@ -139,6 +193,7 @@ class FakeTransport implements ms.Transport {
     // same here is what makes the session's `produce` message get sent at all.
     final handler = handlers['produce'];
     final tag = (appData['tag'] as String?) ?? source;
+    encodingsByTag[tag] = encodings;
     Future<void>(() async {
       var id = 'producer-$tag';
       if (handler != null) {
@@ -213,6 +268,25 @@ class FakeProducer implements ms.Producer {
 
   final String tag;
   final List<ms.RtpEncodingParameters> encodings;
+
+  /// What the microphone is doing, for the voice-activity poll to read.
+  ///
+  /// Null means the stats carry no `media-source` row at all, which is what a
+  /// platform that will not answer looks like from [SfuSession.microphoneLevel].
+  double? level;
+
+  /// Shaped like the real thing rather than like what the caller wants: a whole
+  /// peer connection's worth of rows, of which exactly one is the microphone.
+  /// Reading the wrong row here is how a silent microphone once looked healthy —
+  /// see `SfuSession._reportOutboundRtp` — so the decoys are the point.
+  @override
+  Future<List<StatsReport>> getStats() async => [
+        StatsReport('t', 'transport', 0, {'bytesSent': 99999}),
+        StatsReport('o', 'outbound-rtp', 0, {'kind': 'video', 'bytesSent': 4242}),
+        StatsReport('v', 'media-source', 0, {'kind': 'video', 'framesPerSecond': 24}),
+        if (level != null)
+          StatsReport('a', 'media-source', 0, {'kind': 'audio', 'audioLevel': level}),
+      ];
 
   @override
   bool closed = false;

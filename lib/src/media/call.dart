@@ -160,6 +160,23 @@ abstract class Call {
   Stream<CallState> get states;
   CallState get state;
 
+  /// Whether we are talking right now, as often as that answer changes.
+  ///
+  /// On this interface rather than on [CallState] because it is not call state:
+  /// it changes several times a minute while nothing about the call does, and
+  /// folding it in would republish the whole thing — and rebuild every screen
+  /// listening — on every pause between sentences.
+  ///
+  /// Nothing in the media plane produces this. Gather's speaking ring comes off
+  /// the *game* socket, from `SpaceUser.speaking`, which its clients set with
+  /// `startSpeaking`/`stopSpeaking`; the SFU carries the audio and says nothing
+  /// about whether anybody is using it. So this is measured here — from the
+  /// microphone's own level — and `AppState` is what puts it on the wire.
+  Stream<bool> get speaking;
+
+  /// The current answer, for a screen that starts listening mid-sentence.
+  bool get isSpeaking;
+
   /// Turns the microphone on or off, opening the hardware the first time.
   ///
   /// Returns null when it took, or a sentence explaining why it did not — the

@@ -240,6 +240,14 @@ class WebrtcMediaEngine implements CaptureEngine {
       _log('media: could not read the device mute state: $error');
       return;
     }
+    // Said out loud, because "the microphone is live" is the one claim in this
+    // app that can be wrong without anything failing: the producer is accepted,
+    // the colleague's client draws you unmuted, and the room hears silence.
+    // Measured 2026-09-17: the phone sent 63 packets of 32 bytes in five
+    // seconds, which is Opus DTX describing an empty room.
+    final track = _stream?.getAudioTracks().firstOrNull;
+    _log('media: the device reports the microphone '
+        '${muted ? 'MUTED' : 'live'}, track.enabled=${track?.enabled}');
     _emit(_state.copyWith(audioEnabled: !muted));
   }
 
