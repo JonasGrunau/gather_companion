@@ -63,6 +63,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../src/app_state.dart';
+import '../src/media/media_engine.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
 import 'person_avatar.dart';
@@ -370,6 +371,31 @@ class _ControlBarState extends State<ControlBar> {
                   icon: Icons.groups_rounded,
                   label: 'See your camera',
                   onTap: () => openCallScreen(context, state),
+                ),
+              // The sound's way out. Present only while there is sound to route —
+              // somebody else in the call, or your own hardware live. The
+              // loudspeaker is the resting-on-a-desk default and wears the brand;
+              // the earpiece is the ordinary grey. A headset, once it is in, owns
+              // the route and the glyph, and a tap still forces the speaker over it.
+              if (call.live || state.inCall)
+                _BarButton(
+                  icon: switch (call.audioOutput) {
+                    AudioOutput.speaker => Icons.volume_up_rounded,
+                    AudioOutput.earpiece => Icons.phone_in_talk_rounded,
+                    AudioOutput.bluetooth => Icons.bluetooth_audio_rounded,
+                    AudioOutput.wired => Icons.headset_rounded,
+                  },
+                  label: switch (call.audioOutput) {
+                    AudioOutput.speaker => 'Use the earpiece',
+                    AudioOutput.earpiece => 'Use the speaker',
+                    AudioOutput.bluetooth => 'On Bluetooth — tap for the speaker',
+                    AudioOutput.wired => 'On headphones — tap for the speaker',
+                  },
+                  tint: call.audioOutput == AudioOutput.speaker
+                      ? t.brand
+                      : t.mutedForeground,
+                  onTap: () => _run(() =>
+                      state.setSpeakerOn(call.audioOutput != AudioOutput.speaker)),
                 ),
               const _Rule(),
               _BarButton(

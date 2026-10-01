@@ -14,6 +14,15 @@
 /// over is an option the plugin offers and a decision this app has no reason to
 /// make.
 ///
+/// Output *routing* is the one exception, and it is a different thing. Left to
+/// the plugin defaults, remote audio comes out of the earpiece — right for a
+/// phone held to the ear, wrong for a companion app set down on a desk, where you
+/// then hear nobody. So [prepareAudioSession] sets the loudspeaker as the default
+/// (and auto-selects a headset when one is in), through the plugin's own
+/// `setAppleAudioIOMode` / `setAndroidAudioConfiguration` / `setSpeakerphoneOn`.
+/// Those set category, mode and route; they do **not** switch off the voice
+/// processing above, so the two stances do not contradict.
+///
 /// Mute happens at the **audio device**, not on the track, and the platform mute
 /// sound is accepted rather than avoided.
 ///
@@ -51,6 +60,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -87,6 +97,16 @@ class WebrtcMediaEngine implements CaptureEngine {
   LocalMediaState _state = const LocalMediaState();
 
   MediaStream? _stream;
+
+  /// The person's standing choice, or null to follow the default — loudspeaker
+  /// unless a headset is in. A tap pins it; a headset plugged or pulled clears it
+  /// back to the default, so AirPods grab the audio and unplugging falls back to
+  /// the speaker rather than the earpiece.
+  bool? _speakerOverride;
+
+  /// So [prepareAudioSession] configures the platform once and installs the
+  /// device-change listener once, however many times it is called.
+  bool _sessionReady = false;
 
   @override
   Stream<LocalMediaState> get states => _states.stream;
@@ -215,7 +235,27 @@ class WebrtcMediaEngine implements CaptureEngine {
         /* already gone */
       }
     }
+    // Deliberately *not* releasing the audio session here: this also runs on a
+    // mid-call capture restart (adding the camera), and the route must outlive it.
     _emit(const LocalMediaState());
+  }
+
+  /// Hands the audio session back: drops the device-change listener, forgets any
+  /// forced route, and on Android clears the communication device so the next
+  /// session is not pinned to this one's choice.
+  @override
+  Future<void> releaseAudioSession() async {
+    if (!_sessionReady) return;
+    _sessionReady = false;
+    _speakerOverride = null;
+    navigator.mediaDevices.ondevicechange = null;
+    if (Platform.isAndroid) {
+      try {
+        await Helper.clearAndroidCommunicationDevice();
+      } on Object catch (error) {
+        _log('media: could not clear the communication device: $error');
+      }
+    }
   }
 
   @override
@@ -259,6 +299,106 @@ class WebrtcMediaEngine implements CaptureEngine {
   }
 
   @override
+  Future<void> prepareAudioSession() async {
+    if (_sessionReady) return;
+    _sessionReady = true;
+
+    // The platform session, set the plugin's own way. This is not the hand-rolled
+    // AVAudioSession the header refuses: it sets category, mode and route, and
+    // leaves Apple's voice processing (AEC/NS/AGC) exactly where it was.
+    try {
+      if (Platform.isIOS) {
+        await Helper.setAppleAudioIOMode(AppleAudioIOMode.localAndRemote);
+      } else if (Platform.isAndroid) {
+        await Helper.setAndroidAudioConfiguration(
+          AndroidAudioConfiguration.communication,
+        );
+      }
+    } on Object catch (error) {
+      _log('media: could not configure the audio session: $error');
+    }
+
+    // One callback, owned here. A headset coming or going is a reason to redo the
+    // default — not to honour a tap from before it was plugged in.
+    navigator.mediaDevices.ondevicechange = (_) {
+      _speakerOverride = null;
+      unawaited(_applyRoute());
+    };
+
+    await _applyRoute();
+  }
+
+  @override
+  Future<void> setSpeakerOn(bool on) async {
+    _speakerOverride = on;
+    await _applyRoute();
+  }
+
+  /// Puts the route where [_speakerOverride] — or, failing that, the presence of
+  /// a headset — says it should go, then reads back what actually happened.
+  ///
+  /// Enumerates *before* deciding so a headset already connected at startup wins
+  /// the default rather than losing to a stale read.
+  Future<void> _applyRoute() async {
+    final headset = (await _outputs())
+        .any((d) => d == AudioOutput.bluetooth || d == AudioOutput.wired);
+    final speaker = _speakerOverride ?? !headset;
+    try {
+      // false does not mean earpiece: it releases the override and lets the
+      // system pick, which is headset-if-present, earpiece otherwise.
+      await Helper.setSpeakerphoneOn(speaker);
+    } on Object catch (error) {
+      _log('media: could not set the audio route: $error');
+      return;
+    }
+    await _syncOutput();
+  }
+
+  /// Reads the live output route and publishes it as [AudioOutput].
+  Future<void> _syncOutput() async {
+    final outputs = await _outputs();
+    // The active route is the first the platform lists; default to the earpiece
+    // when it offers nothing, which is also the platform's own fallback.
+    final next = outputs.isEmpty ? AudioOutput.earpiece : outputs.first;
+    _emit(_state.copyWith(audioOutput: next));
+  }
+
+  /// The current output route(s), newest-active-first, as [AudioOutput].
+  ///
+  /// iOS lists only the active port plus a synthetic `Speaker`; Android lists the
+  /// available devices keyed by fixed strings. Both are mapped off `label` and
+  /// `deviceId`, which is the only signal the plugin gives for kind.
+  Future<List<AudioOutput>> _outputs() async {
+    final List<MediaDeviceInfo> devices;
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } on Object catch (error) {
+      _log('media: could not read the audio outputs: $error');
+      return const [];
+    }
+    return [
+      for (final d in devices)
+        if (d.kind == 'audiooutput') _classifyOutput(d),
+    ].whereType<AudioOutput>().toList();
+  }
+
+  static AudioOutput? _classifyOutput(MediaDeviceInfo d) {
+    final tag = '${d.deviceId} ${d.label}'.toLowerCase();
+    if (tag.contains('bluetooth') || tag.contains('airpod')) {
+      return AudioOutput.bluetooth;
+    }
+    if (tag.contains('wired') || tag.contains('headphone') ||
+        tag.contains('headset')) {
+      return AudioOutput.wired;
+    }
+    if (tag.contains('speaker')) return AudioOutput.speaker;
+    if (tag.contains('earpiece') || tag.contains('receiver')) {
+      return AudioOutput.earpiece;
+    }
+    return null;
+  }
+
+  @override
   Future<void> setVideoEnabled(bool enabled) async {
     final track = _stream?.getVideoTracks().firstOrNull;
     if (track == null) return;
@@ -280,6 +420,7 @@ class WebrtcMediaEngine implements CaptureEngine {
 
   @override
   Future<void> dispose() async {
+    await releaseAudioSession();
     await stopCapture();
     await _states.close();
   }

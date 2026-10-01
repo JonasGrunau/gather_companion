@@ -77,6 +77,47 @@ class FakeMediaEngine implements MediaEngine {
     _emit(_state.copyWith(frontCamera: !_state.frontCamera));
   }
 
+  /// What headset, if any, is plugged in — null for none. Lets a test drive the
+  /// auto-select path with no device-change callback anywhere near it.
+  AudioOutput? headset;
+
+  bool? _speakerOverride;
+
+  @override
+  Future<void> prepareAudioSession() async {
+    calls.add('prepareAudioSession');
+    _applyRoute();
+  }
+
+  @override
+  Future<void> setSpeakerOn(bool on) async {
+    calls.add('setSpeakerOn($on)');
+    _speakerOverride = on;
+    _applyRoute();
+  }
+
+  @override
+  Future<void> releaseAudioSession() async {
+    calls.add('releaseAudioSession');
+    _speakerOverride = null;
+  }
+
+  /// Mimics a headset connecting or disconnecting: clears any forced route and
+  /// re-routes, exactly as the real engine's device-change listener does.
+  void connectHeadset(AudioOutput? which) {
+    headset = which;
+    _speakerOverride = null;
+    _applyRoute();
+  }
+
+  void _applyRoute() {
+    final speaker = _speakerOverride ?? (headset == null);
+    _emit(_state.copyWith(
+      audioOutput:
+          speaker ? AudioOutput.speaker : (headset ?? AudioOutput.earpiece),
+    ));
+  }
+
   @override
   Future<void> dispose() async {
     calls.add('dispose');

@@ -61,6 +61,9 @@ class CallState {
   bool get micOn => media.capturing && media.audioEnabled;
   bool get cameraOn => media.hasVideo;
 
+  /// Where the sound is coming out, for the button that switches it.
+  AudioOutput get audioOutput => media.audioOutput;
+
   /// Whether anybody else is on the other end. A call of one is a rehearsal.
   bool get hasCompany => participants.isNotEmpty;
 
@@ -185,6 +188,11 @@ abstract class Call {
   Future<String?> setMicOn(bool on);
 
   Future<String?> setCameraOn(bool on);
+
+  /// Sends the sound to the loudspeaker (`true`) or back to the earpiece —
+  /// or to a headset if one is connected. Same null-or-a-sentence contract as
+  /// [setMicOn].
+  Future<String?> setSpeakerOn(bool on);
 
   /// Front to back and back again. A no-op with no camera running.
   Future<void> switchCamera();

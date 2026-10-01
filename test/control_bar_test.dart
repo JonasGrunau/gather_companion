@@ -220,6 +220,78 @@ void main() {
     expect(find.byTooltip('See your camera'), findsNothing);
   });
 
+  group('the audio route', () {
+    CallState outputting(AudioOutput out) => CallState(
+          media: LocalMediaState(
+            capturing: true,
+            audioEnabled: true,
+            audioTrackId: 'a1',
+            audioOutput: out,
+          ),
+        );
+
+    testWidgets('is absent until there is sound to route', (tester) async {
+      await tester.pumpWidget(wrap(connected()));
+
+      // Nobody in the call and no hardware live — nothing to send anywhere, so
+      // the button is absent rather than dimmed, like the rest of the bar.
+      for (final label in [
+        'Use the speaker',
+        'Use the earpiece',
+        'On Bluetooth — tap for the speaker',
+        'On headphones — tap for the speaker',
+      ]) {
+        expect(find.byTooltip(label), findsNothing, reason: label);
+      }
+    });
+
+    testWidgets('on the loudspeaker it offers the earpiece, wearing the brand',
+        (tester) async {
+      final state = connected()..debugCall = outputting(AudioOutput.speaker);
+      await tester.pumpWidget(wrap(state));
+
+      final button = find.byTooltip('Use the earpiece');
+      expect(button, findsOneWidget);
+      final icon =
+          tester.widget<Icon>(find.descendant(of: button, matching: find.byType(Icon)));
+      expect(icon.icon, Icons.volume_up_rounded);
+      expect(icon.color, tester.element(button).tokens.brand,
+          reason: 'the loudspeaker is the broadcasting state, like a live mic');
+    });
+
+    testWidgets('on the earpiece it offers the speaker, in resting grey',
+        (tester) async {
+      final state = connected()..debugCall = outputting(AudioOutput.earpiece);
+      await tester.pumpWidget(wrap(state));
+
+      final button = find.byTooltip('Use the speaker');
+      expect(button, findsOneWidget);
+      final icon =
+          tester.widget<Icon>(find.descendant(of: button, matching: find.byType(Icon)));
+      expect(icon.icon, Icons.phone_in_talk_rounded);
+      expect(icon.color, tester.element(button).tokens.mutedForeground);
+    });
+
+    testWidgets('a headset owns the glyph, and a tap still reaches AppState',
+        (tester) async {
+      final state = connected()..debugCall = outputting(AudioOutput.bluetooth);
+      await tester.pumpWidget(wrap(state));
+
+      final button = find.byTooltip('On Bluetooth — tap for the speaker');
+      expect(button, findsOneWidget);
+      expect(
+        tester.widget<Icon>(find.descendant(of: button, matching: find.byType(Icon))).icon,
+        Icons.bluetooth_audio_rounded,
+      );
+
+      // The refusal is the proof it is wired to `AppState`, not only to the
+      // widget: there is no socket here, so the route cannot be set.
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      expect(find.text('Not connected to Gather.'), findsOneWidget);
+    });
+  });
+
   group('back to my desk', () {
     /// Paired, on a floor with a desk, standing wherever [at] says.
     AppState atDesk({String? deskId, required int x, required int y}) => AppState()

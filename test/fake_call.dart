@@ -70,6 +70,15 @@ class FakeCall implements Call {
   @override
   Future<String?> setCameraOn(bool on) async => null;
 
+  /// The speaker toggles we were asked for, in order.
+  final List<bool> speakerCalls = [];
+
+  @override
+  Future<String?> setSpeakerOn(bool on) async {
+    speakerCalls.add(on);
+    return null;
+  }
+
   @override
   Future<void> switchCamera() async {}
 

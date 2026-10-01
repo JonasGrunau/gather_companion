@@ -762,6 +762,14 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<String?> setSpeakerOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setSpeakerOn(on);
+    notifyListeners();
+    return failed;
+  }
+
   /// The call itself, for the one screen that draws video.
   ///
   /// Typed as [Call], so nothing here has heard of `MediaStream` and this file

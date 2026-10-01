@@ -9,6 +9,7 @@ library;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/media/live_call.dart';
+import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/media/sfu_session.dart';
 import 'package:gather_companion/src/media/voice_activity.dart';
 
@@ -183,9 +184,10 @@ void main() {
 
       expect(rig.session.ready, isTrue);
       expect(rig.node().has('consume-request'), isTrue);
-      // And it costs no hardware: no capture session, so no permission prompt
-      // and no indicator, for something the person has not asked for.
-      expect(engine.calls, isEmpty);
+      // The audio session is configured so the sound lands on the loudspeaker
+      // the moment it arrives — but no *capture* is opened, so there is still no
+      // permission prompt and no indicator for something nobody asked for.
+      expect(engine.calls, ['prepareAudioSession']);
       expect(call.state.media.capturing, isFalse);
     });
 
@@ -266,12 +268,67 @@ void main() {
     });
   });
 
+  group('the audio route', () {
+    test('walking into a conversation sends the sound to the loudspeaker',
+        () async {
+      // The whole bug: you could hear a conversation only with the phone at your
+      // ear. Listening connects the media plane, and that is where the route is
+      // set — before any capture, with nobody having tapped a thing.
+      await call.setListeningTo({them});
+      await settle();
+
+      expect(engine.calls, contains('prepareAudioSession'));
+      expect(call.state.audioOutput, AudioOutput.speaker);
+      expect(call.state.media.capturing, isFalse);
+    });
+
+    test('turning the microphone on prepares the session too', () async {
+      await call.setMicOn(true);
+
+      expect(engine.calls, contains('prepareAudioSession'));
+    });
+
+    test('the button flips to the earpiece and back, through the queue',
+        () async {
+      await call.setListeningTo({them});
+      await settle();
+
+      expect(await call.setSpeakerOn(false), isNull);
+      await settle();
+      expect(call.state.audioOutput, AudioOutput.earpiece);
+
+      expect(await call.setSpeakerOn(true), isNull);
+      await settle();
+      expect(call.state.audioOutput, AudioOutput.speaker);
+    });
+
+    test('a headset takes the audio, and a tap can still force the speaker',
+        () async {
+      await call.setListeningTo({them});
+      await settle();
+
+      // AirPods arrive mid-call: they win, without a tap.
+      engine.connectHeadset(AudioOutput.bluetooth);
+      await settle();
+      expect(call.state.audioOutput, AudioOutput.bluetooth);
+
+      // But the person can still override to the loudspeaker.
+      await call.setSpeakerOn(true);
+      await settle();
+      expect(call.state.audioOutput, AudioOutput.speaker);
+    });
+  });
+
   test('hanging up releases the hardware and the session', () async {
     await call.setMicOn(true);
 
     await call.hangUp();
 
-    expect(engine.calls, contains('stopCapture'));
+    // The audio session is handed back before the capture, and both are gone.
+    expect(engine.calls, containsAllInOrder(<String>[
+      'releaseAudioSession',
+      'stopCapture',
+    ]));
     expect(rig.node().disposed, isTrue);
     expect(call.state.micOn, isFalse);
   });
