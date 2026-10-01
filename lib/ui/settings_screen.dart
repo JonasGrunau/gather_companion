@@ -100,8 +100,8 @@ class SettingsScreen extends StatelessWidget {
             children: [
               _Row(
                 icon: Icons.mic_rounded,
-                title: 'Mic & camera',
-                subtitle: 'Check that they work before you need them.',
+                title: 'Mic, camera & sound',
+                subtitle: 'Check they work before your next meeting.',
                 goes: true,
                 // Pushed, never a tab: the check opens the hardware in
                 // `initState` and holds it until it is disposed, so it has to be
