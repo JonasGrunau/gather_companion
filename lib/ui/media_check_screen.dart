@@ -20,11 +20,14 @@
 /// ## Where the level comes from with no meeting running
 ///
 /// In a call the microphone level is read from the SFU producer's `getStats`.
-/// There is no SFU here, so this stands up a loopback `RTCPeerConnection`, adds
-/// the live audio track to it, and reads `audioLevel` off the same
-/// `media-source` stats row — the identical number `VoiceActivity` thresholds in
-/// a call. The connection goes nowhere; it exists only so libwebrtc runs the
-/// send pipeline that produces the stat.
+/// There is no SFU here, so this stands up a loopback of two
+/// `RTCPeerConnection`s wired to each other — the live audio track on the
+/// sender, the receiver answering it, ICE and DTLS completing between them — and
+/// reads `audioLevel` off the sender's `media-source` stats row, the identical
+/// number `VoiceActivity` thresholds in a call. The connection goes nowhere off
+/// the device, but it must genuinely *connect*: iOS libwebrtc only runs the
+/// audio send pipeline that fills in that stat once the transport is writable, so
+/// a local offer that is never answered reads as a dead microphone.
 ///
 /// ## The renderer's lifetime is the widget's
 ///
@@ -58,6 +61,12 @@ import '../theme/gather_theme.dart';
 /// down and routing itself to the media speaker; `voiceCommunication` on Android
 /// for the same reason. The point of the test is that the sound comes out where
 /// a *call* would, so it must not open a session of its own.
+///
+/// Set **once**, globally, in `_start` — not per play. `audioplayers`
+/// reconfigures and then deactivates the shared `AVAudioSession` around each
+/// `play`, and doing that to the session flutter_webrtc is holding live restarts
+/// its voice processing IO unit and freezes the app. Mirroring the call's session
+/// here and never touching it again makes a `play` harmless.
 final _toneContext = AudioContext(
   iOS: AudioContextIOS(
     category: AVAudioSessionCategory.playAndRecord,
@@ -84,9 +93,12 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
   final _renderer = RTCVideoRenderer();
   late final WebrtcMediaEngine _engine = WebrtcMediaEngine(log: debugPrint);
 
-  /// The loopback connection that makes the microphone level readable without a
-  /// meeting — see the header. Null until capture gives us an audio track.
+  /// The loopback that makes the microphone level readable without a meeting —
+  /// see the header. A *connected* pair: [_meterPc] sends the live audio track to
+  /// [_meterRecvPc], and the level is read off the sender. Both null until
+  /// capture gives us an audio track.
   RTCPeerConnection? _meterPc;
+  RTCPeerConnection? _meterRecvPc;
   Timer? _meterTimer;
 
   /// The same speaking decision the call draws its ring from, run here against
@@ -115,6 +127,19 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
 
   Future<void> _start() async {
     await _renderer.initialize();
+    // Configure the player's audio session once, globally, and never again. The
+    // reconfigure `audioplayers` does on every `play` otherwise — and the
+    // deactivate it does when playback ends — reach into the *same*
+    // `AVAudioSession` flutter_webrtc is holding live, and restarting the voice
+    // processing IO unit mid-call froze the whole app. Setting it here, to a
+    // session that mirrors the call's (`playAndRecord` + `mixWithOthers`), means
+    // a `play` is just a play: no category change, nothing torn down.
+    try {
+      await AudioPlayer.global.setAudioContext(_toneContext);
+      await _player.setReleaseMode(ReleaseMode.stop);
+    } on Object catch (error) {
+      debugPrint('media-check: could not configure the test-sound player: $error');
+    }
     try {
       await _engine.startCapture();
       _renderer.srcObject = _engine.localStream;
@@ -131,20 +156,44 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
 
   /// Stands up the loopback connection and starts polling the level.
   ///
-  /// `createOffer` + `setLocalDescription` with no remote on the other end: it
-  /// is never answered and never connects. Setting the local description is what
-  /// starts the send pipeline, and the send pipeline is what fills in
-  /// `media-source`'s `audioLevel`.
+  /// A *connected* local loopback: the sender holds the live audio track, the
+  /// receiver answers it, ICE candidates are traded both ways, and DTLS comes up
+  /// — all on the device, going nowhere. The connection has to actually complete,
+  /// because on iOS libwebrtc only runs the audio send pipeline (and computes the
+  /// `media-source` `audioLevel` the bar reads) once the transport is writable. A
+  /// local offer that is never answered — what this used to do — never connects,
+  /// so the stat stayed empty and the bar never moved.
   Future<void> _startMeter() async {
     final stream = _engine.localStream;
     final track = stream?.getAudioTracks().firstOrNull;
     if (track == null) return;
 
     try {
-      final pc = await createPeerConnection(<String, dynamic>{});
-      await pc.addTrack(track, stream!);
-      await pc.setLocalDescription(await pc.createOffer());
-      _meterPc = pc;
+      final send = await createPeerConnection(const <String, dynamic>{});
+      final recv = await createPeerConnection(const <String, dynamic>{});
+
+      // Trickle the candidates across to each other; localhost has few and they
+      // arrive fast, so there is no need to wait and bundle them.
+      send.onIceCandidate = (c) => recv.addCandidate(c);
+      recv.onIceCandidate = (c) => send.addCandidate(c);
+
+      // The receiver would otherwise play the mic straight back out the
+      // loudspeaker, inches from that same live mic — a feedback howl. Muting the
+      // received track kills the playout; the *send* side still runs, so the
+      // level we read off it is unaffected.
+      recv.onTrack = (e) => e.track.enabled = false;
+
+      await send.addTrack(track, stream!);
+
+      final offer = await send.createOffer();
+      await send.setLocalDescription(offer);
+      await recv.setRemoteDescription(offer);
+      final answer = await recv.createAnswer();
+      await recv.setLocalDescription(answer);
+      await send.setRemoteDescription(answer);
+
+      _meterPc = send;
+      _meterRecvPc = recv;
     } on Object catch (error) {
       debugPrint('media-check: could not open the level meter: $error');
       return;
@@ -190,8 +239,9 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
   }
 
   Future<void> _playTone() async {
+    // No `setAudioContext` here on purpose — the session is set once in `_start`.
+    // Touching it per play is what hung the app; see there.
     try {
-      await _player.setAudioContext(_toneContext);
       await _player.play(
         BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
             mimeType: 'audio/wav'),
@@ -208,6 +258,7 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
     // stops the tracks underneath it.
     _meterTimer?.cancel();
     unawaited(_meterPc?.dispose());
+    unawaited(_meterRecvPc?.dispose());
     unawaited(_player.dispose());
     _renderer.srcObject = null;
     _renderer.dispose();
