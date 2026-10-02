@@ -24,12 +24,16 @@
 ///    straight off the microphone, the way a device-setup screen in Teams or Zoom
 ///    does. One owner of the camera, one of the audio session, nothing to fight.
 ///
-///  - **Call pipeline** exercises the *actual* meeting path: the real
-///    [WebrtcMediaEngine], its real routing (`setSpeakerOn`) and its real mute
-///    (`setAudioEnabled`, with the platform mute sound and muted-talker
-///    detection). The mic here shows a plain live/muted status rather than a level
-///    — WebRTC gives no local audio level without a connection, and the loopback
-///    that used to fake one is exactly what froze this screen.
+///  - **Call pipeline** exercises the WebRTC capture path with the real
+///    [WebrtcMediaEngine] — the pre-branch check, restored: a plain
+///    `startCapture()` with mic/camera/switch and real mute (`setAudioEnabled`),
+///    but **no** `prepareAudioSession`, route toggle or test sound. Forcing a
+///    route on this standalone capture (no SFU transport connected) drives the
+///    voice-processing reconfiguration loop that lagged the screen; a real call
+///    tolerates it because its transport is live. The mic shows a plain
+///    live/muted status rather than a level — WebRTC gives no local audio level
+///    without a connection, and the loopback that used to fake one is exactly
+///    what froze this screen.
 ///
 /// Why the split at all: `flutter_webrtc` forces the shared `AVAudioSession` into
 /// `videoChat` mode whenever it holds the camera, while `record` has to activate
@@ -91,25 +95,10 @@ AudioContext _deviceToneContext({required bool speaker}) => AudioContext(
       ),
     );
 
-/// The test sound's session in **Call pipeline** mode.
-///
-/// No `defaultToSpeaker`: the route is the engine's to own through `setSpeakerOn`,
-/// so the chime only has to *mix* into whatever route a call is using rather than
-/// override it. `mixWithOthers` keeps it from tearing the voice session down.
-final _callToneContext = AudioContext(
-  iOS: AudioContextIOS(
-    category: AVAudioSessionCategory.playAndRecord,
-    options: const {
-      AVAudioSessionOptions.mixWithOthers,
-      AVAudioSessionOptions.allowBluetooth,
-    },
-  ),
-  android: const AudioContextAndroid(
-    contentType: AndroidContentType.sonification,
-    usageType: AndroidUsageType.voiceCommunication,
-    audioFocus: AndroidAudioFocus.gainTransientMayDuck,
-  ),
-);
+// Call pipeline mode has no test sound: a chime would need audioplayers to
+// reconfigure the AVAudioSession the engine owns, which revives the category
+// thrash that froze the screen. The speaker test lives in Device mode, where
+// nothing else is holding the session.
 
 /// How the microphone is captured for the meter: raw signed-16-bit PCM, mono, at
 /// a rate that is plenty to tell speech from silence and cheap to carry. The
@@ -181,7 +170,7 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
               child: Text(
                 _mode == _CheckMode.device
                     ? 'The raw hardware — lightest path, with a live mic light.'
-                    : 'The real meeting path — WebRTC capture, routing and mute.',
+                    : 'The WebRTC capture path — camera and mute.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: t.mutedForeground),
               ),
@@ -589,7 +578,8 @@ class _CameraCover extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Call-pipeline mode: the real WebRTC engine, its real routing and mute.
+// Call-pipeline mode: the pre-branch WebRTC check — plain capture, mic/camera/
+// switch, no route forcing (that forcing is what lagged the screen).
 // ---------------------------------------------------------------------------
 
 class _MeetingCheck extends StatefulWidget {
@@ -602,8 +592,6 @@ class _MeetingCheck extends StatefulWidget {
 class _MeetingCheckState extends State<_MeetingCheck> {
   final _renderer = RTCVideoRenderer();
   late final WebrtcMediaEngine _engine = WebrtcMediaEngine(log: debugPrint);
-  final _player = AudioPlayer();
-  final _rng = Random();
 
   StreamSubscription<LocalMediaState>? _sub;
   LocalMediaState _state = const LocalMediaState();
@@ -621,16 +609,12 @@ class _MeetingCheckState extends State<_MeetingCheck> {
   Future<void> _start() async {
     await _renderer.initialize();
     try {
-      await _player.setReleaseMode(ReleaseMode.stop);
-      // Set once, so a tap is just a play: the chime mixes into whatever route the
-      // engine set rather than reconfiguring the session out from under it.
-      await AudioPlayer.global.setAudioContext(_callToneContext);
-    } on Object catch (error) {
-      debugPrint('media-check: could not configure the test-sound player: $error');
-    }
-    try {
-      await _engine.prepareAudioSession();
-      await _engine.startCapture(audio: true, video: true);
+      // Plain capture, like the pre-branch check: no `prepareAudioSession` and
+      // no `setSpeakerOn`. Route forcing on a standalone capture with no SFU
+      // transport connected drives the voice-processing reconfiguration loop
+      // that lagged the screen. A real call tolerates those calls because its
+      // transport is live; a test harness does not.
+      await _engine.startCapture();
       _renderer.srcObject = _engine.localStream;
     } on MediaFailure {
       // Already on `_state` through the stream; the screen renders it below.
@@ -639,21 +623,9 @@ class _MeetingCheckState extends State<_MeetingCheck> {
     }
   }
 
-  Future<void> _playTone() async {
-    try {
-      await _player.play(
-        BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
-            mimeType: 'audio/wav'),
-      );
-    } on Object catch (error) {
-      debugPrint('media-check: could not play the test sound: $error');
-    }
-  }
-
   @override
   void dispose() {
     unawaited(_sub?.cancel());
-    unawaited(_player.dispose());
     _renderer.srcObject = null;
     _renderer.dispose();
     _engine.dispose();
@@ -663,7 +635,6 @@ class _MeetingCheckState extends State<_MeetingCheck> {
   @override
   Widget build(BuildContext context) {
     final showControls = _state.capturing;
-    final speaker = _state.audioOutput == AudioOutput.speaker;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: kGutter),
@@ -685,15 +656,17 @@ class _MeetingCheckState extends State<_MeetingCheck> {
             _Controls(
               micLive: _state.audioEnabled,
               videoOn: _state.videoEnabled,
-              speaker: speaker,
+              // No route toggle and no test sound: the pre-branch check forced
+              // neither, and forcing a route here is what lagged the screen.
+              speaker: null,
               frontCamera: _state.frontCamera,
               hasCamera: true,
               canSwitch: _state.hasVideo,
               onToggleMic: () => _engine.setAudioEnabled(!_state.audioEnabled),
               onToggleVideo: () => _engine.setVideoEnabled(!_state.videoEnabled),
               onSwitchCamera: _engine.switchCamera,
-              onToggleSpeaker: () => _engine.setSpeakerOn(!speaker),
-              onPlayTone: _playTone,
+              onToggleSpeaker: null,
+              onPlayTone: null,
             ),
           const SizedBox(height: kGutter),
         ],
@@ -955,15 +928,24 @@ class _Controls extends StatelessWidget {
 
   final bool micLive;
   final bool videoOn;
-  final bool speaker;
+
+  /// Which way the test sound goes. Null (with [onToggleSpeaker] null) hides the
+  /// route toggle — the call pipeline forces no route, so there is nothing to
+  /// switch.
+  final bool? speaker;
   final bool frontCamera;
   final bool hasCamera;
   final bool canSwitch;
   final VoidCallback onToggleMic;
   final VoidCallback onToggleVideo;
   final VoidCallback onSwitchCamera;
-  final VoidCallback onToggleSpeaker;
-  final VoidCallback onPlayTone;
+  final VoidCallback? onToggleSpeaker;
+
+  /// A tap plays a chime out the current route. Null hides the button — the
+  /// call pipeline can't play a chime without reconfiguring the AVAudioSession
+  /// the engine owns (the old category-thrash), so it leaves the speaker test
+  /// to Device mode.
+  final VoidCallback? onPlayTone;
 
   @override
   Widget build(BuildContext context) {
@@ -972,6 +954,7 @@ class _Controls extends StatelessWidget {
     // The label names where a tap sends the sound, not where it is now: the
     // button is a switch, and the brand tint already says when the speaker is
     // the live one.
+    final speaker = this.speaker ?? false;
     final routeLabel = speaker ? 'Earpiece' : 'Speaker';
 
     return Column(
@@ -1003,25 +986,29 @@ class _Controls extends StatelessWidget {
               tint: t.mutedForeground,
             ),
             // Where the test sound comes out: the loudspeaker wears the brand
-            // like a live control, the earpiece the resting grey.
-            _Toggle(
-              on: speaker,
-              onIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
-              offIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
-              label: routeLabel,
-              tint: speaker ? t.brand : t.mutedForeground,
-              onTap: onToggleSpeaker,
-            ),
+            // like a live control, the earpiece the resting grey. Absent when
+            // no route is forced (the call pipeline).
+            if (onToggleSpeaker != null)
+              _Toggle(
+                on: speaker,
+                onIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
+                offIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
+                label: routeLabel,
+                tint: speaker ? t.brand : t.mutedForeground,
+                onTap: onToggleSpeaker,
+              ),
           ],
         ),
-        const SizedBox(height: 8),
-        // Hear it for yourself: a short chime out of whatever the route above
-        // says, so the speaker test needs no second person on the line.
-        TextButton.icon(
-          onPressed: onPlayTone,
-          icon: const Icon(Icons.graphic_eq_rounded, size: 18),
-          label: const Text('Play a test sound'),
-        ),
+        if (onPlayTone != null) ...[
+          const SizedBox(height: 8),
+          // Hear it for yourself: a short chime out of whatever the route above
+          // says, so the speaker test needs no second person on the line.
+          TextButton.icon(
+            onPressed: onPlayTone,
+            icon: const Icon(Icons.graphic_eq_rounded, size: 18),
+            label: const Text('Play a test sound'),
+          ),
+        ],
       ],
     );
   }
