@@ -427,8 +427,16 @@ class WebrtcMediaEngine implements CaptureEngine {
         .any((d) => d == AudioOutput.bluetooth || d == AudioOutput.wired);
     final speaker = _speakerOverride ?? !headset;
     // A re-apply that would not change the route still emits a route change, so
-    // skip it: nothing to do, and writing it anyway is what the loop feeds on.
-    if (speaker == _appliedSpeaker) return;
+    // skip the *write* — writing it anyway is what the loop feeds on. But the
+    // published output still has to refresh: an external device can appear or
+    // vanish (AirPods in or out) without changing this boolean, and the glyph
+    // must follow the device even when the route write is a no-op. _syncOutput
+    // only enumerates and emits — it never calls setSpeakerphoneOn — so it
+    // cannot re-feed the device-change loop.
+    if (speaker == _appliedSpeaker) {
+      await _syncOutput();
+      return;
+    }
     try {
       // false does not mean earpiece: it releases the override and lets the
       // system pick, which is headset-if-present, earpiece otherwise.
