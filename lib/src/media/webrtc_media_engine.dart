@@ -108,6 +108,15 @@ class WebrtcMediaEngine implements CaptureEngine {
   /// device-change listener once, however many times it is called.
   bool _sessionReady = false;
 
+  /// The in-flight route change, so overlapping ones serialise rather than
+  /// interleave their enumerate / set / read-back. Null when none is running.
+  Future<void>? _routing;
+
+  /// A route request that arrived while one was in flight. Collapses a burst — a
+  /// tap landing during a device-change — into a single trailing re-run on the
+  /// latest [_speakerOverride], rather than one run per call.
+  bool _routeDirty = false;
+
   @override
   Stream<LocalMediaState> get states => _states.stream;
 
@@ -334,12 +343,36 @@ class WebrtcMediaEngine implements CaptureEngine {
     await _applyRoute();
   }
 
+  /// Serialises route changes. Two overlapping runs — the device-change callback
+  /// and a speaker tap, or a burst of taps — would interleave their enumerate /
+  /// set / read-back and let a stale [_syncOutput] land last. So at most one runs;
+  /// a request arriving mid-run is collapsed into a single trailing re-run that
+  /// reads the latest [_speakerOverride].
+  Future<void> _applyRoute() {
+    if (_routing != null) {
+      _routeDirty = true;
+      return _routing!;
+    }
+    return _routing = _runRoute();
+  }
+
+  Future<void> _runRoute() async {
+    try {
+      do {
+        _routeDirty = false;
+        await _applyRouteOnce();
+      } while (_routeDirty);
+    } finally {
+      _routing = null;
+    }
+  }
+
   /// Puts the route where [_speakerOverride] — or, failing that, the presence of
   /// a headset — says it should go, then reads back what actually happened.
   ///
   /// Enumerates *before* deciding so a headset already connected at startup wins
   /// the default rather than losing to a stale read.
-  Future<void> _applyRoute() async {
+  Future<void> _applyRouteOnce() async {
     final headset = (await _outputs())
         .any((d) => d == AudioOutput.bluetooth || d == AudioOutput.wired);
     final speaker = _speakerOverride ?? !headset;
