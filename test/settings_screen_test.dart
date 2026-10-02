@@ -148,7 +148,7 @@ void main() {
     await tester.pumpWidget(wrap(withLink(const LinkStatus(LinkState.live))));
     await tester.pump();
 
-    expect(find.text('Mic & camera'), findsOneWidget);
+    expect(find.text('Mic, camera & sound'), findsOneWidget);
     // Exactly one chevron on the screen, and it is this row's. Reconnect and
     // "Forget this computer" are tappable but go nowhere, and a chevron next to
     // either would be promising a screen that does not exist.

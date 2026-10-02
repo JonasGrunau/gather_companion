@@ -41,6 +41,21 @@ dependencies:
   web_socket_channel: ^3.0.1
   firebase_core: ^4.13.0
   firebase_messaging: ^16.5.0
+  audioplayers: ^6.8.1
+  # The microphone test's "we can hear you" light. That live indicator is local
+  # input metering, not a call — the same thing Teams/Zoom show in device setup —
+  # so it reads the level straight off `AVAudioRecorder`/`AudioRecord` rather than
+  # standing up a WebRTC connection just to get a number (which is what froze the
+  # check screen). See `lib/ui/media_check_screen.dart`.
+  record: ^7.1.1
+  # The check screen's camera preview. Deliberately NOT flutter_webrtc here: on
+  # iOS flutter_webrtc forces the shared `AVAudioSession` into `videoChat` mode,
+  # and `record` (the mic light) keeps reactivating that same session — the two
+  # fight over it hundreds of times a second and freeze the screen. The `camera`
+  # plugin opened video-only (`enableAudio: false`) never touches the audio
+  # session at all, so `record` owns it alone and nothing flaps. The real call
+  # path still uses flutter_webrtc; only this isolated check uses `camera`.
+  camera: ^0.11.0
 
 dev_dependencies:
   flutter_test:
