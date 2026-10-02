@@ -1,18 +1,40 @@
-/// Turning a raw microphone level into something a bar can draw.
+/// Turning raw microphone samples into a level, and that level into a bar.
 ///
-/// The level that arrives from `getStats` is the same `audioLevel` the speaking
-/// ring is built on: linear, 0 to 1, where a quiet room in a held hand reads
-/// about 0.001 and ordinary speech two orders of magnitude above that (see
-/// `voice_activity.dart` for where those numbers were measured). A bar drawn
-/// straight off that linear value would sit dead against the floor and then leap
-/// — all the interesting range lives in the bottom hundredth.
+/// The microphone check does not stand up a call to watch the meter — it reads
+/// the input directly, the way a device-setup screen in Teams or Zoom does. That
+/// gives raw PCM, and [micLevel] reduces a chunk of it to the same kind of number
+/// the speaking ring runs on: a linear RMS, 0 to 1, where a quiet room reads near
+/// the floor and speech two orders of magnitude above it. It is deliberately the
+/// *same* currency the SFU path's `audioLevel` is in, so [VoiceActivity]'s
+/// thresholds judge both without translation (see `voice_activity.dart`).
 ///
-/// So the meter is logarithmic, like every level meter, and like the ear. This
-/// is pure for the same reason [VoiceActivity] is: the mapping is the thing
-/// worth testing, and a device is not needed to test arithmetic.
+/// [meterFraction] is the log mapping for a drawn bar, kept for when a fuller
+/// meter than the plain "we can hear you" light is wanted. Both are pure for the
+/// same reason: the arithmetic is the thing worth testing, and a device is not
+/// needed to test arithmetic.
 library;
 
 import 'dart:math';
+import 'dart:typed_data';
+
+/// The linear RMS level, 0 to 1, of one chunk of signed 16-bit little-endian PCM.
+///
+/// This is the raw-input counterpart to the SFU path's `media-source` audioLevel:
+/// both are a linear root-mean-square of the signal, so [VoiceActivity]'s
+/// thresholds — measured against that stat — apply here unchanged. An empty or
+/// odd-length chunk reads as silence rather than throwing; a dropped buffer is
+/// not a reason to flicker the light.
+double micLevel(Uint8List pcm16le) {
+  final count = pcm16le.length ~/ 2;
+  if (count == 0) return 0;
+  final data = ByteData.sublistView(pcm16le);
+  var sumSquares = 0.0;
+  for (var i = 0; i < count; i++) {
+    final sample = data.getInt16(i * 2, Endian.little) / 32768.0;
+    sumSquares += sample * sample;
+  }
+  return sqrt(sumSquares / count);
+}
 
 /// The quietest level the bar bothers to show, as a fraction of full scale.
 /// Below this is the noise floor and draws as empty.

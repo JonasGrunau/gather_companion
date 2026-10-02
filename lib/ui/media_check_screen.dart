@@ -8,44 +8,55 @@
 /// have, and it answers "is it me or is it them" without dragging a colleague
 /// into the experiment.
 ///
-/// It now checks the whole audio path a meeting uses, not just the camera: a
-/// live level meter off the microphone, the speaker/earpiece route, and a sound
-/// to send out of it. All three lean on the **same** code a real call runs —
-/// `WebrtcMediaEngine.startCapture`, the `media-source audioLevel` stat behind
-/// the speaking ring, and `prepareAudioSession`/`setSpeakerOn` — so a setup that
-/// passes here is the setup a meeting will use.
+/// It checks the whole path a meeting uses: the camera preview, a microphone
+/// that lights up when it hears you, the speaker/earpiece route, and a sound to
+/// send out of it. Nothing here talks to Gather. It opens the hardware, draws it,
+/// and lets go.
 ///
-/// Nothing here talks to Gather. It opens the hardware, draws it, and lets go.
+/// ## Two modes, one framework at a time
 ///
-/// ## Where the level comes from with no meeting running
+/// There are two honest things a person might want to check, and on iOS they
+/// cannot run at once — so a toggle picks one and the other is fully torn down.
 ///
-/// In a call the microphone level is read from the SFU producer's `getStats`.
-/// There is no SFU here, so this stands up a loopback of two
-/// `RTCPeerConnection`s wired to each other — the live audio track on the
-/// sender, the receiver answering it, ICE and DTLS completing between them — and
-/// reads `audioLevel` off the sender's `media-source` stats row, the identical
-/// number `VoiceActivity` thresholds in a call. The connection goes nowhere off
-/// the device, but it must genuinely *connect*: iOS libwebrtc only runs the
-/// audio send pipeline that fills in that stat once the transport is writable, so
-/// a local offer that is never answered reads as a dead microphone.
+///  - **Device** exercises the raw hardware the lightest way: the `camera` plugin
+///    for the preview (opened **`enableAudio: false`**, so it never touches the
+///    audio session) and `record` for a live "we can hear you" light read
+///    straight off the microphone, the way a device-setup screen in Teams or Zoom
+///    does. One owner of the camera, one of the audio session, nothing to fight.
 ///
-/// ## The renderer's lifetime is the widget's
+///  - **Call pipeline** exercises the *actual* meeting path: the real
+///    [WebrtcMediaEngine], its real routing (`setSpeakerOn`) and its real mute
+///    (`setAudioEnabled`, with the platform mute sound and muted-talker
+///    detection). The mic here shows a plain live/muted status rather than a level
+///    — WebRTC gives no local audio level without a connection, and the loopback
+///    that used to fake one is exactly what froze this screen.
 ///
-/// `RTCVideoRenderer` holds a native texture. It must be `initialize()`d before
-/// use and `dispose()`d after, and its lifetime has to be tied to the widget
-/// rather than to the engine — which is why this is a `StatefulWidget` and why
-/// `srcObject` is cleared before disposing. Getting that wrong leaks a texture
-/// per visit, and the symptom is a slow crawl rather than a crash. The loopback
-/// connection and the audio player are torn down in the same order and for the
-/// same reason.
+/// Why the split at all: `flutter_webrtc` forces the shared `AVAudioSession` into
+/// `videoChat` mode whenever it holds the camera, while `record` has to activate
+/// that same session for the meter. Run together they flap the voice-processing
+/// I/O unit hundreds of times a second and freeze the device. Kept apart — each
+/// mode in its own child widget, so switching unmounts and disposes the other —
+/// neither ever contends for the session.
+///
+/// ## Lifetimes are the widget's
+///
+/// Both a `CameraController` and an `RTCVideoRenderer` hold native resources that
+/// must be opened before use and disposed after, tied to the widget rather than
+/// to anything longer-lived. iOS also reclaims the camera in the background, so
+/// the `camera` controller is dropped on `paused` and reopened on `resumed`. The
+/// recorder, the renderer and the audio player are torn down in the same place
+/// and for the same reason.
 library;
 
 import 'dart:async';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:record/record.dart';
 
 import '../src/media/media_engine.dart';
 import '../src/media/mic_level.dart';
@@ -54,20 +65,38 @@ import '../src/media/voice_activity.dart';
 import '../src/media/webrtc_media_engine.dart';
 import '../theme/gather_theme.dart';
 
-/// The playback session for the test sound, pinned to the call's own route.
+/// Which of the two checks is on screen.
+enum _CheckMode { device, callPipeline }
+
+/// The test sound's session in **Device** mode, pinned to the recorder's stance.
 ///
-/// `playAndRecord` with `mixWithOthers` on iOS so the chime rides the voice
-/// session [WebrtcMediaEngine.prepareAudioSession] set up rather than tearing it
-/// down and routing itself to the media speaker; `voiceCommunication` on Android
-/// for the same reason. The point of the test is that the sound comes out where
-/// a *call* would, so it must not open a session of its own.
+/// `playAndRecord` with `mixWithOthers` so the chime rides alongside the live
+/// microphone capture rather than interrupting it, and `defaultToSpeaker` when the
+/// speaker route is chosen so it comes out where a desk companion wants it. Here
+/// `record` owns the session and there is no WebRTC to reassert a competing
+/// category, so the route the toggle picks is the route that takes.
+AudioContext _deviceToneContext({required bool speaker}) => AudioContext(
+      iOS: AudioContextIOS(
+        category: AVAudioSessionCategory.playAndRecord,
+        options: {
+          AVAudioSessionOptions.mixWithOthers,
+          AVAudioSessionOptions.allowBluetooth,
+          if (speaker) AVAudioSessionOptions.defaultToSpeaker,
+        },
+      ),
+      android: const AudioContextAndroid(
+        contentType: AndroidContentType.sonification,
+        usageType: AndroidUsageType.voiceCommunication,
+        audioFocus: AndroidAudioFocus.gainTransientMayDuck,
+      ),
+    );
+
+/// The test sound's session in **Call pipeline** mode.
 ///
-/// Set **once**, globally, in `_start` — not per play. `audioplayers`
-/// reconfigures and then deactivates the shared `AVAudioSession` around each
-/// `play`, and doing that to the session flutter_webrtc is holding live restarts
-/// its voice processing IO unit and freezes the app. Mirroring the call's session
-/// here and never touching it again makes a `play` harmless.
-final _toneContext = AudioContext(
+/// No `defaultToSpeaker`: the route is the engine's to own through `setSpeakerOn`,
+/// so the chime only has to *mix* into whatever route a call is using rather than
+/// override it. `mixWithOthers` keeps it from tearing the voice session down.
+final _callToneContext = AudioContext(
   iOS: AudioContextIOS(
     category: AVAudioSessionCategory.playAndRecord,
     options: const {
@@ -82,6 +111,26 @@ final _toneContext = AudioContext(
   ),
 );
 
+/// How the microphone is captured for the meter: raw signed-16-bit PCM, mono, at
+/// a rate that is plenty to tell speech from silence and cheap to carry. The
+/// audio processing flags are off on purpose — the test should show the real
+/// input, not a gated, gain-ridden version of it — and `mixWithOthers` lets the
+/// test sound play without stealing the session out from under the capture.
+const _recordConfig = RecordConfig(
+  encoder: AudioEncoder.pcm16bits,
+  sampleRate: 16000,
+  numChannels: 1,
+  autoGain: false,
+  echoCancel: false,
+  noiseSuppress: false,
+  iosConfig: IosRecordConfig(
+    categoryOptions: [
+      IosAudioCategoryOption.mixWithOthers,
+      IosAudioCategoryOption.allowBluetooth,
+    ],
+  ),
+);
+
 class MediaCheckScreen extends StatefulWidget {
   const MediaCheckScreen({super.key});
 
@@ -90,181 +139,7 @@ class MediaCheckScreen extends StatefulWidget {
 }
 
 class _MediaCheckScreenState extends State<MediaCheckScreen> {
-  final _renderer = RTCVideoRenderer();
-  late final WebrtcMediaEngine _engine = WebrtcMediaEngine(log: debugPrint);
-
-  /// The loopback that makes the microphone level readable without a meeting —
-  /// see the header. A *connected* pair: [_meterPc] sends the live audio track to
-  /// [_meterRecvPc], and the level is read off the sender. Both null until
-  /// capture gives us an audio track.
-  RTCPeerConnection? _meterPc;
-  RTCPeerConnection? _meterRecvPc;
-  Timer? _meterTimer;
-
-  /// The same speaking decision the call draws its ring from, run here against
-  /// the loopback level so the meter's "we can hear you" settles with the same
-  /// hold the ring does.
-  final _voice = VoiceActivity();
-
-  /// The test sound's player, and the dice for which chime it plays.
-  final _player = AudioPlayer();
-  final _rng = Random();
-
-  LocalMediaState _state = const LocalMediaState();
-
-  /// The latest loopback level, 0–1, for the meter bar.
-  double _level = 0;
-  bool _starting = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _engine.states.listen((s) {
-      if (mounted) setState(() => _state = s);
-    });
-    _start();
-  }
-
-  Future<void> _start() async {
-    await _renderer.initialize();
-    // Configure the player's audio session once, globally, and never again. The
-    // reconfigure `audioplayers` does on every `play` otherwise — and the
-    // deactivate it does when playback ends — reach into the *same*
-    // `AVAudioSession` flutter_webrtc is holding live, and restarting the voice
-    // processing IO unit mid-call froze the whole app. Setting it here, to a
-    // session that mirrors the call's (`playAndRecord` + `mixWithOthers`), means
-    // a `play` is just a play: no category change, nothing torn down.
-    try {
-      await AudioPlayer.global.setAudioContext(_toneContext);
-      await _player.setReleaseMode(ReleaseMode.stop);
-    } on Object catch (error) {
-      debugPrint('media-check: could not configure the test-sound player: $error');
-    }
-    try {
-      await _engine.startCapture();
-      _renderer.srcObject = _engine.localStream;
-      // The route the call would use, applied for a listen-and-speak test the
-      // same way it is applied for a call: idempotent, so a retry is free.
-      await _engine.prepareAudioSession();
-      await _startMeter();
-    } on MediaFailure {
-      // Already on `_state` through the stream; the screen renders it below.
-    } finally {
-      if (mounted) setState(() => _starting = false);
-    }
-  }
-
-  /// Stands up the loopback connection and starts polling the level.
-  ///
-  /// A *connected* local loopback: the sender holds the live audio track, the
-  /// receiver answers it, ICE candidates are traded both ways, and DTLS comes up
-  /// — all on the device, going nowhere. The connection has to actually complete,
-  /// because on iOS libwebrtc only runs the audio send pipeline (and computes the
-  /// `media-source` `audioLevel` the bar reads) once the transport is writable. A
-  /// local offer that is never answered — what this used to do — never connects,
-  /// so the stat stayed empty and the bar never moved.
-  Future<void> _startMeter() async {
-    final stream = _engine.localStream;
-    final track = stream?.getAudioTracks().firstOrNull;
-    if (track == null) return;
-
-    try {
-      final send = await createPeerConnection(const <String, dynamic>{});
-      final recv = await createPeerConnection(const <String, dynamic>{});
-
-      // Trickle the candidates across to each other; localhost has few and they
-      // arrive fast, so there is no need to wait and bundle them.
-      send.onIceCandidate = (c) => recv.addCandidate(c);
-      recv.onIceCandidate = (c) => send.addCandidate(c);
-
-      // The receiver would otherwise play the mic straight back out the
-      // loudspeaker, inches from that same live mic — a feedback howl. Muting the
-      // received track kills the playout; the *send* side still runs, so the
-      // level we read off it is unaffected.
-      recv.onTrack = (e) => e.track.enabled = false;
-
-      await send.addTrack(track, stream!);
-
-      final offer = await send.createOffer();
-      await send.setLocalDescription(offer);
-      await recv.setRemoteDescription(offer);
-      final answer = await recv.createAnswer();
-      await recv.setLocalDescription(answer);
-      await send.setRemoteDescription(answer);
-
-      _meterPc = send;
-      _meterRecvPc = recv;
-    } on Object catch (error) {
-      debugPrint('media-check: could not open the level meter: $error');
-      return;
-    }
-
-    _meterTimer =
-        Timer.periodic(const Duration(milliseconds: 200), (_) => _pollLevel());
-  }
-
-  /// One read of the loopback level, fed to [_voice] and the bar.
-  Future<void> _pollLevel() async {
-    final pc = _meterPc;
-    if (pc == null) return;
-
-    // Muted is known rather than measured: do not wait out the hold watching a
-    // bar twitch on room noise the microphone is no longer sending.
-    if (!_state.audioEnabled) {
-      _voice.silence();
-      if (mounted && _level != 0) setState(() => _level = 0);
-      return;
-    }
-
-    final List<StatsReport> reports;
-    try {
-      reports = await pc.getStats();
-    } on Object {
-      return; // Polled four times a second; a dropped read fixes itself.
-    }
-
-    // The same row the SFU path reads: `media-source`, `kind == audio`, a linear
-    // `audioLevel`. See `sfu_session.dart`'s `microphoneLevel`.
-    double? level;
-    for (final report in reports) {
-      if (report.type != 'media-source') continue;
-      final values = report.values;
-      if (values['kind'] != 'audio') continue;
-      final value = values['audioLevel'];
-      if (value is num) level = value.toDouble();
-    }
-
-    _voice.note(level, DateTime.now());
-    if (mounted) setState(() => _level = level ?? 0);
-  }
-
-  Future<void> _playTone() async {
-    // No `setAudioContext` here on purpose — the session is set once in `_start`.
-    // Touching it per play is what hung the app; see there.
-    try {
-      await _player.play(
-        BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
-            mimeType: 'audio/wav'),
-      );
-    } on Object catch (error) {
-      debugPrint('media-check: could not play the test sound: $error');
-    }
-  }
-
-  @override
-  void dispose() {
-    // Order matters: stop the poll, let go of the loopback connection and the
-    // player, then drop the texture's reference to the stream before the engine
-    // stops the tracks underneath it.
-    _meterTimer?.cancel();
-    unawaited(_meterPc?.dispose());
-    unawaited(_meterRecvPc?.dispose());
-    unawaited(_player.dispose());
-    _renderer.srcObject = null;
-    _renderer.dispose();
-    _engine.dispose();
-    super.dispose();
-  }
+  _CheckMode _mode = _CheckMode.device;
 
   @override
   Widget build(BuildContext context) {
@@ -279,31 +154,433 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
       ),
       body: SafeArea(
         top: false,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: kGutter),
-          child: Column(
-            children: [
-              Expanded(
-                child: _Preview(
-                  renderer: _renderer,
-                  state: _state,
-                  starting: _starting,
-                  onRetry: () {
-                    setState(() => _starting = true);
-                    _start();
-                  },
-                ),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(kGutter, kGutter, kGutter, 4),
+              child: SegmentedButton<_CheckMode>(
+                segments: const [
+                  ButtonSegment(
+                    value: _CheckMode.device,
+                    icon: Icon(Icons.devices_rounded, size: 18),
+                    label: Text('Device'),
+                  ),
+                  ButtonSegment(
+                    value: _CheckMode.callPipeline,
+                    icon: Icon(Icons.hub_rounded, size: 18),
+                    label: Text('Call pipeline'),
+                  ),
+                ],
+                selected: {_mode},
+                showSelectedIcon: false,
+                onSelectionChanged: (s) => setState(() => _mode = s.first),
               ),
-              if (_state.capturing)
-                _AudioMeter(
-                  fraction: meterFraction(_level),
-                  heard: _voice.speaking,
-                  live: _state.audioEnabled,
-                ),
-              if (_state.capturing)
-                _Controls(engine: _engine, state: _state, onPlayTone: _playTone),
-              const SizedBox(height: kGutter),
-            ],
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(kGutter, 0, kGutter, 0),
+              child: Text(
+                _mode == _CheckMode.device
+                    ? 'The raw hardware — lightest path, with a live mic light.'
+                    : 'The real meeting path — WebRTC capture, routing and mute.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: t.mutedForeground),
+              ),
+            ),
+            Expanded(
+              // A keyed swap: picking the other mode unmounts this child, whose
+              // `dispose` tears its framework down before the other's comes up —
+              // which is the whole reason the two never share the audio session.
+              child: _mode == _CheckMode.device
+                  ? const _DeviceCheck(key: ValueKey('device'))
+                  : const _MeetingCheck(key: ValueKey('meeting')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// What can be wrong with the camera, kept distinct because the fixes differ.
+///
+/// A denied permission is fixed in Settings and nowhere else; "no camera on this
+/// device" cannot be fixed at all; anything else is worth a retry. Rendering all
+/// three as one spinner is the bug `lib/ui/AGENTS.md` warns about.
+enum _Problem { permission, noCamera, other }
+
+class _CheckFailure {
+  const _CheckFailure(this.problem, this.message);
+  final _Problem problem;
+  final String message;
+}
+
+// ---------------------------------------------------------------------------
+// Device mode: camera plugin + record. No WebRTC, no audio-session fight.
+// ---------------------------------------------------------------------------
+
+class _DeviceCheck extends StatefulWidget {
+  const _DeviceCheck({super.key});
+
+  @override
+  State<_DeviceCheck> createState() => _DeviceCheckState();
+}
+
+class _DeviceCheckState extends State<_DeviceCheck> with WidgetsBindingObserver {
+  List<CameraDescription> _cameras = const [];
+  CameraController? _camera;
+  int _cameraIndex = 0;
+
+  final _recorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _micSub;
+  final _voice = VoiceActivity();
+
+  final _player = AudioPlayer();
+  final _rng = Random();
+
+  bool _micLive = true;
+  bool _speaker = true;
+  bool _videoOn = true;
+  bool _hearing = false;
+
+  bool _starting = true;
+  _CheckFailure? _failure;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _start();
+  }
+
+  Future<void> _start() async {
+    try {
+      _cameras = await availableCameras();
+    } on CameraException {
+      _cameras = const [];
+    }
+    try {
+      await _player.setReleaseMode(ReleaseMode.stop);
+    } on Object catch (error) {
+      debugPrint('media-check: could not configure the test-sound player: $error');
+    }
+
+    if (_cameras.isEmpty) {
+      // No camera is not an error that should hold the mic test hostage.
+      if (mounted) {
+        setState(() {
+          _starting = false;
+          _failure =
+              const _CheckFailure(_Problem.noCamera, 'No camera on this device.');
+        });
+      }
+      unawaited(_startMeter());
+      return;
+    }
+
+    _cameraIndex =
+        _cameras.indexWhere((c) => c.lensDirection == CameraLensDirection.front);
+    if (_cameraIndex < 0) _cameraIndex = 0;
+
+    await _openCamera();
+    if (mounted) setState(() => _starting = false);
+    unawaited(_startMeter());
+  }
+
+  /// Opens the camera at [_cameraIndex] into a fresh controller.
+  ///
+  /// `enableAudio: false` is the whole point: it keeps the camera off the audio
+  /// session so the microphone meter can own it without a fight (see the header).
+  Future<void> _openCamera() async {
+    if (_cameras.isEmpty) return;
+    final controller = CameraController(
+      _cameras[_cameraIndex],
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
+    try {
+      await controller.initialize();
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() {
+        _camera = controller;
+        _failure = null;
+      });
+    } on CameraException catch (error) {
+      await controller.dispose();
+      if (mounted) setState(() => _failure = _mapCameraError(error));
+    }
+  }
+
+  _CheckFailure _mapCameraError(CameraException error) {
+    const denied = {
+      'CameraAccessDenied',
+      'CameraAccessDeniedWithoutPrompt',
+      'CameraAccessRestricted',
+    };
+    if (denied.contains(error.code)) {
+      return const _CheckFailure(_Problem.permission, 'Camera permission denied.');
+    }
+    return _CheckFailure(
+        _Problem.other, error.description ?? 'The camera could not start.');
+  }
+
+  /// Opens the microphone for the meter and starts feeding [_voice].
+  ///
+  /// Best-effort: a denied permission or a busy device leaves the light dark and
+  /// the rest of the screen working, rather than throwing into the camera path.
+  Future<void> _startMeter() async {
+    try {
+      if (!await _recorder.hasPermission()) return;
+      final stream = await _recorder.startStream(_recordConfig);
+      _micSub = stream.listen(_onSamples, onError: (Object e) {
+        debugPrint('media-check: microphone stream error: $e');
+      });
+    } on Object catch (error) {
+      debugPrint('media-check: could not open the microphone meter: $error');
+    }
+  }
+
+  /// One chunk of PCM: reduce to a level, let [_voice] decide, redraw only when
+  /// the "we can hear you" answer actually flips.
+  void _onSamples(Uint8List samples) {
+    if (!_micLive) return;
+    final flipped = _voice.note(micLevel(samples), DateTime.now());
+    if (flipped && mounted) setState(() => _hearing = _voice.speaking);
+  }
+
+  Future<void> _setMicLive(bool live) async {
+    setState(() {
+      _micLive = live;
+      if (!live) {
+        _voice.silence();
+        _hearing = false;
+      }
+    });
+    try {
+      if (live) {
+        await _recorder.resume();
+      } else {
+        await _recorder.pause();
+      }
+    } on Object catch (error) {
+      debugPrint(
+          'media-check: could not ${live ? 'resume' : 'pause'} the microphone: $error');
+    }
+  }
+
+  Future<void> _setVideoOn(bool on) async {
+    setState(() => _videoOn = on);
+    final camera = _camera;
+    if (camera == null) return;
+    try {
+      if (on) {
+        await camera.resumePreview();
+      } else {
+        await camera.pausePreview();
+      }
+    } on Object catch (error) {
+      debugPrint(
+          'media-check: could not ${on ? 'resume' : 'pause'} the camera: $error');
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_cameras.length < 2) return;
+    final old = _camera;
+    setState(() => _camera = null);
+    await old?.dispose();
+    _cameraIndex = (_cameraIndex + 1) % _cameras.length;
+    await _openCamera();
+    if (!_videoOn) await _camera?.pausePreview();
+  }
+
+  void _setSpeaker(bool speaker) => setState(() => _speaker = speaker);
+
+  Future<void> _playTone() async {
+    try {
+      // Apply the route here so the Speaker/Earpiece choice always wins: the
+      // recorder's session may have been the last to set the category, and there
+      // is no WebRTC to flap it, so one deliberate set per tap is correct and
+      // cheap.
+      await AudioPlayer.global.setAudioContext(_deviceToneContext(speaker: _speaker));
+      await _player.play(
+        BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
+            mimeType: 'audio/wav'),
+      );
+    } on Object catch (error) {
+      debugPrint('media-check: could not play the test sound: $error');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final camera = _camera;
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      // iOS takes the camera back when we leave the foreground; let go first so
+      // it does not come back a black, throwing preview.
+      if (camera != null) {
+        _camera = null;
+        if (mounted) setState(() {});
+        camera.dispose();
+      }
+    } else if (state == AppLifecycleState.resumed) {
+      if (_camera == null && _cameras.isNotEmpty && _failure == null) {
+        _openCamera().then((_) async {
+          if (!_videoOn) await _camera?.pausePreview();
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_micSub?.cancel());
+    unawaited(_recorder.dispose());
+    unawaited(_player.dispose());
+    unawaited(_camera?.dispose());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showControls = !_starting && _failure?.problem != _Problem.permission;
+    final frontCamera = _cameras.isNotEmpty &&
+        _cameras[_cameraIndex].lensDirection == CameraLensDirection.front;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: kGutter),
+      child: Column(
+        children: [
+          Expanded(
+            child: _DevicePreview(
+              camera: _camera,
+              starting: _starting,
+              videoOn: _videoOn,
+              micLive: _micLive,
+              failure: _failure,
+              onRetry: () {
+                setState(() {
+                  _starting = true;
+                  _failure = null;
+                });
+                _start();
+              },
+            ),
+          ),
+          if (showControls) _MicLight(hearing: _hearing, live: _micLive),
+          if (showControls)
+            _Controls(
+              micLive: _micLive,
+              videoOn: _videoOn,
+              speaker: _speaker,
+              frontCamera: frontCamera,
+              hasCamera: _camera != null,
+              canSwitch: _cameras.length > 1,
+              onToggleMic: () => _setMicLive(!_micLive),
+              onToggleVideo: () => _setVideoOn(!_videoOn),
+              onSwitchCamera: _switchCamera,
+              onToggleSpeaker: () => _setSpeaker(!_speaker),
+              onPlayTone: _playTone,
+            ),
+          const SizedBox(height: kGutter),
+        ],
+      ),
+    );
+  }
+}
+
+class _DevicePreview extends StatelessWidget {
+  const _DevicePreview({
+    required this.camera,
+    required this.starting,
+    required this.videoOn,
+    required this.micLive,
+    required this.failure,
+    required this.onRetry,
+  });
+
+  final CameraController? camera;
+  final bool starting;
+  final bool videoOn;
+  final bool micLive;
+  final _CheckFailure? failure;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final fail = failure;
+    if (fail != null) {
+      final needsSettings = fail.problem == _Problem.permission;
+      return _frame(
+        context,
+        _Message(
+          icon: needsSettings
+              ? Icons.lock_outline_rounded
+              : Icons.videocam_off_outlined,
+          title: needsSettings ? 'Permission needed' : 'No camera',
+          body: needsSettings
+              ? 'Gather Companion needs the camera. Turn it on in Settings, then '
+                  'come back.'
+              : fail.message,
+          action: needsSettings ? null : ('Try again', onRetry),
+        ),
+      );
+    }
+
+    if (starting) {
+      return _frame(
+        context,
+        const _Message(
+          icon: Icons.hourglass_empty_rounded,
+          title: 'Starting',
+          body: 'Opening the camera.',
+        ),
+      );
+    }
+
+    final controller = camera;
+    if (!videoOn || controller == null || !controller.value.isInitialized) {
+      return _frame(
+        context,
+        _Message(
+          icon: Icons.videocam_off_outlined,
+          title: controller == null ? 'No camera' : 'Camera off',
+          body: micLive ? 'Your microphone is live.' : 'Your microphone is muted.',
+        ),
+      );
+    }
+
+    return _frame(context, _CameraCover(controller: controller));
+  }
+}
+
+/// A camera preview scaled to fill its frame rather than letterbox inside it.
+///
+/// `CameraPreview` reports its size in the sensor's landscape orientation, so on
+/// a portrait phone the width and height are swapped before the `BoxFit.cover`
+/// does its work — otherwise the preview comes out sideways and squashed.
+class _CameraCover extends StatelessWidget {
+  const _CameraCover({required this.controller});
+
+  final CameraController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final size = controller.value.previewSize;
+    if (size == null) return CameraPreview(controller);
+
+    return ClipRect(
+      child: SizedBox.expand(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: size.height,
+            height: size.width,
+            child: CameraPreview(controller),
           ),
         ),
       ),
@@ -311,13 +588,122 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
   }
 }
 
-/// The three states this screen can honestly be in, kept distinct.
-///
-/// `lib/ui/AGENTS.md`: a denied permission is not a network problem and must not
-/// render as a spinner. Nor is "no camera on this device" the same as "you said
-/// no" — one is fixed in Settings and the other cannot be.
-class _Preview extends StatelessWidget {
-  const _Preview({
+// ---------------------------------------------------------------------------
+// Call-pipeline mode: the real WebRTC engine, its real routing and mute.
+// ---------------------------------------------------------------------------
+
+class _MeetingCheck extends StatefulWidget {
+  const _MeetingCheck({super.key});
+
+  @override
+  State<_MeetingCheck> createState() => _MeetingCheckState();
+}
+
+class _MeetingCheckState extends State<_MeetingCheck> {
+  final _renderer = RTCVideoRenderer();
+  late final WebrtcMediaEngine _engine = WebrtcMediaEngine(log: debugPrint);
+  final _player = AudioPlayer();
+  final _rng = Random();
+
+  StreamSubscription<LocalMediaState>? _sub;
+  LocalMediaState _state = const LocalMediaState();
+  bool _starting = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = _engine.states.listen((s) {
+      if (mounted) setState(() => _state = s);
+    });
+    _start();
+  }
+
+  Future<void> _start() async {
+    await _renderer.initialize();
+    try {
+      await _player.setReleaseMode(ReleaseMode.stop);
+      // Set once, so a tap is just a play: the chime mixes into whatever route the
+      // engine set rather than reconfiguring the session out from under it.
+      await AudioPlayer.global.setAudioContext(_callToneContext);
+    } on Object catch (error) {
+      debugPrint('media-check: could not configure the test-sound player: $error');
+    }
+    try {
+      await _engine.prepareAudioSession();
+      await _engine.startCapture(audio: true, video: true);
+      _renderer.srcObject = _engine.localStream;
+    } on MediaFailure {
+      // Already on `_state` through the stream; the screen renders it below.
+    } finally {
+      if (mounted) setState(() => _starting = false);
+    }
+  }
+
+  Future<void> _playTone() async {
+    try {
+      await _player.play(
+        BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
+            mimeType: 'audio/wav'),
+      );
+    } on Object catch (error) {
+      debugPrint('media-check: could not play the test sound: $error');
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_sub?.cancel());
+    unawaited(_player.dispose());
+    _renderer.srcObject = null;
+    _renderer.dispose();
+    _engine.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showControls = _state.capturing;
+    final speaker = _state.audioOutput == AudioOutput.speaker;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: kGutter),
+      child: Column(
+        children: [
+          Expanded(
+            child: _MeetingPreview(
+              renderer: _renderer,
+              state: _state,
+              starting: _starting,
+              onRetry: () {
+                setState(() => _starting = true);
+                _start();
+              },
+            ),
+          ),
+          if (showControls) _MeetingMicStatus(live: _state.audioEnabled),
+          if (showControls)
+            _Controls(
+              micLive: _state.audioEnabled,
+              videoOn: _state.videoEnabled,
+              speaker: speaker,
+              frontCamera: _state.frontCamera,
+              hasCamera: true,
+              canSwitch: _state.hasVideo,
+              onToggleMic: () => _engine.setAudioEnabled(!_state.audioEnabled),
+              onToggleVideo: () => _engine.setVideoEnabled(!_state.videoEnabled),
+              onSwitchCamera: _engine.switchCamera,
+              onToggleSpeaker: () => _engine.setSpeakerOn(!speaker),
+              onPlayTone: _playTone,
+            ),
+          const SizedBox(height: kGutter),
+        ],
+      ),
+    );
+  }
+}
+
+class _MeetingPreview extends StatelessWidget {
+  const _MeetingPreview({
     required this.renderer,
     required this.state,
     required this.starting,
@@ -331,63 +717,128 @@ class _Preview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final t = context.tokens;
     final failure = state.failure;
-
-    Widget frame(Widget child) => Container(
-          width: double.infinity,
-          margin: const EdgeInsets.symmetric(vertical: kGutter),
-          decoration: BoxDecoration(
-            color: t.card,
-            border: Border.all(color: t.border),
-            borderRadius: BorderRadius.circular(t.radius),
-          ),
-          clipBehavior: Clip.antiAlias,
-          child: child,
-        );
-
     if (failure != null) {
-      return frame(_Message(
-        icon: failure.needsSettings ? Icons.lock_outline_rounded : Icons.videocam_off_outlined,
-        title: failure.needsSettings ? 'Permission needed' : 'No camera or microphone',
-        body: failure.needsSettings
-            ? 'Gather Companion needs the microphone and camera. '
-                'Turn them on in Settings, then come back.'
-            : failure.message,
-        action: failure.needsSettings ? null : ('Try again', onRetry),
-      ));
+      return _frame(
+        context,
+        _Message(
+          icon: failure.needsSettings
+              ? Icons.lock_outline_rounded
+              : Icons.videocam_off_outlined,
+          title: failure.needsSettings
+              ? 'Permission needed'
+              : 'No camera or microphone',
+          body: failure.needsSettings
+              ? 'Gather Companion needs the microphone and camera. Turn them on '
+                  'in Settings, then come back.'
+              : failure.message,
+          action: failure.needsSettings ? null : ('Try again', onRetry),
+        ),
+      );
     }
 
     if (starting) {
-      return frame(const _Message(
-        icon: Icons.hourglass_empty_rounded,
-        title: 'Starting',
-        body: 'Opening the microphone and camera.',
-      ));
+      return _frame(
+        context,
+        const _Message(
+          icon: Icons.hourglass_empty_rounded,
+          title: 'Starting',
+          body: 'Opening the microphone and camera.',
+        ),
+      );
     }
 
     if (!state.hasVideo) {
-      // Capturing, but nothing to draw: the camera is off, or this device has
-      // none. Both are fine and neither is an error.
-      return frame(_Message(
-        icon: Icons.videocam_off_outlined,
-        title: state.capturing ? 'Camera off' : 'Not capturing',
-        body: state.audioEnabled
-            ? 'Your microphone is live.'
-            : 'Your microphone is muted.',
-      ));
+      return _frame(
+        context,
+        _Message(
+          icon: Icons.videocam_off_outlined,
+          title: state.capturing ? 'Camera off' : 'Not capturing',
+          body: state.audioEnabled
+              ? 'Your microphone is live.'
+              : 'Your microphone is muted.',
+        ),
+      );
     }
 
-    return frame(
+    return _frame(
+      context,
       RTCVideoView(
         renderer,
-        // A front camera that is not mirrored looks wrong to the person in it,
-        // and only to them — everyone else sees it unmirrored either way.
         mirror: state.frontCamera,
         objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
       ),
     );
   }
+}
+
+/// The microphone status in call-pipeline mode: live or muted, no level.
+///
+/// WebRTC gives no local audio level without a connection, and the loopback that
+/// faked one is what froze this screen — so this is honest about what it knows.
+/// Live goes green, because "the microphone is working" is the thing being
+/// checked; muted says so in words so a grey light is never mistaken for broken.
+class _MeetingMicStatus extends StatelessWidget {
+  const _MeetingMicStatus({required this.live});
+
+  final bool live;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final colour = live ? t.ok : t.mutedForeground;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: live ? t.ok.withValues(alpha: 0.15) : t.secondary,
+            ),
+            child: Icon(
+              live ? Icons.mic_rounded : Icons.mic_off_rounded,
+              size: 22,
+              color: colour,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              live
+                  ? 'Microphone is live — capturing through the call engine'
+                  : 'Microphone muted',
+              style: TextStyle(fontSize: 13, color: colour),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared bits.
+// ---------------------------------------------------------------------------
+
+/// The card the preview and its messages sit in, identical across both modes.
+Widget _frame(BuildContext context, Widget child) {
+  final t = context.tokens;
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.symmetric(vertical: kGutter),
+    decoration: BoxDecoration(
+      color: t.card,
+      border: Border.all(color: t.border),
+      borderRadius: BorderRadius.circular(t.radius),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: child,
+  );
 }
 
 class _Message extends StatelessWidget {
@@ -434,71 +885,52 @@ class _Message extends StatelessWidget {
   }
 }
 
-/// The live microphone level, as a bar that fills while you talk.
+/// The microphone check, as a light that comes on when it hears you.
 ///
-/// The same decision the call's speaking ring makes drives the colour: quiet is
-/// [GatherTokens.brand] like every other live control, and [GatherTokens.ok] —
-/// the connected green — once [VoiceActivity] is satisfied it is really hearing
-/// speech and not just a held phone's room noise. Muted draws the bar empty and
-/// says so, because a flat meter with no explanation reads as a broken one.
-class _AudioMeter extends StatelessWidget {
-  const _AudioMeter({
-    required this.fraction,
-    required this.heard,
-    required this.live,
-  });
+/// Not a calibrated bar — a plain yes/no, which is all a setup check needs: the
+/// microphone is live and picking you up, or it is muted, or it is quiet. The
+/// same decision the call's speaking ring makes drives the colour, so a mic that
+/// lights [GatherTokens.ok] green here is a mic the room will see light up too.
+/// Muted says so in words, because a dark light with no explanation reads as a
+/// broken one.
+class _MicLight extends StatelessWidget {
+  const _MicLight({required this.hearing, required this.live});
 
-  final double fraction;
-  final bool heard;
+  final bool hearing;
   final bool live;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final fill = heard ? t.ok : t.brand;
-    final (label, labelColour) = !live
-        ? ('Microphone muted', t.faint)
-        : heard
-            ? ('We can hear you', t.ok)
-            : ('Say something — the bar moves when it hears you', t.mutedForeground);
+    final on = live && hearing;
+    final colour = !live ? t.faint : (hearing ? t.ok : t.mutedForeground);
+    final label = !live
+        ? 'Microphone muted'
+        : hearing
+            ? 'We can hear you'
+            : 'Say something — the light comes on when it hears you';
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Row(
         children: [
-          Icon(
-            live ? Icons.mic_rounded : Icons.mic_off_rounded,
-            size: 20,
-            color: !live ? t.faint : (heard ? t.ok : t.mutedForeground),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: on ? t.ok.withValues(alpha: 0.15) : t.secondary,
+            ),
+            child: Icon(
+              live ? Icons.mic_rounded : Icons.mic_off_rounded,
+              size: 22,
+              color: colour,
+            ),
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(999),
-                  child: SizedBox(
-                    height: 8,
-                    width: double.infinity,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        ColoredBox(color: t.secondary),
-                        FractionallySizedBox(
-                          alignment: Alignment.centerLeft,
-                          widthFactor: live ? fraction.clamp(0.0, 1.0) : 0.0,
-                          child: ColoredBox(color: fill),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(label, style: TextStyle(fontSize: 12.5, color: labelColour)),
-              ],
-            ),
+            child: Text(label, style: TextStyle(fontSize: 13, color: colour)),
           ),
         ],
       ),
@@ -508,31 +940,39 @@ class _AudioMeter extends StatelessWidget {
 
 class _Controls extends StatelessWidget {
   const _Controls({
-    required this.engine,
-    required this.state,
+    required this.micLive,
+    required this.videoOn,
+    required this.speaker,
+    required this.frontCamera,
+    required this.hasCamera,
+    required this.canSwitch,
+    required this.onToggleMic,
+    required this.onToggleVideo,
+    required this.onSwitchCamera,
+    required this.onToggleSpeaker,
     required this.onPlayTone,
   });
 
-  final MediaEngine engine;
-  final LocalMediaState state;
+  final bool micLive;
+  final bool videoOn;
+  final bool speaker;
+  final bool frontCamera;
+  final bool hasCamera;
+  final bool canSwitch;
+  final VoidCallback onToggleMic;
+  final VoidCallback onToggleVideo;
+  final VoidCallback onSwitchCamera;
+  final VoidCallback onToggleSpeaker;
   final VoidCallback onPlayTone;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final onSpeaker = state.audioOutput == AudioOutput.speaker;
 
-    // The same glyph the control bar's route button uses — where you are now —
-    // so the switch here reads as the same control you will meet in a call. The
-    // label names where a tap sends you, not where you are: the button is a
-    // switch, and the brand tint already says when the speaker is the live one.
-    final routeIcon = switch (state.audioOutput) {
-      AudioOutput.speaker => Icons.volume_up_rounded,
-      AudioOutput.earpiece => Icons.phone_in_talk_rounded,
-      AudioOutput.bluetooth => Icons.bluetooth_audio_rounded,
-      AudioOutput.wired => Icons.headset_rounded,
-    };
-    final routeLabel = onSpeaker ? 'Earpiece' : 'Speaker';
+    // The label names where a tap sends the sound, not where it is now: the
+    // button is a switch, and the brand tint already says when the speaker is
+    // the live one.
+    final routeLabel = speaker ? 'Earpiece' : 'Speaker';
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -541,38 +981,36 @@ class _Controls extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
             _Toggle(
-              on: state.audioEnabled,
+              on: micLive,
               onIcon: Icons.mic_rounded,
               offIcon: Icons.mic_off_rounded,
-              label: state.audioEnabled ? 'Mic on' : 'Muted',
-              onTap: () => engine.setAudioEnabled(!state.audioEnabled),
+              label: micLive ? 'Mic on' : 'Muted',
+              onTap: onToggleMic,
             ),
             _Toggle(
-              on: state.videoEnabled,
+              on: videoOn,
               onIcon: Icons.videocam_rounded,
               offIcon: Icons.videocam_off_rounded,
-              label: state.videoEnabled ? 'Camera on' : 'Camera off',
-              onTap: () => engine.setVideoEnabled(!state.videoEnabled),
+              label: videoOn ? 'Camera on' : 'Camera off',
+              onTap: hasCamera ? onToggleVideo : null,
             ),
             _Toggle(
               on: true,
               onIcon: Icons.cameraswitch_rounded,
               offIcon: Icons.cameraswitch_rounded,
-              label: state.frontCamera ? 'Front' : 'Back',
-              onTap: state.hasVideo ? engine.switchCamera : null,
+              label: frontCamera ? 'Front' : 'Back',
+              onTap: canSwitch ? onSwitchCamera : null,
               tint: t.mutedForeground,
             ),
-            // The call's own route control, driven straight off the engine: the
-            // loudspeaker wears the brand like a live control, every other route
-            // the resting grey. A tap forces the speaker on, or hands the route
-            // back to the system (headset-if-present, else earpiece).
+            // Where the test sound comes out: the loudspeaker wears the brand
+            // like a live control, the earpiece the resting grey.
             _Toggle(
-              on: onSpeaker,
-              onIcon: routeIcon,
-              offIcon: routeIcon,
+              on: speaker,
+              onIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
+              offIcon: speaker ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
               label: routeLabel,
-              tint: onSpeaker ? t.brand : t.mutedForeground,
-              onTap: () => engine.setSpeakerOn(!onSpeaker),
+              tint: speaker ? t.brand : t.mutedForeground,
+              onTap: onToggleSpeaker,
             ),
           ],
         ),
