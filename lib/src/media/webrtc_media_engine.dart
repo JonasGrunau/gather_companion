@@ -117,6 +117,23 @@ class WebrtcMediaEngine implements CaptureEngine {
   /// latest [_speakerOverride], rather than one run per call.
   bool _routeDirty = false;
 
+  /// The outputs last seen by the device-change listener. Setting the route is
+  /// itself a device-change on iOS, so re-applying the route on *every*
+  /// device-change is a feedback loop: setSpeakerphoneOn → route change →
+  /// ondevicechange → setSpeakerphoneOn, which pins the audio session at dozens of
+  /// reconfigurations a second and starves the media pipeline (observed on device:
+  /// the primary session rebuilt thousands of times in one call). We re-apply only
+  /// when this set actually changes — a headset genuinely coming or going — which a
+  /// self-induced route flip never does, because the *available* outputs are the
+  /// same whichever one is currently active.
+  Set<AudioOutput>? _knownOutputs;
+
+  /// The last route we asked for, so a re-apply that would not change anything is
+  /// skipped rather than written again. A redundant [Helper.setSpeakerphoneOn]
+  /// still emits a route change, so this is the second guard against the loop
+  /// above even if the platform ever reports a spurious output-set change.
+  bool? _appliedSpeaker;
+
   @override
   Stream<LocalMediaState> get states => _states.stream;
 
@@ -257,6 +274,8 @@ class WebrtcMediaEngine implements CaptureEngine {
     if (!_sessionReady) return;
     _sessionReady = false;
     _speakerOverride = null;
+    _knownOutputs = null;
+    _appliedSpeaker = null;
     navigator.mediaDevices.ondevicechange = null;
     if (Platform.isAndroid) {
       try {
@@ -328,12 +347,29 @@ class WebrtcMediaEngine implements CaptureEngine {
     }
 
     // One callback, owned here. A headset coming or going is a reason to redo the
-    // default — not to honour a tap from before it was plugged in.
-    navigator.mediaDevices.ondevicechange = (_) {
-      _speakerOverride = null;
-      unawaited(_applyRoute());
-    };
+    // default — not to honour a tap from before it was plugged in. Guarded by
+    // [_knownOutputs] so the route change our own [_applyRouteOnce] causes does not
+    // come straight back in as a device-change and loop.
+    _knownOutputs = (await _outputs()).toSet();
+    navigator.mediaDevices.ondevicechange = (_) => unawaited(_onDeviceChange());
 
+    await _applyRoute();
+  }
+
+  /// A headset plugged or pulled clears the override and redoes the default.
+  /// Anything that leaves the set of available outputs unchanged — notably the
+  /// route flip [_applyRouteOnce] itself just made — is ignored, which is what
+  /// stops the device-change listener feeding back into itself.
+  Future<void> _onDeviceChange() async {
+    final outputs = (await _outputs()).toSet();
+    final known = _knownOutputs;
+    if (known != null &&
+        known.length == outputs.length &&
+        known.containsAll(outputs)) {
+      return;
+    }
+    _knownOutputs = outputs;
+    _speakerOverride = null;
     await _applyRoute();
   }
 
@@ -376,6 +412,9 @@ class WebrtcMediaEngine implements CaptureEngine {
     final headset = (await _outputs())
         .any((d) => d == AudioOutput.bluetooth || d == AudioOutput.wired);
     final speaker = _speakerOverride ?? !headset;
+    // A re-apply that would not change the route still emits a route change, so
+    // skip it: nothing to do, and writing it anyway is what the loop feeds on.
+    if (speaker == _appliedSpeaker) return;
     try {
       // false does not mean earpiece: it releases the override and lets the
       // system pick, which is headset-if-present, earpiece otherwise.
@@ -384,6 +423,7 @@ class WebrtcMediaEngine implements CaptureEngine {
       _log('media: could not set the audio route: $error');
       return;
     }
+    _appliedSpeaker = speaker;
     await _syncOutput();
   }
 
