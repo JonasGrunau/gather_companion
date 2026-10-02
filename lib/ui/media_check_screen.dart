@@ -199,8 +199,19 @@ enum _Problem { permission, noCamera, other }
 
 class _CheckFailure {
   const _CheckFailure(this.problem, this.message);
+
+  /// From the engine's own failure, so the call-pipeline mode draws the same
+  /// three-way split as the device mode off one shared type.
+  factory _CheckFailure.fromMedia(MediaFailure failure) => _CheckFailure(
+        failure.needsSettings ? _Problem.permission : _Problem.other,
+        failure.message,
+      );
+
   final _Problem problem;
   final String message;
+
+  /// A refused permission is the one problem fixed in Settings rather than here.
+  bool get needsSettings => problem == _Problem.permission;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +331,9 @@ class _DeviceCheckState extends State<_DeviceCheck> with WidgetsBindingObserver 
   /// Best-effort: a denied permission or a busy device leaves the light dark and
   /// the rest of the screen working, rather than throwing into the camera path.
   Future<void> _startMeter() async {
+    // Idempotent: `_start` runs again on a camera retry, and a second stream on
+    // the same recorder would leave the first dangling and the light double-fed.
+    if (_micSub != null) return;
     try {
       if (!await _recorder.hasPermission()) return;
       final stream = await _recorder.startStream(_recordConfig);
@@ -460,7 +474,7 @@ class _DeviceCheckState extends State<_DeviceCheck> with WidgetsBindingObserver 
               },
             ),
           ),
-          if (showControls) _MicLight(hearing: _hearing, live: _micLive),
+          if (showControls) _MicStatus(live: _micLive, hearing: _hearing),
           if (showControls)
             _Controls(
               micLive: _micLive,
@@ -501,49 +515,24 @@ class _DevicePreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final fail = failure;
-    if (fail != null) {
-      final needsSettings = fail.problem == _Problem.permission;
-      return _frame(
-        context,
-        _Message(
-          icon: needsSettings
-              ? Icons.lock_outline_rounded
-              : Icons.videocam_off_outlined,
-          title: needsSettings ? 'Permission needed' : 'No camera',
-          body: needsSettings
-              ? 'Gather Companion needs the camera. Turn it on in Settings, then '
-                  'come back.'
-              : fail.message,
-          action: needsSettings ? null : ('Try again', onRetry),
-        ),
-      );
-    }
-
-    if (starting) {
-      return _frame(
-        context,
-        const _Message(
-          icon: Icons.hourglass_empty_rounded,
-          title: 'Starting',
-          body: 'Opening the camera.',
-        ),
-      );
-    }
-
     final controller = camera;
-    if (!videoOn || controller == null || !controller.value.isInitialized) {
-      return _frame(
-        context,
-        _Message(
-          icon: Icons.videocam_off_outlined,
-          title: controller == null ? 'No camera' : 'Camera off',
-          body: micLive ? 'Your microphone is live.' : 'Your microphone is muted.',
-        ),
-      );
-    }
+    final showOff =
+        !videoOn || controller == null || !controller.value.isInitialized;
 
-    return _frame(context, _CameraCover(controller: controller));
+    return _previewCard(
+      context,
+      failure: failure,
+      failTitle: 'No camera',
+      settingsBody: 'Gather Companion needs the camera. Turn it on in Settings, '
+          'then come back.',
+      starting: starting,
+      startingBody: 'Opening the camera.',
+      showOff: showOff,
+      offTitle: controller == null ? 'No camera' : 'Camera off',
+      offBody: micLive ? 'Your microphone is live.' : 'Your microphone is muted.',
+      onRetry: onRetry,
+      live: () => _CameraCover(controller: controller!),
+    );
   }
 }
 
@@ -596,6 +585,7 @@ class _MeetingCheckState extends State<_MeetingCheck> {
   StreamSubscription<LocalMediaState>? _sub;
   LocalMediaState _state = const LocalMediaState();
   bool _starting = true;
+  bool _rendererReady = false;
 
   @override
   void initState() {
@@ -607,7 +597,12 @@ class _MeetingCheckState extends State<_MeetingCheck> {
   }
 
   Future<void> _start() async {
-    await _renderer.initialize();
+    // Once only: `_start` runs again on retry, and re-initialising a live renderer
+    // throws. The engine's own restart handles a second `startCapture`.
+    if (!_rendererReady) {
+      await _renderer.initialize();
+      _rendererReady = true;
+    }
     try {
       // Plain capture, like the pre-branch check: no `prepareAudioSession` and
       // no `setSpeakerOn`. Route forcing on a standalone capture with no SFU
@@ -651,14 +646,14 @@ class _MeetingCheckState extends State<_MeetingCheck> {
               },
             ),
           ),
-          if (showControls) _MeetingMicStatus(live: _state.audioEnabled),
+          if (showControls) _MicStatus(live: _state.audioEnabled),
           if (showControls)
             _Controls(
               micLive: _state.audioEnabled,
               videoOn: _state.videoEnabled,
               // No route toggle and no test sound: the pre-branch check forced
-              // neither, and forcing a route here is what lagged the screen.
-              speaker: null,
+              // neither, and forcing a route here is what lagged the screen. The
+              // speaker flag stays at its unused default.
               frontCamera: _state.frontCamera,
               hasCamera: true,
               canSwitch: _state.hasVideo,
@@ -691,104 +686,25 @@ class _MeetingPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final failure = state.failure;
-    if (failure != null) {
-      return _frame(
-        context,
-        _Message(
-          icon: failure.needsSettings
-              ? Icons.lock_outline_rounded
-              : Icons.videocam_off_outlined,
-          title: failure.needsSettings
-              ? 'Permission needed'
-              : 'No camera or microphone',
-          body: failure.needsSettings
-              ? 'Gather Companion needs the microphone and camera. Turn them on '
-                  'in Settings, then come back.'
-              : failure.message,
-          action: failure.needsSettings ? null : ('Try again', onRetry),
-        ),
-      );
-    }
 
-    if (starting) {
-      return _frame(
-        context,
-        const _Message(
-          icon: Icons.hourglass_empty_rounded,
-          title: 'Starting',
-          body: 'Opening the microphone and camera.',
-        ),
-      );
-    }
-
-    if (!state.hasVideo) {
-      return _frame(
-        context,
-        _Message(
-          icon: Icons.videocam_off_outlined,
-          title: state.capturing ? 'Camera off' : 'Not capturing',
-          body: state.audioEnabled
-              ? 'Your microphone is live.'
-              : 'Your microphone is muted.',
-        ),
-      );
-    }
-
-    return _frame(
+    return _previewCard(
       context,
-      RTCVideoView(
+      failure: failure == null ? null : _CheckFailure.fromMedia(failure),
+      failTitle: 'No camera or microphone',
+      settingsBody: 'Gather Companion needs the microphone and camera. Turn them '
+          'on in Settings, then come back.',
+      starting: starting,
+      startingBody: 'Opening the microphone and camera.',
+      showOff: !state.hasVideo,
+      offTitle: state.capturing ? 'Camera off' : 'Not capturing',
+      offBody: state.audioEnabled
+          ? 'Your microphone is live.'
+          : 'Your microphone is muted.',
+      onRetry: onRetry,
+      live: () => RTCVideoView(
         renderer,
         mirror: state.frontCamera,
         objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-      ),
-    );
-  }
-}
-
-/// The microphone status in call-pipeline mode: live or muted, no level.
-///
-/// WebRTC gives no local audio level without a connection, and the loopback that
-/// faked one is what froze this screen — so this is honest about what it knows.
-/// Live goes green, because "the microphone is working" is the thing being
-/// checked; muted says so in words so a grey light is never mistaken for broken.
-class _MeetingMicStatus extends StatelessWidget {
-  const _MeetingMicStatus({required this.live});
-
-  final bool live;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.tokens;
-    final colour = live ? t.ok : t.mutedForeground;
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: Row(
-        children: [
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: live ? t.ok.withValues(alpha: 0.15) : t.secondary,
-            ),
-            child: Icon(
-              live ? Icons.mic_rounded : Icons.mic_off_rounded,
-              size: 22,
-              color: colour,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              live
-                  ? 'Microphone is live — capturing through the call engine'
-                  : 'Microphone muted',
-              style: TextStyle(fontSize: 13, color: colour),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -812,6 +728,63 @@ Widget _frame(BuildContext context, Widget child) {
     clipBehavior: Clip.antiAlias,
     child: child,
   );
+}
+
+/// The failure → starting → off → live ladder both previews walk, in one place.
+///
+/// The two modes differ only in their copy and their live child — the shape is
+/// identical, and keeping it identical is what stops one mode's permission screen
+/// drifting from the other's. Each maps its own state onto one [_CheckFailure]
+/// and a handful of strings; the branching lives here.
+Widget _previewCard(
+  BuildContext context, {
+  required _CheckFailure? failure,
+  required String failTitle,
+  required String settingsBody,
+  required bool starting,
+  required String startingBody,
+  required bool showOff,
+  required String offTitle,
+  required String offBody,
+  required VoidCallback onRetry,
+  required Widget Function() live,
+}) {
+  if (failure != null) {
+    final settings = failure.needsSettings;
+    return _frame(
+      context,
+      _Message(
+        icon: settings ? Icons.lock_outline_rounded : Icons.videocam_off_outlined,
+        title: settings ? 'Permission needed' : failTitle,
+        body: settings ? settingsBody : failure.message,
+        action: settings ? null : ('Try again', onRetry),
+      ),
+    );
+  }
+
+  if (starting) {
+    return _frame(
+      context,
+      _Message(
+        icon: Icons.hourglass_empty_rounded,
+        title: 'Starting',
+        body: startingBody,
+      ),
+    );
+  }
+
+  if (showOff) {
+    return _frame(
+      context,
+      _Message(
+        icon: Icons.videocam_off_outlined,
+        title: offTitle,
+        body: offBody,
+      ),
+    );
+  }
+
+  return _frame(context, live());
 }
 
 class _Message extends StatelessWidget {
@@ -858,30 +831,46 @@ class _Message extends StatelessWidget {
   }
 }
 
-/// The microphone check, as a light that comes on when it hears you.
+/// The microphone status, as a light beside a line of words.
 ///
-/// Not a calibrated bar — a plain yes/no, which is all a setup check needs: the
-/// microphone is live and picking you up, or it is muted, or it is quiet. The
-/// same decision the call's speaking ring makes drives the colour, so a mic that
-/// lights [GatherTokens.ok] green here is a mic the room will see light up too.
-/// Muted says so in words, because a dark light with no explanation reads as a
-/// broken one.
-class _MicLight extends StatelessWidget {
-  const _MicLight({required this.hearing, required this.live});
+/// Two shapes behind one widget, picked by whether a live level is available:
+///
+///  - **Device mode** passes [hearing] — there is a real meter — so this is a
+///    light that comes on when it hears you: live and picking you up (green), live
+///    and quiet (grey, "say something"), or muted. The same decision the call's
+///    speaking ring makes drives the colour, so a mic that lights
+///    [GatherTokens.ok] green here is a mic the room will see light up too.
+///  - **Call-pipeline mode** passes `null` — WebRTC gives no local level without a
+///    connection, and the loopback that faked one is what froze this screen — so
+///    it is honest about what it knows: live (green) or muted, no quiet state.
+///
+/// Either way, muted says so in words, because a dark light with no explanation
+/// reads as a broken one.
+class _MicStatus extends StatelessWidget {
+  const _MicStatus({required this.live, this.hearing});
 
-  final bool hearing;
   final bool live;
+
+  /// The live meter's answer, or null when there is no meter (call-pipeline). A
+  /// null reads as "working" for the colour, so a connected-but-level-less mic is
+  /// green rather than stuck on the quiet grey.
+  final bool? hearing;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    final on = live && hearing;
-    final colour = !live ? t.faint : (hearing ? t.ok : t.mutedForeground);
+    final metered = hearing != null;
+    final working = live && (hearing ?? true);
+    final colour = !live
+        ? (metered ? t.faint : t.mutedForeground)
+        : (working ? t.ok : t.mutedForeground);
     final label = !live
         ? 'Microphone muted'
-        : hearing
-            ? 'We can hear you'
-            : 'Say something — the light comes on when it hears you';
+        : metered
+            ? (hearing!
+                ? 'We can hear you'
+                : 'Say something — the light comes on when it hears you')
+            : 'Microphone is live — capturing through the call engine';
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -893,7 +882,7 @@ class _MicLight extends StatelessWidget {
             height: 40,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: on ? t.ok.withValues(alpha: 0.15) : t.secondary,
+              color: working ? t.ok.withValues(alpha: 0.15) : t.secondary,
             ),
             child: Icon(
               live ? Icons.mic_rounded : Icons.mic_off_rounded,
@@ -915,7 +904,6 @@ class _Controls extends StatelessWidget {
   const _Controls({
     required this.micLive,
     required this.videoOn,
-    required this.speaker,
     required this.frontCamera,
     required this.hasCamera,
     required this.canSwitch,
@@ -924,15 +912,16 @@ class _Controls extends StatelessWidget {
     required this.onSwitchCamera,
     required this.onToggleSpeaker,
     required this.onPlayTone,
+    this.speaker = false,
   });
 
   final bool micLive;
   final bool videoOn;
 
-  /// Which way the test sound goes. Null (with [onToggleSpeaker] null) hides the
-  /// route toggle — the call pipeline forces no route, so there is nothing to
-  /// switch.
-  final bool? speaker;
+  /// Which way the test sound goes. Only read when [onToggleSpeaker] is non-null;
+  /// the call pipeline forces no route, hides the toggle, and leaves this at its
+  /// unused default.
+  final bool speaker;
   final bool frontCamera;
   final bool hasCamera;
   final bool canSwitch;
@@ -954,7 +943,6 @@ class _Controls extends StatelessWidget {
     // The label names where a tap sends the sound, not where it is now: the
     // button is a switch, and the brand tint already says when the speaker is
     // the live one.
-    final speaker = this.speaker ?? false;
     final routeLabel = speaker ? 'Earpiece' : 'Speaker';
 
     return Column(
