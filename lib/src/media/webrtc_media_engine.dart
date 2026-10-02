@@ -121,8 +121,7 @@ class WebrtcMediaEngine implements CaptureEngine {
   /// itself a device-change on iOS, so re-applying the route on *every*
   /// device-change is a feedback loop: setSpeakerphoneOn → route change →
   /// ondevicechange → setSpeakerphoneOn, which pins the audio session at dozens of
-  /// reconfigurations a second and starves the media pipeline (observed on device:
-  /// the primary session rebuilt thousands of times in one call). We re-apply only
+  /// reconfigurations a second and starves the media pipeline. We re-apply only
   /// when this set actually changes — a headset genuinely coming or going — which a
   /// self-induced route flip never does, because the *available* outputs are the
   /// same whichever one is currently active.
@@ -130,8 +129,7 @@ class WebrtcMediaEngine implements CaptureEngine {
 
   /// The last route we asked for, so a re-apply that would not change anything is
   /// skipped rather than written again. A redundant [Helper.setSpeakerphoneOn]
-  /// still emits a route change, so this is the second guard against the loop
-  /// above even if the platform ever reports a spurious output-set change.
+  /// still emits a route change, so this is the second guard against the loop.
   bool? _appliedSpeaker;
 
   @override
@@ -350,18 +348,34 @@ class WebrtcMediaEngine implements CaptureEngine {
     // default — not to honour a tap from before it was plugged in. Guarded by
     // [_knownOutputs] so the route change our own [_applyRouteOnce] causes does not
     // come straight back in as a device-change and loop.
-    _knownOutputs = (await _outputs()).toSet();
+    _knownOutputs = await _externalOutputs();
     navigator.mediaDevices.ondevicechange = (_) => unawaited(_onDeviceChange());
 
     await _applyRoute();
   }
 
+  /// The *external* outputs — a headset or Bluetooth device — ignoring the
+  /// built-in speaker/earpiece pair.
+  ///
+  /// iOS only enumerates the earpiece *while it is the active route*, so forcing
+  /// earpiece makes it appear in [_outputs] and forcing speaker makes it vanish.
+  /// Comparing the full set would therefore see every route flip we make
+  /// ourselves as a hardware change — which both re-feeds the device-change loop
+  /// and wipes the user's speaker/earpiece choice. Only an external device coming
+  /// or going is a genuine reason to redo the default, and that set *is* stable
+  /// under our own route flips.
+  Future<Set<AudioOutput>> _externalOutputs() async => {
+        for (final d in await _outputs())
+          if (d == AudioOutput.bluetooth || d == AudioOutput.wired) d,
+      };
+
   /// A headset plugged or pulled clears the override and redoes the default.
-  /// Anything that leaves the set of available outputs unchanged — notably the
-  /// route flip [_applyRouteOnce] itself just made — is ignored, which is what
-  /// stops the device-change listener feeding back into itself.
+  /// Anything that leaves the set of *external* outputs unchanged — notably the
+  /// built-in speaker/earpiece flip [_applyRouteOnce] itself just made — is
+  /// ignored, which is what stops the device-change listener feeding back into
+  /// itself and what lets an earpiece choice survive the route change it causes.
   Future<void> _onDeviceChange() async {
-    final outputs = (await _outputs()).toSet();
+    final outputs = await _externalOutputs();
     final known = _knownOutputs;
     if (known != null &&
         known.length == outputs.length &&
@@ -427,12 +441,25 @@ class WebrtcMediaEngine implements CaptureEngine {
     await _syncOutput();
   }
 
-  /// Reads the live output route and publishes it as [AudioOutput].
+  /// Publishes the active route as [AudioOutput].
+  ///
+  /// Not read from [_outputs] ordering: iOS lists the synthetic `Speaker` first
+  /// even while the earpiece is the active route, so `outputs.first` reported
+  /// speaker for every route and pinned the UI there. An external device, when
+  /// present, is always the active route; otherwise the route is exactly what
+  /// [_applyRouteOnce] just set — speaker when [_appliedSpeaker], earpiece when
+  /// not — which is the one signal that actually tracks the earpiece.
   Future<void> _syncOutput() async {
     final outputs = await _outputs();
-    // The active route is the first the platform lists; default to the earpiece
-    // when it offers nothing, which is also the platform's own fallback.
-    final next = outputs.isEmpty ? AudioOutput.earpiece : outputs.first;
+    final external = [
+      for (final d in outputs)
+        if (d == AudioOutput.bluetooth || d == AudioOutput.wired) d,
+    ];
+    final next = external.isNotEmpty
+        ? external.first
+        : (_appliedSpeaker == false
+            ? AudioOutput.earpiece
+            : AudioOutput.speaker);
     _emit(_state.copyWith(audioOutput: next));
   }
 

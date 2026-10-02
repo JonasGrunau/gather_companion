@@ -66,7 +66,7 @@ class LocalMediaState {
     this.audioEnabled = false,
     this.videoEnabled = false,
     this.frontCamera = true,
-    this.audioOutput = AudioOutput.earpiece,
+    this.audioOutput = AudioOutput.speaker,
     this.videoTrackId,
     this.audioTrackId,
     this.failure,
@@ -77,8 +77,11 @@ class LocalMediaState {
   final bool videoEnabled;
   final bool frontCamera;
 
-  /// Where the sound is coming out. The earpiece until routing is applied — the
-  /// platform default this app exists to override.
+  /// Where the sound is coming out. The speaker until routing is applied: that
+  /// is the default [WebrtcMediaEngine] itself settles on (no headset ⇒ speaker,
+  /// the desk-companion route), so starting here means the control shows the real
+  /// route from the first frame instead of flipping earpiece→speaker once the
+  /// session comes up.
   final AudioOutput audioOutput;
 
   /// Track identities, so a caller can tell one capture session from the next
