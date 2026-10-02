@@ -471,14 +471,17 @@ class _Controls extends StatelessWidget {
     final t = context.tokens;
     final onSpeaker = state.audioOutput == AudioOutput.speaker;
 
-    // The same glyph and words the control bar's route button uses, so the
-    // switch here reads as the same control you will meet in a call.
-    final (routeIcon, routeLabel) = switch (state.audioOutput) {
-      AudioOutput.speaker => (Icons.volume_up_rounded, 'Speaker'),
-      AudioOutput.earpiece => (Icons.phone_in_talk_rounded, 'Earpiece'),
-      AudioOutput.bluetooth => (Icons.bluetooth_audio_rounded, 'Bluetooth'),
-      AudioOutput.wired => (Icons.headset_rounded, 'Headphones'),
+    // The same glyph the control bar's route button uses — where you are now —
+    // so the switch here reads as the same control you will meet in a call. The
+    // label names where a tap sends you, not where you are: the button is a
+    // switch, and the brand tint already says when the speaker is the live one.
+    final routeIcon = switch (state.audioOutput) {
+      AudioOutput.speaker => Icons.volume_up_rounded,
+      AudioOutput.earpiece => Icons.phone_in_talk_rounded,
+      AudioOutput.bluetooth => Icons.bluetooth_audio_rounded,
+      AudioOutput.wired => Icons.headset_rounded,
     };
+    final routeLabel = onSpeaker ? 'Earpiece' : 'Speaker';
 
     return Column(
       mainAxisSize: MainAxisSize.min,
