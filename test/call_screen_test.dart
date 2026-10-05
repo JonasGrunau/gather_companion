@@ -13,6 +13,7 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
+import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
@@ -558,6 +559,157 @@ void main() {
       await tester.pump(reactionLinger);
       await tester.pump();
       expect(find.text('🎉'), findsNothing);
+    });
+  });
+
+  group('the spotlight — manual and automatic', () {
+    // A shared cluster, so a change in who is talking actually reaches the
+    // screen: [AppState] only republishes a speaking change for members of your
+    // own conversation — the auto machine is deaf without it.
+    const me = RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', connected: true);
+
+    RosterRow person(String i, {bool speaking = false}) => RosterRow(
+          id: 'space-$i',
+          name: 'Person $i',
+          clusterId: 'c1',
+          userAccountId: 'account-$i',
+          speaking: speaking,
+        );
+
+    CallState threeFaces() => const CallState(participants: [
+          CallParticipant(srcId: 'account-0', hasVideo: true),
+          CallParticipant(srcId: 'account-1', hasVideo: true),
+          CallParticipant(srcId: 'account-2', hasVideo: true),
+        ]);
+
+    /// The screen with a zero dwell, so the auto machine promotes on the sample
+    /// rather than after a hold `tester.pump` cannot advance.
+    Future<void> showAuto(WidgetTester tester, AppState state) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: CallScreen(
+          state: state,
+          buildTile: inertTile,
+          director: SpotlightDirector(dwell: Duration.zero),
+        ),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('the mode toggle is there, and starts on manual grid', (tester) async {
+      final state = stateWith(threeFaces(), rows: [me, person('0'), person('1'), person('2')]);
+      addTearDown(state.dispose);
+      await show(tester, state);
+
+      expect(find.text('Manual'), findsOneWidget);
+      expect(find.text('Auto'), findsOneWidget);
+      // Nothing enlarged yet.
+      expect(find.byType(GridView), findsOneWidget);
+      expect(find.text('Everyone'), findsNothing);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('tapping a face enlarges it, and the return button goes back', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(threeFaces(), rows: [me, person('0'), person('1'), person('2')])
+        ..debugAttachCall(call);
+      addTearDown(state.dispose);
+      await show(tester, state);
+
+      // By key, not by the label: in the 800×600 test surface a 3:4 grid tile is
+      // tall enough that its name plate sits behind the bottom dock, where a tap
+      // on the text would miss. The tile's own centre is clear.
+      await tester.tap(find.byKey(const ValueKey('space-0')));
+      await tester.pump();
+
+      // Big view: Person 0 is drawn twice — once large, once in the strip — and
+      // the grid has given way to the return button.
+      expect(find.byType(GridView), findsNothing);
+      expect(find.text('Everyone'), findsOneWidget);
+      expect(find.text('Person 0'), findsNWidgets(2));
+
+      // And that one face is now asked for at full quality, everyone else left
+      // on the thumbnail the SFU sends by default.
+      expect(call.watching.last.srcIds, ['account-0']);
+      expect(call.watching.last.quality, VideoQuality.full);
+
+      await tester.tap(find.text('Everyone'));
+      await tester.pump();
+      expect(find.byType(GridView), findsOneWidget);
+      expect(find.text('Everyone'), findsNothing);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('auto follows the talker, and drops to the grid on silence', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(
+        threeFaces(),
+        rows: [me, person('0', speaking: true), person('1'), person('2')],
+      )..debugAttachCall(call);
+      addTearDown(state.dispose);
+      await showAuto(tester, state);
+
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+
+      // The one speaker is enlarged, at full quality.
+      expect(find.text('Everyone'), findsOneWidget);
+      expect(find.text('Person 0'), findsNWidgets(2));
+      expect(call.watching.last.srcIds, ['account-0']);
+      expect(call.watching.last.quality, VideoQuality.full);
+
+      // Person 0 stops. With nobody talking the big view drops back to the grid.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2')]));
+      await tester.pump();
+      expect(find.text('Everyone'), findsNothing);
+      expect(find.byType(GridView), findsOneWidget);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('a tap in auto pins, and the next speaker overrides it without leaving auto', (tester) async {
+      final state = stateWith(
+        threeFaces(),
+        rows: [me, person('0', speaking: true), person('1'), person('2')],
+      );
+      addTearDown(state.dispose);
+      await showAuto(tester, state);
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+      expect(find.text('Person 0'), findsNWidgets(2), reason: 'auto enlarged the talker');
+
+      // Pin Person 1 from the strip. The view moves to them at once.
+      await tester.tap(find.byKey(const ValueKey('strip-space-1')));
+      await tester.pump();
+      expect(find.text('Person 1'), findsNWidgets(2));
+
+      // Still auto: when the floor passes to Person 2, the pin gives way.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2', speaking: true)]));
+      await tester.pump();
+      expect(find.text('Person 2'), findsNWidgets(2), reason: 'auto overrode the pin');
+      expect(find.text('Auto'), findsOneWidget, reason: 'and never left auto mode');
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('auto never enlarges yourself for talking', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(
+        const CallState(
+          media: LocalMediaState(capturing: true, audioEnabled: true),
+          participants: [CallParticipant(srcId: 'account-1', hasVideo: true)],
+        ),
+        rows: [me, person('1')],
+      )..debugAttachCall(call);
+      addTearDown(state.dispose);
+      await showAuto(tester, state);
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+
+      // You start talking. The room does not watch you watch it — the view stays
+      // on the overview.
+      call.speak(true);
+      await tester.pump();
+      expect(find.text('Everyone'), findsNothing);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
     });
   });
 }
