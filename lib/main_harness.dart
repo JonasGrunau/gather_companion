@@ -29,6 +29,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:gather_client/gather_client.dart';
 
 import 'harness/call_scenarios.dart';
 import 'harness/fake_collector.dart';

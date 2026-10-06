@@ -1,9 +1,15 @@
-# Simulator mock harness — multi-party call & spotlight
+# Simulator mock harness — whole app, call & spotlight
 
-A second `flutter run` target that boots straight into a **scripted multi-party
-call** on the iOS simulator — no login, no WebRTC, no Gather backend. Use it to
-watch and drive the call screen (and the `feature/call-spotlight` big-view auto
-mode) without standing up a real room full of people.
+A second `flutter run` target that boots straight into a **scripted scene** on the
+iOS simulator — no login, no WebRTC, no Gather backend. Two targets, chosen with
+`--dart-define=TARGET`:
+
+- **`call`** (default) — straight into the call screen on a scripted multi-party
+  call, for the `feature/call-spotlight` big-view auto mode.
+- **`app`** — the *whole app*: it boots the real pair→home flow into `HomeShell`
+  with a `FakeCollector` standing in for the Gather socket, so the **Office is
+  walkable**, **party mode runs**, and the **Activity feed fills** — all with no
+  network. Tap a tile to walk; `idb`-drive it like any other screen.
 
 It is the gather equivalent of `beacon_manager`'s `example/lib/main.dart` harness.
 
@@ -11,17 +17,17 @@ It is the gather equivalent of `beacon_manager`'s `example/lib/main.dart` harnes
 
 | File | Role |
 |------|------|
-| `lib/main_harness.dart` | Entrypoint. Builds `AppState`, attaches a `ScriptedCall`, starts the driver, mounts `CallScreen` as the home route. |
+| `lib/main_harness.dart` | Entrypoint. `TARGET=call` mounts `CallScreen`; `TARGET=app` injects the fakes, `boot()`s, and mounts the real phase switch (booting→pairing→home). |
 | `lib/harness/scripted_call.dart` | `ScriptedCall implements Call` — a drivable fake: `emit(CallState)` and `speak(bool)`, every hardware/SFU method a recorded no-op. |
-| `lib/harness/harness_data.dart` | The fake cast and the roster/participant builders. Keeps the one invariant that lights a tile: `CallParticipant.srcId == RosterRow.userAccountId`, all in one `clusterId`. |
-| `lib/harness/call_scenarios.dart` | `scenarioFrame()` (pure: time → who's talking) + `CallScenarioDriver` (the timer that pushes each frame into `AppState`). |
-| `test/harness/call_scenario_driver_test.dart` | Unit tests for the scenarios and the driver. |
+| `lib/harness/fake_collector.dart` | `FakeCollector implements Collector` — the presence-plane fake. Holds a mutable roster; `move`/`teleport` advance my tile and **re-emit `rosters`** (the server's half of a step), so the real `Walk`/`PartyMode` drive my avatar against it. `placePerson`/`stepPerson`/`publish`/`wave` are the scenario's levers. |
+| `lib/harness/harness_data.dart` | The fake cast, the call roster builders (`CallParticipant.srcId == RosterRow.userAccountId`, one `clusterId`), **and** the schematic office — `schematicOffice()` (plain grid, a few rooms, no sprite art) with start tiles and map-plane row builders. |
+| `lib/harness/call_scenarios.dart` | `scenarioFrame()` + `CallScenarioDriver` (call); `AppScenarioDriver` (app: mills the cast about and lands waves). |
+| `test/harness/*_test.dart` | Unit tests for the scenarios, the driver and the fake collector. |
 
-No production file is touched. The harness rides entirely on `AppState`'s existing
-`@visibleForTesting` seams (`debugAttachCall`, `debugApplyRoster`) — the same ones
-`test/call_screen_test.dart` uses by hand. Tiles are **avatars, not video**: the
-call screen only reaches for a texture behind a real `LiveCall`, and the spotlight
-logic keys off participants + speaking flags, not pixels.
+No production file is touched. The call path rides `AppState`'s `@visibleForTesting`
+seams; the app path rides the `buildCollector`/`buildCall` constructor seams plus a
+credential-store stub. Tiles and avatars are drawn, never streamed — no texture, no
+sprite art is fetched.
 
 ## Running it
 
@@ -29,15 +35,23 @@ logic keys off participants + speaking flags, not pixels.
 # list booted simulators
 xcrun simctl list devices booted
 
+# the call screen (spotlight)
 flutter run -t lib/main_harness.dart -d <sim-udid> \
-  --dart-define=SCENARIO=roundrobin \
-  --dart-define=PARTICIPANTS=4
+  --dart-define=TARGET=call --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
+
+# the whole app — boots into the Office, walkable, feed alive
+flutter run -t lib/main_harness.dart -d <sim-udid> \
+  --dart-define=TARGET=app --dart-define=SCENARIO=office --dart-define=PARTICIPANTS=4
 ```
 
-- `SCENARIO` — one of the names below (default `group`).
+- `TARGET` — `call` (default) or `app`.
+- `SCENARIO` — a call scenario or an app scenario name (see below).
 - `PARTICIPANTS` — how many of the cast to seat, 1–8 (default `4`).
 
-### Scenarios
+The `app` target needs no `GATHER_PAIR`: a credential-store stub reports "paired"
+so `boot()` reaches `HomeShell`. Nothing on the credential is used — no fetch runs.
+
+### Call scenarios (`TARGET=call`)
 
 | `SCENARIO` | What it exercises |
 |------------|-------------------|
@@ -57,6 +71,27 @@ scenario timings are chosen around it.
 > seams, so they build on any branch — but to *exercise spotlight* run from that
 > branch. On launch the screen opens in **Manual**; tap the header toggle to
 > **Auto** to see the scenario drive the big view.
+
+### App scenarios (`TARGET=app`)
+
+| `SCENARIO` | What it exercises |
+|------------|-------------------|
+| `office` | People drift around the floor; somebody waves every few seconds. The Office is alive and the Activity tab fills. |
+| `still` | Nobody moves. The resting floor — one frame to look at. |
+
+What to check on the `app` target:
+
+- **Activity** opens first: seeded history plus live waves arriving every ~5s, with
+  an unread badge.
+- **Office**: tap it in the rail. The schematic floor draws with ghost avatars —
+  "You" and the seated cast, who mill about. **Tap an empty tile → "Go here" → your
+  avatar walks there** (the real `Walk` stepping against `FakeCollector`, which
+  echoes each step back on the roster). The call control bar sits above the rail.
+- **Settings** renders.
+
+> **Walking.** The D-pad is shelved in production (`kShowDPad = false`) — you walk by
+> tapping a destination tile, exactly as in the real app. That path runs through the
+> same `Walk` → `Collector.move`/route plumbing, so it is genuinely exercised here.
 
 ## Driving it with `idb` (autonomous taps + screenshots)
 

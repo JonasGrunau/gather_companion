@@ -116,21 +116,29 @@ Gather desktop update, re-check the log regexes against a real log:
 npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 ```
 
-### Running the call UI on the iOS Simulator
+### Running the app on the iOS Simulator (no network)
 
-A second `flutter run` target boots straight into a **scripted multi-party call**
-— no login, BLE, WebRTC or backend — to watch and `idb`-drive the call screen and
-the spotlight auto mode without a real room of people:
+A second `flutter run` target boots straight into a **scripted scene** — no login,
+BLE, WebRTC or backend — to watch and `idb`-drive the app without a real room of
+people. Two targets via `--dart-define=TARGET`:
 
 ```sh
+# the call screen + spotlight
 flutter run -t lib/main_harness.dart -d <sim-udid> \
-  --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
+  --dart-define=TARGET=call --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
+
+# the whole app — boots into the Office, walkable, Activity feed alive
+flutter run -t lib/main_harness.dart -d <sim-udid> \
+  --dart-define=TARGET=app --dart-define=SCENARIO=office --dart-define=PARTICIPANTS=4
 ```
 
-Scenarios (`solo`/`pair`/`group`/`roundrobin`/`debate`/`briefnoise`/`churn`), the
-`idb describe-all → tap → screenshot` loop, and the call-screen tap targets are in
-**`docs/sim_harness.md`**. The harness (`lib/main_harness.dart`, `lib/harness/`)
-touches no production file — it rides `AppState`'s existing test seams.
+`TARGET=app` injects a `FakeCollector` (presence plane) and `ScriptedCall` (media
+plane) through `AppState`'s constructor seams, so the real pair→home flow, the
+walkable Office (tap a tile to walk), party mode and the feed all run with no wire.
+Scenarios, the `idb describe-all → tap → screenshot` loop, and the tap targets are
+in **`docs/sim_harness.md`**. The harness (`lib/main_harness.dart`, `lib/harness/`)
+touches no production file — it rides `AppState`'s seams and the `Collector`
+interface in `gather_client`.
 
 ### Common Patterns
 
