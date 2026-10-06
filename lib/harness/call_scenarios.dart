@@ -12,10 +12,12 @@ library;
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:gather_client/gather_client.dart';
 
 import '../src/app_state.dart';
 import '../src/media/call.dart';
 import '../src/media/media_engine.dart';
+import 'fake_collector.dart';
 import 'harness_data.dart';
 import 'scripted_call.dart';
 
@@ -211,6 +213,99 @@ class CallScenarioDriver {
       _ticks++;
       applyAt(period * _ticks);
     });
+  }
+
+  void stop() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
+// ---- the office -------------------------------------------------------------
+
+/// The shapes of office the whole-app harness (TARGET=app) can play.
+enum AppScenario {
+  /// People drift around the floor and somebody waves every few seconds — the
+  /// map and the Activity tab both alive.
+  office,
+
+  /// Nobody moves. The resting floor, for looking at one frame.
+  still;
+
+  static AppScenario fromName(String name) => AppScenario.values.firstWhere(
+        (s) => s.name.toLowerCase() == name.toLowerCase(),
+        orElse: () => AppScenario.office,
+      );
+}
+
+/// Animates the office by driving a [FakeCollector]: walks the cast around the
+/// floor and lands waves in the activity feed, so the map and the Activity tab
+/// are alive on a sim with no network.
+///
+/// This moves *other* people — the fake playing the server's position frames. My
+/// own avatar is driven by the real `Walk` off the D-pad and is never touched
+/// here, which is the whole point: the thing under test (walking, following,
+/// party mode) runs for real against the same fake.
+class AppScenarioDriver {
+  AppScenarioDriver({
+    required this.state,
+    required this.collector,
+    this.scenario = AppScenario.office,
+    this.period = const Duration(milliseconds: 600),
+  });
+
+  final AppState state;
+  final FakeCollector collector;
+  final AppScenario scenario;
+  final Duration period;
+
+  /// A six-step loop with zero net displacement, so people mill about near where
+  /// they started rather than all piling into a corner against the clamp.
+  static const _wander = ['Right', 'Right', 'Down', 'Left', 'Left', 'Up'];
+
+  Timer? _timer;
+  int _ticks = 0;
+
+  /// Seeds the activity history and, unless the floor is [AppScenario.still],
+  /// starts milling the cast about.
+  void start() {
+    _seedActivity();
+    if (scenario == AppScenario.still) return;
+    _timer = Timer.periodic(period, (_) => _tick());
+  }
+
+  /// A few waves already waiting when the app opens, newest first — the Activity
+  /// tab's equivalent of opening the app after a weekend. Pushed through the same
+  /// seam `call_screen_test.dart` uses by hand.
+  void _seedActivity() {
+    final now = DateTime.now().toUtc();
+    final ids = collector.peopleIds.toList();
+    final items = <ActivityItem>[
+      for (var i = 0; i < ids.length && i < 4; i++)
+        WaveActivity(
+          id: 'seed-wave-$i',
+          at: now.subtract(Duration(minutes: (i + 1) * 7)),
+          actorSpaceUserId: ids[i],
+        ),
+    ];
+    // The one lib entrypoint that drives the test seams on purpose.
+    // ignore: invalid_use_of_visible_for_testing_member
+    state.debugApplyActivity(items);
+  }
+
+  void _tick() {
+    _ticks++;
+    final ids = collector.peopleIds.toList();
+    for (var i = 0; i < ids.length; i++) {
+      collector.stepPerson(ids[i], _wander[(_ticks + i) % _wander.length]);
+      // One speaking ring at a time, rotating, so the map shows a live talker.
+      collector.placePerson(ids[i], speaking: _ticks % ids.length == i);
+    }
+    collector.publish();
+    // A wave into the feed every ~5s.
+    if (ids.isNotEmpty && _ticks % 8 == 0) {
+      collector.wave(ids[(_ticks ~/ 8) % ids.length]);
+    }
   }
 
   void stop() {
