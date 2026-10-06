@@ -743,5 +743,98 @@ void main() {
       expect(find.text('Everyone'), findsNothing);
       await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
     });
+
+    testWidgets('switching from a manual face to auto holds the big view instead of dropping to the grid', (tester) async {
+      // Nobody is talking, so auto has nothing of its own to enlarge: the only
+      // thing keeping the big view up across the switch is carrying the manual
+      // pick over as auto's temporary pin.
+      final state = stateWith(threeFaces(), rows: [me, person('0'), person('1'), person('2')]);
+      addTearDown(state.dispose);
+      await showAuto(tester, state);
+
+      await tester.tap(find.byKey(const ValueKey('space-1')));
+      await tester.pump();
+      expect(find.text('Person 1'), findsNWidgets(2), reason: 'manually enlarged');
+
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+      expect(find.byType(GridView), findsNothing, reason: 'the big view held across the switch');
+      expect(find.text('Person 1'), findsNWidgets(2));
+
+      // Still auto: the next speaker to hold the floor takes the pin's place.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2', speaking: true)]));
+      await tester.pump();
+      expect(find.text('Person 2'), findsNWidgets(2), reason: 'a speaker overrode the carried pin');
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('enlarging your own face leaves everyone else on a thumbnail, not the grid split', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(
+        const CallState(
+          media: LocalMediaState(capturing: true),
+          participants: [CallParticipant(srcId: 'account-1', hasVideo: true)],
+        ),
+        rows: [me, person('1')],
+      )..debugAttachCall(call);
+      addTearDown(state.dispose);
+      await show(tester, state);
+
+      // Two in the room counting us, so the overview split asks the one remote
+      // for the half layer.
+      expect(call.watching.last.quality, VideoQuality.half);
+
+      // Enlarge yourself. Your own face has nothing on the media plane to boost,
+      // and the remote is now only a strip thumbnail — so the request drops to
+      // the low layer rather than staying on the grid's count-based split.
+      // The self tile has no map position in this state, so it takes the 'self'
+      // fallback id rather than a roster id.
+      await tester.tap(find.byKey(const ValueKey('self')));
+      await tester.pump();
+      expect(call.watching.last.quality, VideoQuality.thumbnail);
+      expect(call.watching.last.srcIds, ['account-1']);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('the production dwell timer promotes the held speaker once the clock advances', (tester) async {
+      // A real (non-zero) dwell with an injected clock, so the live timer path —
+      // schedule on a pending speaker, fire on its deadline — is exercised, not
+      // the zero-dwell shortcut the other auto tests take.
+      final call = FakeCall();
+      var now = DateTime(2026);
+      final state = stateWith(threeFaces(), rows: [me, person('0'), person('1'), person('2')])
+        ..debugAttachCall(call);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: CallScreen(
+          state: state,
+          buildTile: inertTile,
+          director: SpotlightDirector(
+            dwell: const Duration(milliseconds: 1500),
+            linger: const Duration(seconds: 5),
+          ),
+          now: () => now,
+        ),
+      ));
+      await tester.pump();
+
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+      expect(find.byType(GridView), findsOneWidget, reason: 'nobody has held the floor yet');
+
+      // Person 0 takes the floor. The dwell has not elapsed, so the view waits —
+      // this is the moment the timer is armed.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0', speaking: true), person('1'), person('2')]));
+      await tester.pump();
+      expect(find.byType(GridView), findsOneWidget, reason: 'the floor is not yet held long enough');
+
+      // The dwell elapses: advance the injected clock and let the armed timer fire.
+      now = now.add(const Duration(milliseconds: 1500));
+      await tester.pump(const Duration(milliseconds: 1500));
+      expect(find.text('Person 0'), findsNWidgets(2), reason: 'the dwell timer promoted the held speaker');
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
   });
 }

@@ -106,7 +106,13 @@ typedef CallTileBuilder = Widget Function(BuildContext context, CallTile tile);
 /// bandwidth. That is `consume-set-spatial`, and it is the receive-side half of
 /// the simulcast the publisher already implements.
 class CallScreen extends StatefulWidget {
-  const CallScreen({super.key, required this.state, this.buildTile, this.director});
+  const CallScreen({
+    super.key,
+    required this.state,
+    this.buildTile,
+    this.director,
+    this.now,
+  });
 
   final AppState state;
 
@@ -119,6 +125,13 @@ class CallScreen extends StatefulWidget {
   /// itself is asserted directly in `spotlight_director_test.dart`.
   @visibleForTesting
   final SpotlightDirector? director;
+
+  /// The clock the auto machine reads. Injected under test alongside a real
+  /// (non-zero) [director] so a widget test can drive the dwell timer: advance
+  /// this clock and `tester.pump` the pending [_dwellTimer] to fire a real
+  /// promotion. Defaults to the wall clock in production.
+  @visibleForTesting
+  final DateTime Function()? now;
 
   @override
   State<CallScreen> createState() => _CallScreenState();
@@ -138,6 +151,10 @@ class _CallScreenState extends State<CallScreen> {
   String? _autoPinned;
 
   late final SpotlightDirector _director = widget.director ?? SpotlightDirector();
+
+  /// The clock the auto machine reads, injectable so a widget test can drive the
+  /// dwell timer with a controllable time.
+  late final DateTime Function() _now = widget.now ?? DateTime.now;
 
   /// Fires when a pending speaker has held the floor long enough to promote, so
   /// the view moves even when no further speaking change arrives to re-ask.
@@ -182,7 +199,7 @@ class _CallScreenState extends State<CallScreen> {
   /// mode, so the machine runs only when it is in charge.
   void _driveAuto() {
     if (_mode != SpotlightMode.auto) return;
-    final now = DateTime.now();
+    final now = _now();
     final speaking = {
       for (final tile in _tiles(widget.state))
         if (tile.speaking && !tile.isSelf) tile.id,
@@ -247,16 +264,24 @@ class _CallScreenState extends State<CallScreen> {
   /// default; the overview keeps the old count-based split.
   void _syncWatching() {
     final spotlight = _effectiveSpotlight(_tiles(widget.state));
-    final spotlightSrc =
-        spotlight == null ? null : _srcIdForTileId(spotlight);
+    final call = widget.state.call;
+    final ids = [for (final person in call.participants) person.srcId];
 
-    if (spotlightSrc != null) {
-      _applyWatching([spotlightSrc], VideoQuality.full);
+    if (spotlight != null) {
+      final spotlightSrc = _srcIdForTileId(spotlight);
+      if (spotlightSrc != null) {
+        _applyWatching([spotlightSrc], VideoQuality.full);
+        return;
+      }
+      // A spotlight layout is up, but the big face has nothing on the media
+      // plane to boost — the self tile, or a roster-only row. Everyone else is
+      // only a strip thumbnail, so ask the SFU for the low layer across the
+      // board rather than falling through to the grid's count-based split, which
+      // would over-request half/full for faces that are 72×96 on screen.
+      _applyWatching(ids, VideoQuality.thumbnail);
       return;
     }
 
-    final call = widget.state.call;
-    final ids = [for (final person in call.participants) person.srcId];
     // Ourselves included, because the self tile takes a share of the screen
     // without anybody having to send it to us.
     final count = ids.length + (call.media.capturing ? 1 : 0);
@@ -290,8 +315,12 @@ class _CallScreenState extends State<CallScreen> {
     if (mode == _mode) return;
     setState(() {
       if (mode == SpotlightMode.auto) {
+        // Carry the manually enlarged face across as auto's temporary pin, so
+        // the big view holds until the next speaker holds the floor — rather than
+        // dropping to the grid for the length of a dwell. A self enlargement has
+        // no place in auto and is dropped; [_effectiveSpotlight] refuses it too.
+        _autoPinned = _manualId;
         _manualId = null;
-        _autoPinned = null;
         _director.reset();
       } else {
         // Keep whoever is big now, so turning auto off freezes the view rather
@@ -573,7 +602,11 @@ class _ModeToggle extends StatelessWidget {
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 180),
             curve: Curves.easeOutCubic,
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            alignment: Alignment.center,
+            // Material's minimum interactive dimension, so the switch stays
+            // operable under limited motor precision rather than a ~27px sliver.
+            constraints: const BoxConstraints(minHeight: 48),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(
               color: on ? t.brand : Colors.transparent,
               borderRadius: BorderRadius.circular(t.radius),
@@ -691,7 +724,7 @@ class _Grid extends StatelessWidget {
 /// One face, big, over a strip of everybody else.
 ///
 /// The big tile and the strip both go through the same [buildTile] the grid uses,
-/// so the renderer lifecycle is the one already got right in [_VideoTile] — and a
+/// so the renderer lifecycle is the one [_VideoTile] already gets right — and a
 /// widget test can swap all of them out at once. The spotlighted person appears
 /// twice, once big and once in the strip, so their two renderers are given
 /// distinct keys; the second texture is the price of keeping the strip honest
@@ -806,22 +839,27 @@ class _OverviewButton extends StatelessWidget {
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: onTap,
-          child: const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.grid_view_rounded, size: 15, color: Colors.white),
-                SizedBox(width: 6),
-                Text(
-                  'Everyone',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+          child: ConstrainedBox(
+            // Material's minimum interactive height, so returning to the grid
+            // stays reachable rather than a ~29px sliver on top of the video.
+            constraints: const BoxConstraints(minHeight: 48),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.grid_view_rounded, size: 15, color: Colors.white),
+                  SizedBox(width: 6),
+                  Text(
+                    'Everyone',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
