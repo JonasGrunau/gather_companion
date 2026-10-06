@@ -129,7 +129,15 @@ class _MapScreenState extends State<MapScreen> {
                   child: child,
                 ),
               ),
-              child: widget.state.inCall ? CallBanner(key: const ValueKey('call'), state: widget.state) : const SizedBox.shrink(),
+              // A call to get back to wins the slot; otherwise a dropped connection
+              // claims it, because a reconnect is the one thing the office cannot
+              // show on its own — the floor looks the same whether the roster is
+              // live or an hour stale.
+              child: widget.state.inCall
+                  ? CallBanner(key: const ValueKey('call'), state: widget.state)
+                  : widget.state.link.isReconnecting
+                      ? const _Reconnecting(key: ValueKey('link'))
+                      : const SizedBox.shrink(),
             ),
           ),
         ],
@@ -160,6 +168,57 @@ class _Where extends StatelessWidget {
     // time you arrived on the office. Explicit is what the sibling bars do, so
     // explicit is what matches them.
     return Text(space ?? 'The office', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge);
+  }
+}
+
+/// Shown over the floor when the connection dropped and is coming back.
+///
+/// Lives in the same slot the call banner does and is mutually exclusive with it,
+/// so it never stacks. Tinted danger because it is the one state where what the map
+/// draws is not what is true — the roster is frozen, proximity is stale, and a call
+/// will not start until this clears. A [liveRegion] so a screen reader says it
+/// rather than leaving a blind user wondering why nobody is answering.
+class _Reconnecting extends StatelessWidget {
+  const _Reconnecting({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final tint = t.danger;
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Center(
+        child: Semantics(
+          liveRegion: true,
+          label: 'Reconnecting to Gather',
+          child: ExcludeSemantics(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: tint.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(t.radius),
+                border: Border.all(color: tint.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: tint),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Reconnecting…',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: tint),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 

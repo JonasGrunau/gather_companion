@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
@@ -58,7 +59,18 @@ class AppState extends ChangeNotifier {
     // so the movement and socket diagnostics — refusals, snap-backs, cluster
     // changes — are actually recorded rather than written to a dead `_noop`.
     void Function(String)? log,
+    // Test seams for the network-change watcher. Production uses the real plugin;
+    // a suite injects a controller it can push interface changes through, and a
+    // current-state probe it can answer synchronously. See [_onConnectivityChanged].
+    Stream<List<ConnectivityResult>>? connectivityChanges,
+    Future<List<ConnectivityResult>> Function()? connectivityNow,
+    // Test seam for the resync cooldown clock. Production reads the wall clock.
+    DateTime Function()? now,
   }) : _notifier = notifier ?? Notifier(),
+       _connectivityChanges =
+           connectivityChanges ?? Connectivity().onConnectivityChanged,
+       _connectivityNow = connectivityNow ?? Connectivity().checkConnectivity,
+       _now = now ?? DateTime.now,
        // ignore: prefer_initializing_formals
        _push = push,
        _credentialStore = credentials ?? GatherCredentialStore(),
@@ -83,6 +95,17 @@ class AppState extends ChangeNotifier {
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
+  final Stream<List<ConnectivityResult>> _connectivityChanges;
+  final Future<List<ConnectivityResult>> Function() _connectivityNow;
+  final DateTime Function() _now;
+
+  /// The last interface set seen, so a change is told from a repeat. Seeded from
+  /// [_connectivityNow] on attach so the first real handoff is not swallowed.
+  List<ConnectivityResult>? _lastConnectivity;
+
+  /// When the network watcher last forced a resync, to coalesce the burst of
+  /// events a single handoff emits into one reconnect.
+  DateTime? _lastNetResync;
 
   /// Null in a build with no media layer — a widget test, or a platform where
   /// there is nothing to capture. [canCall] reads false and the bar says so,
@@ -741,6 +764,15 @@ class AppState extends ChangeNotifier {
     _call = call;
     _subs.add(call.speaking.listen(_noteSpeaking));
   }
+
+  /// Test seam: stand a collector in without the whole [_attach] handshake, so the
+  /// network-change watcher has something to resync.
+  @visibleForTesting
+  void debugAttachCollector(Collector collector) => _collector = collector;
+
+  /// Test seam: drive [_onConnectivityChanged] without a plugin behind it.
+  @visibleForTesting
+  void debugNoteConnectivity(List<ConnectivityResult> now) => _onConnectivityChanged(now);
 
   /// Test seam: the call state a screen renders, with no media layer behind it.
   ///
@@ -1711,10 +1743,67 @@ class AppState extends ChangeNotifier {
       ..add(collector.statuses.listen(_onCollectorStatus))
       ..add(party.changes.listen(_onPartyChanged))
       ..add(party.progress.listen(_onPartyProgress))
-      ..add(party.hops.listen(_onPartyHop));
+      ..add(party.hops.listen(_onPartyHop))
+      // The network-change watcher. A wifi<->cellular handoff leaves both sockets
+      // half-open — healthy-looking, carrying nothing — and the deaf-timer takes
+      // 45s to notice, which is 45s of no roster and so no call. This turns the
+      // handoff itself into the trigger. Seeded first so the first change counts.
+      ..add(_connectivityChanges.listen(_onConnectivityChanged));
 
+    unawaited(_seedConnectivity());
     collector.start();
     unawaited(_registerForPush());
+  }
+
+  /// Record the current interface set, so [_onConnectivityChanged] can tell a real
+  /// handoff from a repeat and does not fire a resync on the connection we just
+  /// opened. Best-effort: a probe that throws leaves the baseline null, which only
+  /// costs one extra (harmless) resync on the first change.
+  Future<void> _seedConnectivity() async {
+    try {
+      _lastConnectivity = await _connectivityNow();
+    } on Object {
+      // The watcher degrades to the deaf-timer, which is where we started.
+    }
+  }
+
+  /// A network interface came or went. Force a reconnect when the usable transport
+  /// changed, rather than waiting out the deaf-timer.
+  ///
+  /// Going *offline* is left alone: there is nothing to reconnect to, the socket
+  /// will drop on its own, and a resync into no network is just churn. It is the
+  /// arrival of a *different* transport — cellular taking over from dropped wifi,
+  /// or the reverse — that strands a half-open socket, and that is what this acts
+  /// on. Coalesced on a short cooldown because one handoff emits several events.
+  void _onConnectivityChanged(List<ConnectivityResult> now) {
+    final before = _lastConnectivity;
+    _lastConnectivity = now;
+
+    final online = now.any((r) => r != ConnectivityResult.none);
+    if (!online) {
+      _log('net: went offline — waiting for a transport');
+      return;
+    }
+    if (before != null &&
+        before.length == now.length &&
+        before.toSet().containsAll(now)) {
+      return; // The same interfaces; nothing to reconnect for.
+    }
+
+    final at = _now();
+    final last = _lastNetResync;
+    if (last != null && at.difference(last) < const Duration(seconds: 5)) return;
+    _lastNetResync = at;
+
+    final collector = _collector;
+    if (collector == null) return;
+
+    _log('net: transport changed to ${now.map((r) => r.name).join('+')} — forcing resync');
+    // Flip the badge now rather than waiting for the reconnect to report in, so the
+    // screen says "Reconnecting" the instant the network moves under it.
+    _link = const LinkStatus(LinkState.retrying, 'Network changed — reconnecting.');
+    notifyListeners();
+    unawaited(collector.resync());
   }
 
   Future<void> _detach() async {

@@ -606,7 +606,17 @@ class Walk {
     // matching position patch follows, which [noteRoster] logs when it does not.
     _log('walk: move $direction -> ($_x,$_y) gait=${_gait.name} inflight=${_pending.length + 1}');
     _pending.add((x: _x!, y: _y!));
-    if (_pending.length > _pendingLimit) _pending.removeAt(0);
+    if (_pending.length > _pendingLimit) {
+      _pending.removeAt(0);
+      // The buffer is full of steps the roster never confirmed: we sent the moves
+      // and the server never put us on any of those tiles. That is the direct
+      // answer to "did the move reach the backend" — it did not take effect, which
+      // on a phone almost always means the socket is half-open after a network
+      // change. The optimistic walk is now a full buffer ahead of a stationary
+      // avatar.
+      _log('walk: $_pendingLimit moves sent, none confirmed by a roster — '
+          'server is not applying our moves (socket likely half-open)');
+    }
     // A step that landed is the evidence that re-planning worked.
     _replans = 0;
 

@@ -216,8 +216,13 @@ class FakeCollector implements Collector {
   @override
   ({bool ok, String? detail}) setActive(bool active) => (ok: true, detail: null);
 
+  /// How many times [resync] has been asked for, so a test can assert that a
+  /// network change forced a reconnect.
+  int resyncs = 0;
+
   @override
   Future<({bool ok, String detail})> resync() async {
+    resyncs++;
     publish();
     return (ok: true, detail: 'simulator; a fresh roster follows');
   }

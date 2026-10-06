@@ -21,4 +21,10 @@ class LinkStatus {
   final bool needsPairing;
 
   bool get isLive => state == LinkState.live;
+
+  /// A dropped connection trying to come back — distinct from [LinkState.connecting],
+  /// which is a first connection nobody has lost yet. The office shows this one and
+  /// not that one: the first connect is covered by the map's own "waiting" state,
+  /// while a reconnect is a live screen going quiet under the user and worth a word.
+  bool get isReconnecting => state == LinkState.retrying;
 }
