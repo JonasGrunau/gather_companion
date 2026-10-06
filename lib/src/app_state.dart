@@ -774,6 +774,11 @@ class AppState extends ChangeNotifier {
   @visibleForTesting
   void debugNoteConnectivity(List<ConnectivityResult> now) => _onConnectivityChanged(now);
 
+  /// Test seam: drive [_onCollectorStatus] without the collector's stream wired, so a
+  /// test can land a deaf-timer report while offline and check which word wins.
+  @visibleForTesting
+  void debugNoteCollectorStatus(CollectorStatus status) => _onCollectorStatus(status);
+
   /// Test seam: the call state a screen renders, with no media layer behind it.
   ///
   /// Overrides [call] when set. A widget test cannot build a real [Call] — it
@@ -1775,6 +1780,24 @@ class AppState extends ChangeNotifier {
   /// arrival of a *different* transport — cellular taking over from dropped wifi,
   /// or the reverse — that strands a half-open socket, and that is what this acts
   /// on. Coalesced on a short cooldown because one handoff emits several events.
+  /// True once connectivity has been seen and the last sighting was no transport at all.
+  /// Null (not yet seeded) reads as not-offline, so startup does not flash the banner.
+  bool _isOffline() {
+    final now = _lastConnectivity;
+    return now != null && !now.any((r) => r != ConnectivityResult.none);
+  }
+
+  /// Stand down the steps that need the game socket: party mode, a held D-pad, and a
+  /// live call's publish. Called both when the collector reports unhealthy and the
+  /// instant the network drops, so the mic does not stay open on a room we left and the
+  /// walker does not keep stepping into a socket that refuses every move. Everything
+  /// else — the map, settings, navigation — stays usable; this gates only the online bits.
+  void _suspendOnlineActivity(String detail) {
+    _party?.stop(detail);
+    _walk?.release();
+    unawaited(_call?.hangUp() ?? Future<void>.value());
+  }
+
   void _onConnectivityChanged(List<ConnectivityResult> now) {
     final before = _lastConnectivity;
     _lastConnectivity = now;
@@ -1782,6 +1805,17 @@ class AppState extends ChangeNotifier {
     final online = now.any((r) => r != ConnectivityResult.none);
     if (!online) {
       _log('net: went offline — waiting for a transport');
+      // Say so at once, and stand the online-only steps down now rather than at the
+      // 45s deaf-timer. The socket stays open-but-deaf after the radio drops (flight
+      // mode, a dead zone), so until the timer trips the screen would otherwise keep
+      // claiming we are live while moves fall into the void. There is nothing to
+      // resync to yet — raise the flag and suspend the things that need the network.
+      final collector = _collector;
+      if (collector != null && !_link.isOffline) {
+        _link = const LinkStatus(LinkState.offline, 'No connection — waiting for network.');
+        _suspendOnlineActivity('no network');
+        notifyListeners();
+      }
       return;
     }
     if (before != null &&
@@ -1925,23 +1959,19 @@ class AppState extends ChangeNotifier {
       ),
     );
 
+    // While the radio is down the collector's own health is stale — the socket is open
+    // but deaf, so it may still claim "healthy" for ~45s and would otherwise flip the
+    // badge back to live. Offline wins until a transport returns, and says the truer word.
+    final offline = _isOffline();
     _link = switch (status) {
       CollectorStatus(needsPairing: true) => LinkStatus(LinkState.idle, status.detail, true),
+      _ when offline => const LinkStatus(LinkState.offline, 'No connection — waiting for network.'),
       CollectorStatus(healthy: true) => LinkStatus(LinkState.live, status.detail),
       _ => LinkStatus(LinkState.retrying, status.detail),
     };
 
-    // A party cannot run without Gather, and a switch left glowing through a dropped
-    // connection would be asserting something untrue. A held D-pad is the same
-    // problem with a worse ending: the timer keeps firing into a socket that refuses
-    // every step, and the reconnect turns that into a walk nobody is still asking for.
-    if (!status.healthy) {
-      _party?.stop(status.detail ?? 'lost the connection to Gather');
-      _walk?.release();
-      // And the call: publishing outlives the game socket, so without this the
-      // phone keeps its microphone open and its camera light on for a room it is
-      // no longer connected to. The buttons come back off, which is the truth.
-      unawaited(_call?.hangUp() ?? Future<void>.value());
+    if (!status.healthy || offline) {
+      _suspendOnlineActivity(status.detail ?? 'lost the connection to Gather');
     }
 
     _snapshot = _tracker.snapshot();

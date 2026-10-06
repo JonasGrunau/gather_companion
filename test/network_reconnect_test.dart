@@ -8,6 +8,7 @@ library;
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
 
@@ -35,7 +36,7 @@ void main() {
     expect(state.link.isReconnecting, isTrue, reason: 'the badge should show at once');
   });
 
-  test('the same transport does not reconnect, and offline just waits', () {
+  test('the same transport does not reconnect, and offline flags at once', () {
     final (:state, :collector, :tick) = wired();
 
     state.debugNoteConnectivity([ConnectivityResult.mobile]);
@@ -47,6 +48,34 @@ void main() {
 
     state.debugNoteConnectivity(const []); // lost the network entirely
     expect(collector.resyncs, base, reason: 'nothing to reconnect to yet');
+    expect(state.link.isOffline, isTrue,
+        reason: 'offline must show at once, not wait for the 45s deaf-timer');
+    expect(state.link.isReconnecting, isFalse,
+        reason: 'offline is its own word — no spinner when there is no network');
+  });
+
+  test('offline wins over a stale collector report until a transport returns', () {
+    final (:state, :collector, :tick) = wired();
+
+    state.debugNoteConnectivity([ConnectivityResult.wifi]);
+    tick(const Duration(seconds: 6));
+    state.debugNoteConnectivity(const []); // flight mode
+    expect(state.link.isOffline, isTrue);
+
+    // The deaf-timer finally trips ~45s later and the collector reports unhealthy — the
+    // word stays "offline", not "reconnecting": there is still no network.
+    state.debugNoteCollectorStatus(const CollectorStatus(healthy: false, detail: 'deaf'));
+    expect(state.link.isOffline, isTrue, reason: 'still no transport');
+
+    // A stale "healthy" off the open-but-deaf socket must not flip the badge to live.
+    state.debugNoteCollectorStatus(const CollectorStatus(healthy: true, detail: 'stale'));
+    expect(state.link.isOffline, isTrue, reason: 'the socket is deaf; the radio is down');
+
+    // A transport returns: reconnect now, and a healthy report lands us back live.
+    state.debugNoteConnectivity([ConnectivityResult.wifi]);
+    expect(state.link.isReconnecting, isTrue, reason: 'network back — now a real reconnect');
+    state.debugNoteCollectorStatus(const CollectorStatus(healthy: true, detail: 'ok'));
+    expect(state.link.isLive, isTrue);
   });
 
   test('the burst of events from one handoff coalesces into a single resync', () {

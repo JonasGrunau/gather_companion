@@ -135,8 +135,8 @@ class _MapScreenState extends State<MapScreen> {
               // live or an hour stale.
               child: widget.state.inCall
                   ? CallBanner(key: const ValueKey('call'), state: widget.state)
-                  : widget.state.link.isReconnecting
-                      ? const _Reconnecting(key: ValueKey('link'))
+                  : widget.state.link.isDisrupted
+                      ? _LinkBanner(key: const ValueKey('link'), offline: widget.state.link.isOffline)
                       : const SizedBox.shrink(),
             ),
           ),
@@ -171,26 +171,33 @@ class _Where extends StatelessWidget {
   }
 }
 
-/// Shown over the floor when the connection dropped and is coming back.
+/// Shown over the floor when the connection to Gather is not carrying the roster.
 ///
-/// Lives in the same slot the call banner does and is mutually exclusive with it,
-/// so it never stacks. Tinted danger because it is the one state where what the map
-/// draws is not what is true — the roster is frozen, proximity is stale, and a call
-/// will not start until this clears. A [liveRegion] so a screen reader says it
-/// rather than leaving a blind user wondering why nobody is answering.
-class _Reconnecting extends StatelessWidget {
-  const _Reconnecting({super.key});
+/// Two shapes in one slot. A reconnect — a network that exists, a socket coming back —
+/// gets a spinner, because something is actually happening. Being [offline] — flight
+/// mode, a dead zone, no radio at all — gets a static cloud-off glyph instead: a spinner
+/// there would promise progress nothing can make. Either way it lives in the same slot
+/// the call banner does and is mutually exclusive with it, so it never stacks, and is
+/// tinted danger because it is the state where what the map draws is not what is true —
+/// the roster is frozen, proximity is stale, and a call will not start until it clears.
+/// A [liveRegion] so a screen reader says it rather than leaving a blind user wondering
+/// why nobody is answering.
+class _LinkBanner extends StatelessWidget {
+  const _LinkBanner({super.key, required this.offline});
+
+  final bool offline;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
     final tint = t.danger;
+    final label = offline ? 'No connection' : 'Reconnecting…';
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Center(
         child: Semantics(
           liveRegion: true,
-          label: 'Reconnecting to Gather',
+          label: offline ? 'No connection to Gather' : 'Reconnecting to Gather',
           child: ExcludeSemantics(
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -205,11 +212,13 @@ class _Reconnecting extends StatelessWidget {
                   SizedBox(
                     width: 12,
                     height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: tint),
+                    child: offline
+                        ? Icon(Icons.cloud_off_rounded, size: 12, color: tint)
+                        : CircularProgressIndicator(strokeWidth: 2, color: tint),
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    'Reconnecting…',
+                    label,
                     style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: tint),
                   ),
                 ],
