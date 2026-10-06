@@ -59,15 +59,53 @@ void main() {
     director.update({'ada'}, at(0));
     director.update({'ada'}, at(1500));
 
-    // Ada stops; Grace is talking. Ada loses the big view at once (overview),
-    // and Grace has to hold the floor the full dwell before she takes it.
-    expect(director.update({'grace'}, at(2000)).target, isNull,
-        reason: 'the finished turn drops to the overview immediately');
-    expect(director.update({'grace'}, at(3000)).target, isNull, reason: 'still inside Grace\'s dwell');
+    // Ada stops; Grace is talking. Ada keeps the big view while Grace counts —
+    // the handoff is one face replacing another, not a bounce through the grid —
+    // and Grace has to hold the floor the full dwell before she takes it over.
+    expect(director.update({'grace'}, at(2000)).target, 'ada',
+        reason: 'the last speaker lingers big while the next one counts');
+    expect(director.update({'grace'}, at(3000)).target, 'ada',
+        reason: 'still inside Grace\'s dwell — Ada holds the view');
 
     final r = director.update({'grace'}, at(3500));
     expect(r.target, 'grace');
     expect(r.promoted, isTrue);
+  });
+
+  test('a silent big view lingers, then falls back to the grid after the linger', () {
+    final d = SpotlightDirector(
+      dwell: const Duration(milliseconds: 1500),
+      linger: const Duration(seconds: 5),
+    );
+    d.update({'ada'}, at(0));
+    expect(d.update({'ada'}, at(1500)).target, 'ada');
+
+    // Everyone stops. The silence clock starts at the first quiet sample (2000),
+    // and Ada stays enlarged through the pause between turns...
+    expect(d.update(const {}, at(2000)).target, 'ada', reason: 'just gone quiet');
+    expect(d.update(const {}, at(4000)).target, 'ada', reason: '2s of silence, still up');
+    expect(d.update(const {}, at(6999)).target, 'ada', reason: 'one ms short of the linger');
+
+    // ...until the lull runs the full linger from when it began (2000 + 5000),
+    // when the view finally falls back to the overview grid.
+    final r = d.update(const {}, at(7000));
+    expect(r.target, isNull, reason: 'linger elapsed — back to the grid');
+    expect(r.promoted, isFalse);
+  });
+
+  test('a short lull does not reset the linger clock when it is the target talking', () {
+    // Silence runs from 1500. Ada says one more word at 3000 and stops again:
+    // because it is Ada — the target — she is sticky, which clears the silence
+    // clock, so the linger restarts from her last word rather than carrying over.
+    final d = SpotlightDirector(linger: const Duration(seconds: 5));
+    d.update({'ada'}, at(0));
+    d.update({'ada'}, at(1500));
+    d.update(const {}, at(3000)); // 1.5s of silence
+    expect(d.update({'ada'}, at(3000)).target, 'ada', reason: 'Ada talks again');
+    // Silence clock restarts at 4000; still up at 8000 (4s in), gone at 9000.
+    expect(d.update(const {}, at(4000)).target, 'ada');
+    expect(d.update(const {}, at(8000)).target, 'ada', reason: '4s into the fresh lull');
+    expect(d.update(const {}, at(9000)).target, isNull, reason: '5s — back to grid');
   });
 
   test('a second voice does not reset the clock on the one about to be promoted', () {
@@ -88,6 +126,31 @@ void main() {
 
     director.update({'ada'}, at(1500)); // promotes
     expect(director.timeToPromote(at(1600)), isNull, reason: 'promoted — nothing pending');
+  });
+
+  test('timeToFallback counts down the silent big view and clears on handoff and reset', () {
+    final d = SpotlightDirector(linger: const Duration(seconds: 5));
+    expect(d.timeToFallback(at(0)), isNull, reason: 'no target, nothing lingering');
+
+    d.update({'ada'}, at(0));
+    d.update({'ada'}, at(1500));
+    expect(d.timeToFallback(at(1500)), isNull, reason: 'Ada is talking, not silent');
+
+    // Silence from 1500: five seconds on the clock, counting down.
+    d.update(const {}, at(1500));
+    expect(d.timeToFallback(at(2500)), const Duration(seconds: 4));
+    expect(d.timeToFallback(at(6500)), Duration.zero);
+
+    // A new speaker taking the floor clears it...
+    d.update({'grace'}, at(2000));
+    d.update({'grace'}, at(3500)); // promotes Grace
+    expect(d.timeToFallback(at(3500)), isNull, reason: 'Grace is talking now');
+
+    // ...and so does a reset.
+    d.update(const {}, at(4000));
+    expect(d.timeToFallback(at(4500)), isNotNull);
+    d.reset();
+    expect(d.timeToFallback(at(5000)), isNull, reason: 'reset cleared the linger');
   });
 
   test('reset drops the target back to the overview', () {

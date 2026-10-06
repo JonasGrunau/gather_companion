@@ -193,8 +193,11 @@ class _CallScreenState extends State<CallScreen> {
 
     _dwellTimer?.cancel();
     _dwellTimer = null;
-    final left = _director.timeToPromote(now);
-    if (result.target == null && left != null) {
+    // A pending promotion (somebody counting towards the floor) or a pending
+    // fallback (a silent big view counting down to the grid) — either one needs
+    // the view re-asked when its deadline lands, since no speaking change will.
+    final left = _director.timeToPromote(now) ?? _director.timeToFallback(now);
+    if (left != null) {
       _dwellTimer = Timer(left, () {
         if (!mounted) return;
         _driveAuto();

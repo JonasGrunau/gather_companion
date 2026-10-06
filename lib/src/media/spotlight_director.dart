@@ -15,9 +15,17 @@
 ///    moment" into "the person with the floor", which is what a meeting actually
 ///    looks like.
 ///
+/// And once the view is on somebody, it *stays* big across the gaps. A finished
+/// turn does not drop back to the grid — the last speaker lingers, enlarged, and
+/// the next speaker to hold the floor takes the big view over directly, so a
+/// handoff is one face replacing another rather than a flash of the overview
+/// between them. Only a real lull — nobody talking at all for [linger] — falls
+/// back to the grid.
+///
 /// Pure on purpose, exactly like [VoiceActivity]: no timers, no clock of its own.
 /// It is handed the set of people speaking and the time, and it answers who to
-/// show. The call screen owns the one timer that re-asks when a dwell elapses.
+/// show. The call screen owns the one timer that re-asks when a dwell — or a
+/// [linger] — elapses.
 ///
 /// Self is never in the set it is handed — you do not get enlarged on your own
 /// screen for talking — so that rule lives in the caller, not here.
@@ -25,10 +33,18 @@ library;
 
 /// The automatic-spotlight decision, as a small state machine.
 class SpotlightDirector {
-  SpotlightDirector({this.dwell = const Duration(milliseconds: 1500)});
+  SpotlightDirector({
+    this.dwell = const Duration(milliseconds: 1500),
+    this.linger = const Duration(seconds: 5),
+  });
 
   /// How long a new speaker must hold the floor before the view moves to them.
   final Duration dwell;
+
+  /// How long a silent big view holds the last speaker before it falls back to
+  /// the overview grid. A short lull — the pause between turns — keeps the face
+  /// up; only a real one this long drops it.
+  final Duration linger;
 
   /// Who the view is on now, or null for the overview grid.
   String? _target;
@@ -36,6 +52,10 @@ class SpotlightDirector {
   /// Who is counting towards becoming the target, and since when.
   String? _candidate;
   DateTime? _candidateSince;
+
+  /// When the room fell silent while the view was still on [_target], for the
+  /// [linger] countdown. Null whenever anybody is talking.
+  DateTime? _silentSince;
 
   String? get target => _target;
 
@@ -48,19 +68,31 @@ class SpotlightDirector {
     if (_target != null && speaking.contains(_target)) {
       _candidate = null;
       _candidateSince = null;
+      _silentSince = null;
       return (target: _target, promoted: false);
     }
 
-    // The target has gone quiet (or there was none). They lose the spotlight at
-    // once — a finished turn should not leave a stale big view glowing — and the
-    // screen falls back to the overview until somebody earns it.
-    _target = null;
-
     if (speaking.isEmpty) {
+      // Nobody is talking. The last speaker lingers, enlarged, through the pause
+      // between turns; only once the lull runs the full [linger] does the view
+      // fall back to the overview. (With no target there is nothing to hold.)
       _candidate = null;
       _candidateSince = null;
-      return (target: null, promoted: false);
+      if (_target == null) return (target: null, promoted: false);
+      _silentSince ??= now;
+      if (now.difference(_silentSince!) >= linger) {
+        _target = null;
+        _silentSince = null;
+        return (target: null, promoted: false);
+      }
+      return (target: _target, promoted: false);
     }
+
+    // Somebody other than the target is talking. Any speech pauses the silence
+    // clock, and the newcomer has to hold the floor the full dwell before the
+    // view moves — while they count, the last speaker stays big, so the handoff
+    // is one face replacing another rather than a bounce through the grid.
+    _silentSince = null;
 
     final next = _pick(speaking);
     if (next != _candidate) {
@@ -75,8 +107,9 @@ class SpotlightDirector {
       return (target: _target, promoted: true);
     }
 
-    // Speaking, but not yet long enough to move the view.
-    return (target: null, promoted: false);
+    // Speaking, but not yet long enough to move the view: hold whatever is big
+    // now (the lingering last speaker, or the grid if nobody has earned it yet).
+    return (target: _target, promoted: false);
   }
 
   /// Which speaker to count. Stays with whoever is already counting — so a brief
@@ -99,10 +132,23 @@ class SpotlightDirector {
     return left.isNegative ? Duration.zero : left;
   }
 
+  /// How long until a silent big view falls back to the grid, or null if it is
+  /// not currently lingering. The call screen schedules its one timer off this
+  /// too, so the drop happens even when no further speaking change arrives to
+  /// re-ask. Mutually exclusive with [timeToPromote]: one needs speech, the
+  /// other silence.
+  Duration? timeToFallback(DateTime now) {
+    final since = _silentSince;
+    if (since == null || _target == null) return null;
+    final left = linger - now.difference(since);
+    return left.isNegative ? Duration.zero : left;
+  }
+
   /// Back to the overview, now. For the return button and for leaving auto mode.
   void reset() {
     _target = null;
     _candidate = null;
     _candidateSince = null;
+    _silentSince = null;
   }
 }

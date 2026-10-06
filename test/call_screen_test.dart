@@ -583,14 +583,21 @@ void main() {
         ]);
 
     /// The screen with a zero dwell, so the auto machine promotes on the sample
-    /// rather than after a hold `tester.pump` cannot advance.
-    Future<void> showAuto(WidgetTester tester, AppState state) async {
+    /// rather than after a hold `tester.pump` cannot advance. `linger` defaults
+    /// high so a silent big view stays up across a pump — `DateTime.now()` does
+    /// not advance under `tester.pump`, so a real timeout cannot be driven from
+    /// one; pass `Duration.zero` to exercise the immediate fallback to the grid.
+    Future<void> showAuto(
+      WidgetTester tester,
+      AppState state, {
+      Duration linger = const Duration(seconds: 5),
+    }) async {
       await tester.pumpWidget(MaterialApp(
         theme: buildGatherTheme(),
         home: CallScreen(
           state: state,
           buildTile: inertTile,
-          director: SpotlightDirector(dwell: Duration.zero),
+          director: SpotlightDirector(dwell: Duration.zero, linger: linger),
         ),
       ));
       await tester.pump();
@@ -640,7 +647,7 @@ void main() {
       await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
     });
 
-    testWidgets('auto follows the talker, and drops to the grid on silence', (tester) async {
+    testWidgets('auto follows the talker, and lingers on them when they stop', (tester) async {
       final call = FakeCall();
       final state = stateWith(
         threeFaces(),
@@ -658,7 +665,32 @@ void main() {
       expect(call.watching.last.srcIds, ['account-0']);
       expect(call.watching.last.quality, VideoQuality.full);
 
-      // Person 0 stops. With nobody talking the big view drops back to the grid.
+      // Person 0 stops. Nobody is talking, but inside the linger the big view
+      // stays on them rather than flashing back to the grid.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2')]));
+      await tester.pump();
+      expect(find.text('Everyone'), findsOneWidget, reason: 'still lingering, big view held');
+      expect(find.byType(GridView), findsNothing);
+      expect(find.text('Person 0'), findsNWidgets(2));
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+
+    testWidgets('the lingering big view falls back to the grid once the lull outlasts the linger', (tester) async {
+      final call = FakeCall();
+      final state = stateWith(
+        threeFaces(),
+        rows: [me, person('0', speaking: true), person('1'), person('2')],
+      )..debugAttachCall(call);
+      addTearDown(state.dispose);
+      // Zero linger: the first silent sample is already past the timeout, so the
+      // fallback fires without a wall clock the test cannot advance.
+      await showAuto(tester, state, linger: Duration.zero);
+
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+      expect(find.text('Person 0'), findsNWidgets(2));
+
+      // Person 0 stops; with the linger already spent the view drops to the grid.
       state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2')]));
       await tester.pump();
       expect(find.text('Everyone'), findsNothing);
