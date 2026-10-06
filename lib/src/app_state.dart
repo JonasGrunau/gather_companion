@@ -14,6 +14,7 @@ import 'pairing.dart';
 import 'push.dart';
 import 'reactions.dart';
 import 'settings.dart';
+import 'ui_preferences.dart';
 
 /// Everything the UI reads. One object, so the whole app is a single
 /// `ListenableBuilder` away from being correct.
@@ -66,6 +67,7 @@ class AppState extends ChangeNotifier {
     Future<List<ConnectivityResult>> Function()? connectivityNow,
     // Test seam for the resync cooldown clock. Production reads the wall clock.
     DateTime Function()? now,
+    UiPreferences? uiPreferences,
   }) : _notifier = notifier ?? Notifier(),
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
@@ -76,6 +78,7 @@ class AppState extends ChangeNotifier {
        _credentialStore = credentials ?? GatherCredentialStore(),
        _bridgeStore = bridge ?? BridgeSettingsStore(),
        _log = log ?? _noop,
+       _uiPrefs = uiPreferences ?? UiPreferences(),
        _buildCollector = buildCollector ??
            ((auth, spaceId) =>
                DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
@@ -92,6 +95,7 @@ class AppState extends ChangeNotifier {
 
   final GatherCredentialStore _credentialStore;
   final BridgeSettingsStore _bridgeStore;
+  final UiPreferences _uiPrefs;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -363,6 +367,20 @@ class AppState extends ChangeNotifier {
   bool get partyMode => _snapshot.party.active;
   bool get partyPending => false;
 
+  /// Whether the office tab wears the retro handheld shell. A pure look-and-input
+  /// preference — every underlying action is the same one the normal controls
+  /// call — so it lives next to [partyMode] as one more switch the app owns, read
+  /// back from [UiPreferences] at [boot] and persisted the moment it flips.
+  bool _gameboyMode = false;
+  bool get gameboyMode => _gameboyMode;
+
+  Future<void> setGameboyMode(bool on) async {
+    if (_gameboyMode == on) return;
+    _gameboyMode = on;
+    notifyListeners();
+    await _uiPrefs.saveGameboyMode(on);
+  }
+
   /// Development shortcut past the scanner:
   /// `--dart-define=GATHER_PAIR=host:port:token:refreshToken`.
   ///
@@ -375,6 +393,7 @@ class AppState extends ChangeNotifier {
     _bridgeName = await _bridgeStore.loadName();
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
+    _gameboyMode = await _uiPrefs.loadGameboyMode();
 
     if (!_credentials.isComplete && _devPair.isNotEmpty) {
       final parts = _devPair.split(':');
