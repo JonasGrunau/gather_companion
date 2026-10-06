@@ -994,7 +994,7 @@ class AppState extends ChangeNotifier {
   /// Both halves are needed and neither is optional: the socket to send the step on,
   /// and the tile to judge it from. A pad shown without them is a control that cannot
   /// be told apart from a broken one.
-  bool get canWalk => debugCanWalk ?? (_walk?.at != null && _collector != null);
+  bool get canWalk => debugCanWalk ?? (_walk?.at != null && _collector != null && !_link.isDisrupted);
 
   /// Test seam, as [debugMap]: knowing where you are takes a live roster.
   @visibleForTesting
@@ -1068,6 +1068,9 @@ class AppState extends ChangeNotifier {
     final map = this.map;
     if (map == null) return 'Still reading the floor plan.';
     if (walk == null || _collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a walk started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
 
     final at = walk.at;
     if (at == null) return 'Still working out where you are.';
@@ -1166,6 +1169,9 @@ class AppState extends ChangeNotifier {
     final map = this.map;
     if (map == null) return 'Still reading the floor plan.';
     if (walk == null || _collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a walk started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
 
     final at = walk.at;
     if (at == null) return 'Still working out where you are.';

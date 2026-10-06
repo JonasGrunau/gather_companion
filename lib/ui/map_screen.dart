@@ -191,6 +191,10 @@ class _LinkBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final tint = t.danger;
+    // Solid, not a tint: this is the one state where the map is lying, so the banner has
+    // to read against a busy floor plan behind it — a near-transparent pill vanished
+    // into it. White on danger, with a drop shadow to lift it off the map.
+    const ink = Colors.white;
     final label = offline ? 'No connection' : 'Reconnecting…';
     return Padding(
       padding: const EdgeInsets.only(top: 8),
@@ -200,26 +204,32 @@ class _LinkBanner extends StatelessWidget {
           label: offline ? 'No connection to Gather' : 'Reconnecting to Gather',
           child: ExcludeSemantics(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
               decoration: BoxDecoration(
-                color: tint.withValues(alpha: 0.12),
+                color: tint,
                 borderRadius: BorderRadius.circular(t.radius),
-                border: Border.all(color: tint.withValues(alpha: 0.3)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.28),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   SizedBox(
-                    width: 12,
-                    height: 12,
+                    width: 14,
+                    height: 14,
                     child: offline
-                        ? Icon(Icons.cloud_off_rounded, size: 12, color: tint)
-                        : CircularProgressIndicator(strokeWidth: 2, color: tint),
+                        ? const Icon(Icons.cloud_off_rounded, size: 14, color: ink)
+                        : const CircularProgressIndicator(strokeWidth: 2, color: ink),
                   ),
                   const SizedBox(width: 8),
                   Text(
                     label,
-                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: tint),
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
                   ),
                 ],
               ),
