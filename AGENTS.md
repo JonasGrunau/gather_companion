@@ -136,9 +136,11 @@ flutter run -t lib/main_harness.dart -d <sim-udid> \
 plane) through `AppState`'s constructor seams, so the real pair→home flow, the
 walkable Office (tap a tile to walk), party mode and the feed all run with no wire.
 Scenarios, the `idb describe-all → tap → screenshot` loop, and the tap targets are
-in **`docs/sim_harness.md`**. The harness (`lib/main_harness.dart`, `lib/harness/`)
-touches no production file — it rides `AppState`'s seams and the `Collector`
-interface in `gather_client`.
+in **`docs/sim_harness.md`**. The harness entrypoint and fakes live outside the app
+(`lib/main_harness.dart`, `lib/harness/`), but the seams they ride are production
+code: this change adds the `Collector` interface in `gather_client` and routes
+`AppState`, `Walk`, `PartyMode` and `DirectCollector` through it. So the production
+presence abstraction changed — the harness is not purely additive.
 
 ### Common Patterns
 

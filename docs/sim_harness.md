@@ -24,10 +24,14 @@ It is the gather equivalent of `beacon_manager`'s `example/lib/main.dart` harnes
 | `lib/harness/call_scenarios.dart` | `scenarioFrame()` + `CallScenarioDriver` (call); `AppScenarioDriver` (app: mills the cast about and lands waves). |
 | `test/harness/*_test.dart` | Unit tests for the scenarios, the driver and the fake collector. |
 
-No production file is touched. The call path rides `AppState`'s `@visibleForTesting`
-seams; the app path rides the `buildCollector`/`buildCall` constructor seams plus a
-credential-store stub. Tiles and avatars are drawn, never streamed — no texture, no
-sprite art is fetched.
+The harness entrypoint and fakes are separate files, but they ride production seams,
+one of which this change adds: the `Collector` interface in `gather_client`, with
+`AppState`, `Walk`, `PartyMode` and `DirectCollector` routed through it. The call
+path also rides `AppState`'s `@visibleForTesting` seams; the app path rides the
+`buildCollector`/`buildCall`/`buildActivityFeed` constructor seams plus in-memory
+credential and bridge stores, so nothing reads, writes or clears real simulator
+state and no fetch reaches Gather. Tiles and avatars are drawn, never streamed — no
+texture, no sprite art is fetched.
 
 ## Running it
 

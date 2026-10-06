@@ -36,6 +36,7 @@ import 'harness/fake_collector.dart';
 import 'harness/scripted_call.dart';
 import 'src/app_state.dart';
 import 'src/credentials.dart';
+import 'src/settings.dart';
 import 'theme/gather_theme.dart';
 import 'ui/call_screen.dart';
 import 'ui/home_shell.dart';
@@ -114,10 +115,21 @@ Widget _buildApp(String scenarioName, int participants) {
     // that is not a socket, and a [Call] that is not a microphone.
     buildCollector: (auth, spaceId) => fake,
     buildCall: (auth, spaceId, srcId) => ScriptedCall(),
+    // The feed fills from the collector's interaction stream (live waves), so the
+    // REST feed has nothing to add. A synthetic space id (below) arms the fetch
+    // path; this keeps that path off the wire rather than letting it reach Gather.
+    buildActivityFeed: (auth) => _SilentActivityFeed(auth),
     // A store that reports a complete credential, so `boot()` takes the pair→home
-    // path into [HomeShell] rather than stopping at the pairing screen. Nothing
-    // on the credential is ever used — no fetch runs — it only has to be complete.
+    // path into [HomeShell] rather than stopping at the pairing screen, and a
+    // synthetic space id so the injected [ScriptedCall] can be placed. It reads,
+    // writes and clears nothing, so `unpair()` cannot wipe a real Gather credential
+    // the simulator may already hold.
     credentials: _HarnessCredentials(),
+    // No bridge behind the app harness. The real store would load, save and clear
+    // simulator-persistent bridge settings and let `boot()` register push against a
+    // previously paired bridge; this reports an empty bridge, so push no-ops on an
+    // incomplete setting and `unpair()` clears nothing real.
+    bridge: _HarnessBridgeStore(),
   );
   final driver = AppScenarioDriver(
     state: state,
@@ -127,13 +139,59 @@ Widget _buildApp(String scenarioName, int participants) {
   return _AppHarness(state: state, driver: driver);
 }
 
-/// A credential store that is always "paired", with no keychain behind it.
+/// A credential store that is always "paired", with no keychain behind it. It reads
+/// a complete credential and a synthetic space, and writes/clears nothing — so the
+/// app harness can place a scripted call yet cannot touch the real Gather credential
+/// the simulator keychain may already hold (`unpair()` is inert here).
 class _HarnessCredentials extends GatherCredentialStore {
   @override
   Future<GatherCredentials> load() async => const GatherCredentials(refreshToken: 'sim-harness');
 
+  /// A stand-in space id. `_spaceIdForCall` reads this when the fake roster carries
+  /// no server-supplied space, which is what lets the injected `ScriptedCall` build;
+  /// nothing fetches against it — the feed and photo paths are kept off the wire.
   @override
-  Future<String?> loadSpaceId() async => null;
+  Future<String?> loadSpaceId() async => 'sim-harness-space';
+
+  @override
+  Future<void> save(GatherCredentials credentials) async {}
+
+  @override
+  Future<void> saveSpaceId(String? spaceId) async {}
+
+  @override
+  Future<void> clear() async {}
+}
+
+/// A bridge-settings store with nothing behind it. The app harness never pairs a
+/// bridge, so `load` returns empty — push registration then no-ops on an incomplete
+/// setting — and save/clear do nothing, keeping the simulator's stored bridge
+/// settings untouched.
+class _HarnessBridgeStore extends BridgeSettingsStore {
+  @override
+  Future<BridgeSettings> load() async => BridgeSettings.empty;
+
+  @override
+  Future<String?> loadName() async => null;
+
+  @override
+  Future<void> save(BridgeSettings settings) async {}
+
+  @override
+  Future<void> saveName(String name) async {}
+
+  @override
+  Future<void> clear() async {}
+}
+
+/// An activity feed that never reaches the network. The app harness fills the feed
+/// from the collector's interaction stream, so a REST fetch has nothing to add and
+/// must not hit Gather — it returns an empty page instead.
+class _SilentActivityFeed extends ActivityFeed {
+  _SilentActivityFeed(GatherAuth auth) : super(auth: auth);
+
+  @override
+  Future<ActivityFeedPage> fetch(String spaceId) async => ActivityFeedPage.empty;
 }
 
 class _AppHarness extends StatefulWidget {
