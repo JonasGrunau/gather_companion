@@ -1772,7 +1772,11 @@ class AppState extends ChangeNotifier {
   /// costs one extra (harmless) resync on the first change.
   Future<void> _seedConnectivity() async {
     try {
-      _lastConnectivity = await _connectivityNow();
+      // Check after the await, not with `??=`: `??=` tests null *before* evaluating
+      // the probe, so a real change that lands mid-await would still be overwritten
+      // by the now-stale baseline. Only adopt the probe if nothing arrived first.
+      final seen = await _connectivityNow();
+      _lastConnectivity ??= seen;
     } on Object {
       // The watcher degrades to the deaf-timer, which is where we started.
     }
@@ -1816,6 +1820,11 @@ class AppState extends ChangeNotifier {
       // mode, a dead zone), so until the timer trips the screen would otherwise keep
       // claiming we are live while moves fall into the void. There is nothing to
       // resync to yet — raise the flag and suspend the things that need the network.
+      // Clear the resync cooldown: the next event is a transport *returning*, and
+      // that recovery must reconnect immediately. Without this, a radio that flaps
+      // offline within 5s of a prior resync would have its comeback swallowed by the
+      // cooldown and fall back to the 45s deaf-timer — the very wait this watcher exists to avoid.
+      _lastNetResync = null;
       final collector = _collector;
       if (collector != null && !_link.isOffline) {
         _link = const LinkStatus(LinkState.offline, 'No connection — waiting for network.');

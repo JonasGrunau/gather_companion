@@ -78,6 +78,27 @@ void main() {
     expect(state.link.isLive, isTrue);
   });
 
+  test('a radio that flaps offline within the cooldown still reconnects on return', () {
+    final (:state, :collector, :tick) = wired();
+
+    state.debugNoteConnectivity([ConnectivityResult.wifi]);
+    tick(const Duration(seconds: 6));
+
+    // A transport change resyncs and arms the 5s cooldown.
+    state.debugNoteConnectivity([ConnectivityResult.mobile]);
+    final afterChange = collector.resyncs;
+
+    // The radio drops entirely and comes back inside that 5s window.
+    tick(const Duration(seconds: 2));
+    state.debugNoteConnectivity(const []);
+    tick(const Duration(seconds: 2));
+    state.debugNoteConnectivity([ConnectivityResult.wifi]);
+
+    expect(collector.resyncs, afterChange + 1,
+        reason: 'the comeback must reconnect now, not wait out the deaf-timer');
+    expect(state.link.isReconnecting, isTrue);
+  });
+
   test('the burst of events from one handoff coalesces into a single resync', () {
     final (:state, :collector, :tick) = wired();
 
