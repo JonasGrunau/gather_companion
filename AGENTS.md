@@ -116,6 +116,22 @@ Gather desktop update, re-check the log regexes against a real log:
 npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 ```
 
+### Running the call UI on the iOS Simulator
+
+A second `flutter run` target boots straight into a **scripted multi-party call**
+— no login, BLE, WebRTC or backend — to watch and `idb`-drive the call screen and
+the spotlight auto mode without a real room of people:
+
+```sh
+flutter run -t lib/main_harness.dart -d <sim-udid> \
+  --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
+```
+
+Scenarios (`solo`/`pair`/`group`/`roundrobin`/`debate`/`briefnoise`/`churn`), the
+`idb describe-all → tap → screenshot` loop, and the call-screen tap targets are in
+**`docs/sim_harness.md`**. The harness (`lib/main_harness.dart`, `lib/harness/`)
+touches no production file — it rides `AppState`'s existing test seams.
+
 ### Common Patterns
 
 - Long explanatory doc comments at the top of each file, stating *why* rather
