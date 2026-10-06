@@ -458,6 +458,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   Offset? _firstTap;
   Timer? _tapWindow;
 
+  /// A one-line "why nothing happened" shown in the Go-here pill's slot, and the timer
+  /// that clears it. Set when a destination tap is refused because we are offline — it
+  /// sits where the pill would have been rather than over the bottom controls.
+  String? _blockedNote;
+  Timer? _blockedNoteTimer;
+
   /// What was selected before the tap that is currently provisional.
   ///
   /// A double tap is a zoom, not a selection, so the second half of one has to undo
@@ -539,6 +545,25 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
         target.room == null) {
       setState(() => _selected = null);
+      return;
+    }
+
+    // A real destination, but we are offline or mid-reconnect, so there is no route to
+    // lay and the Go-here pill never appears. Rather than swallow the tap in silence,
+    // say why nothing happened — this is the one tap where the floor would otherwise
+    // have moved you.
+    if (widget.state.link.isDisrupted) {
+      final note = widget.state.link.isOffline
+          ? "Can't move — no connection."
+          : "Can't move — reconnecting…";
+      _blockedNoteTimer?.cancel();
+      _blockedNoteTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted) setState(() => _blockedNote = null);
+      });
+      setState(() {
+        _selected = null;
+        _blockedNote = note;
+      });
       return;
     }
 
@@ -741,6 +766,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     unawaited(_followRequests?.cancel());
     _follow.dispose();
     _tapWindow?.cancel();
+    _blockedNoteTimer?.cancel();
     _motion.dispose();
     _zoom.dispose();
     _view.dispose();
@@ -971,7 +997,66 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               ),
             ),
           ),
+        // The same slot as the Go-here pill, never both at once: offline there is no pill
+        // to go here, so a refused destination tap borrows its place to say why — above
+        // the dock, not a toast flung over it.
+        if (_blockedNote != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(child: _BlockedNote(text: _blockedNote!)),
+            ),
+          ),
       ],
+    );
+  }
+}
+
+/// A transient "why that tap did nothing" pill, shown where the Go-here pill sits when a
+/// move is refused for being offline. Danger-tinted and shadowed like [_LinkBanner] so
+/// the two read as the same voice.
+class _BlockedNote extends StatelessWidget {
+  const _BlockedNote({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    const ink = Colors.white;
+    return Semantics(
+      liveRegion: true,
+      label: text,
+      child: ExcludeSemantics(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: t.danger,
+            borderRadius: BorderRadius.circular(t.radius),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.28),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off_rounded, size: 14, color: ink),
+              const SizedBox(width: 8),
+              Text(
+                text,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
