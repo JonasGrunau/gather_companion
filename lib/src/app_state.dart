@@ -6,6 +6,7 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
 import 'credentials.dart';
+import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
 import 'media/call.dart';
@@ -189,6 +190,132 @@ class AppState extends ChangeNotifier {
   List<PlayerRef> get followers {
     final list = _snapshot.players.where((p) => p.isFollowingMe).toList()..sort((a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()));
     return list;
+  }
+
+  // ---- the directory (LazyBeam) ----------------------------------------------
+  //
+  // The Beam tab is a phone-app over the roster: a contact list and the
+  // conversations already happening, each a tap away from being teleported into.
+  // It reads [_roster] directly for the same reason `peopleOnMap` does — the map's
+  // digest drops positions and the offline, and this screen wants both: everyone
+  // in the space, and somewhere to land next to the ones who are here.
+
+  /// Everybody in the space except me, present first and then by name.
+  ///
+  /// Present-before-offline rather than one flat alphabet, because "who can I
+  /// reach right now" is the question the screen answers and a train of greyed-out
+  /// names above the people actually here would bury it. Within each group the
+  /// sort is the same case-insensitive name order [followers] uses, so the list
+  /// keeps its places between the four-a-second rosters instead of flickering as
+  /// Gather reshuffles its map iteration.
+  List<Contact> get directory {
+    final roster = _roster;
+    if (roster == null) return const [];
+    final selfId = roster.selfId;
+    final out = <Contact>[
+      for (final row in roster.rows)
+        if (row.id != selfId) Contact.fromRow(row),
+    ];
+    out.sort((a, b) {
+      if (a.isPresent != b.isPresent) return a.isPresent ? -1 : 1;
+      return a.label.toLowerCase().compareTo(b.label.toLowerCase());
+    });
+    return out;
+  }
+
+  /// The conversations happening now — every cluster of two or more connected
+  /// people — the one I am in first, then the largest.
+  ///
+  /// A cluster of only me is not here: `clusterId` is null when I stand alone, and
+  /// a group whose only other members have dropped their sockets is no longer a
+  /// conversation to join. [Meeting.roomName] is filled in when a majority of a
+  /// cluster's members sit inside the same named area, so the card can name the
+  /// room rather than only its people.
+  List<Meeting> get meetings {
+    final roster = _roster;
+    if (roster == null) return const [];
+    final selfId = roster.selfId;
+    final map = this.map;
+
+    final groups = <String, List<RosterRow>>{};
+    for (final row in roster.rows) {
+      final cid = row.clusterId;
+      if (cid == null) continue;
+      // A cluster outlives a dropped socket; a disconnected row is not somebody to
+      // count as being in the room — the same rule `Roster.myCluster` follows.
+      if (row.connected == false) continue;
+      (groups[cid] ??= <RosterRow>[]).add(row);
+    }
+
+    final out = <Meeting>[];
+    groups.forEach((cid, rows) {
+      if (rows.length < 2) return;
+      final includesMe = rows.any((row) => row.id == selfId);
+      final members = [
+        for (final row in rows)
+          if (row.id != selfId) Contact.fromRow(row),
+      ];
+      // Only me left once mine are excluded — nothing to join.
+      if (members.isEmpty) return;
+      out.add(Meeting(
+        clusterId: cid,
+        members: members,
+        roomName: _roomNameFor(rows, map),
+        includesMe: includesMe,
+      ));
+    });
+
+    out.sort((a, b) {
+      if (a.includesMe != b.includesMe) return a.includesMe ? -1 : 1;
+      return b.members.length.compareTo(a.members.length);
+    });
+    return out;
+  }
+
+  /// The named area a conversation is in, or null.
+  ///
+  /// Each member is placed in the *innermost* named, non-desk area at their feet —
+  /// the smallest rectangle containing them, so a meeting room wins over the public
+  /// zone it sits inside. The cluster takes a room's name only when a majority of
+  /// its placeable members are in it; a conversation spilling across a doorway has
+  /// no one room and is better named by its people.
+  String? _roomNameFor(List<RosterRow> rows, SpaceMap? map) {
+    if (map == null) return null;
+    final counts = <String, int>{};
+    var placed = 0;
+    for (final row in rows) {
+      final x = row.x, y = row.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      placed++;
+      final name = _innermostNamedRoomAt(map, x.round(), y.round())?.name;
+      if (name != null) counts[name] = (counts[name] ?? 0) + 1;
+    }
+    if (placed == 0) return null;
+    String? best;
+    var bestCount = 0;
+    counts.forEach((name, count) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = name;
+      }
+    });
+    // A strict majority: a conversation split evenly across a doorway has no one
+    // room, and is better named by its people.
+    return bestCount * 2 > placed ? best : null;
+  }
+
+  /// The smallest named, non-desk room containing the tile — the one a person in
+  /// it would say they are in.
+  SpaceRoom? _innermostNamedRoomAt(SpaceMap map, int x, int y) {
+    SpaceRoom? best;
+    for (final room in map.rooms) {
+      if (room.name == null || room.type == 'Desk') continue;
+      if (!room.contains(x, y)) continue;
+      if (best == null || room.width * room.height < best.width * best.height) {
+        best = room;
+      }
+    }
+    return best;
   }
 
   // ---- the map ---------------------------------------------------------------
@@ -1155,6 +1282,121 @@ class AppState extends ChangeNotifier {
     if (id == null) return;
     _lastTeleport = (id: id, x: x, y: y, seq: ++_teleportSeq);
     _positions.tick();
+  }
+
+  // ---- beaming (LazyBeam) -----------------------------------------------------
+  //
+  // The commuting surface moves you without you watching the map. Where [goTo]
+  // walks when it can — because on the office screen the walk *is* the point — a
+  // beam always hops: the Beam tab is for arriving, not travelling, and a thumb on
+  // a train has no patience for a camera gliding across the floor.
+
+  /// Teleport to a free tile at or beside ([x], [y]) — always a hop.
+  ///
+  /// The landing rule is [goTo]'s: a tile that cannot be stood on, or one somebody
+  /// is on, is relocated to the nearest free one rather than refused — which is
+  /// what makes "beam to a person" land you *next* to them, since their own tile is
+  /// taken. Unlike [goTo] there is no route search: this is the teleport branch of
+  /// [_travelTo] on its own.
+  Future<String?> beamToTile(int x, int y) async {
+    final map = this.map;
+    final collector = _collector;
+    if (map == null) return 'Still reading the floor plan.';
+    if (collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a hop started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
+
+    final occupied = _occupied();
+    final taken = {for (final tile in occupied) tile.y * map.width + tile.x};
+
+    var goal = (x: x, y: y);
+    if (!map.isWalkable(x, y) || taken.contains(y * map.width + x)) {
+      final free = map.nearestFree(x, y, occupied: taken);
+      if (free == null) return 'There is nowhere to stand there.';
+      goal = free;
+    }
+
+    // Any route still running was aimed somewhere else — stop it before the hop,
+    // the same order [_travelTo] uses.
+    _walk?.release();
+
+    final me = myTile;
+    final sent = collector.teleport(
+      x: goal.x,
+      y: goal.y,
+      direction: me == null
+          ? 'Down'
+          : headingTo(fromX: me.x, fromY: me.y, toX: goal.x, toY: goal.y),
+    );
+    if (!sent.ok) return sent.detail ?? 'Gather refused that.';
+
+    _noteTeleport(goal.x.toDouble(), goal.y.toDouble());
+    notifyListeners();
+    return null;
+  }
+
+  /// Beam next to a person and open your microphone — LazyBeam's "call".
+  ///
+  /// Aimed at their own tile so [beamToTile]'s relocation lands you adjacent;
+  /// proximity is then Gather's to notice, and the roster that follows drives
+  /// [_noteCluster], which wires the audio. The mic is turned on here because a
+  /// phone call connects the microphone rather than merely placing you in earshot —
+  /// but it is best-effort: a denied permission is news on [notices], not a reason
+  /// to report the beam itself as having failed (which would stop the UI opening
+  /// the call).
+  Future<String?> beamToPerson(Contact contact) async {
+    if (!contact.isPresent) return '${contact.label} is not in the office right now.';
+    final x = contact.x, y = contact.y;
+    if (x == null || y == null || !x.isFinite || !y.isFinite) {
+      return "Can't tell where ${contact.label} is yet.";
+    }
+
+    final failed = await beamToTile(x.round(), y.round());
+    if (failed != null) return failed;
+
+    final micFailed = await setMicOn(true);
+    if (micFailed != null) _notices.add(micFailed);
+    return null;
+  }
+
+  /// Join a conversation already happening, and open your microphone.
+  ///
+  /// A conversation I am already in needs no travel. Otherwise, when the cluster
+  /// sits in a named room I can resolve, I *walk in* with [goToRoom] — which lands
+  /// on a seat and respects a shut door the way entering a meeting should — and
+  /// fall back to beaming beside a member when there is no room to name. Mic is
+  /// handled as in [beamToPerson].
+  Future<String?> beamToMeeting(Meeting meeting) async {
+    if (meeting.includesMe) return null;
+
+    final map = this.map;
+    final roomName = meeting.roomName;
+    if (map != null && roomName != null) {
+      for (final room in map.rooms) {
+        if (room.name != roomName) continue;
+        final failed = await goToRoom(
+          room,
+          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+        );
+        if (failed != null) return failed;
+        final micFailed = await setMicOn(true);
+        if (micFailed != null) _notices.add(micFailed);
+        return null;
+      }
+    }
+
+    for (final member in meeting.members) {
+      final x = member.x, y = member.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      final failed = await beamToTile(x.round(), y.round());
+      if (failed != null) return failed;
+      final micFailed = await setMicOn(true);
+      if (micFailed != null) _notices.add(micFailed);
+      return null;
+    }
+
+    return 'Could not work out where that conversation is.';
   }
 
   /// Walk into a room, landing on a seat if it has a free one.

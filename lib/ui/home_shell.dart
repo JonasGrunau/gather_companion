@@ -46,6 +46,7 @@ import 'package:flutter/services.dart';
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
 import 'activity_screen.dart';
+import 'beam_screen.dart';
 import 'control_bar.dart';
 import 'map_screen.dart';
 import 'settings_screen.dart';
@@ -59,18 +60,20 @@ import 'settings_screen.dart';
 /// silently swapped two tabs' bodies — the rail said Activity and the office
 /// appeared. Adding a destination is a case in [_TabView.icon], [_TabView.label]
 /// and `_bodyFor`, which the compiler will demand.
-enum _Tab { activity, map, settings }
+enum _Tab { activity, map, beam, settings }
 
 extension _TabView on _Tab {
   IconData get icon => switch (this) {
         _Tab.activity => Icons.notifications_rounded,
         _Tab.map => Icons.map_outlined,
+        _Tab.beam => Icons.sensors_rounded,
         _Tab.settings => Icons.settings_rounded,
       };
 
   String get label => switch (this) {
         _Tab.activity => 'Activity',
         _Tab.map => 'Office',
+        _Tab.beam => 'Beam',
         _Tab.settings => 'Settings',
       };
 }
@@ -171,6 +174,9 @@ class _HomeShellState extends State<HomeShell> {
             ),
           ),
         _Tab.activity => ActivityScreen(state: widget.state),
+        // No control bar, so no `kControlBarInset` layer: the shell's own rail
+        // inset is all a scrolling directory needs to clear the dock.
+        _Tab.beam => BeamScreen(state: widget.state),
         _Tab.settings => SettingsScreen(state: widget.state, onUnpair: widget.onUnpair),
       };
 
