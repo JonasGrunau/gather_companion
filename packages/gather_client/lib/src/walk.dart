@@ -591,6 +591,7 @@ class Walk {
 
     final sent = collector.move(direction: direction);
     if (!sent.ok) {
+      _log('walk: move $direction from ($x,$y) not sent — ${sent.detail}');
       if (held == null) release();
       return sent;
     }
@@ -600,6 +601,10 @@ class Walk {
     final delta = stepOf(direction)!;
     _x = x + delta.dx;
     _y = y + delta.dy;
+    // Ground truth for what the phone *tried*. `move` is fire-and-forget, so `sent.ok`
+    // means "handed to the socket", not "accepted" — the real answer is whether a
+    // matching position patch follows, which [noteRoster] logs when it does not.
+    _log('walk: move $direction -> ($_x,$_y) gait=${_gait.name} inflight=${_pending.length + 1}');
     _pending.add((x: _x!, y: _y!));
     if (_pending.length > _pendingLimit) _pending.removeAt(0);
     // A step that landed is the evidence that re-planning worked.
@@ -672,7 +677,18 @@ class Walk {
       }
     }
     final rx = me?.x, ry = me?.y;
-    if (rx == null || ry == null || !rx.isFinite || !ry.isFinite) return;
+    if (rx == null || ry == null || !rx.isFinite || !ry.isFinite) {
+      // No self position in this roster means nothing corrects the optimistic walk —
+      // it runs free, which is exactly how the phone can show you somewhere the
+      // server does not. Logged only while we have steps riding on a correction that
+      // is not coming, so a parked avatar does not spam the file every roster.
+      if (_pending.isNotEmpty) {
+        _log('walk: roster has no self position '
+            '(self=${me == null ? 'unmatched' : 'no-coords'}) — '
+            '${_pending.length} steps unconfirmed, not reconciling');
+      }
+      return;
+    }
 
     final x = rx.round();
     final y = ry.round();
@@ -688,6 +704,14 @@ class Walk {
     if (seen >= 0) {
       _pending.removeRange(0, seen + 1);
       return;
+    }
+    // Gather put us on a tile we never claimed — a dropped step, a refused move, or
+    // the desktop moving the same avatar. This is the snap-back, and when it happens
+    // with steps in flight it is the signature of the desk-desync: the server never
+    // took the walk the phone thought it was taking.
+    if (_pending.isNotEmpty) {
+      _log('walk: server says ($x,$y), we believed (${_x!},${_y!}) '
+          'with ${_pending.length} steps in flight — snapping back');
     }
     _adopt(x, y);
   }

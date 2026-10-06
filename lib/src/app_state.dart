@@ -52,17 +52,26 @@ class AppState extends ChangeNotifier {
     // a [Call] is a microphone, a camera and an SFU, none of which a test runner
     // has. `main.dart` supplies the real one.
     Call Function(GatherAuth auth, String spaceId, String srcId)? buildCall,
+    // Diagnostic sink. `main.dart` hands in `mediaLog`, which also lands on disk
+    // (`tmp/media.log`) so a standalone phone build keeps a record; a test leaves
+    // it null and the lines are discarded. Threaded into the collector and [Walk]
+    // so the movement and socket diagnostics — refusals, snap-backs, cluster
+    // changes — are actually recorded rather than written to a dead `_noop`.
+    void Function(String)? log,
   }) : _notifier = notifier ?? Notifier(),
        // ignore: prefer_initializing_formals
        _push = push,
        _credentialStore = credentials ?? GatherCredentialStore(),
        _bridgeStore = bridge ?? BridgeSettingsStore(),
-       _buildCollector = buildCollector ?? _realCollector,
+       _log = log ?? _noop,
+       _buildCollector = buildCollector ??
+           ((auth, spaceId) =>
+               DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
        _buildActivityFeed = buildActivityFeed ?? _realActivityFeed,
        // ignore: prefer_initializing_formals
        _buildCall = buildCall;
 
-  static Collector _realCollector(GatherAuth auth, String? spaceId) => DirectCollector(auth: auth, spaceId: spaceId);
+  static void _noop(String _) {}
 
   static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
@@ -73,6 +82,7 @@ class AppState extends ChangeNotifier {
   final BridgeSettingsStore _bridgeStore;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
+  final void Function(String) _log;
 
   /// Null in a build with no media layer — a widget test, or a platform where
   /// there is nothing to capture. [canCall] reads false and the bar says so,
@@ -850,6 +860,12 @@ class AppState extends ChangeNotifier {
       return;
     }
     _clusterWanted = wanted;
+    // The one line that says whether Gather ever formed a conversation for us. An
+    // empty set after walking up to somebody is the fingerprint of the desk-desync
+    // bug: the server never counted us as adjacent, so there is nobody to listen to
+    // and no call to start. See [_noteConversation] for the id that pairs with it.
+    _log('cluster: members -> ${wanted.length}'
+        '${wanted.isEmpty ? '' : ' (${wanted.join(',')})'}');
 
     _clusterDebounce?.cancel();
     _clusterDebounce = Timer(
@@ -885,6 +901,7 @@ class AppState extends ChangeNotifier {
     final id = roster.myClusterId;
     if (id == _conversation) return;
     _conversation = id;
+    _log('cluster: conversation id -> ${id ?? '(none)'}');
     unawaited(_call?.setConversation(id) ?? Future<void>.value());
   }
 
@@ -1482,6 +1499,11 @@ class AppState extends ChangeNotifier {
     if (me == null) return;
     if (!event.isFor(me) && event.payload['spaceUserId'] != me) return;
 
+    // A prime suspect for "I walked up but no call": Gather refused the steps into a
+    // locked or meeting area, published this to us alone, and let the action return
+    // Success with no position patch — so the phone walked on optimistically while
+    // the server kept us put. Recorded so the log says so instead of us guessing.
+    _log('move: refused entry — ${event.name} area=${event.payload['areaId'] ?? '?'}');
     _walk?.release();
     notifyListeners();
     _notices.add(_refusalText(event, meeting: event.name == meeting));
@@ -1652,6 +1674,7 @@ class AppState extends ChangeNotifier {
       // Same reasoning: the kart appearing and disappearing is a thing the screen
       // shows, and it happens mid-walk rather than on a roster boundary.
       onGaitChanged: notifyListeners,
+      log: _log,
     )..boost = _boost;
 
     _subs

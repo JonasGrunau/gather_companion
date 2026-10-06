@@ -76,6 +76,11 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
       srcId: srcId,
       log: mediaLog,
     ),
+    // The same sink the call uses, so the movement, socket and cluster diagnostics
+    // land in `tmp/media.log` alongside the media ones — the file a standalone phone
+    // build keeps and `devicectl` can copy off. Without this the collector and walk
+    // log into a `_noop` and a desk-desync leaves no trace.
+    log: mediaLog,
   );
 
   @override
