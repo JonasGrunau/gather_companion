@@ -48,7 +48,7 @@ library;
 
 import 'dart:async';
 
-import 'direct_collector.dart';
+import 'collector.dart';
 import 'game_protocol.dart';
 import 'space_map.dart';
 
@@ -164,7 +164,7 @@ const _maxReplans = 4;
 /// One step's worth of state, held so the D-pad can be a dumb button.
 class Walk {
   Walk({
-    required DirectCollector? Function() collector,
+    required Collector? Function() collector,
     required SpaceMap? Function() map,
     void Function(String)? log,
     /// Called when a route stops running, for whatever reason. See [release].
@@ -192,7 +192,7 @@ class Walk {
 
   /// Looked up per step rather than held: both are replaced whenever the app
   /// reconnects, and a stale collector is a step into a dead socket.
-  final DirectCollector? Function() _collector;
+  final Collector? Function() _collector;
   final SpaceMap? Function() _map;
   final void Function(String) _log;
   final void Function()? _onRouteEnded;

@@ -71,7 +71,7 @@ import 'dart:math';
 
 import 'package:gather_events/gather_events.dart';
 
-import 'direct_collector.dart';
+import 'collector.dart';
 import 'game_protocol.dart';
 import 'space_map.dart';
 
@@ -153,7 +153,7 @@ class PartyTile {
 
 class PartyMode {
   PartyMode({
-    required DirectCollector? Function() collector,
+    required Collector? Function() collector,
     void Function(String)? log,
     this.interval = hopInterval,
     this.safeTiles = safeTilesDefault,
@@ -173,7 +173,7 @@ class PartyMode {
 
   /// Looked up per hop rather than held: the collector is replaced whenever the app
   /// reconnects to Gather, and a stale reference would teleport into a dead socket.
-  final DirectCollector? Function() _collector;
+  final Collector? Function() _collector;
   final void Function(String) _log;
   final Duration interval;
   final int safeTiles;

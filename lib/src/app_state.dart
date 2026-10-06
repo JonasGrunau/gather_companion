@@ -44,8 +44,9 @@ class AppState extends ChangeNotifier {
     PushRegistrar? push,
     GatherCredentialStore? credentials,
     BridgeSettingsStore? bridge,
-    // Test seam: lets a suite drive a fake Gather without a network.
-    DirectCollector Function(GatherAuth auth, String? spaceId)? buildCollector,
+    // Test seam: lets a suite — or the simulator harness — drive a fake Gather
+    // without a network, by handing back a [Collector] that is not a socket.
+    Collector Function(GatherAuth auth, String? spaceId)? buildCollector,
     ActivityFeed Function(GatherAuth auth)? buildActivityFeed,
     // The media seam, and the reason this file does not import `flutter_webrtc`:
     // a [Call] is a microphone, a camera and an SFU, none of which a test runner
@@ -61,7 +62,7 @@ class AppState extends ChangeNotifier {
        // ignore: prefer_initializing_formals
        _buildCall = buildCall;
 
-  static DirectCollector _realCollector(GatherAuth auth, String? spaceId) => DirectCollector(auth: auth, spaceId: spaceId);
+  static Collector _realCollector(GatherAuth auth, String? spaceId) => DirectCollector(auth: auth, spaceId: spaceId);
 
   static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
@@ -70,7 +71,7 @@ class AppState extends ChangeNotifier {
 
   final GatherCredentialStore _credentialStore;
   final BridgeSettingsStore _bridgeStore;
-  final DirectCollector Function(GatherAuth auth, String? spaceId) _buildCollector;
+  final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
 
   /// Null in a build with no media layer — a widget test, or a platform where
@@ -94,7 +95,7 @@ class AppState extends ChangeNotifier {
 
   // ---- the Gather connection -------------------------------------------------
 
-  DirectCollector? _collector;
+  Collector? _collector;
   PartyMode? _party;
   Walk? _walk;
 
