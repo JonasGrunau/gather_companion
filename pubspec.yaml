@@ -36,6 +36,14 @@ dependencies:
     path: packages/gather_client
   gather_events:
     path: packages/gather_events
+  # Detects the wifi<->cellular handoff that silently kills the game and SFU
+  # sockets. Without it a half-open socket after a network change is only noticed
+  # by the 45s deaf-timer — 45s of no roster, no proximity and so no call. See
+  # `AppState._onConnectivityChanged`, which forces a resync the moment the
+  # interface changes. Pinned to 7.x because it ships `ios/connectivity_plus/
+  # Package.swift`: it stays on Swift Package Manager and does not drag this
+  # project back onto CocoaPods, the same constraint the flutter_webrtc pin guards.
+  connectivity_plus: ^7.0.0
   mobile_scanner: ^7.4.0
   shared_preferences: ^2.3.3
   web_socket_channel: ^3.0.1

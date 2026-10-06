@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
@@ -52,17 +53,37 @@ class AppState extends ChangeNotifier {
     // a [Call] is a microphone, a camera and an SFU, none of which a test runner
     // has. `main.dart` supplies the real one.
     Call Function(GatherAuth auth, String spaceId, String srcId)? buildCall,
+    // Diagnostic sink. `main.dart` hands in `mediaLog`, which also lands on disk
+    // (`tmp/media.log`) so a standalone phone build keeps a record; a test leaves
+    // it null and the lines are discarded. Threaded into the collector and [Walk]
+    // so the movement and socket diagnostics — refusals, snap-backs, cluster
+    // changes — are actually recorded rather than written to a dead `_noop`.
+    void Function(String)? log,
+    // Test seams for the network-change watcher. Production uses the real plugin;
+    // a suite injects a controller it can push interface changes through, and a
+    // current-state probe it can answer synchronously. See [_onConnectivityChanged].
+    Stream<List<ConnectivityResult>>? connectivityChanges,
+    Future<List<ConnectivityResult>> Function()? connectivityNow,
+    // Test seam for the resync cooldown clock. Production reads the wall clock.
+    DateTime Function()? now,
   }) : _notifier = notifier ?? Notifier(),
+       _connectivityChanges =
+           connectivityChanges ?? Connectivity().onConnectivityChanged,
+       _connectivityNow = connectivityNow ?? Connectivity().checkConnectivity,
+       _now = now ?? DateTime.now,
        // ignore: prefer_initializing_formals
        _push = push,
        _credentialStore = credentials ?? GatherCredentialStore(),
        _bridgeStore = bridge ?? BridgeSettingsStore(),
-       _buildCollector = buildCollector ?? _realCollector,
+       _log = log ?? _noop,
+       _buildCollector = buildCollector ??
+           ((auth, spaceId) =>
+               DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
        _buildActivityFeed = buildActivityFeed ?? _realActivityFeed,
        // ignore: prefer_initializing_formals
        _buildCall = buildCall;
 
-  static Collector _realCollector(GatherAuth auth, String? spaceId) => DirectCollector(auth: auth, spaceId: spaceId);
+  static void _noop(String _) {}
 
   static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
@@ -73,6 +94,18 @@ class AppState extends ChangeNotifier {
   final BridgeSettingsStore _bridgeStore;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
+  final void Function(String) _log;
+  final Stream<List<ConnectivityResult>> _connectivityChanges;
+  final Future<List<ConnectivityResult>> Function() _connectivityNow;
+  final DateTime Function() _now;
+
+  /// The last interface set seen, so a change is told from a repeat. Seeded from
+  /// [_connectivityNow] on attach so the first real handoff is not swallowed.
+  List<ConnectivityResult>? _lastConnectivity;
+
+  /// When the network watcher last forced a resync, to coalesce the burst of
+  /// events a single handoff emits into one reconnect.
+  DateTime? _lastNetResync;
 
   /// Null in a build with no media layer — a widget test, or a platform where
   /// there is nothing to capture. [canCall] reads false and the bar says so,
@@ -732,6 +765,20 @@ class AppState extends ChangeNotifier {
     _subs.add(call.speaking.listen(_noteSpeaking));
   }
 
+  /// Test seam: stand a collector in without the whole [_attach] handshake, so the
+  /// network-change watcher has something to resync.
+  @visibleForTesting
+  void debugAttachCollector(Collector collector) => _collector = collector;
+
+  /// Test seam: drive [_onConnectivityChanged] without a plugin behind it.
+  @visibleForTesting
+  void debugNoteConnectivity(List<ConnectivityResult> now) => _onConnectivityChanged(now);
+
+  /// Test seam: drive [_onCollectorStatus] without the collector's stream wired, so a
+  /// test can land a deaf-timer report while offline and check which word wins.
+  @visibleForTesting
+  void debugNoteCollectorStatus(CollectorStatus status) => _onCollectorStatus(status);
+
   /// Test seam: the call state a screen renders, with no media layer behind it.
   ///
   /// Overrides [call] when set. A widget test cannot build a real [Call] — it
@@ -850,6 +897,12 @@ class AppState extends ChangeNotifier {
       return;
     }
     _clusterWanted = wanted;
+    // The one line that says whether Gather ever formed a conversation for us. An
+    // empty set after walking up to somebody is the fingerprint of the desk-desync
+    // bug: the server never counted us as adjacent, so there is nobody to listen to
+    // and no call to start. See [_noteConversation] for the id that pairs with it.
+    _log('cluster: members -> ${wanted.length}'
+        '${wanted.isEmpty ? '' : ' (${wanted.join(',')})'}');
 
     _clusterDebounce?.cancel();
     _clusterDebounce = Timer(
@@ -885,6 +938,7 @@ class AppState extends ChangeNotifier {
     final id = roster.myClusterId;
     if (id == _conversation) return;
     _conversation = id;
+    _log('cluster: conversation id -> ${id ?? '(none)'}');
     unawaited(_call?.setConversation(id) ?? Future<void>.value());
   }
 
@@ -940,7 +994,7 @@ class AppState extends ChangeNotifier {
   /// Both halves are needed and neither is optional: the socket to send the step on,
   /// and the tile to judge it from. A pad shown without them is a control that cannot
   /// be told apart from a broken one.
-  bool get canWalk => debugCanWalk ?? (_walk?.at != null && _collector != null);
+  bool get canWalk => debugCanWalk ?? (_walk?.at != null && _collector != null && !_link.isDisrupted);
 
   /// Test seam, as [debugMap]: knowing where you are takes a live roster.
   @visibleForTesting
@@ -1014,6 +1068,9 @@ class AppState extends ChangeNotifier {
     final map = this.map;
     if (map == null) return 'Still reading the floor plan.';
     if (walk == null || _collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a walk started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
 
     final at = walk.at;
     if (at == null) return 'Still working out where you are.';
@@ -1112,6 +1169,9 @@ class AppState extends ChangeNotifier {
     final map = this.map;
     if (map == null) return 'Still reading the floor plan.';
     if (walk == null || _collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a walk started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
 
     final at = walk.at;
     if (at == null) return 'Still working out where you are.';
@@ -1482,6 +1542,11 @@ class AppState extends ChangeNotifier {
     if (me == null) return;
     if (!event.isFor(me) && event.payload['spaceUserId'] != me) return;
 
+    // A prime suspect for "I walked up but no call": Gather refused the steps into a
+    // locked or meeting area, published this to us alone, and let the action return
+    // Success with no position patch — so the phone walked on optimistically while
+    // the server kept us put. Recorded so the log says so instead of us guessing.
+    _log('move: refused entry — ${event.name} area=${event.payload['areaId'] ?? '?'}');
     _walk?.release();
     notifyListeners();
     _notices.add(_refusalText(event, meeting: event.name == meeting));
@@ -1652,6 +1717,7 @@ class AppState extends ChangeNotifier {
       // Same reasoning: the kart appearing and disappearing is a thing the screen
       // shows, and it happens mid-walk rather than on a roster boundary.
       onGaitChanged: notifyListeners,
+      log: _log,
     )..boost = _boost;
 
     _subs
@@ -1688,10 +1754,105 @@ class AppState extends ChangeNotifier {
       ..add(collector.statuses.listen(_onCollectorStatus))
       ..add(party.changes.listen(_onPartyChanged))
       ..add(party.progress.listen(_onPartyProgress))
-      ..add(party.hops.listen(_onPartyHop));
+      ..add(party.hops.listen(_onPartyHop))
+      // The network-change watcher. A wifi<->cellular handoff leaves both sockets
+      // half-open — healthy-looking, carrying nothing — and the deaf-timer takes
+      // 45s to notice, which is 45s of no roster and so no call. This turns the
+      // handoff itself into the trigger. Seeded first so the first change counts.
+      ..add(_connectivityChanges.listen(_onConnectivityChanged));
 
+    unawaited(_seedConnectivity());
     collector.start();
     unawaited(_registerForPush());
+  }
+
+  /// Record the current interface set, so [_onConnectivityChanged] can tell a real
+  /// handoff from a repeat and does not fire a resync on the connection we just
+  /// opened. Best-effort: a probe that throws leaves the baseline null, which only
+  /// costs one extra (harmless) resync on the first change.
+  Future<void> _seedConnectivity() async {
+    try {
+      // Check after the await, not with `??=`: `??=` tests null *before* evaluating
+      // the probe, so a real change that lands mid-await would still be overwritten
+      // by the now-stale baseline. Only adopt the probe if nothing arrived first.
+      final seen = await _connectivityNow();
+      _lastConnectivity ??= seen;
+    } on Object {
+      // The watcher degrades to the deaf-timer, which is where we started.
+    }
+  }
+
+  /// A network interface came or went. Force a reconnect when the usable transport
+  /// changed, rather than waiting out the deaf-timer.
+  ///
+  /// Going *offline* is left alone: there is nothing to reconnect to, the socket
+  /// will drop on its own, and a resync into no network is just churn. It is the
+  /// arrival of a *different* transport — cellular taking over from dropped wifi,
+  /// or the reverse — that strands a half-open socket, and that is what this acts
+  /// on. Coalesced on a short cooldown because one handoff emits several events.
+  /// True once connectivity has been seen and the last sighting was no transport at all.
+  /// Null (not yet seeded) reads as not-offline, so startup does not flash the banner.
+  bool _isOffline() {
+    final now = _lastConnectivity;
+    return now != null && !now.any((r) => r != ConnectivityResult.none);
+  }
+
+  /// Stand down the steps that need the game socket: party mode, a held D-pad, and a
+  /// live call's publish. Called both when the collector reports unhealthy and the
+  /// instant the network drops, so the mic does not stay open on a room we left and the
+  /// walker does not keep stepping into a socket that refuses every move. Everything
+  /// else — the map, settings, navigation — stays usable; this gates only the online bits.
+  void _suspendOnlineActivity(String detail) {
+    _party?.stop(detail);
+    _walk?.release();
+    unawaited(_call?.hangUp() ?? Future<void>.value());
+  }
+
+  void _onConnectivityChanged(List<ConnectivityResult> now) {
+    final before = _lastConnectivity;
+    _lastConnectivity = now;
+
+    final online = now.any((r) => r != ConnectivityResult.none);
+    if (!online) {
+      _log('net: went offline — waiting for a transport');
+      // Say so at once, and stand the online-only steps down now rather than at the
+      // 45s deaf-timer. The socket stays open-but-deaf after the radio drops (flight
+      // mode, a dead zone), so until the timer trips the screen would otherwise keep
+      // claiming we are live while moves fall into the void. There is nothing to
+      // resync to yet — raise the flag and suspend the things that need the network.
+      // Clear the resync cooldown: the next event is a transport *returning*, and
+      // that recovery must reconnect immediately. Without this, a radio that flaps
+      // offline within 5s of a prior resync would have its comeback swallowed by the
+      // cooldown and fall back to the 45s deaf-timer — the very wait this watcher exists to avoid.
+      _lastNetResync = null;
+      final collector = _collector;
+      if (collector != null && !_link.isOffline) {
+        _link = const LinkStatus(LinkState.offline, 'No connection — waiting for network.');
+        _suspendOnlineActivity('no network');
+        notifyListeners();
+      }
+      return;
+    }
+    if (before != null &&
+        before.length == now.length &&
+        before.toSet().containsAll(now)) {
+      return; // The same interfaces; nothing to reconnect for.
+    }
+
+    final at = _now();
+    final last = _lastNetResync;
+    if (last != null && at.difference(last) < const Duration(seconds: 5)) return;
+    _lastNetResync = at;
+
+    final collector = _collector;
+    if (collector == null) return;
+
+    _log('net: transport changed to ${now.map((r) => r.name).join('+')} — forcing resync');
+    // Flip the badge now rather than waiting for the reconnect to report in, so the
+    // screen says "Reconnecting" the instant the network moves under it.
+    _link = const LinkStatus(LinkState.retrying, 'Network changed — reconnecting.');
+    notifyListeners();
+    unawaited(collector.resync());
   }
 
   Future<void> _detach() async {
@@ -1813,23 +1974,19 @@ class AppState extends ChangeNotifier {
       ),
     );
 
+    // While the radio is down the collector's own health is stale — the socket is open
+    // but deaf, so it may still claim "healthy" for ~45s and would otherwise flip the
+    // badge back to live. Offline wins until a transport returns, and says the truer word.
+    final offline = _isOffline();
     _link = switch (status) {
       CollectorStatus(needsPairing: true) => LinkStatus(LinkState.idle, status.detail, true),
+      _ when offline => const LinkStatus(LinkState.offline, 'No connection — waiting for network.'),
       CollectorStatus(healthy: true) => LinkStatus(LinkState.live, status.detail),
       _ => LinkStatus(LinkState.retrying, status.detail),
     };
 
-    // A party cannot run without Gather, and a switch left glowing through a dropped
-    // connection would be asserting something untrue. A held D-pad is the same
-    // problem with a worse ending: the timer keeps firing into a socket that refuses
-    // every step, and the reconnect turns that into a walk nobody is still asking for.
-    if (!status.healthy) {
-      _party?.stop(status.detail ?? 'lost the connection to Gather');
-      _walk?.release();
-      // And the call: publishing outlives the game socket, so without this the
-      // phone keeps its microphone open and its camera light on for a room it is
-      // no longer connected to. The buttons come back off, which is the truth.
-      unawaited(_call?.hangUp() ?? Future<void>.value());
+    if (!status.healthy || offline) {
+      _suspendOnlineActivity(status.detail ?? 'lost the connection to Gather');
     }
 
     _snapshot = _tracker.snapshot();

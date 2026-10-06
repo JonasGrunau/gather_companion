@@ -339,6 +339,25 @@ void main() {
       expect(find.text('Go here'), findsOneWidget);
     });
 
+    testWidgets('a tap while offline says why, and offers nothing', (tester) async {
+      // Offline the Go-here pill never appears (no route to lay), so a bare tap would
+      // otherwise do nothing visible. The destination tap is the one that explains it.
+      final state = ready()
+        ..debugApplyLink(
+            const LinkStatus(LinkState.offline, 'No connection — waiting for network.'));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tapFloor(tester);
+      await tester.pump();
+
+      expect(find.text('Go here'), findsNothing);
+      expect(find.text("Can't move — no connection."), findsOneWidget);
+
+      // It is transient — the pill clears itself so the slot is free again.
+      await tester.pump(const Duration(seconds: 3));
+      expect(find.text("Can't move — no connection."), findsNothing);
+    });
+
     testWidgets('a second tap zooms and leaves no reticle behind', (tester) async {
       // The double tap is counted by hand precisely so the first one can select at
       // once — and the price of that is the second one having to put back what the

@@ -52,6 +52,7 @@ class SettingsScreen extends StatelessWidget {
             LinkState.live => ('Connected', space == null ? 'Talking to Gather.' : 'To $space.', t.ok),
             LinkState.connecting => ('Connecting', 'Opening a connection to Gather.', t.warn),
             LinkState.retrying => ('Reconnecting', link.detail ?? 'The connection dropped. Trying again.', t.danger),
+            LinkState.offline => ('No connection', link.detail ?? 'No network. Waiting for a connection.', t.danger),
             LinkState.idle => ('Not connected', 'Nothing is listening to Gather right now.', t.faint),
           };
 

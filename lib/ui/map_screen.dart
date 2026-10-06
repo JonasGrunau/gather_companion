@@ -129,7 +129,15 @@ class _MapScreenState extends State<MapScreen> {
                   child: child,
                 ),
               ),
-              child: widget.state.inCall ? CallBanner(key: const ValueKey('call'), state: widget.state) : const SizedBox.shrink(),
+              // A call to get back to wins the slot; otherwise a dropped connection
+              // claims it, because a reconnect is the one thing the office cannot
+              // show on its own — the floor looks the same whether the roster is
+              // live or an hour stale.
+              child: widget.state.inCall
+                  ? CallBanner(key: const ValueKey('call'), state: widget.state)
+                  : widget.state.link.isDisrupted
+                      ? _LinkBanner(key: const ValueKey('link'), offline: widget.state.link.isOffline)
+                      : const SizedBox.shrink(),
             ),
           ),
         ],
@@ -160,6 +168,76 @@ class _Where extends StatelessWidget {
     // time you arrived on the office. Explicit is what the sibling bars do, so
     // explicit is what matches them.
     return Text(space ?? 'The office', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge);
+  }
+}
+
+/// Shown over the floor when the connection to Gather is not carrying the roster.
+///
+/// Two shapes in one slot. A reconnect — a network that exists, a socket coming back —
+/// gets a spinner, because something is actually happening. Being [offline] — flight
+/// mode, a dead zone, no radio at all — gets a static cloud-off glyph instead: a spinner
+/// there would promise progress nothing can make. Either way it lives in the same slot
+/// the call banner does and is mutually exclusive with it, so it never stacks, and is
+/// tinted danger because it is the state where what the map draws is not what is true —
+/// the roster is frozen, proximity is stale, and a call will not start until it clears.
+/// A [liveRegion] so a screen reader says it rather than leaving a blind user wondering
+/// why nobody is answering.
+class _LinkBanner extends StatelessWidget {
+  const _LinkBanner({super.key, required this.offline});
+
+  final bool offline;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final tint = t.danger;
+    // Solid, not a tint: this is the one state where the map is lying, so the banner has
+    // to read against a busy floor plan behind it — a near-transparent pill vanished
+    // into it. White on danger, with a drop shadow to lift it off the map.
+    const ink = Colors.white;
+    final label = offline ? 'No connection' : 'Reconnecting…';
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Center(
+        child: Semantics(
+          liveRegion: true,
+          label: offline ? 'No connection to Gather' : 'Reconnecting to Gather',
+          child: ExcludeSemantics(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+              decoration: BoxDecoration(
+                color: tint,
+                borderRadius: BorderRadius.circular(t.radius),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.28),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: offline
+                        ? const Icon(Icons.cloud_off_rounded, size: 14, color: ink)
+                        : const CircularProgressIndicator(strokeWidth: 2, color: ink),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -380,6 +458,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   Offset? _firstTap;
   Timer? _tapWindow;
 
+  /// A one-line "why nothing happened" shown in the Go-here pill's slot, and the timer
+  /// that clears it. Set when a destination tap is refused because we are offline — it
+  /// sits where the pill would have been rather than over the bottom controls.
+  String? _blockedNote;
+  Timer? _blockedNoteTimer;
+
   /// What was selected before the tap that is currently provisional.
   ///
   /// A double tap is a zoom, not a selection, so the second half of one has to undo
@@ -461,6 +545,25 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
         target.room == null) {
       setState(() => _selected = null);
+      return;
+    }
+
+    // A real destination, but we are offline or mid-reconnect, so there is no route to
+    // lay and the Go-here pill never appears. Rather than swallow the tap in silence,
+    // say why nothing happened — this is the one tap where the floor would otherwise
+    // have moved you.
+    if (widget.state.link.isDisrupted) {
+      final note = widget.state.link.isOffline
+          ? "Can't move — no connection."
+          : "Can't move — reconnecting…";
+      _blockedNoteTimer?.cancel();
+      _blockedNoteTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted) setState(() => _blockedNote = null);
+      });
+      setState(() {
+        _selected = null;
+        _blockedNote = note;
+      });
       return;
     }
 
@@ -663,6 +766,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     unawaited(_followRequests?.cancel());
     _follow.dispose();
     _tapWindow?.cancel();
+    _blockedNoteTimer?.cancel();
     _motion.dispose();
     _zoom.dispose();
     _view.dispose();
@@ -893,7 +997,66 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               ),
             ),
           ),
+        // The same slot as the Go-here pill, never both at once: offline there is no pill
+        // to go here, so a refused destination tap borrows its place to say why — above
+        // the dock, not a toast flung over it.
+        if (_blockedNote != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(child: _BlockedNote(text: _blockedNote!)),
+            ),
+          ),
       ],
+    );
+  }
+}
+
+/// A transient "why that tap did nothing" pill, shown where the Go-here pill sits when a
+/// move is refused for being offline. Danger-tinted and shadowed like [_LinkBanner] so
+/// the two read as the same voice.
+class _BlockedNote extends StatelessWidget {
+  const _BlockedNote({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    const ink = Colors.white;
+    return Semantics(
+      liveRegion: true,
+      label: text,
+      child: ExcludeSemantics(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: t.danger,
+            borderRadius: BorderRadius.circular(t.radius),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.28),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off_rounded, size: 14, color: ink),
+              const SizedBox(width: 8),
+              Text(
+                text,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
