@@ -137,6 +137,22 @@ class FakeCollector implements Collector {
   /// Everyone currently on the floor, by `spaceId`.
   Iterable<String> get peopleIds => _people.keys;
 
+  /// How close a colleague must stand to be in a call with me, in tiles. A
+  /// conversation's cluster is tighter than Gather's `inRange` circle (12) on
+  /// purpose: on this small schematic floor, "near enough to talk" is a couple
+  /// of desks, so milling cast do not keep falling into a call in passing.
+  static const int kCallRange = 3;
+
+  Iterable<_Standing> _nearMe() => _people.values.where((s) {
+        final dx = s.x - _me.x, dy = s.y - _me.y;
+        return dx * dx + dy * dy <= kCallRange * kCallRange;
+      });
+
+  /// The cast standing close enough to be in a call with me right now — what the
+  /// office call driver mirrors into the [ScriptedCall] and what [_roster] tags
+  /// into my cluster. Empty when I am standing alone.
+  List<CallPerson> get callmates => [for (final s in _nearMe()) s.person];
+
   /// Sends a wave from [fromSpaceId] to me, on the event bus. Surfaces in the
   /// Activity feed as a live item through `AppState._noteActivity`.
   void wave(String fromSpaceId) {
@@ -150,19 +166,31 @@ class FakeCollector implements Collector {
     ));
   }
 
-  Roster _roster() => Roster(
-        selfId: kSelfId,
-        rows: [
-          selfOfficeRow(_me, direction: _myDirection, speaking: _mySpeaking),
-          for (final s in _people.values)
-            officeRow(
-              s.person,
-              (x: s.x, y: s.y),
-              direction: s.direction,
-              speaking: s.speaking,
-            ),
-        ],
-      );
+  Roster _roster() {
+    // The people close enough to be in a call: self and they share one cluster,
+    // which is what `Roster.myCluster` — and so the call screen's faces — read.
+    final near = {for (final s in _nearMe()) s.person.spaceId};
+    final inCall = near.isNotEmpty;
+    return Roster(
+      selfId: kSelfId,
+      rows: [
+        selfOfficeRow(
+          _me,
+          direction: _myDirection,
+          speaking: _mySpeaking,
+          clusterId: inCall ? kHuddleCluster : null,
+        ),
+        for (final s in _people.values)
+          officeRow(
+            s.person,
+            (x: s.x, y: s.y),
+            direction: s.direction,
+            speaking: s.speaking,
+            clusterId: near.contains(s.person.spaceId) ? kHuddleCluster : null,
+          ),
+      ],
+    );
+  }
 
   // ---- the write side: the server's half of each action ----------------------
 

@@ -156,12 +156,14 @@ purely additive.
 - **Coordinate units differ.** `idb ui tap` takes **logical points**; `simctl`
   screenshots are **pixels** (×3 on a 3× device, so `point = px / 3`). Read frames
   straight from `idb ui describe-all` to skip the math.
-- **The call path has no live SFU in `TARGET=app`.** A real outbound call (e.g.
-  **Warp** on the Dial tab) reorders the recents and then shows *"No connection —
-  waiting for network"* — the fakes cover presence and the scripted call, not a
-  dialled connection. Verify call *UI* in `TARGET=app`; verify the *in-call*
-  screen (spotlight, speaking ring) in `TARGET=call`, which mounts `CallScreen`
-  directly on a scripted multi-party call.
+- **The call runs in `TARGET=app` too, end to end.** Warp someone on the Dial
+  tab, or walk within `FakeCollector.kCallRange` tiles of them in the Office, and
+  `FakeCollector` puts you both in one cluster while `AppScenarioDriver` drives the
+  injected `ScriptedCall` — so the call screen opens with real faces and a rotating
+  speaking ring, and the Office shows the "In a call with …" banner. `TARGET=call`
+  still exists for the in-call screen in isolation (it mounts `CallScreen` directly
+  on a scripted multi-party call, no office around it); `TARGET=app` is the one that
+  exercises the *paths into* a call.
 - **`simctl privacy grant camera` does not rescue `lib/main.dart`** — the grant
   does not reliably suppress the pairing dialog, which is why the rule above is
   "always the harness", not "grant and run the real app".

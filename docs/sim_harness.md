@@ -91,6 +91,14 @@ What to check on the `app` target:
   "You" and the seated cast, who mill about. **Tap an empty tile → "Go here" → your
   avatar walks there** (the real `Walk` stepping against `FakeCollector`, which
   echoes each step back on the roster). The call control bar sits above the rail.
+- **The call**, from either door: **Warp** someone on the Dial tab, or walk within
+  `FakeCollector.kCallRange` (3) tiles of a colleague in the Office. Either forms a
+  cluster, and `AppScenarioDriver` drives the injected `ScriptedCall` — so the call
+  screen opens with "You" + their face and a rotating speaking ring, and the Office
+  shows the **"In a call with …"** banner (tap it to reach the faces). Whoever you
+  are talking to stops milling until you walk away, so the call holds. This is the
+  whole in-call screen reached through the app's own paths, where `TARGET=call`
+  mounts it directly.
 - **Settings** renders.
 
 > **Walking.** The D-pad is shelved in production (`kShowDPad = false`) — you walk by

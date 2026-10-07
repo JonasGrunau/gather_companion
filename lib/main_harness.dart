@@ -27,6 +27,7 @@
 /// is how many of the cast to seat (default 4). See `docs/sim_harness.md`.
 library;
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart';
@@ -110,11 +111,21 @@ class _CallHarnessState extends State<_CallHarness> {
 
 Widget _buildApp(String scenarioName, int participants) {
   final fake = FakeCollector(participants: participants);
+  // One [ScriptedCall], held here so the driver can push call state onto the very
+  // instance `AppState` builds on the first warp or proximity huddle — a warp's
+  // `setMicOn`, or `_noteCluster`, calls this back for the same object.
+  final call = ScriptedCall();
   final state = AppState(
     // The two seams that make the whole app run without a wire: a [Collector]
     // that is not a socket, and a [Call] that is not a microphone.
     buildCollector: (auth, spaceId) => fake,
-    buildCall: (auth, spaceId, srcId) => ScriptedCall(),
+    buildCall: (auth, spaceId, srcId) => call,
+    // Without this the simulator's real connectivity plugin reports no interface,
+    // `_isOffline()` reads true, the link parks offline, and every warp refuses
+    // with "No connection — waiting for network." Report Wi-Fi so `boot()` brings
+    // the link live and the call paths actually run.
+    connectivityNow: () async => const [ConnectivityResult.wifi],
+    connectivityChanges: const Stream<List<ConnectivityResult>>.empty(),
     // The feed fills from the collector's interaction stream (live waves), so the
     // REST feed has nothing to add. A synthetic space id (below) arms the fetch
     // path; this keeps that path off the wire rather than letting it reach Gather.
@@ -134,6 +145,7 @@ Widget _buildApp(String scenarioName, int participants) {
   final driver = AppScenarioDriver(
     state: state,
     collector: fake,
+    call: call,
     scenario: AppScenario.fromName(scenarioName),
   );
   return _AppHarness(state: state, driver: driver);
