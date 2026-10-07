@@ -77,6 +77,7 @@ void main() {
     await tester.pump();
 
     expect(find.text('SafeNow'), findsOneWidget);
+    expect(find.text('warp dial'), findsOneWidget, reason: 'the tab wears its codename beside the space name');
     expect(find.text('Zoe'), findsOneWidget);
     expect(find.text('Xander'), findsOneWidget, reason: 'the offline are listed, not hidden');
   });

@@ -67,14 +67,14 @@ extension _TabView on _Tab {
   IconData get icon => switch (this) {
         _Tab.activity => Icons.notifications_rounded,
         _Tab.map => Icons.map_outlined,
-        _Tab.dial => Icons.sensors_rounded,
+        _Tab.dial => Icons.bolt,
         _Tab.settings => Icons.settings_rounded,
       };
 
   String get label => switch (this) {
         _Tab.activity => 'Activity',
         _Tab.map => 'Office',
-        _Tab.dial => 'Dial',
+        _Tab.dial => 'Warp',
         _Tab.settings => 'Settings',
       };
 }
@@ -201,7 +201,7 @@ class _HomeShellState extends State<HomeShell> {
         _Tab.activity => ActivityScreen(state: widget.state),
         // No control bar, so no `kControlBarInset` layer: the shell's own rail
         // inset is all a scrolling directory needs to clear the dock.
-        _Tab.dial => DialScreen(state: widget.state),
+        _Tab.dial => DialScreen(state: widget.state, visible: _tab == _Tab.dial),
         _Tab.settings => SettingsScreen(state: widget.state, onUnpair: widget.onUnpair),
       };
 

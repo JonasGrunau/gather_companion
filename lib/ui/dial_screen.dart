@@ -35,19 +35,33 @@ import 'call_screen.dart';
 import 'person_avatar.dart';
 
 class DialScreen extends StatefulWidget {
-  const DialScreen({super.key, required this.state});
+  const DialScreen({super.key, required this.state, this.visible = true});
 
   final AppState state;
+
+  /// Whether this tab is the one on screen. The shell flips it on every tab
+  /// switch (home_shell `_bodyFor`), and the app-bar subtitle warps itself back
+  /// in each time it turns true — the Dial tab announcing itself on arrival.
+  /// Defaults to true so the screen plays the flourish once when stood up alone.
+  final bool visible;
 
   @override
   State<DialScreen> createState() => _DialScreenState();
 }
 
-class _DialScreenState extends State<DialScreen> {
+class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateMixin {
   /// The person or meeting a warp is in flight for, keyed by contact id or
   /// cluster id, so its tile can show a spinner while the hop and the mic settle.
   /// One at a time — a second tap mid-warp is ignored rather than queued.
   String? _warping;
+
+  /// Drives the subtitle's warp-in. Restarted whenever the tab becomes visible,
+  /// which is free to tick exactly then: the shell wraps each tab in a
+  /// `TickerMode` that enables in the same frame the tab is selected.
+  late final AnimationController _warp = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 500),
+  );
 
   AppState get state => widget.state;
 
@@ -57,11 +71,20 @@ class _DialScreenState extends State<DialScreen> {
     // The shell's own [ListenableBuilder] misses availability and cluster changes;
     // this is the signal that carries them. See the library comment.
     state.directoryChanges.addListener(_onDirectoryChanged);
+    if (widget.visible) _warp.forward(from: 0);
+  }
+
+  @override
+  void didUpdateWidget(DialScreen old) {
+    super.didUpdateWidget(old);
+    // Each return to the tab replays the flourish; leaving it does nothing.
+    if (widget.visible && !old.visible) _warp.forward(from: 0);
   }
 
   @override
   void dispose() {
     state.directoryChanges.removeListener(_onDirectoryChanged);
+    _warp.dispose();
     super.dispose();
   }
 
@@ -114,7 +137,7 @@ class _DialScreenState extends State<DialScreen> {
       backgroundColor: t.background,
       appBar: AppBar(
         backgroundColor: t.background,
-        title: Text(state.spaceName ?? 'Dial'),
+        title: _Title(space: state.spaceName, warp: _warp),
         titleTextStyle: Theme.of(context).textTheme.titleLarge,
       ),
       body: SafeArea(
@@ -492,6 +515,91 @@ class _Empty extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.fromLTRB(kTextGutter, 8, kTextGutter, 24),
       child: Text(message, style: TextStyle(color: t.mutedForeground, height: 1.5)),
+    );
+  }
+}
+
+/// The app-bar title: the space name, with the tab's own codename — "warp dial" —
+/// warping in small beside it. The codename is the only place the name surfaces;
+/// everywhere else the tab is just the bolt and "Warp".
+///
+/// When there is no space name yet the codename stands alone rather than sitting
+/// beside the bare "Dial" fallback — two names for one tab reads as a bug.
+class _Title extends StatelessWidget {
+  const _Title({required this.space, required this.warp});
+
+  final String? space;
+  final Animation<double> warp;
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = _WarpIn(warp: warp, child: const _Codename());
+    if (space == null) return subtitle;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.baseline,
+      textBaseline: TextBaseline.alphabetic,
+      children: [
+        Flexible(child: Text(space!, maxLines: 1, overflow: TextOverflow.ellipsis)),
+        const SizedBox(width: 10),
+        subtitle,
+      ],
+    );
+  }
+}
+
+/// The codename itself, styled as a quiet tag. Pulled out so [_WarpIn] animates a
+/// const child — only the transform rebuilds each frame, not the text.
+class _Codename extends StatelessWidget {
+  const _Codename();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Text(
+      'warp dial',
+      style: TextStyle(
+        color: t.mutedForeground,
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 0.6,
+      ),
+    );
+  }
+}
+
+/// A warp-in: the child arrives as a flat horizontal streak anchored to its left
+/// edge, snaps open to full width with a hair of overshoot, and fades up as it
+/// lands. Scaling from the left makes it read as warping *out of* the word it sits
+/// beside rather than zooming from its own centre.
+class _WarpIn extends StatelessWidget {
+  const _WarpIn({required this.warp, required this.child});
+
+  final Animation<double> warp;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: warp,
+      child: child,
+      builder: (context, child) {
+        final v = Curves.easeOutBack.transform(warp.value);
+        final op = Curves.easeOut.transform(warp.value).clamp(0.0, 1.0);
+        final scaleX = 0.15 + (1.0 - 0.15) * v;
+        final dx = (1 - v) * 8.0;
+        return Opacity(
+          opacity: op,
+          child: Transform.translate(
+            offset: Offset(dx, 0),
+            child: Transform.scale(
+              scaleX: scaleX,
+              alignment: Alignment.centerLeft,
+              child: child,
+            ),
+          ),
+        );
+      },
     );
   }
 }
