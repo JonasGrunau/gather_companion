@@ -9,11 +9,15 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
+import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
+import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
+import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/gameboy_shell.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
@@ -58,9 +62,13 @@ void main() {
         ),
       );
 
+  // Gameboy mode opens on the office: the handheld wraps it, so there is no
+  // floating Office dock to tap — the shell is already here. Just settle and
+  // confirm the office is on screen before the test acts on it.
   Future<void> toOffice(WidgetTester tester) async {
-    await tester.tap(find.byTooltip('Office'));
     await tester.pumpAndSettle();
+    expect(find.byType(GameboyShell), findsOneWidget,
+        reason: 'Gameboy mode opens on the office');
   }
 
   group('the settings toggle', () {
@@ -95,6 +103,26 @@ void main() {
 
     testWidgets('defaults off when nothing is stored', (tester) async {
       expect(await UiPreferences().loadGameboyMode(), isFalse);
+    });
+  });
+
+  group('the startup tab', () {
+    testWidgets('Gameboy mode opens on the office', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(GameboyShell), findsOneWidget, reason: 'the handheld wraps the office');
+      expect(find.byType(DialScreen), findsNothing, reason: 'Dial is not the Gameboy home');
+    });
+
+    testWidgets('normal mode opens on Dial', (tester) async {
+      final state = configure(AppState());
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(DialScreen), findsOneWidget);
+      expect(find.byType(GameboyShell), findsNothing, reason: 'no handheld without Gameboy mode');
     });
   });
 
@@ -214,6 +242,7 @@ void main() {
       await tester.tap(find.text('SELECT'));
       await tester.pumpAndSettle();
 
+      expect(find.text('Dial'), findsOneWidget);
       expect(find.text('Activity'), findsOneWidget);
       expect(find.text('Settings'), findsOneWidget);
       expect(find.textContaining('camera'), findsOneWidget);
@@ -235,6 +264,24 @@ void main() {
 
       expect(find.byType(SettingsScreen), findsOneWidget);
       expect(find.byType(GameboyShell), findsNothing, reason: 'left the office for settings');
+    });
+
+    testWidgets('the Dial row leaves the office for the dialer', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      await tester.tap(find.text('SELECT'));
+      await tester.pumpAndSettle();
+      // The menu scrolls inside the LCD, so the Dial row can sit below the fold on
+      // a short screen — bring it up before choosing it.
+      await tester.ensureVisible(find.text('Dial'));
+      await tester.tap(find.text('Dial'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(DialScreen), findsOneWidget);
+      expect(find.byType(GameboyShell), findsNothing, reason: 'left the office for the dialer');
     });
 
     testWidgets('Start is wired and does not throw with no desk to return to', (tester) async {
@@ -408,22 +455,136 @@ void main() {
       await tester.pumpAndSettle();
 
       // Walk the cursor down to the last row (Settings). Pressing the bottom of the
-      // cross is a Down; four of them land on Settings from the status row.
+      // cross is a Down; from the status row it is five of them past Camera, Emotes,
+      // Dial and Activity onto Settings.
       final pad = tester.getRect(find.byKey(const Key('gb-dpad')));
       final down = Offset(pad.center.dx, pad.top + pad.height * 0.88);
-      for (var i = 0; i < 4; i++) {
+      for (var i = 0; i < 5; i++) {
         final g = await tester.startGesture(down);
         await tester.pump();
         await g.up();
         await tester.pumpAndSettle();
       }
 
-      // The lit row is now in the well and hit-testable where it is drawn — tapping
-      // it reaches the real action rather than missing an off-screen row. Without
-      // the ensureVisible this tap would miss and SettingsScreen would never open.
-      await tester.tap(find.text('Settings'));
+      // Confirm with A, not a direct tap on 'Settings': the row is the cursor's now,
+      // and the app had to scroll it into the well for A to land on the real action
+      // rather than firing an off-screen one.
+      await tester.tap(find.text('A'));
       await tester.pumpAndSettle();
       expect(find.byType(SettingsScreen), findsOneWidget, reason: 'the scrolled-in row was the real, hittable one');
+    });
+  });
+
+  group('the call banner on the LCD', () {
+    /// A live call, the way the roster says so: self and [name] in one cluster.
+    void startCall(AppState state, String name) => state.debugApplyRoster(
+          Roster(selfId: 'me', rows: [
+            const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1'),
+            RosterRow(id: name, name: name, clusterId: 'c1'),
+          ]),
+        );
+
+    testWidgets('a live call lights the LCD, with the way back on it', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      expect(find.text('In a call with Ada'), findsOneWidget);
+      expect(find.text('Press A or tap'), findsOneWidget);
+      // The office's own app-themed banner is held off the LCD — only the pixel
+      // one is drawn, never both.
+      expect(find.byType(CallBanner), findsNothing);
+    });
+
+    testWidgets('A opens the call while one is live', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('A'));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('tapping the LCD banner opens the call', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Press A or tap'));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('no call, no banner', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.text('Press A or tap'), findsNothing);
+    });
+
+    testWidgets('names the media-only peer, not a bare "In a call"', (tester) async {
+      // The half second at the end of a conversation: the roster cluster has let
+      // go, so there is no huddle, but the SFU is still sending Ada. The LCD and
+      // the office banner both read this off the call's own tiles, so the handheld
+      // names her here rather than falling back to the anonymous title.
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugCall = const CallState(
+          participants: [CallParticipant(srcId: 'acc-ada', hasAudio: true)],
+        )
+        ..debugApplyRoster(const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'Jonas'),
+          // No clusterId — the huddle is empty; only the media plane says Ada is here.
+          RosterRow(id: 'ada', name: 'Ada', userAccountId: 'acc-ada'),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+      await tester.pumpAndSettle();
+
+      expect(state.inHuddle, isFalse, reason: 'no cluster, so no huddle');
+      expect(state.inCall, isTrue, reason: 'but the media plane still has company');
+      expect(find.text('In a call with Ada'), findsOneWidget);
+    });
+  });
+
+  group('the D-pad release', () {
+    testWidgets('always stops walking, even once the Select menu has taken the pad', (tester) async {
+      // Opening the menu with the pad still held once left the walk timer running:
+      // the menu swapped the release to a no-op, so lifting never called
+      // stopWalking and the avatar walked on. Release must always stop walking.
+      final state = configure(_SpyState())
+        ..setGameboyMode(true)
+        ..debugCanWalk = true;
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      await tester.tap(find.text('SELECT'));
+      await tester.pumpAndSettle();
+
+      final pad = tester.getRect(find.byKey(const Key('gb-dpad')));
+      final gesture = await tester.startGesture(Offset(pad.center.dx, pad.top + pad.height * 0.12));
+      await tester.pump();
+      await gesture.up();
+      await tester.pump();
+
+      expect(state.released, greaterThan(0), reason: 'lifting the pad stopped the walk');
     });
   });
 }

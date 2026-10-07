@@ -47,6 +47,7 @@ import 'package:gather_client/gather_client.dart' show settableAvailabilities;
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart' show availabilityColor, availabilityLabel, GatherThemeContext;
+import 'call_screen.dart' show callBannerTextFor, openCallScreen;
 
 // The shell's own palette, kept deliberately apart from [GatherTokens]: the
 // office inside the screen must stay the app's normal colours, so the retro
@@ -114,18 +115,22 @@ const _emotes = ['👋', '❤️', '🎉', '👍️', '🤣', '👏', '💯', '�
 
 /// The Select menu's rows, in D-pad order top to bottom. Two of them — the
 /// status choices and the emote strip — are rows the D-pad walks left/right
-/// inside; the other three are single targets. Kept as a count so the cursor can
+/// inside; the other four are single targets, one per tab the menu can leave to
+/// (Dial, Activity, Settings) plus the camera toggle. Kept as a count so the cursor can
 /// clamp without the menu and the router disagreeing about how many rows there are.
 const int _menuRowStatus = 0;
 const int _menuRowCamera = 1;
 const int _menuRowEmotes = 2;
-const int _menuRowActivity = 3;
-const int _menuRowSettings = 4;
-const int _menuRowCount = 5;
+const int _menuRowDial = 3;
+const int _menuRowActivity = 4;
+const int _menuRowSettings = 5;
+const int _menuRowCount = 6;
 
-/// Wraps [child] (the office) in the handheld. [onOpenSettings]/[onOpenActivity]
-/// are how the Select menu leaves for another tab — the shell cannot switch tabs
-/// itself, so the home shell hands it the two it owns.
+/// Wraps [child] (the office) in the handheld. [onOpenDial]/[onOpenActivity]/
+/// [onOpenSettings] are how the Select menu leaves for another tab — the shell
+/// cannot switch tabs itself, so the home shell hands it the ones it owns. The
+/// menu mirrors the bottom tab bar, so every tab reachable there (bar the map,
+/// which is the office under the shell) has a row here.
 ///
 /// Stateful only for the Select menu: whether it is open, which row the cursor is
 /// on, and which emote within the strip. Everything else is still a straight pass
@@ -139,12 +144,14 @@ class GameboyShell extends StatefulWidget {
     required this.child,
     required this.onOpenSettings,
     required this.onOpenActivity,
+    required this.onOpenDial,
   });
 
   final AppState state;
   final Widget child;
   final VoidCallback onOpenSettings;
   final VoidCallback onOpenActivity;
+  final VoidCallback onOpenDial;
 
   @override
   State<GameboyShell> createState() => _GameboyShellState();
@@ -166,7 +173,13 @@ class _GameboyShellState extends State<GameboyShell> {
   /// sit below the fold, so a D-pad move has to scroll the lit row back into the
   /// well — otherwise the highlight walks off-screen and A fires a row nobody can
   /// see. The keys hang on the rows in [_GameboyMenu]; [_revealRow] rides them.
-  final List<GlobalKey> _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
+  ///
+  /// Regenerated on every open rather than held for the shell's life: the
+  /// [AnimatedSwitcher] that fades the menu keeps the outgoing instance mounted
+  /// for the length of its transition, so a close-then-reopen inside that window
+  /// would leave two menus alive at once. Sharing one set of [GlobalKey]s across
+  /// both is a duplicate-key crash; a fresh set per open keeps them apart.
+  List<GlobalKey> _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
 
   /// Scroll the focused row into view after a vertical move. Every row is built
   /// eagerly inside the menu's scroll view, so the context is already there; the
@@ -189,6 +202,9 @@ class _GameboyShellState extends State<GameboyShell> {
     setState(() {
       _menuOpen = !_menuOpen;
       if (_menuOpen) {
+        // Fresh keys for this instance, so a reopen while the previous menu is
+        // still fading out never mounts the same GlobalKeys twice.
+        _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
         // Open on the status row with its cursor already on the status you are,
         // so the first thing the menu offers is a one-press change away from it.
         _row = _menuRowStatus;
@@ -258,6 +274,11 @@ class _GameboyShellState extends State<GameboyShell> {
     _run(() => widget.state.sendEmoteLocalFirst(emote));
   }
 
+  void _doDial() {
+    _closeMenu();
+    widget.onOpenDial();
+  }
+
   void _doActivity() {
     _closeMenu();
     widget.onOpenActivity();
@@ -277,6 +298,8 @@ class _GameboyShellState extends State<GameboyShell> {
         _doCamera();
       case _menuRowEmotes:
         _doReact(_emotes[_emote]);
+      case _menuRowDial:
+        _doDial();
       case _menuRowActivity:
         _doActivity();
       case _menuRowSettings:
@@ -321,6 +344,7 @@ class _GameboyShellState extends State<GameboyShell> {
                           onStatus: _doStatus,
                           onCamera: _doCamera,
                           onReact: _doReact,
+                          onDial: _doDial,
                           onActivity: _doActivity,
                           onSettings: _doSettings,
                           onDismiss: _closeMenu,
@@ -541,6 +565,99 @@ class _StatusGlyph extends StatelessWidget {
   }
 }
 
+/// The way back to a live call, drawn inside the LCD under the status strip.
+///
+/// Gameboy mode skins only the office, and the office's own [CallBanner] is held
+/// off the screen there (see `map_screen.dart`) so it is not drawn twice nor out
+/// of the LCD's pixel grammar. This is its handheld replacement: a green call
+/// light, who the call is with, and the one line that says how to reach it on a
+/// console — the A button, or a thumb on the strip itself. Both routes land on
+/// [openCallScreen]. Self-listening on [AppState], so it appears and disappears
+/// with the call; the shell holds it down while the Select menu is up.
+class _LcdCallBanner extends StatelessWidget {
+  const _LcdCallBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, _) {
+        if (!state.inCall) return const SizedBox.shrink();
+        // Only the title; the handheld's second line is fixed — how to reach the
+        // call on this device, not the touchscreen's "Tap to see everyone". Drawn
+        // from the call's own tiles via [callBannerTextFor], the same source the
+        // office banner uses, so the two skins name the call the same way — and the
+        // media-only moment, when a peer outlives the roster cluster, still names
+        // that peer instead of a bare "In a call".
+        final title = callBannerTextFor(state).title;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Semantics(
+            button: true,
+            label: '$title. Press A or tap to open the call.',
+            child: ExcludeSemantics(
+              child: Material(
+                color: _scMid,
+                borderRadius: BorderRadius.circular(6),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () => openCallScreen(context, state),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      // The live-green ring the menu's lit rows use, so "a call is
+                      // on" reads in the same light as "the camera is on".
+                      border: Border.all(color: _online, width: 1.5),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.call_rounded, size: 18, color: _online),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scWhite,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 1),
+                              const Text(
+                                'Press A or tap',
+                                style: TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scGlyphOff,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// The head count, re-cut for the LCD: the same "N here" pill the map's app bar
 /// carried, in the pixel face on the screen's dark. The dot glows the live-green
 /// when anyone is in, so an empty room reads at a glance too.
@@ -689,6 +806,11 @@ class _Screen extends StatelessWidget {
                 children: [
                   _LcdStatusBar(state: state),
                   const SizedBox(height: 6),
+                  // The way back to a live call, inside the LCD and above the
+                  // office. Held down while the Select menu is up: A means
+                  // "choose" there, and the office it would return to is covered
+                  // anyway.
+                  if (menu == null) _LcdCallBanner(state: state),
                   Expanded(
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(4),
@@ -806,26 +928,42 @@ class _ControlsDeck extends StatelessWidget {
                       builder: (context, _) => _GbDpad(
                         key: const Key('gb-dpad'),
                         enabled: menuOpen || state.canWalk,
+                        // The menu drives the cursor, the office walks — name the
+                        // gesture for whichever the pad is doing right now.
+                        moveVerb: menuOpen ? 'Move' : 'Walk',
                         onPress: menuOpen ? onMenuMove : state.walk,
-                        onRelease: menuOpen ? () {} : state.stopWalking,
+                        // Always stop walking on release. It is idempotent, and the
+                        // case that matters is opening the menu with the pad still
+                        // held: a no-op release there would let the walk timer
+                        // outlive the lift and step the avatar forever. See
+                        // [Walk.release].
+                        onRelease: state.stopWalking,
                       ),
                     ),
                   ),
                   // A, raised and to the right: the cart, or — in the menu — the
-                  // choose key. Lit while the cart is latched on; plain in the menu.
+                  // choose key, or — during a call — the way back to the faces, the
+                  // partner to the LCD banner's "Press A or tap". Lit while the cart
+                  // is latched on or a call is live; plain in the menu.
                   Positioned(
                     right: 18,
                     top: 30,
                     child: _GbRoundButton(
                       label: 'A',
                       size: 64,
-                      lit: !menuOpen && state.boost,
+                      lit: !menuOpen && (state.inCall || state.boost),
+                      // A switch only when it means boost. In the menu it chooses,
+                      // during a call it opens the call — both actions, so the glow
+                      // there is not an "on" state the reader should announce.
+                      toggled: (menuOpen || state.inCall) ? null : state.boost,
                       onTap: menuOpen
                           ? onMenuConfirm
-                          : () {
-                              HapticFeedback.selectionClick();
-                              state.boost = !state.boost;
-                            },
+                          : state.inCall
+                              ? () => openCallScreen(context, state)
+                              : () {
+                                  HapticFeedback.selectionClick();
+                                  state.boost = !state.boost;
+                                },
                     ),
                   ),
                   // B, below and left of A: mute. Lit means the mic is live, so the
@@ -838,6 +976,9 @@ class _ControlsDeck extends StatelessWidget {
                       label: 'B',
                       size: 64,
                       lit: !menuOpen && call.micOn,
+                      // Mute is a real switch; inert in the menu, so no toggle state
+                      // there.
+                      toggled: menuOpen ? null : call.micOn,
                       onTap: menuOpen ? null : () => _run(context, () => state.setMicOn(!call.micOn)),
                     ),
                   ),
@@ -890,11 +1031,17 @@ class _GbDpad extends StatefulWidget {
   const _GbDpad({
     super.key,
     required this.enabled,
+    required this.moveVerb,
     required this.onPress,
     required this.onRelease,
   });
 
   final bool enabled;
+
+  /// What a press does right now, for the screen reader: "Walk" in the office,
+  /// "Move" while the Select menu owns the pad. The arms announce `<verb> up`
+  /// etc., so a reader never hears "Walk" for a gesture that moves the cursor.
+  final String moveVerb;
   final void Function(String direction) onPress;
   final VoidCallback onRelease;
 
@@ -965,7 +1112,7 @@ class _GbDpadState extends State<_GbDpad> {
                 child: Semantics(
                   button: true,
                   enabled: widget.enabled,
-                  label: 'Walk ${arm.direction.toLowerCase()}',
+                  label: '${widget.moveVerb} ${arm.direction.toLowerCase()}',
                   onTap: widget.enabled
                       ? () {
                           widget.onPress(arm.direction);
@@ -1077,11 +1224,22 @@ class _GbRoundButton extends StatefulWidget {
     required this.size,
     required this.lit,
     required this.onTap,
+    this.toggled,
   });
 
   final String label;
   final double size;
+
+  /// The green glow: purely visual, "this control is live". It is not the same as
+  /// the semantic on/off — A glows during a call, but pressing it then *opens* the
+  /// call, it does not toggle anything. See [toggled].
   final bool lit;
+
+  /// The screen-reader on/off, kept apart from [lit]. Null means the button is an
+  /// action, not a switch, so VoiceOver never announces it as selected; true/false
+  /// is a real toggle (mute, boost). B is always a toggle; A is one only while it
+  /// means boost.
+  final bool? toggled;
   final VoidCallback? onTap;
 
   @override
@@ -1101,7 +1259,7 @@ class _GbRoundButtonState extends State<_GbRoundButton> {
     final lit = widget.lit;
     return Semantics(
       button: true,
-      toggled: lit,
+      toggled: widget.toggled,
       label: widget.label,
       child: GestureDetector(
         onTapDown: widget.onTap == null ? null : (_) => _set(true),
@@ -1306,6 +1464,7 @@ class _GameboyMenu extends StatelessWidget {
     required this.onStatus,
     required this.onCamera,
     required this.onReact,
+    required this.onDial,
     required this.onActivity,
     required this.onSettings,
     required this.onDismiss,
@@ -1322,6 +1481,7 @@ class _GameboyMenu extends StatelessWidget {
   final ValueChanged<String> onStatus;
   final VoidCallback onCamera;
   final ValueChanged<String> onReact;
+  final VoidCallback onDial;
   final VoidCallback onActivity;
   final VoidCallback onSettings;
   final VoidCallback onDismiss;
@@ -1329,7 +1489,12 @@ class _GameboyMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cameraOn = state.call.cameraOn;
-    return Stack(
+    // The scrim dims the office but does not take it out of the semantics tree, so
+    // without this a screen reader could still reach and fire the office controls
+    // hidden under the open menu. [BlockSemantics] makes the overlay modal to
+    // assistive tech, matching what the dim already does for sighted eyes.
+    return BlockSemantics(
+      child: Stack(
       key: const ValueKey('gb-menu-open'),
       children: [
         // The scrim: the office dimmed, not hidden, so the menu reads as laid over
@@ -1378,6 +1543,16 @@ class _GameboyMenu extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 KeyedSubtree(
+                  key: rowKeys[_menuRowDial],
+                  child: _MenuRow(
+                    icon: Icons.sensors_rounded,
+                    title: 'Dial',
+                    focused: focusedRow == _menuRowDial,
+                    onTap: onDial,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                KeyedSubtree(
                   key: rowKeys[_menuRowActivity],
                   child: _MenuRow(
                     icon: Icons.notifications_rounded,
@@ -1401,6 +1576,7 @@ class _GameboyMenu extends StatelessWidget {
           ),
         ),
       ],
+      ),
     );
   }
 }

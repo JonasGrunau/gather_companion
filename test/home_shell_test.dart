@@ -21,6 +21,7 @@ import 'package:gather_companion/ui/control_bar.dart';
 import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
+import 'package:gather_companion/ui/media_check_screen.dart';
 import 'package:gather_companion/ui/settings_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
@@ -72,20 +73,66 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('a banner says so on the office, and only there', (tester) async {
+    testWidgets('a banner is one tap from the call on every tab', (tester) async {
       final state = talkingWith(['Ada Lovelace', 'Grace Hopper']);
       await tester.pumpWidget(wrap(state));
       await tester.pumpAndSettle();
-      expect(find.byType(CallBanner), findsNothing, reason: 'not over the activity tab');
 
-      await tester.tap(find.byTooltip('Office'));
-      await tester.pumpAndSettle();
+      // Dial is the home tab: the banner is there the instant the app opens into
+      // a live call, so a warp that drops you back here is never a dead end.
+      expect(find.byType(CallBanner), findsOneWidget, reason: 'over the dial tab');
       expect(find.text('In a call with Ada and Grace'), findsOneWidget);
-      expect(find.text('Tap to see everyone'), findsOneWidget);
+
+      // And on every other tab in turn — the office over its floor, the list tabs
+      // in a strip of their own.
+      for (final tab in const ['Office', 'Activity', 'Settings']) {
+        await tester.tap(find.byTooltip(tab));
+        await tester.pumpAndSettle();
+        expect(find.byType(CallBanner), findsOneWidget, reason: 'over the $tab tab');
+      }
+    });
+
+    testWidgets('on a list tab the banner reserves a strip rather than overlaying',
+        (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
+
+      // Home is Dial, a scrolling directory. The banner sits above the list, not
+      // over it: its bottom is at the list's top, so no row is ever covered.
+      final banner = tester.getRect(find.byType(CallBanner));
+      final list = tester.getRect(find.descendant(
+        of: find.byType(DialScreen),
+        matching: find.byType(CustomScrollView),
+      ));
+      expect(banner.bottom, lessThanOrEqualTo(list.top + 0.5),
+          reason: 'the directory starts below the banner, not behind it');
+    });
+
+    testWidgets('from a list tab the banner reopens the call', (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
+
+      // On Dial, not the office.
+      expect(find.byType(DialScreen), findsOneWidget);
+      await tester.tap(find.byType(CallBanner));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('a deeper screen does not carry the banner', (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
 
       await tester.tap(find.byTooltip('Settings'));
       await tester.pumpAndSettle();
-      expect(find.byType(CallBanner), findsNothing, reason: 'nor over settings');
+      expect(find.byType(CallBanner), findsOneWidget, reason: 'on the settings root');
+
+      await tester.scrollUntilVisible(find.text('Mic, camera & sound'), 120);
+      await tester.tap(find.text('Mic, camera & sound'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaCheckScreen), findsOneWidget);
+      expect(find.byType(CallBanner), findsNothing,
+          reason: 'the device check is a screen of its own, not a tab');
     });
 
     testWidgets('it sits under the title bar, over the floor, in an even margin', (tester) async {

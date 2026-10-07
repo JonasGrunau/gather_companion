@@ -1267,8 +1267,9 @@ class _Plate extends StatelessWidget {
 /// It replaced a button in the control bar, which sat among the controls as one more
 /// glyph and said nothing until pressed. A call is a state you are *in*, so it gets
 /// a sentence naming who with, where the office's own chrome stops and the floor
-/// begins. Only on the office: the call is something happening *in* the room, and
-/// the other tabs are a record and a settings page.
+/// begins. The office floats it over the floor; every other tab reserves a strip
+/// for it above the content, via [CallBannerHeader], so a live call is one tap
+/// from anywhere rather than only from the office.
 ///
 /// The dock's own fill, border and corner, and its grey for anything secondary, so
 /// the banner reads as one more piece of the same controls, which is what it is. The
@@ -1293,10 +1294,7 @@ class CallBanner extends StatelessWidget {
         final t = context.tokens;
         // The call screen's own list, so the banner and the screen it opens can
         // never disagree about who is in the call.
-        final faces = [for (final tile in _tiles(state)) if (!tile.isSelf) tile];
-        final (:title, :subtitle) = callBannerText([
-          for (final face in faces) face.label == _someone ? null : face.label,
-        ]);
+        final (:title, :subtitle) = callBannerTextFor(state);
         final fill = t.card;
 
         return Padding(
@@ -1365,6 +1363,37 @@ class CallBanner extends StatelessWidget {
 
 }
 
+/// The [CallBanner] as a tab's header: it reserves its own height at the top of a
+/// body and pushes the content below it down, rather than floating over it.
+///
+/// The office draws the banner over its floor (a call is something happening *in*
+/// the room, and the floor is allowed under it), and Gameboy mode draws its own
+/// inside the LCD. Every other tab is a list or a form that must not be covered,
+/// so there the banner takes a strip of its own. [AnimatedSize] so the content
+/// slides down when a call starts and closes back up when it ends; self-listening
+/// on [AppState] so it appears and disappears with the call wherever it is dropped
+/// in, without the host screen having to rebuild for it.
+class CallBannerHeader extends StatelessWidget {
+  const CallBannerHeader({super.key, required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: state,
+        builder: (context, _) => AnimatedSize(
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          // A zero-height, full-width box when there is no call, so the strip
+          // collapses to nothing rather than leaving a gap above the content.
+          child: state.inCall
+              ? CallBanner(state: state)
+              : const SizedBox(width: double.infinity),
+        ),
+      );
+}
+
 /// The banner's two lines, for everybody in the call — a name, or null for somebody
 /// the roster cannot name yet.
 ///
@@ -1372,7 +1401,10 @@ class CallBanner extends StatelessWidget {
 /// Grace Hopper" does not fit in it. Named people lead and the unnamed are counted,
 /// so a colleague whose row has not landed reads as "someone else" rather than as a
 /// person called Someone.
-@visibleForTesting
+///
+/// Shared production code, not test-only: Gameboy mode's own LCD banner
+/// (`gameboy_shell.dart`) titles itself from this too, so the phrasing stays in
+/// one place across both skins.
 ({String title, String subtitle}) callBannerText(List<String?> people) {
   final names = [for (final name in people) ?_firstName(name)];
   final total = people.length;
@@ -1393,6 +1425,22 @@ class CallBanner extends StatelessWidget {
   };
   return (title: title, subtitle: subtitle);
 }
+
+/// The banner line for [state], resolved from the live call's own participant
+/// tiles — the very list [CallScreen] draws — so every skin of the banner agrees
+/// with the screen it opens about who is in the call.
+///
+/// This is the one right source: [AppState.inCall] stays true for the half second
+/// a media peer outlives the roster cluster, and during that window the roster's
+/// `huddle` is empty while a tile is still present. Titling from the tiles names
+/// that peer instead of falling back to a bare "In a call"; it also maps the
+/// unnamed [_someone] placeholder to null, so an un-landed row reads as "someone"
+/// rather than as a person literally called Someone.
+({String title, String subtitle}) callBannerTextFor(AppState state) =>
+    callBannerText([
+      for (final tile in tilesFor(state))
+        if (!tile.isSelf) tile.label == _someone ? null : tile.label,
+    ]);
 
 String? _firstName(String? name) {
   if (name == null) return null;

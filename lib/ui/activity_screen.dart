@@ -47,6 +47,7 @@ import 'package:gather_client/gather_client.dart';
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
+import 'call_screen.dart';
 import 'person_avatar.dart';
 
 class ActivityScreen extends StatefulWidget {
@@ -173,8 +174,14 @@ class _ActivityScreenState extends State<ActivityScreen> with SingleTickerProvid
       ),
       // Not wrapped in a `SafeArea`: the list runs under the rail, and the
       // trailing sliver below is what lets the last row be scrolled clear of it.
-      body: Stack(
-        children: [
+      //
+      // A live call reserves a strip above the history rather than floating over
+      // it — the record stays fully readable while a call is on.
+      body: Column(children: [
+        CallBannerHeader(state: widget.state),
+        Expanded(
+          child: Stack(
+            children: [
           RefreshIndicator(
             color: t.brand,
             backgroundColor: t.card,
@@ -225,8 +232,10 @@ class _ActivityScreenState extends State<ActivityScreen> with SingleTickerProvid
               ),
             ),
           ),
-        ],
-      ),
+            ],
+          ),
+        ),
+      ]),
     );
   }
 }

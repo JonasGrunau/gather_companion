@@ -119,9 +119,14 @@ class _DialScreenState extends State<DialScreen> {
       ),
       body: SafeArea(
         top: false,
-        child: CustomScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          slivers: [
+        // A live call reserves a strip above the directory rather than floating
+        // over it — the list must stay fully readable while you place the next call.
+        child: Column(children: [
+          CallBannerHeader(state: state),
+          Expanded(
+            child: CustomScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              slivers: [
             if (recents.isNotEmpty)
               SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson)),
 
@@ -166,9 +171,11 @@ class _DialScreenState extends State<DialScreen> {
               ),
             ],
 
-            SliverToBoxAdapter(child: SizedBox(height: bottomInset + 32)),
-          ],
-        ),
+                SliverToBoxAdapter(child: SizedBox(height: bottomInset + 32)),
+              ],
+            ),
+          ),
+        ]),
       ),
     );
   }

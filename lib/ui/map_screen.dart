@@ -142,7 +142,11 @@ class _MapScreenState extends State<MapScreen> {
               // claims it, because a reconnect is the one thing the office cannot
               // show on its own — the floor looks the same whether the roster is
               // live or an hour stale.
-              child: widget.state.inCall
+              //
+              // Not in Gameboy mode: the handheld draws its own call banner inside
+              // the LCD (see `gameboy_shell.dart`), so an app-themed pill here would
+              // both double it and sit outside the screen well's pixel grammar.
+              child: widget.state.inCall && !widget.state.gameboyMode
                   ? CallBanner(key: const ValueKey('call'), state: widget.state)
                   : widget.state.link.isDisrupted
                       ? _LinkBanner(key: const ValueKey('link'), offline: widget.state.link.isOffline)

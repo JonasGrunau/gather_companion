@@ -22,6 +22,7 @@ import '../src/app_state.dart';
 import '../src/link_status.dart';
 import '../src/push.dart';
 import '../theme/gather_theme.dart';
+import 'call_screen.dart';
 import 'media_check_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -84,9 +85,15 @@ class SettingsScreen extends StatelessWidget {
       appBar: AppBar(backgroundColor: t.background, title: const Text('Settings'), titleTextStyle: Theme.of(context).textTheme.titleLarge),
       // Not a `SafeArea`: see [bottomInset] above. The list runs under the dock
       // and the padding below is what lets the last row be scrolled clear of it.
-      body: ListView(
-        padding: EdgeInsets.only(bottom: bottomInset + 24),
-        children: [
+      //
+      // A live call reserves a strip above the settings rather than floating over
+      // them — the list stays fully readable while a call is on.
+      body: Column(children: [
+        CallBannerHeader(state: state),
+        Expanded(
+          child: ListView(
+            padding: EdgeInsets.only(bottom: bottomInset + 24),
+            children: [
           const _SectionLabel('Gather'),
           _Card(
             children: [
@@ -131,8 +138,10 @@ class SettingsScreen extends StatelessWidget {
           _Card(
             children: [_Row(icon: Icons.link_off_rounded, title: 'Forget this computer', subtitle: 'Sign out of Gather.', tint: t.danger, onTap: onUnpair)],
           ),
-        ],
-      ),
+            ],
+          ),
+        ),
+      ]),
     );
   }
 }

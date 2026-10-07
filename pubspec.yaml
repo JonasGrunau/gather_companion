@@ -87,7 +87,9 @@ flutter:
     # (HERE, POWER, A/B, SELECT/START) and the Select menu. The office world and
     # the rest of the app keep the system font; this never leaves
     # `gameboy_shell.dart`. Pixelify Sans, SIL Open Font License 1.1 — a rounded
-    # pixel face with real lowercase, matching the mock's wordmark.
+    # pixel face with real lowercase, matching the mock's wordmark. The OFL
+    # requires the copyright and licence to travel with the font: the full text is
+    # filed with Flutter's LicenseRegistry in `lib/src/fonts_license.dart`.
     - family: PixelifySans
       fonts:
         - asset: assets/fonts/PixelifySans-Regular.ttf
