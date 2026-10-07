@@ -1,9 +1,9 @@
-/// LazyBeam: the office as a phone app.
+/// Warp Dial: the office as a phone app.
 ///
 /// The map answers "where is everyone"; this answers "who do I want, and where are
 /// the conversations". It is the screen for a thumb on a train — a contact list
 /// (here first, gone last), the conversations happening right now, and a rail of
-/// the people you have heard from lately — where a tap beams you next to them and
+/// the people you have heard from lately — where a tap warps you next to them and
 /// opens the call, with none of the panning the office asks for.
 ///
 /// ## Why it reads the directory, not the map
@@ -30,32 +30,32 @@ import '../theme/gather_theme.dart';
 import 'call_screen.dart';
 import 'person_avatar.dart';
 
-class BeamScreen extends StatefulWidget {
-  const BeamScreen({super.key, required this.state});
+class DialScreen extends StatefulWidget {
+  const DialScreen({super.key, required this.state});
 
   final AppState state;
 
   @override
-  State<BeamScreen> createState() => _BeamScreenState();
+  State<DialScreen> createState() => _DialScreenState();
 }
 
-class _BeamScreenState extends State<BeamScreen> {
-  /// The person or meeting a beam is in flight for, keyed by contact id or
+class _DialScreenState extends State<DialScreen> {
+  /// The person or meeting a warp is in flight for, keyed by contact id or
   /// cluster id, so its tile can show a spinner while the hop and the mic settle.
-  /// One at a time — a second tap mid-beam is ignored rather than queued.
-  String? _beaming;
+  /// One at a time — a second tap mid-warp is ignored rather than queued.
+  String? _warping;
 
   AppState get state => widget.state;
 
-  /// Beams, then opens the faces on success. The sentence a refusal returns is
+  /// Warps, then opens the faces on success. The sentence a refusal returns is
   /// shown here rather than swallowed; the async refusals Gather pushes later
   /// arrive on [AppState.notices], which the office surfaces.
   Future<void> _run(String key, Future<String?> Function() action) async {
-    if (_beaming != null) return;
-    setState(() => _beaming = key);
+    if (_warping != null) return;
+    setState(() => _warping = key);
     final failed = await action();
     if (!mounted) return;
-    setState(() => _beaming = null);
+    setState(() => _warping = null);
     if (failed != null) {
       _say(failed);
       return;
@@ -92,7 +92,7 @@ class _BeamScreenState extends State<BeamScreen> {
       backgroundColor: t.background,
       appBar: AppBar(
         backgroundColor: t.background,
-        title: Text(state.spaceName ?? 'Beam'),
+        title: Text(state.spaceName ?? 'Dial'),
         titleTextStyle: Theme.of(context).textTheme.titleLarge,
       ),
       body: SafeArea(
@@ -101,7 +101,7 @@ class _BeamScreenState extends State<BeamScreen> {
           physics: const AlwaysScrollableScrollPhysics(),
           slivers: [
             if (recents.isNotEmpty)
-              SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _beamToPerson)),
+              SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson)),
 
             if (meetings.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Happening now')),
@@ -110,8 +110,8 @@ class _BeamScreenState extends State<BeamScreen> {
                 itemBuilder: (context, i) => _MeetingCard(
                   state: state,
                   meeting: meetings[i],
-                  busy: _beaming == meetings[i].clusterId,
-                  onTap: () => _run(meetings[i].clusterId, () => state.beamToMeeting(meetings[i])),
+                  busy: _warping == meetings[i].clusterId,
+                  onTap: () => _run(meetings[i].clusterId, () => state.warpToMeeting(meetings[i])),
                 ),
               ),
             ],
@@ -125,8 +125,8 @@ class _BeamScreenState extends State<BeamScreen> {
                 itemBuilder: (context, i) => _ContactTile(
                   state: state,
                   contact: present[i],
-                  busy: _beaming == present[i].id,
-                  onTap: () => _beamToPerson(present[i]),
+                  busy: _warping == present[i].id,
+                  onTap: () => _warpToPerson(present[i]),
                 ),
               ),
 
@@ -145,7 +145,7 @@ class _BeamScreenState extends State<BeamScreen> {
     );
   }
 
-  void _beamToPerson(Contact contact) => _run(contact.id, () => state.beamToPerson(contact));
+  void _warpToPerson(Contact contact) => _run(contact.id, () => state.warpToPerson(contact));
 
   /// The people behind the most recent activity, newest first and deduplicated —
   /// a "recent calls" rail. Capped, because this is a glance and not the history
@@ -321,7 +321,7 @@ class _FacePile extends StatelessWidget {
   }
 }
 
-/// One person in the directory. Tappable to beam while they are here; dimmed and
+/// One person in the directory. Tappable to warp while they are here; dimmed and
 /// inert while they are not.
 class _ContactTile extends StatelessWidget {
   const _ContactTile({required this.state, required this.contact, required this.busy, required this.onTap});
@@ -377,7 +377,7 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              if (present) _JoinButton(busy: busy, label: 'Beam', icon: Icons.call_rounded),
+              if (present) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
           ),
         ),
@@ -386,7 +386,7 @@ class _ContactTile extends StatelessWidget {
   }
 }
 
-/// The call-to-action on a row: a filled pill that spins while its beam settles.
+/// The call-to-action on a row: a filled pill that spins while its warp settles.
 class _JoinButton extends StatelessWidget {
   const _JoinButton({required this.busy, required this.label, this.icon});
 

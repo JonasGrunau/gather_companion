@@ -1,6 +1,6 @@
 /// Who you can reach, and the conversations already happening.
 ///
-/// These are LazyBeam's view-models — the Beam tab is a phone-app over the same
+/// These are Warp Dial's view-models — the Dial tab is a phone-app over the same
 /// roster the map draws, so it wants the *whole* office, including the people who
 /// are offline, rather than only those with somewhere to draw them.
 ///
@@ -8,7 +8,7 @@
 /// needs coordinates and nothing else; `PlayerRef` carries who somebody is *to
 /// you* (following, talking) and drops positions on principle. The directory wants
 /// a third thing — a contact card: a name, whether they are here, and enough of a
-/// position to beam next to them if they are. A [Contact] built from a
+/// position to warp next to them if they are. A [Contact] built from a
 /// [RosterRow] is exactly that and no more.
 library;
 
@@ -77,7 +77,7 @@ class Contact {
   /// The line under their name, if Gather holds one that has not expired.
   final PersonStatus? status;
 
-  /// Whether there is somewhere to beam to: present, and with a finite position.
+  /// Whether there is somewhere to warp to: present, and with a finite position.
   bool get isReachable => isPresent && x != null && y != null && x!.isFinite && y!.isFinite;
 }
 

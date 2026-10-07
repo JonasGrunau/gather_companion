@@ -192,9 +192,9 @@ class AppState extends ChangeNotifier {
     return list;
   }
 
-  // ---- the directory (LazyBeam) ----------------------------------------------
+  // ---- the directory (Warp Dial) ---------------------------------------------
   //
-  // The Beam tab is a phone-app over the roster: a contact list and the
+  // The Dial tab is a phone-app over the roster: a contact list and the
   // conversations already happening, each a tap away from being teleported into.
   // It reads [_roster] directly for the same reason `peopleOnMap` does — the map's
   // digest drops positions and the offline, and this screen wants both: everyone
@@ -1284,21 +1284,21 @@ class AppState extends ChangeNotifier {
     _positions.tick();
   }
 
-  // ---- beaming (LazyBeam) -----------------------------------------------------
+  // ---- warping (Warp Dial) ----------------------------------------------------
   //
   // The commuting surface moves you without you watching the map. Where [goTo]
   // walks when it can — because on the office screen the walk *is* the point — a
-  // beam always hops: the Beam tab is for arriving, not travelling, and a thumb on
+  // warp always hops: the Dial tab is for arriving, not travelling, and a thumb on
   // a train has no patience for a camera gliding across the floor.
 
   /// Teleport to a free tile at or beside ([x], [y]) — always a hop.
   ///
   /// The landing rule is [goTo]'s: a tile that cannot be stood on, or one somebody
   /// is on, is relocated to the nearest free one rather than refused — which is
-  /// what makes "beam to a person" land you *next* to them, since their own tile is
+  /// what makes "warp to a person" land you *next* to them, since their own tile is
   /// taken. Unlike [goTo] there is no route search: this is the teleport branch of
   /// [_travelTo] on its own.
-  Future<String?> beamToTile(int x, int y) async {
+  Future<String?> warpToTile(int x, int y) async {
     final map = this.map;
     final collector = _collector;
     if (map == null) return 'Still reading the floor plan.';
@@ -1336,23 +1336,23 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  /// Beam next to a person and open your microphone — LazyBeam's "call".
+  /// Warp next to a person and open your microphone — Warp Dial's "call".
   ///
-  /// Aimed at their own tile so [beamToTile]'s relocation lands you adjacent;
+  /// Aimed at their own tile so [warpToTile]'s relocation lands you adjacent;
   /// proximity is then Gather's to notice, and the roster that follows drives
   /// [_noteCluster], which wires the audio. The mic is turned on here because a
   /// phone call connects the microphone rather than merely placing you in earshot —
   /// but it is best-effort: a denied permission is news on [notices], not a reason
-  /// to report the beam itself as having failed (which would stop the UI opening
+  /// to report the warp itself as having failed (which would stop the UI opening
   /// the call).
-  Future<String?> beamToPerson(Contact contact) async {
+  Future<String?> warpToPerson(Contact contact) async {
     if (!contact.isPresent) return '${contact.label} is not in the office right now.';
     final x = contact.x, y = contact.y;
     if (x == null || y == null || !x.isFinite || !y.isFinite) {
       return "Can't tell where ${contact.label} is yet.";
     }
 
-    final failed = await beamToTile(x.round(), y.round());
+    final failed = await warpToTile(x.round(), y.round());
     if (failed != null) return failed;
 
     final micFailed = await setMicOn(true);
@@ -1365,9 +1365,9 @@ class AppState extends ChangeNotifier {
   /// A conversation I am already in needs no travel. Otherwise, when the cluster
   /// sits in a named room I can resolve, I *walk in* with [goToRoom] — which lands
   /// on a seat and respects a shut door the way entering a meeting should — and
-  /// fall back to beaming beside a member when there is no room to name. Mic is
-  /// handled as in [beamToPerson].
-  Future<String?> beamToMeeting(Meeting meeting) async {
+  /// fall back to warping beside a member when there is no room to name. Mic is
+  /// handled as in [warpToPerson].
+  Future<String?> warpToMeeting(Meeting meeting) async {
     if (meeting.includesMe) return null;
 
     final map = this.map;
@@ -1389,7 +1389,7 @@ class AppState extends ChangeNotifier {
     for (final member in meeting.members) {
       final x = member.x, y = member.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      final failed = await beamToTile(x.round(), y.round());
+      final failed = await warpToTile(x.round(), y.round());
       if (failed != null) return failed;
       final micFailed = await setMicOn(true);
       if (micFailed != null) _notices.add(micFailed);

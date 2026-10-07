@@ -1,11 +1,11 @@
-/// LazyBeam's data layer: the directory, the conversations, and the beam.
+/// Warp Dial's data layer: the directory, the conversations, and the warp.
 ///
-/// These assert the three things the Beam tab is built on, all off a crafted
+/// These assert the three things the Dial tab is built on, all off a crafted
 /// roster fed through [AppState.debugApplyRoster] — the same path the live socket
 /// drives: that the contact list sorts the people who are here above the people who
 /// are not, that a cluster of two or more becomes a joinable meeting (and a
 /// singleton does not), that a conversation sitting in a named room is named by it,
-/// and that beaming to a person hops the avatar and leaves the offline unreachable.
+/// and that warping to a person hops the avatar and leaves the offline unreachable.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -137,7 +137,7 @@ void main() {
     });
   });
 
-  group('beamToPerson', () {
+  group('warpToPerson', () {
     ({AppState state, FakeCollector collector}) wired(List<RosterRow> rows) {
       final collector = FakeCollector();
       final state = AppState()
@@ -155,10 +155,10 @@ void main() {
 
       final before = collector.teleports.length;
       final ada = state.directory.firstWhere((c) => c.id == 'a');
-      final failed = await state.beamToPerson(ada);
+      final failed = await state.warpToPerson(ada);
 
       expect(failed, isNull);
-      expect(collector.teleports.length, before + 1, reason: 'a beam is a teleport');
+      expect(collector.teleports.length, before + 1, reason: 'a warp is a teleport');
     });
 
     test('refuses an offline person and sends nothing', () async {
@@ -168,7 +168,7 @@ void main() {
       ]);
 
       final ada = state.directory.firstWhere((c) => c.id == 'a');
-      final failed = await state.beamToPerson(ada);
+      final failed = await state.warpToPerson(ada);
 
       expect(failed, contains('not in the office'));
       expect(collector.teleports, isEmpty);
@@ -182,7 +182,7 @@ void main() {
       state.debugApplyLink(const LinkStatus(LinkState.offline));
 
       final ada = state.directory.firstWhere((c) => c.id == 'a');
-      final failed = await state.beamToPerson(ada);
+      final failed = await state.warpToPerson(ada);
 
       expect(failed, contains('No connection'));
       expect(collector.teleports, isEmpty);

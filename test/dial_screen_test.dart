@@ -1,9 +1,9 @@
-/// The Beam tab, at the widget level: that it shows the office as a directory with
+/// The Dial tab, at the widget level: that it shows the office as a directory with
 /// the people who are here above the people who are not, draws a card for a
-/// conversation already happening, and offers a beam only against someone it can
+/// conversation already happening, and offers a warp only against someone it can
 /// reach.
 ///
-/// The beam *action* — the teleport, the auto-mic, the offline refusal — is
+/// The warp *action* — the teleport, the auto-mic, the offline refusal — is
 /// asserted in `directory_test.dart`, where it needs no navigator; this is about
 /// what the screen puts on the glass.
 library;
@@ -15,7 +15,7 @@ import 'package:gather_companion/harness/harness_data.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
-import 'package:gather_companion/ui/beam_screen.dart';
+import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
 void main() {
@@ -66,7 +66,7 @@ void main() {
         theme: buildGatherTheme(),
         home: ListenableBuilder(
           listenable: state,
-          builder: (context, _) => BeamScreen(state: state),
+          builder: (context, _) => DialScreen(state: state),
         ),
       );
 
@@ -102,13 +102,13 @@ void main() {
     expect(find.text('Join'), findsOneWidget);
   });
 
-  testWidgets('offers a beam only against the reachable', (tester) async {
+  testWidgets('offers a warp only against the reachable', (tester) async {
     final state = peopled();
     addTearDown(state.dispose);
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    // Ada, Bob and Zoe are here; Xander is not. One beam each for the present.
-    expect(find.text('Beam'), findsNWidgets(3));
+    // Ada, Bob and Zoe are here; Xander is not. One warp each for the present.
+    expect(find.text('Warp'), findsNWidgets(3));
   });
 }
