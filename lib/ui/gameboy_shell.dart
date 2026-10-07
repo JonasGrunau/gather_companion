@@ -1043,23 +1043,25 @@ class _Screen extends StatelessWidget {
                           ),
                           // Shown only when somebody is in call distance (Gather's
                           // cluster) — the handheld's answer to "wave at someone".
-                          // Floated over the office at the foot of the LCD rather
-                          // than given a row of its own. Stands down while a toast is
+                          // Floated over the *top* of the office, not the foot: the
+                          // map's own selected-person card and legend live at the
+                          // bottom of the LCD, so a prompt down there landed on top of
+                          // the card you had just tapped. Stands down while a toast is
                           // up: the two share this slot and never show at once. Held
                           // down under the Select menu like the call banner.
                           if (menu == null && onWave != null && toast == null)
                             Positioned(
                               left: 0,
                               right: 0,
-                              bottom: 6,
+                              top: 6,
                               child: _LcdWavePrompt(state: state, onWave: onWave!),
                             ),
-                          // The handheld's snackbar, in the same slot, fading in and
-                          // out over the office.
+                          // The handheld's snackbar, in the same top slot, fading in
+                          // and out over the office.
                           Positioned(
                             left: 8,
                             right: 8,
-                            bottom: 6,
+                            top: 6,
                             child: AnimatedSwitcher(
                               duration: const Duration(milliseconds: 160),
                               child: toast == null
