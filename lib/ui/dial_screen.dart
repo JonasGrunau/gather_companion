@@ -26,6 +26,9 @@
 /// because a stranger took a step.
 library;
 
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
 import '../src/app_state.dart';
@@ -35,19 +38,33 @@ import 'call_screen.dart';
 import 'person_avatar.dart';
 
 class DialScreen extends StatefulWidget {
-  const DialScreen({super.key, required this.state});
+  const DialScreen({super.key, required this.state, this.visible = true});
 
   final AppState state;
+
+  /// Whether this tab is the one on screen. The shell flips it on every tab
+  /// switch (home_shell `_bodyFor`), and the app-bar subtitle warps itself back
+  /// in each time it turns true — the Dial tab announcing itself on arrival.
+  /// Defaults to true so the screen plays the flourish once when stood up alone.
+  final bool visible;
 
   @override
   State<DialScreen> createState() => _DialScreenState();
 }
 
-class _DialScreenState extends State<DialScreen> {
+class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateMixin {
   /// The person or meeting a warp is in flight for, keyed by contact id or
   /// cluster id, so its tile can show a spinner while the hop and the mic settle.
   /// One at a time — a second tap mid-warp is ignored rather than queued.
   String? _warping;
+
+  /// Drives the subtitle's warp-in. Restarted whenever the tab becomes visible,
+  /// which is free to tick exactly then: the shell wraps each tab in a
+  /// `TickerMode` that enables in the same frame the tab is selected.
+  late final AnimationController _warp = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 650),
+  );
 
   AppState get state => widget.state;
 
@@ -57,11 +74,20 @@ class _DialScreenState extends State<DialScreen> {
     // The shell's own [ListenableBuilder] misses availability and cluster changes;
     // this is the signal that carries them. See the library comment.
     state.directoryChanges.addListener(_onDirectoryChanged);
+    if (widget.visible) _warp.forward(from: 0);
+  }
+
+  @override
+  void didUpdateWidget(DialScreen old) {
+    super.didUpdateWidget(old);
+    // Each return to the tab replays the flourish; leaving it does nothing.
+    if (widget.visible && !old.visible) _warp.forward(from: 0);
   }
 
   @override
   void dispose() {
     state.directoryChanges.removeListener(_onDirectoryChanged);
+    _warp.dispose();
     super.dispose();
   }
 
@@ -114,7 +140,7 @@ class _DialScreenState extends State<DialScreen> {
       backgroundColor: t.background,
       appBar: AppBar(
         backgroundColor: t.background,
-        title: Text(state.spaceName ?? 'Dial'),
+        title: _Title(space: state.spaceName, warp: _warp),
         titleTextStyle: Theme.of(context).textTheme.titleLarge,
       ),
       body: SafeArea(
@@ -492,6 +518,167 @@ class _Empty extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.fromLTRB(kTextGutter, 8, kTextGutter, 24),
       child: Text(message, style: TextStyle(color: t.mutedForeground, height: 1.5)),
+    );
+  }
+}
+
+/// The app-bar title: the space name, with the tab's own codename — "warp dial" —
+/// warping in small beside it. The codename is the only place the name surfaces;
+/// everywhere else the tab is just the bolt and "Warp".
+///
+/// When there is no space name yet the codename stands alone rather than sitting
+/// beside the bare "Dial" fallback — two names for one tab reads as a bug.
+class _Title extends StatelessWidget {
+  const _Title({required this.space, required this.warp});
+
+  final String? space;
+  final Animation<double> warp;
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = _WarpCodename(warp: warp);
+    if (space == null) return subtitle;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Flexible(child: Text(space!, maxLines: 1, overflow: TextOverflow.ellipsis)),
+        const SizedBox(width: 10),
+        subtitle,
+      ],
+    );
+  }
+}
+
+/// The codename arriving on a lightning strike. A bolt flashes in ahead of the
+/// words — electric blue-white, haloed in glow, strobing and shivering with the
+/// current — and the codename streaks out of it. Over the first fraction of the
+/// animation the strike decays: the glow dies, the flicker stills, the bolt cools
+/// from electric to the quiet brand colour it wears on the nav tab. Spectacle on
+/// arrival, a calm tag once landed.
+class _WarpCodename extends StatelessWidget {
+  const _WarpCodename({required this.warp});
+
+  final Animation<double> warp;
+
+  /// The hot blue-white of the strike, before it cools to the brand bolt.
+  static const _electric = Color(0xFFEAF0FF);
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return AnimatedBuilder(
+      animation: warp,
+      builder: (context, _) {
+        final p = warp.value;
+        // The strike itself: a fast-decaying envelope over the first ~45% that
+        // the glow, the flicker and the shiver all ride. After it, the bolt is
+        // just a quiet glyph.
+        final strike = 1 - Curves.easeOutCubic.transform((p / 0.45).clamp(0.0, 1.0));
+        // Lightning flicker — a strobe that only reads while the strike is hot.
+        final flicker = 0.55 + 0.45 * math.sin(p * 46);
+        final glow = (strike * (0.7 + 0.3 * flicker)).clamp(0.0, 1.0);
+        // Pops in with a hair of overshoot, then swells while the current is hot
+        // and shrinks back to its resting size — the bolt flaring on the strike.
+        final boltScale = ui.lerpDouble(0.3, 1.0, Curves.easeOutBack.transform(p))! * (1 + 0.55 * strike);
+        final shiver = math.sin(p * 38) * 0.11 * strike;
+        final boltColor = Color.lerp(_electric, t.brand, Curves.easeOut.transform(p))!;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Transform.rotate(
+              angle: shiver,
+              child: Transform.scale(
+                scale: boltScale,
+                child: Icon(
+                  Icons.bolt,
+                  size: 17,
+                  color: boltColor,
+                  // Two haloes — a tight hot core and a wide electric bloom — so
+                  // the strike flares rather than merely tints.
+                  shadows: [
+                    Shadow(color: _electric.withValues(alpha: glow), blurRadius: 10 * glow),
+                    Shadow(color: t.brand.withValues(alpha: 0.8 * glow), blurRadius: 28 * glow),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 1),
+            _WarpIn(warp: warp, child: const _Codename()),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// The codename itself, styled as a quiet tag. Pulled out so [_WarpIn] animates a
+/// const child — only the transform rebuilds each frame, not the text.
+class _Codename extends StatelessWidget {
+  const _Codename();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Text(
+      'warp dial',
+      style: TextStyle(
+        color: t.mutedForeground,
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 0.6,
+      ),
+    );
+  }
+}
+
+/// A warp-in: the codename drops out of hyperspace. It arrives over-stretched
+/// along its travel and smeared by a horizontal motion blur — a light-speed
+/// streak — then the stretch collapses past itself with a spring and the blur
+/// resolves to crisp type as it lands, sliding the last few pixels into place
+/// from the word it sits beside. The blur is what sells it as a *warp* rather
+/// than a zoom; the overshoot is the snap of arrival.
+class _WarpIn extends StatelessWidget {
+  const _WarpIn({required this.warp, required this.child});
+
+  final Animation<double> warp;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: warp,
+      child: child,
+      builder: (context, child) {
+        final t = warp.value;
+        // The spring that lands the stretch; easeOutBack overshoots past 1,
+        // which here reads as the type compressing a hair under full width
+        // before settling — the snap.
+        final land = Curves.easeOutBack.transform(t);
+        // Stretched wide along travel at launch, collapsing to 1.0 as it lands.
+        final scaleX = ui.lerpDouble(2.6, 1.0, land)!;
+        // Motion smear, heaviest at launch, gone by the time it's crisp.
+        final blur = (1 - Curves.easeOutCubic.transform(t)) * 7.0;
+        // Trails in from the left over the first half, then holds.
+        final dx = (1 - Curves.easeOutCubic.transform(t)) * 16.0;
+        // Fades up fast so the streak is visible rather than popping in solid.
+        final op = (t * 1.8).clamp(0.0, 1.0);
+        return Opacity(
+          opacity: op,
+          child: Transform.translate(
+            offset: Offset(dx, 0),
+            child: Transform.scale(
+              scaleX: scaleX,
+              alignment: Alignment.centerLeft,
+              child: ImageFiltered(
+                enabled: blur > 0.05,
+                imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: 0, tileMode: TileMode.decal),
+                child: child,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
