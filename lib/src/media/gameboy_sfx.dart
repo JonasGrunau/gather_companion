@@ -229,11 +229,6 @@ class GameboySfx {
   AudioPlayer? _player;
   final _cache = <GbSound, Uint8List>{};
 
-  /// Which route the player's context currently carries, or null before any
-  /// context is applied. Guards against reconfiguring the session once a call
-  /// owns it: see [_contextFor].
-  bool? _appliedSpeaker;
-
   /// Serialises stop/play (and the one-time context set) so two fast presses
   /// cannot interleave — without this, concurrent calls can reorder a `stop()`
   /// past the `play()` it was meant to precede.
@@ -310,13 +305,17 @@ class GameboySfx {
 
   Future<AudioPlayer> _ensurePlayer({required bool inCall}) async {
     final player = _player ??= await _createPlayer();
-    // Idle is the only time it is safe to (re)configure the shared session; in a
-    // call we ride whatever the call set. On first ever use mid-call, _createPlayer
-    // has already applied the call-safe context once.
-    final wantSpeaker = !inCall;
-    if (!inCall && _appliedSpeaker != wantSpeaker) {
-      await player.setAudioContext(wantSpeaker ? _speakerContext : _callSafeContext);
-      _appliedSpeaker = wantSpeaker;
+    // Idle is the only time it is safe to (re)configure the shared session, and
+    // the only time we know enough to: the process-global `AVAudioSession` can be
+    // re-routed out from under us by the call or the media check, so a cached flag
+    // cannot prove the current route. We therefore reassert the speaker context on
+    // every idle play rather than trusting `_appliedSpeaker` — reconfiguring is
+    // safe while no call owns the session, and otherwise a blip after a call would
+    // be stuck on the earpiece/prior route. In a call we ride whatever the call
+    // set and never reconfigure; first-ever mid-call use already seeded the
+    // call-safe context in _createPlayer.
+    if (!inCall) {
+      await player.setAudioContext(_speakerContext);
     }
     return player;
   }
@@ -328,7 +327,6 @@ class GameboySfx {
     // it lands mid-call — never forces a route. Idle playback upgrades to the
     // speaker route in _ensurePlayer.
     await player.setAudioContext(_callSafeContext);
-    _appliedSpeaker = false;
     return player;
   }
 
@@ -337,7 +335,6 @@ class GameboySfx {
   Future<void> dispose() async {
     await _player?.dispose();
     _player = null;
-    _appliedSpeaker = null;
     _queue = Future<void>.value();
     _cache.clear();
   }

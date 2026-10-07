@@ -222,11 +222,14 @@ class _GameboyShellState extends State<GameboyShell> {
     _sfx(_menuOpen ? GbSound.open : GbSound.back);
   }
 
-  void _closeMenu() {
+  void _closeMenu({bool silent = false}) {
     if (!_menuOpen) return;
     HapticFeedback.selectionClick();
     setState(() => _menuOpen = false);
-    _sfx(GbSound.back);
+    // The A-button confirm path closes silently: its own `confirm` cue is the
+    // sound for that press, and the serial player would cut it off if `back`
+    // were queued right behind it.
+    if (!silent) _sfx(GbSound.back);
   }
 
   /// One D-pad step while the menu is open. Up/Down walk the rows; Left/Right move
@@ -302,6 +305,10 @@ class _GameboyShellState extends State<GameboyShell> {
 
   /// A press of the A button while the menu is open: do whatever the cursor is on.
   void _confirm() {
+    // Close first and silently, so each dispatched `_do…` sees the menu already
+    // shut and its own `_closeMenu()` no-ops instead of queueing `back` behind —
+    // and the serial player cannot cut the confirm cue off.
+    _closeMenu(silent: true);
     _sfx(GbSound.confirm);
     switch (_row) {
       case _menuRowStatus:
