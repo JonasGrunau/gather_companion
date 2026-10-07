@@ -217,6 +217,11 @@ Uint8List _wrapWav(Int16List samples) {
 /// already applied and do **not** reconfigure. All of it rides `mixWithOthers`,
 /// on this player only, so the blip sounds alongside a call and is never fed into
 /// the WebRTC mic track.
+///
+/// To keep even the *first* blip off the call's session, [prewarm] builds the
+/// player and pins its context when Gameboy mode (or the sound-effects switch) is
+/// turned on — an idle moment — so by the time a call is up there is nothing left
+/// to configure.
 class GameboySfx {
   GameboySfx._();
   static final GameboySfx instance = GameboySfx._();
@@ -275,6 +280,19 @@ class GameboySfx {
     // every sound after it.
     _queue = op.catchError((_) {});
     return op;
+  }
+
+  /// Builds the player and pins its audio context **now**, so the first blip
+  /// during a later call never has to call `setAudioContext` on the session the
+  /// call owns. Meant to be called at an idle moment — when Gameboy mode or the
+  /// sound-effects switch is turned on — where reconfiguring the session is free;
+  /// pass the current [inCall] so a warm-up that does land mid-call still picks
+  /// the call-safe, no-route context. Serialised with [play] and idempotent once
+  /// warmed, so calling it more than once is harmless.
+  Future<void> prewarm({required bool inCall}) {
+    final op = _queue.then((_) => _ensurePlayer(inCall: inCall));
+    _queue = op.then((_) {}).catchError((_) {});
+    return _queue;
   }
 
   Future<void> _playNow(GbSound sound, {required bool inCall}) async {
