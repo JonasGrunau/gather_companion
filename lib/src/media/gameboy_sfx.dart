@@ -204,13 +204,19 @@ Uint8List _wrapWav(Int16List samples) {
 /// never fed into the WebRTC mic track, so the Gather backend and anyone else on
 /// a call never hear them — including the mute cue. They are a cue for *you*.
 ///
-/// **Why `mixWithOthers` and no route or global context** (see `lib/ui/AGENTS.md`
-/// and `media_check_screen.dart`'s `_deviceToneContext`): on iOS, reconfiguring
-/// the shared `AVAudioSession` — which `AudioPlayer.global.setAudioContext` or a
-/// forced `defaultToSpeaker` would do — thrashes the voice-processing unit a live
-/// call owns and can freeze the screen. So the context is set **once on this
-/// player only**, as `playAndRecord` + `mixWithOthers`, forcing no route: the
-/// blip plays alongside a call instead of wrestling the session from it.
+/// **Route is chosen by call state, and never re-chosen mid-call** (see
+/// `lib/ui/AGENTS.md` and `media_check_screen.dart`'s `_deviceToneContext`): on
+/// iOS the `AVAudioSession` is process-global, so the one thing that must never
+/// happen is a *category or route change* while a call owns it — that flaps the
+/// voice-processing unit (the device-syslog freeze AGENTS.md documents came from
+/// hundreds of such changes a second). So, **idle** (no call holding the
+/// session), the context is set to `playAndRecord` + `mixWithOthers` +
+/// `defaultToSpeaker`, which actually puts the blip out the loudspeaker rather
+/// than the earpiece `playAndRecord` would otherwise pick. **In a call**, the
+/// session is left exactly as the call set it: we play on whatever context is
+/// already applied and do **not** reconfigure. All of it rides `mixWithOthers`,
+/// on this player only, so the blip sounds alongside a call and is never fed into
+/// the WebRTC mic track.
 class GameboySfx {
   GameboySfx._();
   static final GameboySfx instance = GameboySfx._();
@@ -218,30 +224,62 @@ class GameboySfx {
   AudioPlayer? _player;
   final _cache = <GbSound, Uint8List>{};
 
-  /// Set on the player once, then left alone. No `defaultToSpeaker` — forcing a
-  /// route is exactly the session reconfiguration a live call cannot take.
-  static final AudioContext _context = AudioContext(
-    iOS: AudioContextIOS(
-      category: AVAudioSessionCategory.playAndRecord,
-      options: {
-        AVAudioSessionOptions.mixWithOthers,
-        AVAudioSessionOptions.allowBluetooth,
-      },
-    ),
-    android: const AudioContextAndroid(
-      contentType: AndroidContentType.sonification,
-      usageType: AndroidUsageType.assistanceSonification,
-      audioFocus: AndroidAudioFocus.gainTransientMayDuck,
-    ),
-  );
+  /// Which route the player's context currently carries, or null before any
+  /// context is applied. Guards against reconfiguring the session once a call
+  /// owns it: see [_contextFor].
+  bool? _appliedSpeaker;
+
+  /// Serialises stop/play (and the one-time context set) so two fast presses
+  /// cannot interleave — without this, concurrent calls can reorder a `stop()`
+  /// past the `play()` it was meant to precede.
+  Future<void> _queue = Future<void>.value();
+
+  /// Idle: force the loudspeaker. Safe because no call holds the session, and
+  /// `playAndRecord` alone would route a blip to the earpiece.
+  static final AudioContext _speakerContext = _contextWith(speaker: true);
+
+  /// In a call: no forced route. Set only if the player has never been
+  /// configured; once a call owns the session we ride whatever it chose.
+  static final AudioContext _callSafeContext = _contextWith(speaker: false);
+
+  static AudioContext _contextWith({required bool speaker}) => AudioContext(
+        iOS: AudioContextIOS(
+          category: AVAudioSessionCategory.playAndRecord,
+          options: {
+            AVAudioSessionOptions.mixWithOthers,
+            AVAudioSessionOptions.allowBluetooth,
+            if (speaker) AVAudioSessionOptions.defaultToSpeaker,
+          },
+        ),
+        android: const AudioContextAndroid(
+          contentType: AndroidContentType.sonification,
+          usageType: AndroidUsageType.assistanceSonification,
+          audioFocus: AndroidAudioFocus.gainTransientMayDuck,
+        ),
+      );
 
   /// Sound [sound], unless [enabled] is false (the Sound effects setting is off),
-  /// in which case this is a no-op. Best-effort: a failed blip is logged and
-  /// swallowed so it can never break the interaction it accompanies.
-  Future<void> play(GbSound sound, {required bool enabled}) async {
+  /// in which case this is a no-op. [inCall] is the caller's live call state: it
+  /// picks the speaker route when idle and, crucially, suppresses any session
+  /// reconfiguration while a call holds the shared audio session. Best-effort: a
+  /// failed blip is logged and swallowed so it can never break the interaction it
+  /// accompanies. Calls are serialised, so rapid presses cannot interleave.
+  Future<void> play(
+    GbSound sound, {
+    required bool enabled,
+    required bool inCall,
+  }) async {
     if (!enabled) return;
+    final op = _queue.then((_) => _playNow(sound, inCall: inCall));
+    // Keep the chain alive even when a blip throws, so one failure does not wedge
+    // every sound after it.
+    _queue = op.catchError((_) {});
+    return op;
+  }
+
+  Future<void> _playNow(GbSound sound, {required bool inCall}) async {
     try {
-      final player = await _ensurePlayer();
+      final player = await _ensurePlayer(inCall: inCall);
       final bytes = _cache[sound] ??= gbSoundWav(sound);
       // Stop any still-ringing blip first: presses come faster than a note's
       // tail, and restarting is snappier than letting them queue.
@@ -252,13 +290,28 @@ class GameboySfx {
     }
   }
 
-  Future<AudioPlayer> _ensurePlayer() async {
-    final existing = _player;
-    if (existing != null) return existing;
+  Future<AudioPlayer> _ensurePlayer({required bool inCall}) async {
+    final player = _player ??= await _createPlayer();
+    // Idle is the only time it is safe to (re)configure the shared session; in a
+    // call we ride whatever the call set. On first ever use mid-call, _createPlayer
+    // has already applied the call-safe context once.
+    final wantSpeaker = !inCall;
+    if (!inCall && _appliedSpeaker != wantSpeaker) {
+      await player.setAudioContext(wantSpeaker ? _speakerContext : _callSafeContext);
+      _appliedSpeaker = wantSpeaker;
+    }
+    return player;
+  }
+
+  Future<AudioPlayer> _createPlayer() async {
     final player = AudioPlayer();
     await player.setReleaseMode(ReleaseMode.stop);
-    await player.setAudioContext(_context);
-    return _player = player;
+    // Seed with the call-safe (no-route) context so the very first blip — even if
+    // it lands mid-call — never forces a route. Idle playback upgrades to the
+    // speaker route in _ensurePlayer.
+    await player.setAudioContext(_callSafeContext);
+    _appliedSpeaker = false;
+    return player;
   }
 
   /// For tests and teardown; the app itself keeps the one player for its life.
@@ -266,6 +319,8 @@ class GameboySfx {
   Future<void> dispose() async {
     await _player?.dispose();
     _player = null;
+    _appliedSpeaker = null;
+    _queue = Future<void>.value();
     _cache.clear();
   }
 }

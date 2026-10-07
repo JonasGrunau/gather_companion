@@ -200,7 +200,8 @@ class _GameboyShellState extends State<GameboyShell> {
 
   /// One blip, in the handheld's voice, unless the sound-effects switch is off.
   /// Rides alongside the haptic the controls already give, never replacing it.
-  void _sfx(GbSound sound) => GameboySfx.instance.play(sound, enabled: widget.state.soundEffects);
+  void _sfx(GbSound sound) => GameboySfx.instance
+      .play(sound, enabled: widget.state.soundEffects, inCall: widget.state.inCall);
 
   void _toggleMenu() {
     HapticFeedback.selectionClick();
@@ -886,7 +887,8 @@ class _ControlsDeck extends StatelessWidget {
   final VoidCallback onMenuToggle;
 
   /// One blip, in the handheld's voice, unless the sound-effects switch is off.
-  void _sfx(GbSound sound) => GameboySfx.instance.play(sound, enabled: state.soundEffects);
+  void _sfx(GbSound sound) =>
+      GameboySfx.instance.play(sound, enabled: state.soundEffects, inCall: state.inCall);
 
   /// Puts a refusal in front of the person, the app's one existing way: an action
   /// returns null on success or a sentence to show. The messenger is captured

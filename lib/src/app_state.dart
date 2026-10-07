@@ -551,7 +551,9 @@ class AppState extends ChangeNotifier {
     // The power-on jingle, on the off→on flip only — switching the handheld on is
     // the one moment it earns a boot chime; a rebuild or a restore into the mode
     // must stay silent. Gated by the sound-effects switch like every other blip.
-    if (on) GameboySfx.instance.play(GbSound.boot, enabled: _soundEffects);
+    if (on) {
+      GameboySfx.instance.play(GbSound.boot, enabled: _soundEffects, inCall: inCall);
+    }
     await _uiPrefs.saveGameboyMode(on);
   }
 
