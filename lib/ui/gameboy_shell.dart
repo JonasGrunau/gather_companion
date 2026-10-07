@@ -46,6 +46,7 @@ import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart' show settableAvailabilities;
 
 import '../src/app_state.dart';
+import '../src/media/gameboy_sfx.dart';
 import '../theme/gather_theme.dart' show availabilityColor, availabilityLabel, GatherThemeContext;
 import 'call_screen.dart' show callBannerTextFor, openCallScreen;
 
@@ -197,6 +198,10 @@ class _GameboyShellState extends State<GameboyShell> {
     });
   }
 
+  /// One blip, in the handheld's voice, unless the sound-effects switch is off.
+  /// Rides alongside the haptic the controls already give, never replacing it.
+  void _sfx(GbSound sound) => GameboySfx.instance.play(sound, enabled: widget.state.soundEffects);
+
   void _toggleMenu() {
     HapticFeedback.selectionClick();
     setState(() {
@@ -212,12 +217,15 @@ class _GameboyShellState extends State<GameboyShell> {
         _status = at < 0 ? 0 : at;
       }
     });
+    // The menu coming up climbs, backing out of it falls.
+    _sfx(_menuOpen ? GbSound.open : GbSound.back);
   }
 
   void _closeMenu() {
     if (!_menuOpen) return;
     HapticFeedback.selectionClick();
     setState(() => _menuOpen = false);
+    _sfx(GbSound.back);
   }
 
   /// One D-pad step while the menu is open. Up/Down walk the rows; Left/Right move
@@ -241,6 +249,7 @@ class _GameboyShellState extends State<GameboyShell> {
       }
     });
     HapticFeedback.selectionClick();
+    _sfx(GbSound.cursor);
   }
 
   /// Puts a refusal in front of the person, the app's one existing way: an action
@@ -250,6 +259,7 @@ class _GameboyShellState extends State<GameboyShell> {
     final messenger = ScaffoldMessenger.of(context);
     final failed = await action();
     if (failed == null) return;
+    _sfx(GbSound.denied);
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(failed)));
@@ -291,6 +301,7 @@ class _GameboyShellState extends State<GameboyShell> {
 
   /// A press of the A button while the menu is open: do whatever the cursor is on.
   void _confirm() {
+    _sfx(GbSound.confirm);
     switch (_row) {
       case _menuRowStatus:
         _doStatus(settableAvailabilities[_status]);
@@ -874,6 +885,9 @@ class _ControlsDeck extends StatelessWidget {
   final VoidCallback onMenuClose;
   final VoidCallback onMenuToggle;
 
+  /// One blip, in the handheld's voice, unless the sound-effects switch is off.
+  void _sfx(GbSound sound) => GameboySfx.instance.play(sound, enabled: state.soundEffects);
+
   /// Puts a refusal in front of the person, the app's one existing way: an action
   /// returns null on success or a sentence to show. The messenger is captured
   /// before the await because the press may have moved on by the time it answers.
@@ -881,6 +895,7 @@ class _ControlsDeck extends StatelessWidget {
     final messenger = ScaffoldMessenger.of(context);
     final failed = await action();
     if (failed == null) return;
+    _sfx(GbSound.denied);
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(failed)));
@@ -889,6 +904,7 @@ class _ControlsDeck extends StatelessWidget {
   /// Start: leave the conversation and walk home, each only when there is one to
   /// do — the dock's door, transcribed. See `control_bar.dart`'s `_leave`.
   Future<void> _goHome(BuildContext context) async {
+    _sfx(GbSound.back);
     if (state.inHuddle) {
       await _run(context, state.leaveHuddle);
     }
@@ -963,6 +979,8 @@ class _ControlsDeck extends StatelessWidget {
                               : () {
                                   HapticFeedback.selectionClick();
                                   state.boost = !state.boost;
+                                  // Up for latched on, down for released.
+                                  _sfx(state.boost ? GbSound.toggleOn : GbSound.toggleOff);
                                 },
                     ),
                   ),
@@ -979,7 +997,16 @@ class _ControlsDeck extends StatelessWidget {
                       // Mute is a real switch; inert in the menu, so no toggle state
                       // there.
                       toggled: menuOpen ? null : call.micOn,
-                      onTap: menuOpen ? null : () => _run(context, () => state.setMicOn(!call.micOn)),
+                      onTap: menuOpen
+                          ? null
+                          : () {
+                              // Unmuting climbs, muting falls. Local-only: this
+                              // plays on our own speaker and is never mixed into
+                              // the mic uplink, so no one else on the call hears it.
+                              final unmuting = !call.micOn;
+                              _sfx(unmuting ? GbSound.toggleOn : GbSound.toggleOff);
+                              _run(context, () => state.setMicOn(!call.micOn));
+                            },
                     ),
                   ),
                 ],

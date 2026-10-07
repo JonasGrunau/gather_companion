@@ -10,6 +10,7 @@ import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
 import 'media/call.dart';
+import 'media/gameboy_sfx.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
@@ -547,7 +548,25 @@ class AppState extends ChangeNotifier {
     if (_gameboyMode == on) return;
     _gameboyMode = on;
     notifyListeners();
+    // The power-on jingle, on the off→on flip only — switching the handheld on is
+    // the one moment it earns a boot chime; a rebuild or a restore into the mode
+    // must stay silent. Gated by the sound-effects switch like every other blip.
+    if (on) GameboySfx.instance.play(GbSound.boot, enabled: _soundEffects);
     await _uiPrefs.saveGameboyMode(on);
+  }
+
+  /// Whether the app's sound effects play — the handheld's blips, the boot
+  /// jingle, and the speaker-test chime. On by default. This never touches
+  /// in-call voice; it is a UI-sound switch only, read back at [boot] and
+  /// persisted the moment it flips, exactly like [gameboyMode].
+  bool _soundEffects = true;
+  bool get soundEffects => _soundEffects;
+
+  Future<void> setSoundEffects(bool on) async {
+    if (_soundEffects == on) return;
+    _soundEffects = on;
+    notifyListeners();
+    await _uiPrefs.saveSoundEffects(on);
   }
 
   /// Development shortcut past the scanner:
@@ -563,6 +582,7 @@ class AppState extends ChangeNotifier {
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
     _gameboyMode = await _uiPrefs.loadGameboyMode();
+    _soundEffects = await _uiPrefs.loadSoundEffects();
 
     if (!_credentials.isComplete && _devPair.isNotEmpty) {
       final parts = _devPair.split(':');

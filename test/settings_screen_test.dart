@@ -80,6 +80,14 @@ void main() {
     // is a different repair in a different place, which is why they are separate
     // sentences and not one boolean.
     Future<void> pumpReach(WidgetTester tester, PushReach reach, {String? name}) async {
+      // A viewport tall enough to render the whole list — the push card sits
+      // below the Gather, phone and Appearance cards and would otherwise fall
+      // past the default 600px test surface.
+      tester.view.physicalSize = const Size(1200, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
       final state = withLink(const LinkStatus(LinkState.live))
         ..debugApplyPushReach(PushRegistration(reach), bridgeName: name);
       await tester.pumpWidget(wrap(state));
