@@ -17,6 +17,7 @@ import '../src/map_person.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
 import 'dpad.dart';
+import 'person_avatar.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -450,6 +451,25 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// appears and disappears with it, which is a rebuild by definition.
   ({int x, int y, SpaceRoom? room})? _selected;
 
+  /// The person a tap picked out, shown as a card with a wave on it. Mutually
+  /// exclusive with [_selected] — a tap is either on somebody or on the floor, never
+  /// both — and held here for the same reason: it is not presence, and it should not
+  /// outlive the screen.
+  MapPerson? _selectedPerson;
+
+  /// The person standing under a tap, if any — feet on [at]'s tile, or the tile the
+  /// body rises into (an avatar is a tile wide and about two tall on the glass, so a
+  /// tap on the head reads as them too). Me excluded: [AppState.peopleOnMap] already
+  /// leaves me out, and a wave at myself means nothing.
+  MapPerson? _personAt(({int x, int y}) at) {
+    for (final p in widget.state.peopleOnMap) {
+      final px = p.x.round();
+      final py = p.y.round();
+      if (px == at.x && (py == at.y || py == at.y + 1)) return p;
+    }
+    return null;
+  }
+
   /// Which tile a point on the glass is over, or null when it is off the floor.
   ///
   /// The same inverse the double tap takes, one step further: [_onDoubleTap] wants the
@@ -508,8 +528,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (second != null && (point - second).distance <= kDoubleTapSlop) {
       _tapped = point;
       // Put back whatever the first of the pair displaced. Usually null, and either
-      // way not the tile somebody was aiming a pinch at.
-      setState(() => _selected = _beforeTap);
+      // way not the tile somebody was aiming a pinch at. A zoom is never a person
+      // selection, so any card the first tap raised comes down with it.
+      setState(() {
+        _selected = _beforeTap;
+        _selectedPerson = null;
+      });
       _onDoubleTap(viewport, child);
       return;
     }
@@ -519,11 +543,28 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     _firstTap = point;
     _tapWindow = Timer(kDoubleTapTimeout, () => _firstTap = null);
     _beforeTap = _selected;
+    // Cleared up front so every outcome below that does not re-set it — a tile, a
+    // locked room, empty floor — takes the person card down. Only the person branch
+    // puts it back.
+    _selectedPerson = null;
 
     final map = widget.map;
     final at = _tileAt(point, base);
     if (at == null) {
       setState(() => _selected = null);
+      return;
+    }
+
+    // Somebody standing here wins the tap: a wave at a person is the one thing on
+    // this screen you aim at a body rather than a tile. Checked before the floor so a
+    // person on walkable ground is pickable, not swallowed by the Go-here reticle.
+    final person = _personAt(at);
+    if (person != null) {
+      HapticFeedback.selectionClick();
+      setState(() {
+        _selected = null;
+        _selectedPerson = person;
+      });
       return;
     }
 
@@ -640,6 +681,18 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     return room == null
         ? state.goTo(target.x, target.y)
         : state.goToRoom(room, toward: (x: target.x, y: target.y));
+  }
+
+  /// Waves at the selected person and takes the card down. There is no feed echo for
+  /// our own wave, so the line shown here is the only confirmation it went — the same
+  /// reason the dial confirms in words.
+  Future<void> _waveAtPerson(MapPerson person) async {
+    final failed = await widget.state.sendWave(person.id);
+    if (!mounted) return;
+    setState(() => _selectedPerson = null);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(failed ?? '👋 Waved at ${person.label.split(' ').first}')));
   }
 
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
@@ -1042,7 +1095,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         // because a thumb rolls around a disc and would have caught the rail, and a
         // pill is tapped once. Sitting just above the island reads as the same
         // control surface rather than as something adrift over the floor.
-        if (state.onRoute || (_selected != null && state.canWalk))
+        if (_selectedPerson == null && (state.onRoute || (_selected != null && state.canWalk)))
           Positioned(
             left: 0,
             right: 0,
@@ -1093,7 +1146,104 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               child: Center(child: _BlockedNote(text: _blockedNote!)),
             ),
           ),
+        // A tapped person, in the Go-here pill's slot — you have picked somebody, not
+        // somewhere, so the one offer is a wave rather than a walk.
+        if (_selectedPerson != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(
+                child: _PersonCard(
+                  state: state,
+                  person: _selectedPerson!,
+                  onWave: () => _waveAtPerson(_selectedPerson!),
+                  onClear: () => setState(() => _selectedPerson = null),
+                ),
+              ),
+            ),
+          ),
       ],
+    );
+  }
+}
+
+/// A tapped person's card: their face and name, a wave, and a way to put it down.
+/// Sits where the Go-here pill sits, and is never shown alongside it.
+class _PersonCard extends StatelessWidget {
+  const _PersonCard({
+    required this.state,
+    required this.person,
+    required this.onWave,
+    required this.onClear,
+  });
+
+  final AppState state;
+  final MapPerson person;
+  final VoidCallback onWave;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Material(
+      color: t.card,
+      borderRadius: BorderRadius.circular(t.radius),
+      elevation: 3,
+      shadowColor: Colors.black.withValues(alpha: 0.28),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            PersonAvatar(
+              id: person.id,
+              label: person.label,
+              photoUrl: state.photoUrlFor(person.id),
+              size: 36,
+              availability: person.availability,
+              dotRing: t.card,
+            ),
+            const SizedBox(width: 10),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 140),
+              child: Text(
+                person.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Material(
+              color: t.brand.withValues(alpha: 0.18),
+              borderRadius: BorderRadius.circular(17),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(17),
+                onTap: onWave,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.waving_hand_rounded, size: 16, color: t.brand),
+                      const SizedBox(width: 6),
+                      Text('Wave', style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            IconButton(
+              icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+              onPressed: onClear,
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -127,6 +127,10 @@ abstract interface class Collector {
   /// Throws an emoji over the room.
   ({bool ok, String? detail}) broadcastEmote(String emote, {int count});
 
+  /// Waves at one person. Fire-and-forget; the server replays it on [interactions]
+  /// as a `WaveEvent` naming the recipient — but, unlike an emote, not back to us.
+  ({bool ok, String? detail}) wave(String targetSpaceUserId);
+
   /// Says whether we are talking. This is the speaking ring.
   ({bool ok, String? detail}) setSpeaking(bool speaking);
 

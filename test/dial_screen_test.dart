@@ -11,6 +11,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/harness/harness_data.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
@@ -110,5 +111,33 @@ void main() {
 
     // Ada, Bob and Zoe are here; Xander is not. One warp each for the present.
     expect(find.text('Warp'), findsNWidgets(3));
+  });
+
+  testWidgets('offers a wave against everyone present, and nobody offline', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // Ada, Bob and Zoe are here; Xander is away. A wave at an absent person would
+    // land nowhere, so the button is withheld there.
+    expect(find.byIcon(Icons.waving_hand_rounded), findsNWidgets(3));
+  });
+
+  testWidgets('tapping a wave sends one at that person', (tester) async {
+    final collector = FakeCollector();
+    final state = AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugAttachCollector(collector)
+      ..debugApplyRoster(peopledRoster());
+    addTearDown(state.dispose);
+
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    await tester.tap(find.byIcon(Icons.waving_hand_rounded).first);
+    await tester.pump();
+
+    expect(collector.waves, hasLength(1), reason: 'the press reached the wave action');
   });
 }

@@ -78,7 +78,7 @@ void main() {
       fake.interactions.listen(events.add);
       fake.start();
 
-      fake.wave('space-ada');
+      fake.injectWave('space-ada');
       await Future<void>.delayed(Duration.zero);
 
       expect(events.single.name, 'WaveEvent');

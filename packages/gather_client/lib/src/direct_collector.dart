@@ -432,6 +432,21 @@ class DirectCollector implements Collector {
     });
   }
 
+  /// Waves at one person.
+  ///
+  /// **Unverified, unlike everything else in this file.** Every other action here
+  /// was read off a live capture; an *outgoing* wave never was — only the
+  /// `WaveEvent` it comes back as (`payload.senderId`, `options.targetUserIds`).
+  /// So the action name and the arg key below are a best guess, modelled on
+  /// [broadcastEmote] and the received envelope. If the server refuses, the
+  /// refusal names this action on [refusals]; the knobs to try are the action
+  /// (`wave`/`sendWave`/`waveAt`) and the key (`targetSpaceUserId`/`targetUserId`).
+  @override
+  ({bool ok, String? detail}) wave(String targetSpaceUserId) {
+    if (targetSpaceUserId.isEmpty) return (ok: false, detail: 'no target to wave at');
+    return _act('wave', {'targetSpaceUserId': targetSpaceUserId});
+  }
+
   /// Puts a hand up, or takes it down. A bare bool, not a map.
   ({bool ok, String? detail}) setHandRaised(bool raised) =>
       _act('setHandRaised', raised);

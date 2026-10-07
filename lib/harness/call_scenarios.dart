@@ -351,7 +351,7 @@ class AppScenarioDriver {
 
     // A wave into the feed every ~5s.
     if (milling && ids.isNotEmpty && _ticks % 8 == 0) {
-      collector.wave(ids[(_ticks ~/ 8) % ids.length]);
+      collector.injectWave(ids[(_ticks ~/ 8) % ids.length]);
     }
   }
 

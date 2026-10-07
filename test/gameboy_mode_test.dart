@@ -10,6 +10,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/media/call.dart';
@@ -244,6 +245,57 @@ void main() {
       // No call to mute into, so the action refuses with a sentence rather than
       // crashing — the point is simply that the key reached an action.
       expect(tester.takeException(), isNull);
+    });
+
+    // A roster that puts me in a cluster with Ada — Gather's "in call distance", the
+    // one condition the handheld's wave prompt shows under.
+    Roster withAdaInCallDistance() => const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'You', clusterId: 'c1', clusterIdKnown: true, x: 10, y: 7),
+          RosterRow(id: 'a', name: 'Ada', clusterId: 'c1', clusterIdKnown: true, x: 10, y: 8),
+        ]);
+
+    testWidgets('a wave prompt appears when someone is in call distance', (tester) async {
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.text('Wave at Ada'), findsOneWidget);
+      expect(find.text('Tap to wave'), findsOneWidget);
+    });
+
+    testWidgets('no wave prompt while standing alone', (tester) async {
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugApplyRoster(const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'You', x: 10, y: 7),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.textContaining('Wave at'), findsNothing);
+    });
+
+    testWidgets('tapping the wave prompt sends a wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      // A live collector keeps the tree ticking, so `pumpAndSettle` would never
+      // return — a couple of plain pumps are enough to lay the prompt out.
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(GameboyShell), findsOneWidget);
+
+      await tester.tap(find.text('Wave at Ada'));
+      await tester.pump();
+
+      expect(collector.waves, ['a'], reason: 'the prompt waves at the person in call distance');
     });
 
     testWidgets('the D-pad asks to walk while a thumb is on it', (tester) async {

@@ -288,6 +288,31 @@ class _GameboyShellState extends State<GameboyShell> {
     _run(() => widget.state.sendEmoteLocalFirst(emote));
   }
 
+  /// Waves at whoever you are in call distance with — Gather's cluster, the nearest
+  /// thing this app has to "somebody is right here". Reached from the LCD prompt that
+  /// only appears while that is true, never the menu, so it is outside the `_do…` the
+  /// Select rows dispatch. Targets the first of the huddle; there is no feed echo for
+  /// our own wave, so the blip and the line are the only sign it went.
+  Future<void> _doWave() async {
+    final rows = widget.state.huddleRows;
+    if (rows.isEmpty) return;
+    final target = rows.first;
+    final messenger = ScaffoldMessenger.of(context);
+    final failed = await widget.state.sendWave(target.id);
+    if (!mounted) return;
+    if (failed != null) {
+      _sfx(GbSound.denied);
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(failed)));
+      return;
+    }
+    _sfx(GbSound.confirm);
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('👋 Waved at ${target.name ?? 'them'}')));
+  }
+
   void _doDial() {
     _closeMenu();
     widget.onOpenDial();
@@ -350,6 +375,9 @@ class _GameboyShellState extends State<GameboyShell> {
               Expanded(
                 child: _Screen(
                   state: widget.state,
+                  // Only live while somebody is in call distance; the prompt itself
+                  // decides when to show, this just gives it the action.
+                  onWave: _doWave,
                   // The Select menu is the screen's overlay, not the device's: it
                   // is handed in here so it clips to the LCD well and leaves the
                   // plastic body showing around it.
@@ -677,6 +705,88 @@ class _LcdCallBanner extends StatelessWidget {
   }
 }
 
+/// The wave prompt, inside the LCD: shown only while somebody is in call distance
+/// (Gather's cluster, which is the nearest this app comes to "right here"), it is the
+/// handheld's "wave at someone". A tap sends the wave — not a hardware button, because
+/// in a call every key already means something, so the prompt is the control.
+class _LcdWavePrompt extends StatelessWidget {
+  const _LcdWavePrompt({required this.state, required this.onWave});
+
+  final AppState state;
+  final VoidCallback onWave;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, _) {
+        final rows = state.huddleRows;
+        if (rows.isEmpty) return const SizedBox.shrink();
+        final who = rows.length == 1 ? (rows.first.name ?? 'them') : 'them';
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Semantics(
+            button: true,
+            label: 'Wave at $who. Tap to wave.',
+            child: ExcludeSemantics(
+              child: Material(
+                color: _scMid,
+                borderRadius: BorderRadius.circular(6),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: onWave,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: _accentPink, width: 1.5),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.waving_hand_rounded, size: 18, color: _accentPink),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Wave at $who',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scWhite,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 1),
+                              const Text(
+                                'Tap to wave',
+                                style: TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scGlyphOff,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// The head count, re-cut for the LCD: the same "N here" pill the map's app bar
 /// carried, in the pixel face on the screen's dark. The dot glows the live-green
 /// when anyone is in, so an empty room reads at a glance too.
@@ -777,7 +887,7 @@ class _FollowerChip extends StatelessWidget {
 /// by the Select [menu] — both are the screen's furniture and so clip to it,
 /// leaving the plastic body around the screen untouched.
 class _Screen extends StatelessWidget {
-  const _Screen({required this.state, required this.child, this.menu});
+  const _Screen({required this.state, required this.child, this.menu, this.onWave});
 
   final AppState state;
   final Widget child;
@@ -785,6 +895,10 @@ class _Screen extends StatelessWidget {
   /// The Select menu overlay, or null when it is closed. Drawn over the office,
   /// inside the LCD.
   final Widget? menu;
+
+  /// Sends a wave to whoever is in call distance. The LCD wave prompt that calls it
+  /// shows itself only while there is such a person; null leaves it absent.
+  final VoidCallback? onWave;
 
   @override
   Widget build(BuildContext context) {
@@ -830,6 +944,12 @@ class _Screen extends StatelessWidget {
                   // "choose" there, and the office it would return to is covered
                   // anyway.
                   if (menu == null) _LcdCallBanner(state: state),
+                  // Shown only when somebody is in call distance (Gather's cluster) —
+                  // the handheld's answer to "wave at someone", a prompt you tap
+                  // rather than a button, since every hardware key is already spoken
+                  // for while a call is on. Held down under the Select menu like the
+                  // call banner.
+                  if (menu == null && onWave != null) _LcdWavePrompt(state: state, onWave: onWave!),
                   Expanded(
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(4),

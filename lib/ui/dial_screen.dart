@@ -85,6 +85,15 @@ class _DialScreenState extends State<DialScreen> {
     await openCallScreen(context, state);
   }
 
+  /// Waves at a contact without warping or opening the call — the one directory
+  /// action that touches somebody without going to them. There is no feed echo for
+  /// our own wave, so the confirmation here is the only sign it went.
+  Future<void> _waveAt(Contact contact) async {
+    final failed = await state.sendWave(contact.id);
+    if (!mounted) return;
+    _say(failed ?? '👋 Waved at ${_firstName(contact.label)}');
+  }
+
   void _say(String message) {
     final t = context.tokens;
     ScaffoldMessenger.of(context)
@@ -158,6 +167,7 @@ class _DialScreenState extends State<DialScreen> {
                     busy: _warping == c.id,
                     canWarp: canWarp,
                     onTap: canWarp ? () => _warpToPerson(c) : null,
+                    onWave: () => _waveAt(c),
                   );
                 },
               ),
@@ -365,6 +375,7 @@ class _ContactTile extends StatelessWidget {
     required this.busy,
     required this.canWarp,
     required this.onTap,
+    this.onWave,
   });
 
   final AppState state;
@@ -375,6 +386,11 @@ class _ContactTile extends StatelessWidget {
   /// Drives the pill: a present person on another floor is listed but not called.
   final bool canWarp;
   final VoidCallback? onTap;
+
+  /// Waves at this contact. Null for an offline row — a wave at somebody who is not
+  /// here would land nowhere. A present person on another floor can still be waved
+  /// at even when [canWarp] is false, so this is independent of the warp pill.
+  final VoidCallback? onWave;
 
   @override
   Widget build(BuildContext context) {
@@ -422,9 +438,38 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
+              if (onWave != null && present) ...[
+                _WaveButton(onTap: busy ? null : onWave),
+                const SizedBox(width: 8),
+              ],
               if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A quiet round wave button, sized to sit beside the Warp pill without competing
+/// with it — a wave is the lighter of the two touches a row offers.
+class _WaveButton extends StatelessWidget {
+  const _WaveButton({required this.onTap});
+
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Material(
+      color: t.card,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Icon(Icons.waving_hand_rounded, size: 18, color: t.mutedForeground),
         ),
       ),
     );

@@ -944,6 +944,31 @@ class AppState extends ChangeNotifier {
     return sendEmote(emote);
   }
 
+  /// When we last waved at each person, to hold the button back.
+  ///
+  /// The server enforces one wave per person per [waveCooldown] and drops the rest
+  /// (see `presence_tracker`); mirroring it here turns a mashed button into a quiet
+  /// no-op instead of a string of refusals the UI would have to swallow.
+  final Map<String, DateTime> _lastWaveAt = {};
+
+  /// Waves at one person.
+  ///
+  /// Unlike an emote there is no self-echo — Gather does not replay a wave to its
+  /// sender — so nothing lands on the activity feed here; the caller shows its own
+  /// confirmation. A repeat inside [waveCooldown] is swallowed rather than sent.
+  Future<String?> sendWave(String targetSpaceUserId) async {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    if (targetSpaceUserId.isEmpty) return 'Nobody to wave at.';
+
+    final now = DateTime.now();
+    final last = _lastWaveAt[targetSpaceUserId];
+    if (last != null && now.difference(last) < waveCooldown) return null;
+    _lastWaveAt[targetSpaceUserId] = now;
+
+    return _sent(collector.wave(targetSpaceUserId), 'Could not wave.');
+  }
+
   /// Who in the conversation is talking, so their ring can be redrawn.
   ///
   /// The call screen rebuilds on [notifyListeners] and on nothing else — unlike
@@ -2034,6 +2059,7 @@ class AppState extends ChangeNotifier {
         'setAvailability' => 'Gather would not change your availability',
         'setCustomStatus' || 'clearCustomStatus' => 'Gather would not change your status',
         'broadcastEmote' => 'Gather would not send that',
+        'wave' => 'Gather would not send that wave',
         'startSpeaking' || 'stopSpeaking' => 'Gather would not show that you are talking',
         'leaveCluster' => 'Gather would not leave the conversation',
         'teleport' || 'move' => 'Gather would not move you',
