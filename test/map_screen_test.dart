@@ -8,6 +8,8 @@
 /// than a map with nobody on it.
 library;
 
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
@@ -1085,6 +1087,124 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       expect(said, hasLength(3));
+    });
+  });
+
+  // The handheld's camera, mounted. The sibling signal tests in gameboy_mode_test
+  // pin that a D-pad walk fires [AppState.recentre]; these pin what the map then
+  // does with it — the `_locked` ticker that keeps the avatar dead-centre, eases to
+  // the fixed walking zoom, clamps at the office edge, lets a finger-pan break the
+  // lock and re-grabs it on the next walk. Asserted against [framedOn] on a fixed
+  // viewport, so a regression in the state machine fails here rather than sailing
+  // through green.
+  group('the Gameboy handheld camera', () {
+    // A phone-shaped LCD, sized so the floor overflows it in both axes at the
+    // walking zoom — which is what makes the edge clamp something to test.
+    const viewport = Size(390, 780);
+
+    /// The office, in Gameboy mode, with me standing on the given tile.
+    AppState handheld({required num x, required num y}) => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugCanWalk = true
+      ..debugMap = _map()
+      ..setGameboyMode(true)
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', x, y, name: 'Me')]));
+
+    /// The live transform the screen is holding — the InteractiveViewer's own.
+    Matrix4 cameraOf(WidgetTester tester) => tester
+        .widget<InteractiveViewer>(find.byType(InteractiveViewer))
+        .transformationController!
+        .value;
+
+    /// The same frame the locked ticker is aiming for: me centred, edge-clamped,
+    /// at the fixed walking zoom. `_covered` is zero here (the test view carries no
+    /// bottom padding), so the ticker's centre and this one line up.
+    Matrix4 centredOn(num x, num y) {
+      final base = math.max(
+        viewport.height / (10 * artTileSize),
+        viewport.width / (20 * artTileSize),
+      );
+      final child = Size(20 * artTileSize * base, 10 * artTileSize * base);
+      return framedOn(
+        at: Offset((x + 0.5) * artTileSize * base, (y + 0.5) * artTileSize * base),
+        viewport: viewport,
+        child: child,
+        zoom: 3,
+      );
+    }
+
+    Future<void> mount(WidgetTester tester, AppState state) async {
+      tester.view.physicalSize = viewport;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump(); // layout, _centreOnMe engages the lock, the ticker starts
+      await tester.pump(const Duration(seconds: 1)); // the zoom eases home
+    }
+
+    testWidgets('locks the avatar to the centre at the fixed walking zoom', (tester) async {
+      final state = handheld(x: 10, y: 5);
+      await mount(tester, state);
+
+      final cam = cameraOf(tester);
+      final want = centredOn(10, 5);
+      expect(cam.getMaxScaleOnAxis(), closeTo(3, 0.02), reason: 'eased to the walking zoom');
+      expect(cam.getTranslation().x, closeTo(want.getTranslation().x, 0.5),
+          reason: 'the avatar sits in the middle of the LCD');
+      expect(cam.getTranslation().y, closeTo(want.getTranslation().y, 0.5));
+    });
+
+    testWidgets('clamps at the office edge rather than showing the void', (tester) async {
+      // Top-left corner: centring it dead-centre would pull the map's edge off the
+      // viewport's, so [framedOn] clamps and the corner sits in the corner.
+      final state = handheld(x: 0, y: 0);
+      await mount(tester, state);
+
+      final cam = cameraOf(tester);
+      expect(cam.getMaxScaleOnAxis(), closeTo(3, 0.02));
+      expect(cam.getTranslation().x, closeTo(0, 0.5), reason: 'no void left of the office');
+      expect(cam.getTranslation().y, closeTo(0, 0.5), reason: 'no void above it');
+    });
+
+    testWidgets('a finger-pan breaks the lock and the view stays where it is dragged', (tester) async {
+      final state = handheld(x: 10, y: 5);
+      await mount(tester, state);
+      final locked = cameraOf(tester);
+
+      // A drag on the floor takes the camera back: [_stopFollowing] drops the lock
+      // and stops the ticker, so the dragged-to transform is left in place.
+      await tester.drag(find.byType(InteractiveViewer), const Offset(-60, -60));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1)); // a still-locked ticker would yank it back
+
+      final panned = cameraOf(tester);
+      final moved = (panned.getTranslation().x - locked.getTranslation().x).abs() +
+          (panned.getTranslation().y - locked.getTranslation().y).abs();
+      expect(moved, greaterThan(20),
+          reason: 'the pan stuck — the camera was not pinned back to centre');
+    });
+
+    testWidgets('a D-pad walk re-grabs the lock after a pan let it go', (tester) async {
+      final state = handheld(x: 10, y: 5);
+      await mount(tester, state);
+
+      await tester.drag(find.byType(InteractiveViewer), const Offset(-60, -60));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+
+      // The D-pad fires [AppState.recentre] in Gameboy mode; the map re-engages the
+      // centred lock. The walk plumbing is null in a test, so the avatar does not
+      // actually step — the camera comes home to where it already stood.
+      state.walk('Up');
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+
+      final cam = cameraOf(tester);
+      final want = centredOn(10, 5);
+      expect(cam.getMaxScaleOnAxis(), closeTo(3, 0.02), reason: 're-grabbed and re-settled');
+      expect(cam.getTranslation().x, closeTo(want.getTranslation().x, 0.5),
+          reason: 'back to centre after the re-grab');
+      expect(cam.getTranslation().y, closeTo(want.getTranslation().y, 0.5));
     });
   });
 }
