@@ -41,6 +41,8 @@
 /// is only half a handheld.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart' show settableAvailabilities;
@@ -203,6 +205,28 @@ class _GameboyShellState extends State<GameboyShell> {
   void _sfx(GbSound sound) => GameboySfx.instance
       .play(sound, enabled: widget.state.soundEffects, inCall: widget.state.inCall);
 
+  /// The handheld's own snackbar: a line shown *inside* the LCD rather than through
+  /// [ScaffoldMessenger], whose floating bar would dock on the plastic below the
+  /// screen, outside the console's world. `bad` tints a refusal red. Every bit of
+  /// action feedback in Gameboy mode goes through here.
+  ({String text, bool bad})? _toast;
+  Timer? _toastTimer;
+
+  void _say(String message, {bool bad = false}) {
+    _toastTimer?.cancel();
+    setState(() => _toast = (text: message, bad: bad));
+    _toastTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      setState(() => _toast = null);
+    });
+  }
+
+  @override
+  void dispose() {
+    _toastTimer?.cancel();
+    super.dispose();
+  }
+
   void _toggleMenu() {
     HapticFeedback.selectionClick();
     setState(() {
@@ -257,16 +281,12 @@ class _GameboyShellState extends State<GameboyShell> {
   }
 
   /// Puts a refusal in front of the person, the app's one existing way: an action
-  /// returns null on success or a sentence to show. The messenger is captured
-  /// before the await because the press may have moved on by the time it answers.
+  /// returns null on success or a sentence to show. Shown inside the LCD.
   Future<void> _run(Future<String?> Function() action) async {
-    final messenger = ScaffoldMessenger.of(context);
     final failed = await action();
-    if (failed == null) return;
+    if (!mounted || failed == null) return;
     _sfx(GbSound.denied);
-    messenger
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(failed)));
+    _say(failed, bad: true);
   }
 
   // The four menu actions, shared by a thumb tapping a row and the A button
@@ -286,6 +306,30 @@ class _GameboyShellState extends State<GameboyShell> {
   void _doReact(String emote) {
     _closeMenu();
     _run(() => widget.state.sendEmoteLocalFirst(emote));
+  }
+
+  /// Waves at whoever you are in call distance with — Gather's cluster, the nearest
+  /// thing this app has to "somebody is right here". Reached from the LCD prompt that
+  /// only appears while that is true, never the menu, so it is outside the `_do…` the
+  /// Select rows dispatch. Targets the first of the huddle; there is no feed echo for
+  /// our own wave, so the blip and the line are the only sign it went.
+  Future<void> _doWave() async {
+    final rows = widget.state.huddleRows;
+    if (rows.isEmpty) return;
+    final target = rows.first;
+    final result = await widget.state.sendWave(target.id);
+    if (!mounted) return;
+    if (result.error != null) {
+      _sfx(GbSound.denied);
+      _say(result.error!, bad: true);
+      return;
+    }
+    if (result.sent) {
+      // A cooldown no-op stays silent — the blip and the line are for a wave that
+      // actually went, not for a mashed second press the cooldown held back.
+      _sfx(GbSound.confirm);
+      _say('👋 Waved at ${target.name ?? 'them'}');
+    }
   }
 
   void _doDial() {
@@ -350,6 +394,11 @@ class _GameboyShellState extends State<GameboyShell> {
               Expanded(
                 child: _Screen(
                   state: widget.state,
+                  // The handheld's own snackbar, shown inside the LCD.
+                  toast: _toast,
+                  // Only live while somebody is in call distance; the prompt itself
+                  // decides when to show, this just gives it the action.
+                  onWave: _doWave,
                   // The Select menu is the screen's overlay, not the device's: it
                   // is handed in here so it clips to the LCD well and leaves the
                   // plastic body showing around it.
@@ -384,6 +433,11 @@ class _GameboyShellState extends State<GameboyShell> {
                 onMenuConfirm: _confirm,
                 onMenuClose: _closeMenu,
                 onMenuToggle: _toggleMenu,
+                // The same wave the LCD prompt sends; the deck fires it on a
+                // double-tap of B while someone is in call distance.
+                onWave: _doWave,
+                // Refusals (mute, the door) land in the LCD, not on the plastic.
+                onMessage: _say,
               ),
             ],
           ),
@@ -677,6 +731,141 @@ class _LcdCallBanner extends StatelessWidget {
   }
 }
 
+/// The wave prompt, inside the LCD: shown only while somebody is in call distance
+/// (Gather's cluster, which is the nearest this app comes to "right here"), it is the
+/// handheld's "wave at someone". A tap sends the wave — not a hardware button, because
+/// in a call every key already means something, so the prompt is the control.
+class _LcdWavePrompt extends StatelessWidget {
+  const _LcdWavePrompt({required this.state, required this.onWave});
+
+  final AppState state;
+  final VoidCallback onWave;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, _) {
+        final rows = state.huddleRows;
+        if (rows.isEmpty) return const SizedBox.shrink();
+        final who = rows.length == 1 ? (rows.first.name?.split(' ').first ?? 'them') : 'them';
+        // A small pink-outlined chip centred over the foot of the office. It carries
+        // its own dark fill (the same slate the call banner uses) so the label stays
+        // legible over the office art it floats on. The hardware hint ("B B") rides
+        // on the end, because a double-tap of B sends the same wave the chip does and
+        // a handheld says which key does what.
+        return Align(
+          alignment: Alignment.center,
+          child: Semantics(
+            button: true,
+            label: 'Wave at $who. Double-tap B or tap.',
+            child: ExcludeSemantics(
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: onWave,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: _scMid,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: _accentPink, width: 1.5),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.waving_hand_rounded, size: 14, color: _accentPink),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            'Wave at $who',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: _pixelFont,
+                              color: _scWhite,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(3),
+                            border: Border.all(color: _accentPink, width: 1),
+                          ),
+                          child: const Text(
+                            'B B',
+                            style: TextStyle(
+                              fontFamily: _pixelFont,
+                              color: _accentPink,
+                              fontSize: 8,
+                              fontWeight: FontWeight.w700,
+                              height: 1,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// The handheld's snackbar, drawn inside the LCD rather than through
+/// [ScaffoldMessenger] — whose floating bar docks on the plastic below the screen,
+/// outside the console's world. Mirrors [_LcdCallBanner]'s grammar: a dark slate
+/// panel in the pixel face, ringed `_online` for ordinary feedback and `_danger`
+/// for a refusal. Transient and untappable; [GameboyShell] clears it on a timer.
+class _LcdToast extends StatelessWidget {
+  const _LcdToast({super.key, required this.message, required this.bad});
+
+  final String message;
+  final bool bad;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: _scMid,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: bad ? _danger : _online, width: 1.5),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        // A live region: this replaces the SnackBar for every Gameboy action, and
+        // without it a refusal or a wave confirmation would appear in the LCD
+        // without ever being announced to a screen reader.
+        child: Semantics(
+          liveRegion: true,
+          child: Text(
+            message,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: _pixelFont,
+              color: _scWhite,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// The head count, re-cut for the LCD: the same "N here" pill the map's app bar
 /// carried, in the pixel face on the screen's dark. The dot glows the live-green
 /// when anyone is in, so an empty room reads at a glance too.
@@ -777,7 +966,7 @@ class _FollowerChip extends StatelessWidget {
 /// by the Select [menu] — both are the screen's furniture and so clip to it,
 /// leaving the plastic body around the screen untouched.
 class _Screen extends StatelessWidget {
-  const _Screen({required this.state, required this.child, this.menu});
+  const _Screen({required this.state, required this.child, this.menu, this.onWave, this.toast});
 
   final AppState state;
   final Widget child;
@@ -785,6 +974,15 @@ class _Screen extends StatelessWidget {
   /// The Select menu overlay, or null when it is closed. Drawn over the office,
   /// inside the LCD.
   final Widget? menu;
+
+  /// Sends a wave to whoever is in call distance. The LCD wave prompt that calls it
+  /// shows itself only while there is such a person; null leaves it absent.
+  final VoidCallback? onWave;
+
+  /// The handheld's snackbar: a line shown over the foot of the office, or null when
+  /// nothing is up. `bad` tints a refusal red. Shares the wave prompt's slot — the
+  /// two never show at once.
+  final ({String text, bool bad})? toast;
 
   @override
   Widget build(BuildContext context) {
@@ -853,6 +1051,38 @@ class _Screen extends StatelessWidget {
                               child: menu ?? const SizedBox.shrink(key: ValueKey('gb-menu-closed')),
                             ),
                           ),
+                          // Shown only when somebody is in call distance (Gather's
+                          // cluster) — the handheld's answer to "wave at someone".
+                          // Floated over the *top* of the office, not the foot: the
+                          // map's own selected-person card and legend live at the
+                          // bottom of the LCD, so a prompt down there landed on top of
+                          // the card you had just tapped. Stands down while a toast is
+                          // up: the two share this slot and never show at once. Held
+                          // down under the Select menu like the call banner.
+                          if (menu == null && onWave != null && toast == null)
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              top: 6,
+                              child: _LcdWavePrompt(state: state, onWave: onWave!),
+                            ),
+                          // The handheld's snackbar, in the same top slot, fading in
+                          // and out over the office.
+                          Positioned(
+                            left: 8,
+                            right: 8,
+                            top: 6,
+                            child: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 160),
+                              child: toast == null
+                                  ? const SizedBox.shrink(key: ValueKey('gb-toast-none'))
+                                  : _LcdToast(
+                                      key: ValueKey(toast!.text),
+                                      message: toast!.text,
+                                      bad: toast!.bad,
+                                    ),
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -876,7 +1106,7 @@ class _Screen extends StatelessWidget {
 /// hardware at it: the D-pad becomes the cursor, A chooses, Start backs out, and B
 /// goes inert. The menu owns the meaning of the keys for as long as it is up, the
 /// way a real handheld's buttons mean different things on a menu than in a game.
-class _ControlsDeck extends StatelessWidget {
+class _ControlsDeck extends StatefulWidget {
   const _ControlsDeck({
     required this.state,
     required this.menuOpen,
@@ -884,6 +1114,8 @@ class _ControlsDeck extends StatelessWidget {
     required this.onMenuConfirm,
     required this.onMenuClose,
     required this.onMenuToggle,
+    required this.onWave,
+    required this.onMessage,
   });
 
   final AppState state;
@@ -893,33 +1125,142 @@ class _ControlsDeck extends StatelessWidget {
   final VoidCallback onMenuClose;
   final VoidCallback onMenuToggle;
 
+  /// Sends the proximity wave — the same action the LCD prompt fires. Reached from
+  /// a double-tap of B while somebody is in call distance.
+  final VoidCallback onWave;
+
+  /// Shows a line in the LCD — the handheld's snackbar, for a control's refusal.
+  final void Function(String message, {bool bad}) onMessage;
+
+  @override
+  State<_ControlsDeck> createState() => _ControlsDeckState();
+}
+
+/// How long after the first B tap a second one still counts as a double. Counted by
+/// hand, not with [GestureDetector.onDoubleTap], whose arena would hold every single
+/// B press this long before letting it through — and mute has to be instant. Same
+/// reasoning as the map's hand-counted tap in `map_screen.dart`.
+const Duration _bDoubleTapWindow = Duration(milliseconds: 280);
+
+class _ControlsDeckState extends State<_ControlsDeck> {
+  AppState get state => widget.state;
+  bool get menuOpen => widget.menuOpen;
+  void Function(String direction) get onMenuMove => widget.onMenuMove;
+  VoidCallback get onMenuConfirm => widget.onMenuConfirm;
+  VoidCallback get onMenuClose => widget.onMenuClose;
+  VoidCallback get onMenuToggle => widget.onMenuToggle;
+
+  /// A pending unmute, held back behind the double-tap window so a second B tap can
+  /// cancel it. Non-null only while a muted B tap is waiting to resolve — the mic is
+  /// never opened on the first tap, or a double-tap-to-wave would leave you broadcast.
+  Timer? _bDefer;
+
+  /// When a *muting* B tap last landed while a wave was available, so a follow-up
+  /// inside the window is caught as a double without ever delaying the mute itself.
+  DateTime? _bMuteTapAt;
+
+  @override
+  void dispose() {
+    _bDefer?.cancel();
+    super.dispose();
+  }
+
+  /// What B does, split by direction so an unmute never fires on the first tap:
+  ///
+  /// - **No wave available** — plain mute/unmute, instant, as B always was.
+  /// - **Wave available, mic on** (a tap would *mute*, which is safe to do at once):
+  ///   the first tap mutes now; a second inside the window silently restores the mic
+  ///   and waves, so a wanted wave costs at most a brief, safe mute.
+  /// - **Wave available, mic off** (a tap would *unmute*, the dangerous direction):
+  ///   the unmute is deferred behind the window; a second tap cancels it and waves,
+  ///   so you stay muted. Nobody is ever opened up by accident.
+  void _tapB() {
+    final waveReady = state.huddleRows.isNotEmpty;
+
+    if (!waveReady) {
+      _bDefer?.cancel();
+      _bDefer = null;
+      _bMuteTapAt = null;
+      _toggleMic(state.call.micOn);
+      return;
+    }
+
+    // The second tap of a mute-then-wave, decided before the current mic state is
+    // read. The first tap mutes *asynchronously* and emits a new call state, so by
+    // now `micOn` can already read false; branching on it first would route a
+    // perfectly normal second tap into the mic-off path, clear this pending tap,
+    // and schedule an unmute instead of waving. The pending timestamp is the
+    // intent, and it is the only reliable witness that the first tap was a mute.
+    final mutedAt = _bMuteTapAt;
+    if (mutedAt != null && DateTime.now().difference(mutedAt) < _bDoubleTapWindow) {
+      // Put the mic back silently (the wave's blip is the feedback) and wave. Net:
+      // mic unchanged, wave sent.
+      _bMuteTapAt = null;
+      _run(() => state.setMicOn(true));
+      widget.onWave();
+      return;
+    }
+
+    if (state.call.micOn) {
+      // First tap while live: muting is the safe direction, so do it now and open
+      // the window for a second tap to turn the pair into a wave.
+      _bMuteTapAt = DateTime.now();
+      _sfx(GbSound.toggleOff);
+      _run(() => state.setMicOn(false));
+      return;
+    }
+
+    // Mic already off: a tap would *unmute*, the dangerous direction, so defer it
+    // behind the window where a second tap can cancel it and wave instead.
+    _bMuteTapAt = null;
+    if (_bDefer != null) {
+      // Second tap before the deferred unmute fired: the wave was the intent.
+      _bDefer!.cancel();
+      _bDefer = null;
+      widget.onWave();
+      return;
+    }
+    _bDefer = Timer(_bDoubleTapWindow, () {
+      _bDefer = null;
+      if (!mounted) return;
+      _sfx(GbSound.toggleOn);
+      _run(() => state.setMicOn(true));
+    });
+  }
+
+  /// A plain mute toggle with its blip — B's job whenever there is no wave to steal
+  /// the double-tap.
+  void _toggleMic(bool micOn) {
+    // Unmuting climbs, muting falls. Local-only: this plays on our own speaker and
+    // is never mixed into the mic uplink, so no one else on the call hears it.
+    _sfx(micOn ? GbSound.toggleOff : GbSound.toggleOn);
+    _run(() => state.setMicOn(!micOn));
+  }
+
   /// One blip, in the handheld's voice, unless the sound-effects switch is off.
   void _sfx(GbSound sound) =>
       GameboySfx.instance.play(sound, enabled: state.soundEffects, inCall: state.inCall);
 
   /// Puts a refusal in front of the person, the app's one existing way: an action
-  /// returns null on success or a sentence to show. The messenger is captured
-  /// before the await because the press may have moved on by the time it answers.
-  Future<void> _run(BuildContext context, Future<String?> Function() action) async {
-    final messenger = ScaffoldMessenger.of(context);
+  /// returns null on success or a sentence to show. The refusal lands in the LCD,
+  /// not on the plastic — see [GameboyShell]'s `_say`.
+  Future<void> _run(Future<String?> Function() action) async {
     final failed = await action();
-    if (failed == null) return;
+    if (!mounted || failed == null) return;
     _sfx(GbSound.denied);
-    messenger
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(failed)));
+    widget.onMessage(failed, bad: true);
   }
 
   /// Start: leave the conversation and walk home, each only when there is one to
   /// do — the dock's door, transcribed. See `control_bar.dart`'s `_leave`.
-  Future<void> _goHome(BuildContext context) async {
+  Future<void> _goHome() async {
     _sfx(GbSound.back);
     if (state.inHuddle) {
-      await _run(context, state.leaveHuddle);
+      await _run(state.leaveHuddle);
     }
     if (state.myDesk != null && !state.atMyDesk) {
-      if (!context.mounted) return;
-      await _run(context, state.goToMyDesk);
+      if (!mounted) return;
+      await _run(state.goToMyDesk);
     }
   }
 
@@ -993,7 +1334,8 @@ class _ControlsDeck extends StatelessWidget {
                                 },
                     ),
                   ),
-                  // B, below and left of A: mute. Lit means the mic is live, so the
+                  // B, below and left of A: mute, and — double-tapped while somebody
+                  // is in call distance — a wave. Lit means the mic is live, so the
                   // button glows when you are the one being heard. Inert in the
                   // menu — it has no job there, and a stray mute mid-menu surprises.
                   Positioned(
@@ -1006,16 +1348,7 @@ class _ControlsDeck extends StatelessWidget {
                       // Mute is a real switch; inert in the menu, so no toggle state
                       // there.
                       toggled: menuOpen ? null : call.micOn,
-                      onTap: menuOpen
-                          ? null
-                          : () {
-                              // Unmuting climbs, muting falls. Local-only: this
-                              // plays on our own speaker and is never mixed into
-                              // the mic uplink, so no one else on the call hears it.
-                              final unmuting = !call.micOn;
-                              _sfx(unmuting ? GbSound.toggleOn : GbSound.toggleOff);
-                              _run(context, () => state.setMicOn(!call.micOn));
-                            },
+                      onTap: menuOpen ? null : _tapB,
                     ),
                   ),
                 ],
@@ -1044,7 +1377,7 @@ class _ControlsDeck extends StatelessWidget {
                           const SizedBox(width: 22),
                           // Start goes home in the office, and backs out of the menu
                           // while it is up.
-                          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : () => _goHome(context)),
+                          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
                         ],
                       ),
                     ),

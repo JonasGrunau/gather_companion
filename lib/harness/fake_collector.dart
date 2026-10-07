@@ -153,9 +153,10 @@ class FakeCollector implements Collector {
   /// into my cluster. Empty when I am standing alone.
   List<CallPerson> get callmates => [for (final s in _nearMe()) s.person];
 
-  /// Sends a wave from [fromSpaceId] to me, on the event bus. Surfaces in the
-  /// Activity feed as a live item through `AppState._noteActivity`.
-  void wave(String fromSpaceId) {
+  /// Injects an *incoming* wave from [fromSpaceId] to me, on the event bus. Surfaces
+  /// in the Activity feed as a live item through `AppState._noteActivity`. Distinct
+  /// from [wave], which is the Collector action for *sending* one.
+  void injectWave(String fromSpaceId) {
     if (_interactions.isClosed) return;
     _interactions.add(BusEvent(
       name: 'WaveEvent',
@@ -240,6 +241,22 @@ class FakeCollector implements Collector {
   ({bool ok, String? detail}) clearCustomStatus() => (ok: true, detail: null);
   @override
   ({bool ok, String? detail}) broadcastEmote(String emote, {int count = 1}) => (ok: true, detail: null);
+
+  /// Every id we have been asked to wave at, in order — so a test can assert the
+  /// right person was targeted and that the client-side cooldown held a repeat back.
+  final List<String> waves = [];
+
+  /// When set, [wave] reports a failure without recording the target — the test
+  /// seam for "the socket was closed when the press landed", so the cooldown's
+  /// arm-only-on-success behaviour can be exercised.
+  bool failSends = false;
+  @override
+  ({bool ok, String? detail}) wave(String targetSpaceUserId) {
+    if (failSends) return (ok: false, detail: 'not connected to Gather');
+    waves.add(targetSpaceUserId);
+    return (ok: true, detail: null);
+  }
+
   @override
   ({bool ok, String? detail}) leaveCluster() => (ok: true, detail: null);
   @override

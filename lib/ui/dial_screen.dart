@@ -111,8 +111,30 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
     await openCallScreen(context, state);
   }
 
+  /// Waves at a contact without warping or opening the call — the one directory
+  /// action that touches somebody without going to them. There is no feed echo for
+  /// our own wave, so the confirmation here is the only sign it went.
+  Future<void> _waveAt(Contact contact) async {
+    final result = await state.sendWave(contact.id);
+    if (!mounted) return;
+    if (result.error != null) {
+      _say(result.error!);
+    } else if (result.sent) {
+      // Only a frame that went gets a confirmation; a cooldown no-op says nothing.
+      _say('👋 Waved at ${_firstName(contact.label)}');
+    }
+  }
+
   void _say(String message) {
     final t = context.tokens;
+    // Float the bar just above the nav rail: the rail floats over content, so a
+    // bar docked at the true bottom would sit behind it. The margin is measured
+    // from the Scaffold, which re-adds the home-indicator safe area under the
+    // floating bar itself — so the rail inset alone (plus a gutter) lands the bar
+    // snug above the dock. Using the tab's own `paddingOf`, which already carries
+    // that inset *and* the safe area, double-counts the safe area and floats it a
+    // home-indicator too high.
+    final bottom = kRailInset + kGutter;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
       ..showSnackBar(
@@ -120,6 +142,7 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
           content: Text(message),
           backgroundColor: t.card,
           behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.fromLTRB(kGutter, 0, kGutter, bottom),
         ),
       );
   }
@@ -184,6 +207,7 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
                     busy: _warping == c.id,
                     canWarp: canWarp,
                     onTap: canWarp ? () => _warpToPerson(c) : null,
+                    onWave: () => _waveAt(c),
                   );
                 },
               ),
@@ -391,6 +415,7 @@ class _ContactTile extends StatelessWidget {
     required this.busy,
     required this.canWarp,
     required this.onTap,
+    this.onWave,
   });
 
   final AppState state;
@@ -401,6 +426,11 @@ class _ContactTile extends StatelessWidget {
   /// Drives the pill: a present person on another floor is listed but not called.
   final bool canWarp;
   final VoidCallback? onTap;
+
+  /// Waves at this contact. Null for an offline row — a wave at somebody who is not
+  /// here would land nowhere. A present person on another floor can still be waved
+  /// at even when [canWarp] is false, so this is independent of the warp pill.
+  final VoidCallback? onWave;
 
   @override
   Widget build(BuildContext context) {
@@ -448,8 +478,49 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
+              if (onWave != null && present) ...[
+                _WaveButton(onTap: busy ? null : onWave, label: contact.label),
+                const SizedBox(width: 8),
+              ],
               if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A quiet round wave button, sized to sit beside the Warp pill without competing
+/// with it — a wave is the lighter of the two touches a row offers.
+class _WaveButton extends StatelessWidget {
+  const _WaveButton({required this.onTap, required this.label});
+
+  final VoidCallback? onTap;
+
+  /// Who the wave is aimed at, so an icon-only button still names its action and
+  /// target to a screen reader: "Wave at Ada" rather than an unlabelled button.
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final waveAt = 'Wave at ${_firstName(label)}';
+    return Semantics(
+      button: true,
+      label: waveAt,
+      child: Tooltip(
+        message: waveAt,
+        child: Material(
+          color: t.card,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Icon(Icons.waving_hand_rounded, size: 18, color: t.mutedForeground),
+            ),
           ),
         ),
       ),

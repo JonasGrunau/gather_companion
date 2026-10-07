@@ -376,6 +376,19 @@ void main() {
       expect(c.broadcastEmote('').ok, isFalse);
     });
 
+    test('wave is sendWave addressed to the target, with no third argument',
+        () async {
+      final (c, conn) = await connected();
+
+      // Unlike every other action, the id is the recipient's, not 'me-1', and
+      // there is no payload — a third element draws `Array must contain at most
+      // 0 element(s)`, so the frame is the bare two-element tuple.
+      expect(c.wave('ada').ok, isTrue);
+      expect((await lastFrame(conn, 'sendWave'))['args'], ['SpaceUser', 'ada']);
+
+      expect(c.wave('').ok, isFalse);
+    });
+
     test('every one of them refuses before it knows which avatar is ours', () {
       final c = build();
       expect(c.setAvailability('Busy').ok, isFalse);

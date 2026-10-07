@@ -10,9 +10,11 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/media/call.dart';
+import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
@@ -244,6 +246,144 @@ void main() {
       // No call to mute into, so the action refuses with a sentence rather than
       // crashing — the point is simply that the key reached an action.
       expect(tester.takeException(), isNull);
+    });
+
+    // A roster that puts me in a cluster with Ada — Gather's "in call distance", the
+    // one condition the handheld's wave prompt shows under.
+    Roster withAdaInCallDistance() => const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'You', clusterId: 'c1', clusterIdKnown: true, x: 10, y: 7),
+          RosterRow(id: 'a', name: 'Ada', clusterId: 'c1', clusterIdKnown: true, x: 10, y: 8),
+        ]);
+
+    testWidgets('a wave prompt appears when someone is in call distance', (tester) async {
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.text('Wave at Ada'), findsOneWidget);
+    });
+
+    testWidgets('no wave prompt while standing alone', (tester) async {
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugApplyRoster(const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'You', x: 10, y: 7),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.textContaining('Wave at'), findsNothing);
+    });
+
+    testWidgets('tapping the wave prompt sends a wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      // A live collector keeps the tree ticking, so `pumpAndSettle` would never
+      // return — a couple of plain pumps are enough to lay the prompt out.
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(GameboyShell), findsOneWidget);
+
+      await tester.tap(find.text('Wave at Ada'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'], reason: 'the prompt waves at the person in call distance');
+      // The confirmation lands inside the LCD, not on a Scaffold snackbar below the
+      // plastic.
+      expect(
+        find.descendant(of: find.byType(GameboyShell), matching: find.text('👋 Waved at Ada')),
+        findsOneWidget,
+      );
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('double-tapping B sends a wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // Two B presses inside the double-tap window — the window is wall-clock, and
+      // two taps land microseconds apart, so no timer advance is needed.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'a double-tap of B waves at the person in call distance');
+      expect(
+        find.descendant(of: find.byType(GameboyShell), matching: find.text('👋 Waved at Ada')),
+        findsOneWidget,
+      );
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('double-tapping B waves even after the first tap has muted', (tester) async {
+      // Regression: the first B tap mutes *asynchronously*, so by the second tap the
+      // call can already report mic-off. The wave must still fire — the pending mute
+      // tap is the witness of intent, not the live mic flag. Branching on the flag
+      // first would route this second tap into the mic-off path and schedule an
+      // unmute instead of waving.
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance())
+        ..debugCall = const CallState(
+          media: LocalMediaState(capturing: true, audioEnabled: true),
+        );
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // First tap while live records the mute intent.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      // The mute lands: the call now reads mic-off, exactly what a real `setMicOn`
+      // would emit between the two taps.
+      state.debugCall = const CallState();
+      await tester.pump();
+
+      // Second tap, now observing mic-off, must still wave.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'the pending mute tap, not the live mic flag, decides the second tap');
+    });
+
+    testWidgets('a single B tap does not wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // One tap is a mute; past the window it must not have turned into a wave.
+      await tester.tap(find.text('B'));
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(collector.waves, isEmpty, reason: 'one B tap mutes; it does not wave');
     });
 
     testWidgets('the D-pad asks to walk while a thumb is on it', (tester) async {
