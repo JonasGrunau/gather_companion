@@ -27,6 +27,8 @@
 /// is how many of the cast to seat (default 4). See `docs/sim_harness.md`.
 library;
 
+import 'dart:async';
+
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -38,6 +40,7 @@ import 'harness/scripted_call.dart';
 import 'src/app_state.dart';
 import 'src/credentials.dart';
 import 'src/settings.dart';
+import 'src/ui_preferences.dart';
 import 'theme/gather_theme.dart';
 import 'ui/call_screen.dart';
 import 'ui/home_shell.dart';
@@ -220,13 +223,26 @@ class _AppHarnessState extends State<_AppHarness> {
   @override
   void initState() {
     super.initState();
-    // Boot the real flow, then animate once the collector is subscribed. `boot`
-    // runs `_attach`, which calls `FakeCollector.start()` and wires the streams;
-    // starting the driver after keeps the first scripted roster from being
-    // emitted into a broadcast stream nobody is listening to yet.
-    widget.state.boot().then((_) {
-      if (mounted) widget.driver.start();
-    });
+    unawaited(_boot());
+  }
+
+  /// Boot the real flow, then animate once the collector is subscribed. `boot`
+  /// runs `_attach`, which calls `FakeCollector.start()` and wires the streams;
+  /// starting the driver after keeps the first scripted roster from being emitted
+  /// into a broadcast stream nobody is listening to yet.
+  Future<void> _boot() async {
+    // `--dart-define=GAMEBOY=true` boots straight into the handheld, for watching the
+    // Gameboy shell and its centred camera on a bare sim. Written to [UiPreferences]
+    // *before* [AppState.boot], because boot reads the flag from there — setting it
+    // after would land on the Dial tab, since [HomeShell] picks its opening tab from
+    // the flag as it first builds. The pref sticks on the throwaway sim, so the define
+    // is honoured only when actually passed: `GAMEBOY=true` arms it, `GAMEBOY=false`
+    // clears it again, and leaving it off keeps whatever the last run set.
+    if (const bool.hasEnvironment('GAMEBOY')) {
+      await UiPreferences().saveGameboyMode(const bool.fromEnvironment('GAMEBOY'));
+    }
+    await widget.state.boot();
+    if (mounted) widget.driver.start();
   }
 
   @override

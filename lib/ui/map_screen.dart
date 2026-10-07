@@ -677,6 +677,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       widget.state.takeFollowRequest();
       _startFollowing();
     });
+    // Gameboy mode's handheld camera. A D-pad walk re-grabs the centred lock after a
+    // pan has broken it; the lock is otherwise engaged on entry (see [_centreOnMe]) and
+    // held for as long as the office is on the little screen.
+    _recentre = widget.state.recentre.listen((_) {
+      if (mounted) _lockCamera();
+    });
     // A desk walk asked for while this screen did not exist — from the call
     // screen, whose dock carries the same button, or from another tab. Deferred
     // one frame because following needs a layout that has not happened yet:
@@ -690,6 +696,15 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   // ---- riding along ----------------------------------------------------------
 
   StreamSubscription<void>? _followRequests;
+
+  /// A D-pad walk in Gameboy mode, asking the camera to re-grab the centred lock.
+  StreamSubscription<void>? _recentre;
+
+  /// Whether the Gameboy camera lock is engaged: the avatar is pinned to the centre of
+  /// the LCD and the floor scrolls under it. Persistent while the office is on the
+  /// handheld's screen, dropped the moment the user pans or pinches (see
+  /// [_stopFollowing]) and re-grabbed on the next D-pad walk (see [_recentre]).
+  bool _locked = false;
 
   /// Keeps the camera on my own avatar for the length of a walk — see
   /// [AppState.followMe] for which walks ask for it.
@@ -724,7 +739,21 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   }
 
   void _stopFollowing() {
+    // A pan, a pinch or a double tap takes the camera back — so it also drops the
+    // Gameboy lock, which the next D-pad walk re-grabs.
+    _locked = false;
     if (_follow.isActive) _follow.stop();
+  }
+
+  /// Engage Gameboy mode's centred camera: the avatar is held at the middle of the LCD
+  /// and the floor scrolls under it, eased in to a fixed walking zoom. Idempotent — a
+  /// press while the lock is already running only refreshes it.
+  void _lockCamera() {
+    if (!mounted) return;
+    _zoom.stop();
+    _locked = true;
+    _followLast = Duration.zero;
+    if (!_follow.isActive) _follow.start();
   }
 
   /// Eases the view towards me, and lets go once I have arrived and it has caught up.
@@ -738,6 +767,31 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (me == null || _child.isEmpty) return _stopFollowing();
     final now = _motion.now;
     final at = _motion.positionOf(me, now);
+
+    if (_locked) {
+      // Gameboy camera: ease the zoom toward the fixed walking level, but pin the centre
+      // at that eased zoom every frame, so the avatar stays dead-centre while the floor
+      // scrolls and stops at the office edges ([framedOn] clamps). Easing the translation
+      // instead — the desk-return path below — would let the body drift off centre while
+      // it moves, the opposite of a handheld camera. At min zoom [framedOn] simply shows
+      // the whole floor, so the avatar is in view regardless. Never auto-stops: the lock
+      // is released only by a pan (see [_stopFollowing]).
+      final dt = (elapsed - _followLast).inMicroseconds / Duration.microsecondsPerSecond;
+      _followLast = elapsed;
+      final cur = _view.value.getMaxScaleOnAxis();
+      final z = cur + (_gameboyZoom - cur) * (1 - math.exp(-dt / 0.12));
+      final locked = framedOn(
+        at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base + _covered / 2 / z),
+        viewport: _viewport,
+        child: _child,
+        zoom: z,
+      );
+      // Skip the write — and the InteractiveViewer repaint it triggers — while the avatar
+      // stands still and the zoom has settled, so an idle handheld is not repainting at 60fps.
+      if (_view.value != locked) _view.value = locked;
+      return;
+    }
+
     final target = framedOn(
       at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base + _covered / 2 / _followZoom),
       viewport: _viewport,
@@ -777,6 +831,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   void dispose() {
     unawaited(_notices?.cancel());
     unawaited(_followRequests?.cancel());
+    unawaited(_recentre?.cancel());
     _follow.dispose();
     _tapWindow?.cancel();
     _blockedNoteTimer?.cancel();
@@ -801,6 +856,16 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (me == null) return;
     _placed = true;
 
+    // Gameboy mode wants the handheld camera, not a one-shot opening frame: engage the
+    // centred lock the moment there is a position to centre on, and let [_followFrame]
+    // ease the zoom in and keep the avatar on screen from here on. A runtime toggle of
+    // Gameboy mode rebuilds this screen (home_shell swaps the subtree), so `_placed`
+    // resets and this re-runs.
+    if (widget.state.gameboyMode) {
+      _lockCamera();
+      return;
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _view.value = framedOn(at: Offset((me.x + 0.5) * artTileSize * base, (me.y + 0.5) * artTileSize * base), viewport: viewport, child: child, zoom: _openingZoom);
@@ -809,6 +874,11 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
   /// Close enough that a desk is a desk, far enough to see the room it is in.
   static const _openingZoom = 3.0;
+
+  /// The fixed zoom the Gameboy handheld camera eases to and holds — a consistent
+  /// walking scale, so a D-pad walk is always framed the same. Separate from
+  /// [_openingZoom] so the two can be tuned apart even though they share a value today.
+  static const _gameboyZoom = 3.0;
 
   /// Double tap zooms in on what was tapped, or back out again if already close.
   ///
