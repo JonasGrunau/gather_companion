@@ -10,6 +10,7 @@ import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
 import 'media/call.dart';
+import 'media/gameboy_sfx.dart';
 import 'notifications.dart';
 import 'pairing.dart';
 import 'push.dart';
@@ -547,7 +548,37 @@ class AppState extends ChangeNotifier {
     if (_gameboyMode == on) return;
     _gameboyMode = on;
     notifyListeners();
+    // The power-on jingle, on the off→on flip only — switching the handheld on is
+    // the one moment it earns a boot chime; a rebuild or a restore into the mode
+    // must stay silent. Gated by the sound-effects switch like every other blip.
+    if (on && _soundEffects) {
+      // Build the SFX player at this idle moment so the first blip during a later
+      // call never reconfigures the session the call owns; the boot jingle then
+      // plays on the already-warm player.
+      GameboySfx.instance.prewarm(inCall: inCall);
+      GameboySfx.instance.play(GbSound.boot, enabled: _soundEffects, inCall: inCall);
+    }
     await _uiPrefs.saveGameboyMode(on);
+  }
+
+  /// Whether the app's sound effects play — the handheld's blips, the boot
+  /// jingle, and the speaker-test chime. On by default. This never touches
+  /// in-call voice; it is a UI-sound switch only, read back at [boot] and
+  /// persisted the moment it flips, exactly like [gameboyMode].
+  bool _soundEffects = true;
+  bool get soundEffects => _soundEffects;
+
+  Future<void> setSoundEffects(bool on) async {
+    if (_soundEffects == on) return;
+    _soundEffects = on;
+    notifyListeners();
+    // Turning sounds on while already in Gameboy mode is the other idle moment a
+    // blip first becomes possible — warm the player here too, so a later in-call
+    // blip never has to reconfigure the call's audio session.
+    if (on && _gameboyMode) {
+      GameboySfx.instance.prewarm(inCall: inCall);
+    }
+    await _uiPrefs.saveSoundEffects(on);
   }
 
   /// Development shortcut past the scanner:
@@ -563,6 +594,15 @@ class AppState extends ChangeNotifier {
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
     _gameboyMode = await _uiPrefs.loadGameboyMode();
+    _soundEffects = await _uiPrefs.loadSoundEffects();
+
+    // Launched straight into Gameboy mode with sounds on: no setter ran to warm
+    // the SFX player, so do it here while there is no call yet. The restore itself
+    // stays silent (no boot jingle), it just pins the player's audio context now
+    // so the first blip during a later call never reconfigures the call's session.
+    if (_gameboyMode && _soundEffects) {
+      GameboySfx.instance.prewarm(inCall: inCall);
+    }
 
     if (!_credentials.isComplete && _devPair.isNotEmpty) {
       final parts = _devPair.split(':');

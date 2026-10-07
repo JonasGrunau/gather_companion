@@ -19,6 +19,7 @@ class UiPreferences {
   SharedPreferences? _prefs;
 
   static const _gameboyKey = 'ui.gameboyMode';
+  static const _soundEffectsKey = 'ui.soundEffects';
 
   Future<SharedPreferences?> _store() async {
     if (_prefs != null) return _prefs;
@@ -43,6 +44,25 @@ class UiPreferences {
   Future<void> saveGameboyMode(bool on) async {
     try {
       await (await _store())?.setBool(_gameboyKey, on);
+    } on Object {
+      /* nothing useful to do; the next toggle writes it again */
+    }
+  }
+
+  /// Whether the app's sound effects play. On by default — the blips and chimes
+  /// are the expected behaviour, and this switch is how somebody turns them off,
+  /// not how they opt in. Never touches in-call voice; it gates UI sound only.
+  Future<bool> loadSoundEffects() async {
+    try {
+      return (await _store())?.getBool(_soundEffectsKey) ?? true;
+    } on Object {
+      return true;
+    }
+  }
+
+  Future<void> saveSoundEffects(bool on) async {
+    try {
+      await (await _store())?.setBool(_soundEffectsKey, on);
     } on Object {
       /* nothing useful to do; the next toggle writes it again */
     }

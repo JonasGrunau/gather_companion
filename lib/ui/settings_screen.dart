@@ -114,14 +114,17 @@ class SettingsScreen extends StatelessWidget {
                 // Pushed, never a tab: the check opens the hardware in
                 // `initState` and holds it until it is disposed, so it has to be
                 // a screen you leave rather than one that sits behind another.
-                onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const MediaCheckScreen())),
+                onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => MediaCheckScreen(state: state))),
               ),
             ],
           ),
           SizedBox(height: 8),
           const _SectionLabel('Appearance'),
           _Card(
-            children: [_GameboyRow(state: state)],
+            children: [
+              _GameboyRow(state: state),
+              _SoundEffectsRow(state: state),
+            ],
           ),
           SizedBox(height: 8),
           // Not 'Paired computer': that asserted a pairing as the *label*, above a
@@ -341,6 +344,34 @@ class _GameboyRow extends StatelessWidget {
         title: 'Gameboy mode',
         subtitle: on ? 'The office, played as a handheld.' : 'Play the office like a handheld.',
         onTap: () => state.setGameboyMode(!on),
+        trailing: _PartySwitch(on: on, pending: false),
+      ),
+    );
+  }
+}
+
+/// The sound-effects switch, beside Gameboy mode in the Appearance card. Gates
+/// the app's UI sounds — the handheld's blips, the boot jingle, the speaker-test
+/// chime — and nothing else; in-call voice is never a sound effect. On by
+/// default, so this is the off switch, not the opt-in.
+class _SoundEffectsRow extends StatelessWidget {
+  const _SoundEffectsRow({required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final on = state.soundEffects;
+
+    return Semantics(
+      toggled: on,
+      child: _Row(
+        icon: on ? Icons.volume_up_rounded : Icons.volume_off_rounded,
+        tint: on ? t.brand : null,
+        title: 'Sound effects',
+        subtitle: on ? 'Clicks and chimes play.' : 'The app is silent, bar calls.',
+        onTap: () => state.setSoundEffects(!on),
         trailing: _PartySwitch(on: on, pending: false),
       ),
     );

@@ -62,6 +62,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:record/record.dart';
 
+import '../src/app_state.dart';
+import '../src/media/gameboy_sfx.dart';
 import '../src/media/media_engine.dart';
 import '../src/media/mic_level.dart';
 import '../src/media/test_tone.dart';
@@ -121,7 +123,12 @@ const _recordConfig = RecordConfig(
 );
 
 class MediaCheckScreen extends StatefulWidget {
-  const MediaCheckScreen({super.key});
+  const MediaCheckScreen({super.key, required this.state});
+
+  /// Carried only to read two switches when the speaker test fires: whether
+  /// sound effects are on at all, and whether Gameboy mode wants the chime in
+  /// the handheld's square-wave voice instead of the plain sine.
+  final AppState state;
 
   @override
   State<MediaCheckScreen> createState() => _MediaCheckScreenState();
@@ -180,7 +187,7 @@ class _MediaCheckScreenState extends State<MediaCheckScreen> {
               // `dispose` tears its framework down before the other's comes up —
               // which is the whole reason the two never share the audio session.
               child: _mode == _CheckMode.device
-                  ? const _DeviceCheck(key: ValueKey('device'))
+                  ? _DeviceCheck(key: const ValueKey('device'), state: widget.state)
                   : const _MeetingCheck(key: ValueKey('meeting')),
             ),
           ],
@@ -219,7 +226,10 @@ class _CheckFailure {
 // ---------------------------------------------------------------------------
 
 class _DeviceCheck extends StatefulWidget {
-  const _DeviceCheck({super.key});
+  const _DeviceCheck({super.key, required this.state});
+
+  /// Only the speaker test reads it: see [MediaCheckScreen.state].
+  final AppState state;
 
   @override
   State<_DeviceCheck> createState() => _DeviceCheckState();
@@ -402,16 +412,20 @@ class _DeviceCheckState extends State<_DeviceCheck> with WidgetsBindingObserver 
   void _setSpeaker(bool speaker) => setState(() => _speaker = speaker);
 
   Future<void> _playTone() async {
+    // The chime is a sound effect; the Sound effects switch silences it too.
+    if (!widget.state.soundEffects) return;
     try {
       // Apply the route here so the Speaker/Earpiece choice always wins: the
       // recorder's session may have been the last to set the category, and there
       // is no WebRTC to flap it, so one deliberate set per tap is correct and
       // cheap.
       await AudioPlayer.global.setAudioContext(_deviceToneContext(speaker: _speaker));
-      await _player.play(
-        BytesSource(chimeWav(variant: _rng.nextInt(variantCount)),
-            mimeType: 'audio/wav'),
-      );
+      // In Gameboy mode the speaker test speaks the handheld's square-wave voice;
+      // otherwise the plain sine chime, picked fresh so taps do not repeat.
+      final bytes = widget.state.gameboyMode
+          ? gbSoundWav(GbSound.chime)
+          : chimeWav(variant: _rng.nextInt(variantCount));
+      await _player.play(BytesSource(bytes, mimeType: 'audio/wav'));
     } on Object catch (error) {
       debugPrint('media-check: could not play the test sound: $error');
     }

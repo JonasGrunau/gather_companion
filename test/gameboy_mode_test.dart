@@ -106,6 +106,54 @@ void main() {
     });
   });
 
+  // The sound-effects switch gates every blip, so — like Gameboy mode — a silent
+  // restore or a dropped default must not quietly turn sounds back on. Pinned at
+  // the same three seams the mode is: the UI flip, the persistence round-trip, and
+  // the stored-value default, plus the off-state surviving a reboot.
+  group('the sound-effects toggle', () {
+    Widget wrapSettings(AppState state) => MaterialApp(
+          theme: buildGatherTheme(),
+          home: ListenableBuilder(
+            listenable: state,
+            builder: (context, _) => SettingsScreen(state: state, onUnpair: () {}),
+          ),
+        );
+
+    testWidgets('flips the setting on and off', (tester) async {
+      final state = configure(AppState());
+      await tester.pumpWidget(wrapSettings(state));
+      await tester.pump();
+
+      expect(state.soundEffects, isTrue, reason: 'on by default');
+      await tester.ensureVisible(find.text('Sound effects'));
+      await tester.tap(find.text('Sound effects'));
+      await tester.pumpAndSettle();
+      expect(state.soundEffects, isFalse);
+
+      await tester.tap(find.text('Sound effects'));
+      await tester.pumpAndSettle();
+      expect(state.soundEffects, isTrue);
+    });
+
+    testWidgets('survives a reload through the preference store', (tester) async {
+      await UiPreferences().saveSoundEffects(false);
+      expect(await UiPreferences().loadSoundEffects(), isFalse);
+    });
+
+    testWidgets('defaults on when nothing is stored', (tester) async {
+      expect(await UiPreferences().loadSoundEffects(), isTrue);
+    });
+
+    testWidgets('an off setting is what a reboot reads back', (tester) async {
+      // Flip it off through AppState, then read the store the way boot() does
+      // (`loadSoundEffects`): it must come back off, so nothing it gates can
+      // silently re-sound on the next launch.
+      await configure(AppState()).setSoundEffects(false);
+      expect(await UiPreferences().loadSoundEffects(), isFalse,
+          reason: 'boot() reads this value, so the off state survives a relaunch');
+    });
+  });
+
   group('the startup tab', () {
     testWidgets('Gameboy mode opens on the office', (tester) async {
       final state = configure(AppState())..setGameboyMode(true);
