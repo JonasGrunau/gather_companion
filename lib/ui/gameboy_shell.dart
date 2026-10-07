@@ -722,59 +722,51 @@ class _LcdWavePrompt extends StatelessWidget {
       builder: (context, _) {
         final rows = state.huddleRows;
         if (rows.isEmpty) return const SizedBox.shrink();
-        final who = rows.length == 1 ? (rows.first.name ?? 'them') : 'them';
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 6),
-          child: Semantics(
-            button: true,
-            label: 'Wave at $who. Tap to wave.',
-            child: ExcludeSemantics(
-              child: Material(
-                color: _scMid,
-                borderRadius: BorderRadius.circular(6),
-                child: InkWell(
+        final who = rows.length == 1 ? (rows.first.name?.split(' ').first ?? 'them') : 'them';
+        // A small chip at the foot of the LCD, hugged to the right rather than
+        // spanning the screen — it is a prompt, not a banner, and the office
+        // behind it should stay the thing you are looking at.
+        return Align(
+          alignment: Alignment.centerRight,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Semantics(
+              button: true,
+              label: 'Wave at $who. Tap to wave.',
+              child: ExcludeSemantics(
+                child: Material(
+                  color: _scMid,
                   borderRadius: BorderRadius.circular(6),
-                  onTap: onWave,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: _accentPink, width: 1.5),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.waving_hand_rounded, size: 18, color: _accentPink),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Wave at $who',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontFamily: _pixelFont,
-                                  color: _scWhite,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w700,
-                                ),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    onTap: onWave,
+                    child: Container(
+                      constraints: const BoxConstraints(maxWidth: 170),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: _accentPink, width: 1.5),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.waving_hand_rounded, size: 14, color: _accentPink),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              'Wave at $who',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontFamily: _pixelFont,
+                                color: _scWhite,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
                               ),
-                              const SizedBox(height: 1),
-                              const Text(
-                                'Tap to wave',
-                                style: TextStyle(
-                                  fontFamily: _pixelFont,
-                                  color: _scGlyphOff,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -944,12 +936,6 @@ class _Screen extends StatelessWidget {
                   // "choose" there, and the office it would return to is covered
                   // anyway.
                   if (menu == null) _LcdCallBanner(state: state),
-                  // Shown only when somebody is in call distance (Gather's cluster) —
-                  // the handheld's answer to "wave at someone", a prompt you tap
-                  // rather than a button, since every hardware key is already spoken
-                  // for while a call is on. Held down under the Select menu like the
-                  // call banner.
-                  if (menu == null && onWave != null) _LcdWavePrompt(state: state, onWave: onWave!),
                   Expanded(
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(4),
@@ -977,6 +963,12 @@ class _Screen extends StatelessWidget {
                       ),
                     ),
                   ),
+                  // Shown only when somebody is in call distance (Gather's cluster) —
+                  // the handheld's answer to "wave at someone", a prompt you tap
+                  // rather than a button, since every hardware key is already spoken
+                  // for while a call is on. Sits at the foot of the LCD, under the
+                  // office. Held down under the Select menu like the call banner.
+                  if (menu == null && onWave != null) _LcdWavePrompt(state: state, onWave: onWave!),
                 ],
               ),
             ),

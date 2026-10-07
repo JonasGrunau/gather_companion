@@ -96,6 +96,9 @@ class _DialScreenState extends State<DialScreen> {
 
   void _say(String message) {
     final t = context.tokens;
+    // Float the bar above the nav rail: the rail floats over content, so a
+    // bar docked at the true bottom would sit behind it and cover the dock.
+    final bottom = kRailInset + MediaQuery.paddingOf(context).bottom + 8;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
       ..showSnackBar(
@@ -103,6 +106,7 @@ class _DialScreenState extends State<DialScreen> {
           content: Text(message),
           backgroundColor: t.card,
           behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.fromLTRB(kGutter, 0, kGutter, bottom),
         ),
       );
   }

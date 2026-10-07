@@ -38,6 +38,20 @@ import 'person_avatar.dart';
 /// 222 KB, which is why "draw all of it" is a reasonable thing to do on a phone. See
 /// `art_cache.dart` for the fetching and `space_art.dart` for where the URLs come
 /// from.
+/// Every map toast goes through here so it floats above the nav rail rather than
+/// docking at the true bottom, where the rail floats over content and would cover
+/// it. Same inset the tabs pad themselves by.
+SnackBar _railClearSnack(BuildContext context, String message) => SnackBar(
+      content: Text(message),
+      behavior: SnackBarBehavior.floating,
+      margin: EdgeInsets.fromLTRB(
+        kGutter,
+        0,
+        kGutter,
+        kRailInset + MediaQuery.paddingOf(context).bottom + 8,
+      ),
+    );
+
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key, required this.state});
 
@@ -591,9 +605,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(
-          content: Text('${room.name ?? 'That room'} is locked.'),
-        ));
+        ..showSnackBar(_railClearSnack(context, '${room.name ?? 'That room'} is locked.'));
       return;
     }
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
@@ -692,7 +704,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     setState(() => _selectedPerson = null);
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(failed ?? '👋 Waved at ${person.label.split(' ').first}')));
+      ..showSnackBar(_railClearSnack(context, failed ?? '👋 Waved at ${person.label.split(' ').first}'));
   }
 
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
@@ -722,7 +734,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(notice)));
+        ..showSnackBar(_railClearSnack(context, notice));
     });
     _followRequests = widget.state.followMe.listen((_) {
       // Claimed, so the latch below does not ride the same walk a second time
@@ -1385,7 +1397,7 @@ class _GoToState extends State<_GoTo> {
     if (!mounted || failed == null) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(failed)));
+      ..showSnackBar(_railClearSnack(context, failed));
   }
 
   @override

@@ -263,7 +263,6 @@ void main() {
       await toOffice(tester);
 
       expect(find.text('Wave at Ada'), findsOneWidget);
-      expect(find.text('Tap to wave'), findsOneWidget);
     });
 
     testWidgets('no wave prompt while standing alone', (tester) async {
