@@ -363,11 +363,11 @@ void main() {
     // the edge of the test viewport, and past the lazy list's built range, until
     // scrolled to.
     await tester.scrollUntilVisible(find.text('Forget this computer'), 120);
-    // The last row can come to rest just under the floating dock; scroll to the
-    // very end (the list's bottom padding reserves the dock's strip) so it is
-    // hittable rather than half behind the island.
-    await tester.drag(find.byType(SettingsScreen), const Offset(0, -200));
-    await tester.pumpAndSettle();
+    // Fully into view before tapping: with the Appearance section above it the
+    // row can stop at the very bottom edge, where its centre is off-screen and the
+    // tap misses.
+    await tester.ensureVisible(find.text('Forget this computer'));
+    await tester.pump();
     await tester.tap(find.text('Forget this computer'));
     await tester.pump();
 
