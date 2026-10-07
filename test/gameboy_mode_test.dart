@@ -297,6 +297,44 @@ void main() {
       expect(collector.waves, ['a'], reason: 'the prompt waves at the person in call distance');
     });
 
+    testWidgets('double-tapping B sends a wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // Two B presses inside the double-tap window — the window is wall-clock, and
+      // two taps land microseconds apart, so no timer advance is needed.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'a double-tap of B waves at the person in call distance');
+    });
+
+    testWidgets('a single B tap does not wave', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // One tap is a mute; past the window it must not have turned into a wave.
+      await tester.tap(find.text('B'));
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(collector.waves, isEmpty, reason: 'one B tap mutes; it does not wave');
+    });
+
     testWidgets('the D-pad asks to walk while a thumb is on it', (tester) async {
       final state = configure(_SpyState())
         ..setGameboyMode(true)

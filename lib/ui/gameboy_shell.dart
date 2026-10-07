@@ -41,6 +41,8 @@
 /// is only half a handheld.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart' show settableAvailabilities;
@@ -412,6 +414,9 @@ class _GameboyShellState extends State<GameboyShell> {
                 onMenuConfirm: _confirm,
                 onMenuClose: _closeMenu,
                 onMenuToggle: _toggleMenu,
+                // The same wave the LCD prompt sends; the deck fires it on a
+                // double-tap of B while someone is in call distance.
+                onWave: _doWave,
               ),
             ],
           ),
@@ -723,48 +728,65 @@ class _LcdWavePrompt extends StatelessWidget {
         final rows = state.huddleRows;
         if (rows.isEmpty) return const SizedBox.shrink();
         final who = rows.length == 1 ? (rows.first.name?.split(' ').first ?? 'them') : 'them';
-        // A small pink-outlined chip centred at the foot of the LCD. No fill of its
-        // own — the screen's own black shows through the outline — so it reads as
-        // drawn on the office rather than a panel dropped over it.
+        // A small pink-outlined chip centred over the foot of the office. No fill of
+        // its own — the map shows through the outline — so it reads as drawn on the
+        // office rather than a panel dropped over it. The hardware hint ("B B")
+        // rides on the end, because a double-tap of B sends the same wave the chip
+        // does and a handheld says which key does what.
         return Align(
           alignment: Alignment.center,
-          child: Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: Semantics(
-              button: true,
-              label: 'Wave at $who. Tap to wave.',
-              child: ExcludeSemantics(
-                child: Material(
-                  type: MaterialType.transparency,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(6),
-                    onTap: onWave,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: _accentPink, width: 1.5),
-                      ),
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.waving_hand_rounded, size: 14, color: _accentPink),
-                          const SizedBox(width: 6),
-                          Flexible(
-                            child: Text(
-                              'Wave at $who',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontFamily: _pixelFont,
-                                color: _scWhite,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                              ),
+          child: Semantics(
+            button: true,
+            label: 'Wave at $who. Double-tap B or tap.',
+            child: ExcludeSemantics(
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: onWave,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: _accentPink, width: 1.5),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.waving_hand_rounded, size: 14, color: _accentPink),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            'Wave at $who',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: _pixelFont,
+                              color: _scWhite,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
                             ),
                           ),
-                        ],
-                      ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(3),
+                            border: Border.all(color: _accentPink, width: 1),
+                          ),
+                          child: const Text(
+                            'B B',
+                            style: TextStyle(
+                              fontFamily: _pixelFont,
+                              color: _accentPink,
+                              fontSize: 8,
+                              fontWeight: FontWeight.w700,
+                              height: 1,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -957,16 +979,23 @@ class _Screen extends StatelessWidget {
                               child: menu ?? const SizedBox.shrink(key: ValueKey('gb-menu-closed')),
                             ),
                           ),
+                          // Shown only when somebody is in call distance (Gather's
+                          // cluster) — the handheld's answer to "wave at someone".
+                          // Floated over the office at the foot of the LCD rather
+                          // than given a row of its own, so the map shows through
+                          // behind the outlined chip instead of a black strip under
+                          // it. Held down under the Select menu like the call banner.
+                          if (menu == null && onWave != null)
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              bottom: 6,
+                              child: _LcdWavePrompt(state: state, onWave: onWave!),
+                            ),
                         ],
                       ),
                     ),
                   ),
-                  // Shown only when somebody is in call distance (Gather's cluster) —
-                  // the handheld's answer to "wave at someone", a prompt you tap
-                  // rather than a button, since every hardware key is already spoken
-                  // for while a call is on. Sits at the foot of the LCD, under the
-                  // office. Held down under the Select menu like the call banner.
-                  if (menu == null && onWave != null) _LcdWavePrompt(state: state, onWave: onWave!),
                 ],
               ),
             ),
@@ -986,7 +1015,7 @@ class _Screen extends StatelessWidget {
 /// hardware at it: the D-pad becomes the cursor, A chooses, Start backs out, and B
 /// goes inert. The menu owns the meaning of the keys for as long as it is up, the
 /// way a real handheld's buttons mean different things on a menu than in a game.
-class _ControlsDeck extends StatelessWidget {
+class _ControlsDeck extends StatefulWidget {
   const _ControlsDeck({
     required this.state,
     required this.menuOpen,
@@ -994,6 +1023,7 @@ class _ControlsDeck extends StatelessWidget {
     required this.onMenuConfirm,
     required this.onMenuClose,
     required this.onMenuToggle,
+    required this.onWave,
   });
 
   final AppState state;
@@ -1002,6 +1032,105 @@ class _ControlsDeck extends StatelessWidget {
   final VoidCallback onMenuConfirm;
   final VoidCallback onMenuClose;
   final VoidCallback onMenuToggle;
+
+  /// Sends the proximity wave — the same action the LCD prompt fires. Reached from
+  /// a double-tap of B while somebody is in call distance.
+  final VoidCallback onWave;
+
+  @override
+  State<_ControlsDeck> createState() => _ControlsDeckState();
+}
+
+/// How long after the first B tap a second one still counts as a double. Counted by
+/// hand, not with [GestureDetector.onDoubleTap], whose arena would hold every single
+/// B press this long before letting it through — and mute has to be instant. Same
+/// reasoning as the map's hand-counted tap in `map_screen.dart`.
+const Duration _bDoubleTapWindow = Duration(milliseconds: 280);
+
+class _ControlsDeckState extends State<_ControlsDeck> {
+  AppState get state => widget.state;
+  bool get menuOpen => widget.menuOpen;
+  void Function(String direction) get onMenuMove => widget.onMenuMove;
+  VoidCallback get onMenuConfirm => widget.onMenuConfirm;
+  VoidCallback get onMenuClose => widget.onMenuClose;
+  VoidCallback get onMenuToggle => widget.onMenuToggle;
+
+  /// A pending unmute, held back behind the double-tap window so a second B tap can
+  /// cancel it. Non-null only while a muted B tap is waiting to resolve — the mic is
+  /// never opened on the first tap, or a double-tap-to-wave would leave you broadcast.
+  Timer? _bDefer;
+
+  /// When a *muting* B tap last landed while a wave was available, so a follow-up
+  /// inside the window is caught as a double without ever delaying the mute itself.
+  DateTime? _bMuteTapAt;
+
+  @override
+  void dispose() {
+    _bDefer?.cancel();
+    super.dispose();
+  }
+
+  /// What B does, split by direction so an unmute never fires on the first tap:
+  ///
+  /// - **No wave available** — plain mute/unmute, instant, as B always was.
+  /// - **Wave available, mic on** (a tap would *mute*, which is safe to do at once):
+  ///   the first tap mutes now; a second inside the window silently restores the mic
+  ///   and waves, so a wanted wave costs at most a brief, safe mute.
+  /// - **Wave available, mic off** (a tap would *unmute*, the dangerous direction):
+  ///   the unmute is deferred behind the window; a second tap cancels it and waves,
+  ///   so you stay muted. Nobody is ever opened up by accident.
+  void _tapB(BuildContext context) {
+    final micOn = state.call.micOn;
+    final waveReady = state.huddleRows.isNotEmpty;
+
+    if (!waveReady) {
+      _bDefer?.cancel();
+      _bDefer = null;
+      _bMuteTapAt = null;
+      _toggleMic(context, micOn);
+      return;
+    }
+
+    if (micOn) {
+      final at = _bMuteTapAt;
+      if (at != null && DateTime.now().difference(at) < _bDoubleTapWindow) {
+        // Second tap: put the mic back silently (the wave's blip is the feedback)
+        // and wave. Net: mic unchanged, wave sent.
+        _bMuteTapAt = null;
+        _run(context, () => state.setMicOn(true));
+        widget.onWave();
+        return;
+      }
+      _bMuteTapAt = DateTime.now();
+      _sfx(GbSound.toggleOff);
+      _run(context, () => state.setMicOn(false));
+      return;
+    }
+
+    _bMuteTapAt = null;
+    if (_bDefer != null) {
+      // Second tap before the deferred unmute fired: the wave was the intent.
+      _bDefer!.cancel();
+      _bDefer = null;
+      widget.onWave();
+      return;
+    }
+    _bDefer = Timer(_bDoubleTapWindow, () {
+      _bDefer = null;
+      if (!mounted) return;
+      _sfx(GbSound.toggleOn);
+      _run(this.context, () => state.setMicOn(true));
+    });
+  }
+
+  /// A plain mute toggle with its blip — B's job whenever there is no wave to steal
+  /// the double-tap.
+  void _toggleMic(BuildContext context, bool micOn) {
+    // Unmuting climbs, muting falls. Local-only: this plays on our own speaker and
+    // is never mixed into the mic uplink, so no one else on the call hears it.
+    _sfx(micOn ? GbSound.toggleOff : GbSound.toggleOn);
+    _run(context, () => state.setMicOn(!micOn));
+  }
 
   /// One blip, in the handheld's voice, unless the sound-effects switch is off.
   void _sfx(GbSound sound) =>
@@ -1103,7 +1232,8 @@ class _ControlsDeck extends StatelessWidget {
                                 },
                     ),
                   ),
-                  // B, below and left of A: mute. Lit means the mic is live, so the
+                  // B, below and left of A: mute, and — double-tapped while somebody
+                  // is in call distance — a wave. Lit means the mic is live, so the
                   // button glows when you are the one being heard. Inert in the
                   // menu — it has no job there, and a stray mute mid-menu surprises.
                   Positioned(
@@ -1116,16 +1246,7 @@ class _ControlsDeck extends StatelessWidget {
                       // Mute is a real switch; inert in the menu, so no toggle state
                       // there.
                       toggled: menuOpen ? null : call.micOn,
-                      onTap: menuOpen
-                          ? null
-                          : () {
-                              // Unmuting climbs, muting falls. Local-only: this
-                              // plays on our own speaker and is never mixed into
-                              // the mic uplink, so no one else on the call hears it.
-                              final unmuting = !call.micOn;
-                              _sfx(unmuting ? GbSound.toggleOn : GbSound.toggleOff);
-                              _run(context, () => state.setMicOn(!call.micOn));
-                            },
+                      onTap: menuOpen ? null : () => _tapB(context),
                     ),
                   ),
                 ],

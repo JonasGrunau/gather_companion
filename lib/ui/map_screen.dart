@@ -16,6 +16,7 @@ import '../src/map_motion.dart';
 import '../src/map_person.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
+import 'control_bar.dart';
 import 'dpad.dart';
 import 'person_avatar.dart';
 
@@ -40,17 +41,20 @@ import 'person_avatar.dart';
 /// from.
 /// Every map toast goes through here so it sits in the same slot as the selected-
 /// person card — just above the dock island — rather than docking at the true
-/// bottom behind it. The screen's bottom padding already carries the whole island
-/// (the shell's rail inset plus this tab's control-bar inset), so clearing that
-/// plus a gutter lands it exactly where the card does.
-SnackBar _railClearSnack(BuildContext context, String message) => SnackBar(
+/// bottom behind it. The margin is measured from the Scaffold, which re-adds the
+/// home-indicator safe area under the floating bar itself, so the two island
+/// insets alone (rail + control bar) plus a gutter land it exactly where the card
+/// does. Using the tab's own `paddingOf` — which already carries both insets *and*
+/// the safe area — double-counts the safe area and floats it a home-indicator too
+/// high.
+SnackBar _railClearSnack(String message) => SnackBar(
       content: Text(message),
       behavior: SnackBarBehavior.floating,
-      margin: EdgeInsets.fromLTRB(
+      margin: const EdgeInsets.fromLTRB(
         kGutter,
         0,
         kGutter,
-        MediaQuery.paddingOf(context).bottom + kGutter,
+        kRailInset + kControlBarInset + kGutter,
       ),
     );
 
@@ -607,7 +611,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(_railClearSnack(context, '${room.name ?? 'That room'} is locked.'));
+        ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
       return;
     }
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
@@ -706,7 +710,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     setState(() => _selectedPerson = null);
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(_railClearSnack(context, failed ?? '👋 Waved at ${person.label.split(' ').first}'));
+      ..showSnackBar(_railClearSnack(failed ?? '👋 Waved at ${person.label.split(' ').first}'));
   }
 
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
@@ -736,7 +740,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(_railClearSnack(context, notice));
+        ..showSnackBar(_railClearSnack(notice));
     });
     _followRequests = widget.state.followMe.listen((_) {
       // Claimed, so the latch below does not ride the same walk a second time
@@ -1399,7 +1403,7 @@ class _GoToState extends State<_GoTo> {
     if (!mounted || failed == null) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(_railClearSnack(context, failed));
+      ..showSnackBar(_railClearSnack(failed));
   }
 
   @override

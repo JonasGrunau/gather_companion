@@ -97,10 +97,13 @@ class _DialScreenState extends State<DialScreen> {
   void _say(String message) {
     final t = context.tokens;
     // Float the bar just above the nav rail: the rail floats over content, so a
-    // bar docked at the true bottom would sit behind it. The screen's bottom
-    // padding already carries the rail inset (the shell adds it to every tab), so
-    // clearing that plus a gutter lands the bar snug above the dock.
-    final bottom = MediaQuery.paddingOf(context).bottom + kGutter;
+    // bar docked at the true bottom would sit behind it. The margin is measured
+    // from the Scaffold, which re-adds the home-indicator safe area under the
+    // floating bar itself — so the rail inset alone (plus a gutter) lands the bar
+    // snug above the dock. Using the tab's own `paddingOf`, which already carries
+    // that inset *and* the safe area, double-counts the safe area and floats it a
+    // home-indicator too high.
+    final bottom = kRailInset + kGutter;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
       ..showSnackBar(
