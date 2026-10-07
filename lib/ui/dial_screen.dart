@@ -26,6 +26,9 @@
 /// because a stranger took a step.
 library;
 
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
 import '../src/app_state.dart';
@@ -60,7 +63,7 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   /// `TickerMode` that enables in the same frame the tab is selected.
   late final AnimationController _warp = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 500),
+    duration: const Duration(milliseconds: 650),
   );
 
   AppState get state => widget.state;
@@ -533,17 +536,78 @@ class _Title extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final subtitle = _WarpIn(warp: warp, child: const _Codename());
+    final subtitle = _WarpCodename(warp: warp);
     if (space == null) return subtitle;
     return Row(
       mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.baseline,
-      textBaseline: TextBaseline.alphabetic,
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         Flexible(child: Text(space!, maxLines: 1, overflow: TextOverflow.ellipsis)),
         const SizedBox(width: 10),
         subtitle,
       ],
+    );
+  }
+}
+
+/// The codename arriving on a lightning strike. A bolt flashes in ahead of the
+/// words — electric blue-white, haloed in glow, strobing and shivering with the
+/// current — and the codename streaks out of it. Over the first fraction of the
+/// animation the strike decays: the glow dies, the flicker stills, the bolt cools
+/// from electric to the quiet brand colour it wears on the nav tab. Spectacle on
+/// arrival, a calm tag once landed.
+class _WarpCodename extends StatelessWidget {
+  const _WarpCodename({required this.warp});
+
+  final Animation<double> warp;
+
+  /// The hot blue-white of the strike, before it cools to the brand bolt.
+  static const _electric = Color(0xFFEAF0FF);
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return AnimatedBuilder(
+      animation: warp,
+      builder: (context, _) {
+        final p = warp.value;
+        // The strike itself: a fast-decaying envelope over the first ~45% that
+        // the glow, the flicker and the shiver all ride. After it, the bolt is
+        // just a quiet glyph.
+        final strike = 1 - Curves.easeOutCubic.transform((p / 0.45).clamp(0.0, 1.0));
+        // Lightning flicker — a strobe that only reads while the strike is hot.
+        final flicker = 0.55 + 0.45 * math.sin(p * 46);
+        final glow = (strike * (0.7 + 0.3 * flicker)).clamp(0.0, 1.0);
+        // Pops in with a hair of overshoot, then swells while the current is hot
+        // and shrinks back to its resting size — the bolt flaring on the strike.
+        final boltScale = ui.lerpDouble(0.3, 1.0, Curves.easeOutBack.transform(p))! * (1 + 0.55 * strike);
+        final shiver = math.sin(p * 38) * 0.11 * strike;
+        final boltColor = Color.lerp(_electric, t.brand, Curves.easeOut.transform(p))!;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Transform.rotate(
+              angle: shiver,
+              child: Transform.scale(
+                scale: boltScale,
+                child: Icon(
+                  Icons.bolt,
+                  size: 17,
+                  color: boltColor,
+                  // Two haloes — a tight hot core and a wide electric bloom — so
+                  // the strike flares rather than merely tints.
+                  shadows: [
+                    Shadow(color: _electric.withValues(alpha: glow), blurRadius: 10 * glow),
+                    Shadow(color: t.brand.withValues(alpha: 0.8 * glow), blurRadius: 28 * glow),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 1),
+            _WarpIn(warp: warp, child: const _Codename()),
+          ],
+        );
+      },
     );
   }
 }
@@ -568,10 +632,12 @@ class _Codename extends StatelessWidget {
   }
 }
 
-/// A warp-in: the child arrives as a flat horizontal streak anchored to its left
-/// edge, snaps open to full width with a hair of overshoot, and fades up as it
-/// lands. Scaling from the left makes it read as warping *out of* the word it sits
-/// beside rather than zooming from its own centre.
+/// A warp-in: the codename drops out of hyperspace. It arrives over-stretched
+/// along its travel and smeared by a horizontal motion blur — a light-speed
+/// streak — then the stretch collapses past itself with a spring and the blur
+/// resolves to crisp type as it lands, sliding the last few pixels into place
+/// from the word it sits beside. The blur is what sells it as a *warp* rather
+/// than a zoom; the overshoot is the snap of arrival.
 class _WarpIn extends StatelessWidget {
   const _WarpIn({required this.warp, required this.child});
 
@@ -584,10 +650,19 @@ class _WarpIn extends StatelessWidget {
       animation: warp,
       child: child,
       builder: (context, child) {
-        final v = Curves.easeOutBack.transform(warp.value);
-        final op = Curves.easeOut.transform(warp.value).clamp(0.0, 1.0);
-        final scaleX = 0.15 + (1.0 - 0.15) * v;
-        final dx = (1 - v) * 8.0;
+        final t = warp.value;
+        // The spring that lands the stretch; easeOutBack overshoots past 1,
+        // which here reads as the type compressing a hair under full width
+        // before settling — the snap.
+        final land = Curves.easeOutBack.transform(t);
+        // Stretched wide along travel at launch, collapsing to 1.0 as it lands.
+        final scaleX = ui.lerpDouble(2.6, 1.0, land)!;
+        // Motion smear, heaviest at launch, gone by the time it's crisp.
+        final blur = (1 - Curves.easeOutCubic.transform(t)) * 7.0;
+        // Trails in from the left over the first half, then holds.
+        final dx = (1 - Curves.easeOutCubic.transform(t)) * 16.0;
+        // Fades up fast so the streak is visible rather than popping in solid.
+        final op = (t * 1.8).clamp(0.0, 1.0);
         return Opacity(
           opacity: op,
           child: Transform.translate(
@@ -595,7 +670,11 @@ class _WarpIn extends StatelessWidget {
             child: Transform.scale(
               scaleX: scaleX,
               alignment: Alignment.centerLeft,
-              child: child,
+              child: ImageFiltered(
+                enabled: blur > 0.05,
+                imageFilter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: 0, tileMode: TileMode.decal),
+                child: child,
+              ),
             ),
           ),
         );
