@@ -71,6 +71,19 @@ void main() {
         ),
       );
 
+  // The same screen stood up with explicit visibility, so a test can flip the tab
+  // on and off the way the shell does.
+  Widget wrapVisible(AppState state, {required bool visible}) => MaterialApp(
+        theme: buildGatherTheme(),
+        home: DialScreen(state: state, visible: visible),
+      );
+
+  // The codename's warp-in opacity: 0 while the flourish is held at its start,
+  // climbing to 1 as it lands. The readable proxy for "the animation is running".
+  double warpOpacity(WidgetTester tester) => tester
+      .widget<Opacity>(find.ancestor(of: find.text('warp dial'), matching: find.byType(Opacity)))
+      .opacity;
+
   testWidgets('shows the space name, and everyone in it including the offline', (tester) async {
     final state = peopled();
     addTearDown(state.dispose);
@@ -78,6 +91,7 @@ void main() {
     await tester.pump();
 
     expect(find.text('SafeNow'), findsOneWidget);
+    expect(find.text('warp dial'), findsOneWidget, reason: 'the tab wears its codename beside the space name');
     expect(find.text('Zoe'), findsOneWidget);
     expect(find.text('Xander'), findsOneWidget, reason: 'the offline are listed, not hidden');
   });
@@ -139,5 +153,34 @@ void main() {
     await tester.pump();
 
     expect(collector.waves, hasLength(1), reason: 'the press reached the wave action');
+  });
+
+  testWidgets('replays the codename flourish each time the tab becomes visible', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+
+    // Stood up off-screen: initState withholds the flourish, so it sits at its
+    // start and the codename is invisible.
+    await tester.pumpWidget(wrapVisible(state, visible: false));
+    await tester.pump();
+    expect(warpOpacity(tester), 0.0, reason: 'a hidden tab holds the flourish at frame zero');
+
+    // The tab comes on screen: didUpdateWidget restarts the animation from zero,
+    // so mid-flight the codename is part-way faded in.
+    await tester.pumpWidget(wrapVisible(state, visible: true));
+    await tester.pump(const Duration(milliseconds: 325));
+    final mid = warpOpacity(tester);
+    expect(mid, greaterThan(0.0));
+    expect(mid, lessThan(1.0));
+    await tester.pumpAndSettle();
+    expect(warpOpacity(tester), 1.0, reason: 'the flourish lands fully opaque');
+
+    // Leaving and returning replays it from the start, not from where it rested.
+    await tester.pumpWidget(wrapVisible(state, visible: false));
+    await tester.pump();
+    await tester.pumpWidget(wrapVisible(state, visible: true));
+    await tester.pump(const Duration(milliseconds: 16));
+    expect(warpOpacity(tester), lessThan(1.0), reason: 'a return to the tab restarts the flourish');
+    await tester.pumpAndSettle();
   });
 }

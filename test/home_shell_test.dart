@@ -338,13 +338,13 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Dial')), isSemantics(isButton: true, isSelected: true));
+    expect(tester.getSemantics(find.byTooltip('Warp')), isSemantics(isButton: true, isSelected: true));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isButton: true, isSelected: false));
 
     await tester.tap(find.byTooltip('Settings'));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Dial')), isSemantics(isSelected: false));
+    expect(tester.getSemantics(find.byTooltip('Warp')), isSemantics(isSelected: false));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isSelected: true));
 
     handle.dispose();

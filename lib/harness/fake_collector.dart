@@ -174,6 +174,7 @@ class FakeCollector implements Collector {
     final inCall = near.isNotEmpty;
     return Roster(
       selfId: kSelfId,
+      spaceName: 'SafeNow',
       rows: [
         selfOfficeRow(
           _me,
