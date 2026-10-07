@@ -60,7 +60,7 @@ import 'settings_screen.dart';
 /// silently swapped two tabs' bodies — the rail said Activity and the office
 /// appeared. Adding a destination is a case in [_TabView.icon], [_TabView.label]
 /// and `_bodyFor`, which the compiler will demand.
-enum _Tab { activity, map, dial, settings }
+enum _Tab { dial, map, activity, settings }
 
 extension _TabView on _Tab {
   IconData get icon => switch (this) {
@@ -89,14 +89,13 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
-  /// Activity opens first: it is the leftmost destination, and it is the one
-  /// screen that can have something waiting on it — "did I miss anything" is
-  /// what somebody unlocking their phone is usually asking.
+  /// Dial opens first: it is the leftmost destination, and it is what somebody
+  /// unlocking a closed app is reaching for — the directory to place a call.
   ///
   /// The office being one tap away costs it nothing. No tab is rebuilt when you
   /// leave it, so it is already drawn, already panned where you left it, and its
   /// artwork is still decoded.
-  _Tab _tab = _Tab.activity;
+  _Tab _tab = _Tab.dial;
 
   /// Built once and held. A fresh `Listenable.merge` on every build would hand
   /// the map's `ListenableBuilder` a new object each frame and make it
