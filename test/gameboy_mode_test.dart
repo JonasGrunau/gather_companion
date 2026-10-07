@@ -14,6 +14,7 @@ import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/media/call.dart';
+import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
@@ -330,6 +331,42 @@ void main() {
         findsOneWidget,
       );
       expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('double-tapping B waves even after the first tap has muted', (tester) async {
+      // Regression: the first B tap mutes *asynchronously*, so by the second tap the
+      // call can already report mic-off. The wave must still fire — the pending mute
+      // tap is the witness of intent, not the live mic flag. Branching on the flag
+      // first would route this second tap into the mic-off path and schedule an
+      // unmute instead of waving.
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance())
+        ..debugCall = const CallState(
+          media: LocalMediaState(capturing: true, audioEnabled: true),
+        );
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // First tap while live records the mute intent.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      // The mute lands: the call now reads mic-off, exactly what a real `setMicOn`
+      // would emit between the two taps.
+      state.debugCall = const CallState();
+      await tester.pump();
+
+      // Second tap, now observing mic-off, must still wave.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'the pending mute tap, not the live mic flag, decides the second tap');
     });
 
     testWidgets('a single B tap does not wave', (tester) async {

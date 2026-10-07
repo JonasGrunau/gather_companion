@@ -946,27 +946,40 @@ class AppState extends ChangeNotifier {
 
   /// When we last waved at each person, to hold the button back.
   ///
-  /// The server enforces one wave per person per [waveCooldown] and drops the rest
-  /// (see `presence_tracker`); mirroring it here turns a mashed button into a quiet
-  /// no-op instead of a string of refusals the UI would have to swallow.
+  /// The server does *not* rate-limit this — `presence_tracker` measured 41
+  /// `WaveEvent`s delivered in eight seconds — so the quiet is entirely ours: the
+  /// cooldown here turns a mashed button into a no-op instead of 41 identical rows
+  /// on every other client in the space.
   final Map<String, DateTime> _lastWaveAt = {};
 
   /// Waves at one person.
   ///
   /// Unlike an emote there is no self-echo — Gather does not replay a wave to its
   /// sender — so nothing lands on the activity feed here; the caller shows its own
-  /// confirmation. A repeat inside [waveCooldown] is swallowed rather than sent.
-  Future<String?> sendWave(String targetSpaceUserId) async {
+  /// confirmation.
+  ///
+  /// The outcome is three-way on purpose. `sent` is true only when a frame actually
+  /// went, so a caller confirms "Waved" on exactly that and nothing else. A repeat
+  /// inside [waveCooldown] is `(sent: false, error: null)` — held back, not failed,
+  /// and not a thing to confirm — which is what keeps a mashed button from claiming
+  /// a wave on every press though only the first reached the wire.
+  Future<({bool sent, String? error})> sendWave(String targetSpaceUserId) async {
     final collector = _collector;
-    if (collector == null) return 'Not connected to Gather.';
-    if (targetSpaceUserId.isEmpty) return 'Nobody to wave at.';
+    if (collector == null) return (sent: false, error: 'Not connected to Gather.');
+    if (targetSpaceUserId.isEmpty) return (sent: false, error: 'Nobody to wave at.');
 
     final now = DateTime.now();
     final last = _lastWaveAt[targetSpaceUserId];
-    if (last != null && now.difference(last) < waveCooldown) return null;
-    _lastWaveAt[targetSpaceUserId] = now;
+    if (last != null && now.difference(last) < waveCooldown) {
+      return (sent: false, error: null);
+    }
 
-    return _sent(collector.wave(targetSpaceUserId), 'Could not wave.');
+    final error = _sent(collector.wave(targetSpaceUserId), 'Could not wave.');
+    // Arm the cooldown only once a frame has actually gone. Recording it before the
+    // send would swallow a retry: a first press that failed on a just-closed socket
+    // would then return a silent no-op for the next 30 seconds instead of resending.
+    if (error == null) _lastWaveAt[targetSpaceUserId] = now;
+    return (sent: error == null, error: error);
   }
 
   /// Who in the conversation is talking, so their ring can be redrawn.
@@ -2059,7 +2072,7 @@ class AppState extends ChangeNotifier {
         'setAvailability' => 'Gather would not change your availability',
         'setCustomStatus' || 'clearCustomStatus' => 'Gather would not change your status',
         'broadcastEmote' => 'Gather would not send that',
-        'wave' => 'Gather would not send that wave',
+        'sendWave' => 'Gather would not send that wave',
         'startSpeaking' || 'stopSpeaking' => 'Gather would not show that you are talking',
         'leaveCluster' => 'Gather would not leave the conversation',
         'teleport' || 'move' => 'Gather would not move you',

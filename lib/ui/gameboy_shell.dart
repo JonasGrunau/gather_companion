@@ -317,15 +317,19 @@ class _GameboyShellState extends State<GameboyShell> {
     final rows = widget.state.huddleRows;
     if (rows.isEmpty) return;
     final target = rows.first;
-    final failed = await widget.state.sendWave(target.id);
+    final result = await widget.state.sendWave(target.id);
     if (!mounted) return;
-    if (failed != null) {
+    if (result.error != null) {
       _sfx(GbSound.denied);
-      _say(failed, bad: true);
+      _say(result.error!, bad: true);
       return;
     }
-    _sfx(GbSound.confirm);
-    _say('👋 Waved at ${target.name ?? 'them'}');
+    if (result.sent) {
+      // A cooldown no-op stays silent — the blip and the line are for a wave that
+      // actually went, not for a mashed second press the cooldown held back.
+      _sfx(GbSound.confirm);
+      _say('👋 Waved at ${target.name ?? 'them'}');
+    }
   }
 
   void _doDial() {
@@ -839,16 +843,22 @@ class _LcdToast extends StatelessWidget {
           border: Border.all(color: bad ? _danger : _online, width: 1.5),
         ),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        child: Text(
-          message,
-          textAlign: TextAlign.center,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-            fontFamily: _pixelFont,
-            color: _scWhite,
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
+        // A live region: this replaces the SnackBar for every Gameboy action, and
+        // without it a refusal or a wave confirmation would appear in the LCD
+        // without ever being announced to a screen reader.
+        child: Semantics(
+          liveRegion: true,
+          child: Text(
+            message,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: _pixelFont,
+              color: _scWhite,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
       ),
@@ -1165,33 +1175,43 @@ class _ControlsDeckState extends State<_ControlsDeck> {
   ///   the unmute is deferred behind the window; a second tap cancels it and waves,
   ///   so you stay muted. Nobody is ever opened up by accident.
   void _tapB() {
-    final micOn = state.call.micOn;
     final waveReady = state.huddleRows.isNotEmpty;
 
     if (!waveReady) {
       _bDefer?.cancel();
       _bDefer = null;
       _bMuteTapAt = null;
-      _toggleMic(micOn);
+      _toggleMic(state.call.micOn);
       return;
     }
 
-    if (micOn) {
-      final at = _bMuteTapAt;
-      if (at != null && DateTime.now().difference(at) < _bDoubleTapWindow) {
-        // Second tap: put the mic back silently (the wave's blip is the feedback)
-        // and wave. Net: mic unchanged, wave sent.
-        _bMuteTapAt = null;
-        _run(() => state.setMicOn(true));
-        widget.onWave();
-        return;
-      }
+    // The second tap of a mute-then-wave, decided before the current mic state is
+    // read. The first tap mutes *asynchronously* and emits a new call state, so by
+    // now `micOn` can already read false; branching on it first would route a
+    // perfectly normal second tap into the mic-off path, clear this pending tap,
+    // and schedule an unmute instead of waving. The pending timestamp is the
+    // intent, and it is the only reliable witness that the first tap was a mute.
+    final mutedAt = _bMuteTapAt;
+    if (mutedAt != null && DateTime.now().difference(mutedAt) < _bDoubleTapWindow) {
+      // Put the mic back silently (the wave's blip is the feedback) and wave. Net:
+      // mic unchanged, wave sent.
+      _bMuteTapAt = null;
+      _run(() => state.setMicOn(true));
+      widget.onWave();
+      return;
+    }
+
+    if (state.call.micOn) {
+      // First tap while live: muting is the safe direction, so do it now and open
+      // the window for a second tap to turn the pair into a wave.
       _bMuteTapAt = DateTime.now();
       _sfx(GbSound.toggleOff);
       _run(() => state.setMicOn(false));
       return;
     }
 
+    // Mic already off: a tap would *unmute*, the dangerous direction, so defer it
+    // behind the window where a second tap can cancel it and wave instead.
     _bMuteTapAt = null;
     if (_bDefer != null) {
       // Second tap before the deferred unmute fired: the wave was the intent.

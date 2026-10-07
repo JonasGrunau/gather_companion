@@ -244,8 +244,14 @@ class FakeCollector implements Collector {
   /// Every id we have been asked to wave at, in order — so a test can assert the
   /// right person was targeted and that the client-side cooldown held a repeat back.
   final List<String> waves = [];
+
+  /// When set, [wave] reports a failure without recording the target — the test
+  /// seam for "the socket was closed when the press landed", so the cooldown's
+  /// arm-only-on-success behaviour can be exercised.
+  bool failSends = false;
   @override
   ({bool ok, String? detail}) wave(String targetSpaceUserId) {
+    if (failSends) return (ok: false, detail: 'not connected to Gather');
     waves.add(targetSpaceUserId);
     return (ok: true, detail: null);
   }

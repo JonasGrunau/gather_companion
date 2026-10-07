@@ -705,12 +705,17 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// our own wave, so the line shown here is the only confirmation it went — the same
   /// reason the dial confirms in words.
   Future<void> _waveAtPerson(MapPerson person) async {
-    final failed = await widget.state.sendWave(person.id);
+    final result = await widget.state.sendWave(person.id);
     if (!mounted) return;
     setState(() => _selectedPerson = null);
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(_railClearSnack(failed ?? '👋 Waved at ${person.label.split(' ').first}'));
+    final messenger = ScaffoldMessenger.of(context)..hideCurrentSnackBar();
+    if (result.error != null) {
+      messenger.showSnackBar(_railClearSnack(result.error!));
+    } else if (result.sent) {
+      // A cooldown no-op takes the card down without a second "Waved" — only a
+      // frame that actually went is worth confirming.
+      messenger.showSnackBar(_railClearSnack('👋 Waved at ${person.label.split(' ').first}'));
+    }
   }
 
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
@@ -1225,8 +1230,11 @@ class _PersonCard extends StatelessWidget {
               dotRing: t.card,
             ),
             const SizedBox(width: 10),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 140),
+            Flexible(
+              // Flexible, not a fixed max width: the avatar, Wave control, close
+              // button, gaps and padding can already fill a narrow phone, so a long
+              // name has to shrink and ellipsize into what is left rather than claim
+              // its full intrinsic width and overflow the row.
               child: Text(
                 person.label,
                 maxLines: 1,
@@ -1256,6 +1264,9 @@ class _PersonCard extends StatelessWidget {
             ),
             IconButton(
               icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+              // Names the otherwise icon-only control for a screen reader, as the
+              // rail's own clear control is named.
+              tooltip: 'Dismiss',
               onPressed: onClear,
               visualDensity: VisualDensity.compact,
             ),

@@ -89,9 +89,14 @@ class _DialScreenState extends State<DialScreen> {
   /// action that touches somebody without going to them. There is no feed echo for
   /// our own wave, so the confirmation here is the only sign it went.
   Future<void> _waveAt(Contact contact) async {
-    final failed = await state.sendWave(contact.id);
+    final result = await state.sendWave(contact.id);
     if (!mounted) return;
-    _say(failed ?? '👋 Waved at ${_firstName(contact.label)}');
+    if (result.error != null) {
+      _say(result.error!);
+    } else if (result.sent) {
+      // Only a frame that went gets a confirmation; a cooldown no-op says nothing.
+      _say('👋 Waved at ${_firstName(contact.label)}');
+    }
   }
 
   void _say(String message) {
@@ -448,7 +453,7 @@ class _ContactTile extends StatelessWidget {
               ),
               const SizedBox(width: 12),
               if (onWave != null && present) ...[
-                _WaveButton(onTap: busy ? null : onWave),
+                _WaveButton(onTap: busy ? null : onWave, label: contact.label),
                 const SizedBox(width: 8),
               ],
               if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
@@ -463,22 +468,34 @@ class _ContactTile extends StatelessWidget {
 /// A quiet round wave button, sized to sit beside the Warp pill without competing
 /// with it — a wave is the lighter of the two touches a row offers.
 class _WaveButton extends StatelessWidget {
-  const _WaveButton({required this.onTap});
+  const _WaveButton({required this.onTap, required this.label});
 
   final VoidCallback? onTap;
+
+  /// Who the wave is aimed at, so an icon-only button still names its action and
+  /// target to a screen reader: "Wave at Ada" rather than an unlabelled button.
+  final String label;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    return Material(
-      color: t.card,
-      shape: const CircleBorder(),
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Icon(Icons.waving_hand_rounded, size: 18, color: t.mutedForeground),
+    final waveAt = 'Wave at ${_firstName(label)}';
+    return Semantics(
+      button: true,
+      label: waveAt,
+      child: Tooltip(
+        message: waveAt,
+        child: Material(
+          color: t.card,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Icon(Icons.waving_hand_rounded, size: 18, color: t.mutedForeground),
+            ),
+          ),
         ),
       ),
     );
