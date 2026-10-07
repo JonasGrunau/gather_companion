@@ -247,16 +247,26 @@ enum AppScenario {
 /// own avatar is driven by the real `Walk` off the D-pad and is never touched
 /// here, which is the whole point: the thing under test (walking, following,
 /// party mode) runs for real against the same fake.
+///
+/// It also plays the *call*. When I warp next to someone (the Dial tab) or walk
+/// into them on the floor, [FakeCollector.callmates] fills, the roster puts us in
+/// one cluster, and this driver pushes the matching [CallState] onto the injected
+/// [ScriptedCall] and rotates a speaking ring — so the call screen lights up with
+/// real faces, reached through the app's own paths rather than mounted directly
+/// the way `TARGET=call` does. The people beside me stop milling while we talk,
+/// so the call holds until I walk away.
 class AppScenarioDriver {
   AppScenarioDriver({
     required this.state,
     required this.collector,
+    required this.call,
     this.scenario = AppScenario.office,
     this.period = const Duration(milliseconds: 600),
   });
 
   final AppState state;
   final FakeCollector collector;
+  final ScriptedCall call;
   final AppScenario scenario;
   final Duration period;
 
@@ -264,8 +274,13 @@ class AppScenarioDriver {
   /// they started rather than all piling into a corner against the clamp.
   static const _wander = ['Right', 'Right', 'Down', 'Left', 'Left', 'Up'];
 
+  /// The self tile's media, so the call screen draws a "You" avatar at the head
+  /// of the strip. Same state `CallScenarioDriver` uses.
+  static const _selfMedia = LocalMediaState(capturing: true, audioEnabled: true);
+
   Timer? _timer;
   int _ticks = 0;
+  bool _wasInCall = false;
 
   final Random _rng = Random();
 
@@ -275,11 +290,11 @@ class AppScenarioDriver {
   /// and go independently instead of handing the floor round one at a time.
   final Map<String, int> _speakingTicksLeft = {};
 
-  /// Seeds the activity history and, unless the floor is [AppScenario.still],
-  /// starts milling the cast about.
+  /// Seeds the activity history and starts the clock. The timer runs even on
+  /// [AppScenario.still] — the cast stay put there, but a warp still has to form
+  /// a call, which is what each tick drives.
   void start() {
     _seedActivity();
-    if (scenario == AppScenario.still) return;
     _timer = Timer.periodic(period, (_) => _tick());
   }
 
@@ -304,27 +319,74 @@ class AppScenarioDriver {
 
   void _tick() {
     _ticks++;
+    final mates = collector.callmates;
+    final mateIds = {for (final p in mates) p.spaceId};
     final ids = collector.peopleIds.toList();
+
+    final milling = scenario != AppScenario.still;
     for (var i = 0; i < ids.length; i++) {
       final id = ids[i];
-      collector.stepPerson(id, _wander[(_ticks + i) % _wander.length]);
-      // Each person talks in their own random bursts: silent people start one
-      // with a small chance each tick, then hold the floor for a random spell
-      // (2–6 ticks ≈ 1.2–3.6s at the 600ms period). Because the draws are
-      // independent, nobody owns the floor on a rota and several can be lit at
-      // once — a real-looking babble rather than a hand-off round robin.
+      // Whoever is in my call stays put, so the conversation holds until I walk
+      // away rather than someone wandering out of range a tick later.
+      if (mateIds.contains(id)) continue;
+      if (milling) {
+        collector.stepPerson(id, _wander[(_ticks + i) % _wander.length]);
+      }
+      // Each of the *rest* talks in their own random bursts: a silent person
+      // starts one with a small chance each tick, then holds the floor for a
+      // random spell (2–6 ticks ≈ 1.2–3.6s at the 600ms period). Independent
+      // draws mean nobody owns the floor on a rota and several can be lit at
+      // once — a real babble rather than a hand-off round robin. Call-mates'
+      // rings are driven below; a still office stays quiet.
       var left = _speakingTicksLeft[id] ?? 0;
-      if (left == 0 && _rng.nextDouble() < 0.18) {
+      if (milling && left == 0 && _rng.nextDouble() < 0.18) {
         left = 2 + _rng.nextInt(5);
       }
       collector.placePerson(id, speaking: left > 0);
       _speakingTicksLeft[id] = left > 0 ? left - 1 : 0;
     }
+
+    _driveCall(mates);
     collector.publish();
+
     // A wave into the feed every ~5s.
-    if (ids.isNotEmpty && _ticks % 8 == 0) {
+    if (milling && ids.isNotEmpty && _ticks % 8 == 0) {
       collector.wave(ids[(_ticks ~/ 8) % ids.length]);
     }
+  }
+
+  /// Plays the call with whoever is standing beside me. Rotates the floor among
+  /// the [mates] and my own voice so every tile's ring animates, and pushes the
+  /// matching media-plane state onto the [ScriptedCall]. When nobody is near, the
+  /// call empties once and goes quiet.
+  ///
+  /// The roster rows for [mates] are re-marked here each tick (by [collector]'s
+  /// `placePerson`) so the map ring and the call-screen ring agree; the call
+  /// state carries the same people as audio-only participants.
+  void _driveCall(List<CallPerson> mates) {
+    if (mates.isEmpty) {
+      if (_wasInCall) {
+        call.emit(const CallState());
+        call.speak(false);
+        _wasInCall = false;
+      }
+      return;
+    }
+    _wasInCall = true;
+
+    // The floor passes between the people beside me and, every few turns, me —
+    // one speaker at a time, changing about every 1.2s (two 600ms ticks).
+    final turn = (_ticks ~/ 2) % (mates.length + 1);
+    final ownSpeaking = turn == mates.length;
+    for (var i = 0; i < mates.length; i++) {
+      collector.placePerson(mates[i].spaceId, speaking: !ownSpeaking && i == turn);
+    }
+    call.speak(ownSpeaking);
+    call.emit(CallState(
+      media: _selfMedia,
+      publishingAudio: true,
+      participants: participantsForPeople(mates),
+    ));
   }
 
   void stop() {

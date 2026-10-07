@@ -16,9 +16,9 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
-import 'package:gather_companion/ui/activity_screen.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
+import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
 import 'package:gather_companion/ui/settings_screen.dart';
@@ -156,12 +156,13 @@ void main() {
     });
   });
 
-  testWidgets('activity is what the app opens on', (tester) async {
+  testWidgets('dial is what the app opens on', (tester) async {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(find.textContaining('Waves and meeting notes'), findsOneWidget);
-    // The other two are in the tree but not on screen, which is the whole point.
+    expect(find.textContaining("Nobody's in the office right now."), findsOneWidget);
+    // The others are in the tree but not on screen, which is the whole point.
+    expect(find.textContaining('Waves and meeting notes'), findsNothing);
     expect(find.textContaining('Reading the floor plan'), findsNothing);
     expect(find.byType(MapScreen, skipOffstage: false), findsOneWidget);
   });
@@ -174,7 +175,7 @@ void main() {
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    expect(find.byType(ControlBar), findsNothing, reason: 'not on the activity tab');
+    expect(find.byType(ControlBar), findsNothing, reason: 'not on the dial tab');
 
     await tester.tap(find.byTooltip('Office'));
     await tester.pumpAndSettle();
@@ -245,13 +246,13 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isTrue);
+    expect(TickerMode.valuesOf(tester.element(find.byType(DialScreen, skipOffstage: false))).enabled, isTrue);
     expect(TickerMode.valuesOf(tester.element(find.byType(MapScreen, skipOffstage: false))).enabled, isFalse);
 
     await tester.tap(find.byTooltip('Office'));
     await tester.pump();
 
-    expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isFalse);
+    expect(TickerMode.valuesOf(tester.element(find.byType(DialScreen, skipOffstage: false))).enabled, isFalse);
     expect(TickerMode.valuesOf(tester.element(find.byType(MapScreen, skipOffstage: false))).enabled, isTrue);
   });
 
@@ -274,7 +275,7 @@ void main() {
         )
         .listenable;
 
-    // Opening on Activity, so the map is behind another tab: presence only.
+    // Opening on Dial, so the map is behind another tab: presence only.
     expect(identical(feeding(), state), isTrue,
         reason: 'off the map tab, only presence should rebuild it');
 
@@ -290,13 +291,13 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Activity')), isSemantics(isButton: true, isSelected: true));
+    expect(tester.getSemantics(find.byTooltip('Dial')), isSemantics(isButton: true, isSelected: true));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isButton: true, isSelected: false));
 
     await tester.tap(find.byTooltip('Settings'));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Activity')), isSemantics(isSelected: false));
+    expect(tester.getSemantics(find.byTooltip('Dial')), isSemantics(isSelected: false));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isSelected: true));
 
     handle.dispose();
@@ -315,6 +316,11 @@ void main() {
     // the edge of the test viewport, and past the lazy list's built range, until
     // scrolled to.
     await tester.scrollUntilVisible(find.text('Forget this computer'), 120);
+    // Fully into view before tapping: with the Appearance section above it the
+    // row can stop at the very bottom edge, where its centre is off-screen and the
+    // tap misses.
+    await tester.ensureVisible(find.text('Forget this computer'));
+    await tester.pump();
     await tester.tap(find.text('Forget this computer'));
     await tester.pump();
 

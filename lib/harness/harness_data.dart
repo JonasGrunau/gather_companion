@@ -64,9 +64,15 @@ List<CallPerson> seated(int count) =>
 ///
 /// Audio on, video off — the harness draws avatars, not textures, so no stream
 /// is ever attached (the call screen only reaches for one behind a `LiveCall`).
-List<CallParticipant> participantsFor(int count) => [
-      for (final p in seated(count))
-        CallParticipant(srcId: p.accountId, hasAudio: true),
+List<CallParticipant> participantsFor(int count) =>
+    participantsForPeople(seated(count));
+
+/// The media-plane view of a call with exactly [people] in it — the office
+/// harness's equivalent of [participantsFor], keyed to the specific colleagues
+/// standing beside me rather than the first N of the cast. Audio on, video off,
+/// for the same reason.
+List<CallParticipant> participantsForPeople(Iterable<CallPerson> people) => [
+      for (final p in people) CallParticipant(srcId: p.accountId, hasAudio: true),
     ];
 
 /// The game-plane view: the roster Gather would have sent, with the given
@@ -144,14 +150,18 @@ const Map<String, ({int x, int y})> kCastStartTiles = {
   'space-linus': (x: 14, y: 8),
 };
 
-/// My own map-plane row: present, here, drawable. `clusterId` is null — the
-/// office is not a huddle, and the speaking ring on the map reads the row's own
-/// `speaking` flag rather than a cluster (see `AppState.peopleOnMap`).
-RosterRow selfOfficeRow(({int x, int y}) at, {String direction = 'Down', bool speaking = false}) => RosterRow(
+/// My own map-plane row: present, here, drawable. `clusterId` is null on an
+/// empty floor — the office is not a huddle — but the whole-app harness passes
+/// [kHuddleCluster] the instant somebody is close enough to be in a call, which
+/// is what lights `AppState.inHuddle` and the "In a call" banner. The speaking
+/// ring on the map still reads the row's own `speaking` flag (see
+/// `AppState.peopleOnMap`).
+RosterRow selfOfficeRow(({int x, int y}) at, {String direction = 'Down', bool speaking = false, String? clusterId}) => RosterRow(
       id: kSelfId,
       name: 'You',
       connected: true,
       availability: 'Active',
+      clusterId: clusterId,
       x: at.x,
       y: at.y,
       direction: direction,
@@ -161,12 +171,17 @@ RosterRow selfOfficeRow(({int x, int y}) at, {String direction = 'Down', bool sp
 /// One colleague's map-plane row, standing at [at]. `isPresent` needs
 /// `connected == true` and a non-`Offline` availability, or `peopleOnMap` drops
 /// them — the one invariant that keeps a mocked floor from being empty.
-RosterRow officeRow(CallPerson p, ({int x, int y}) at, {String direction = 'Down', bool speaking = false}) => RosterRow(
+///
+/// [clusterId] is [kHuddleCluster] only while this person is within call range of
+/// me, so `Roster.myCluster` carries exactly the people the office call driver is
+/// animating — the bridge between standing-next-to and being-in-a-call-with.
+RosterRow officeRow(CallPerson p, ({int x, int y}) at, {String direction = 'Down', bool speaking = false, String? clusterId}) => RosterRow(
       id: p.spaceId,
       name: p.name,
       userAccountId: p.accountId,
       connected: true,
       availability: 'Active',
+      clusterId: clusterId,
       x: at.x,
       y: at.y,
       direction: direction,

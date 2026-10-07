@@ -116,31 +116,57 @@ Gather desktop update, re-check the log regexes against a real log:
 npx gather-app-bridge replay ~/Library/Logs/GatherV2/main.log
 ```
 
-### Running the app on the iOS Simulator (no network)
+### Running the app on the iOS Simulator (ALWAYS the harness)
 
-A second `flutter run` target boots straight into a **scripted scene** — no login,
-BLE, WebRTC or backend — to watch and `idb`-drive the app without a real room of
-people. Two targets via `--dart-define=TARGET`:
+**On a simulator, always launch the harness entrypoint, never `lib/main.dart`.**
+The real entrypoint dead-ends at the pairing screen — it wants a camera to scan a
+bridge QR, and a simulator has no camera and no bridge, so you get a permission
+dialog over a screen you can never clear. `lib/main_harness.dart` boots straight
+into a **scripted scene** — no login, BLE, WebRTC or backend — to watch and
+`idb`-drive the app without a real room of people. Two targets via
+`--dart-define=TARGET`:
 
 ```sh
 # the call screen + spotlight
 flutter run -t lib/main_harness.dart -d <sim-udid> \
   --dart-define=TARGET=call --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
 
-# the whole app — boots into the Office, walkable, Activity feed alive
+# the whole app — boots into the Office, walkable, Activity feed alive, Dial tab
 flutter run -t lib/main_harness.dart -d <sim-udid> \
   --dart-define=TARGET=app --dart-define=SCENARIO=office --dart-define=PARTICIPANTS=4
 ```
 
 `TARGET=app` injects a `FakeCollector` (presence plane) and `ScriptedCall` (media
 plane) through `AppState`'s constructor seams, so the real pair→home flow, the
-walkable Office (tap a tile to walk), party mode and the feed all run with no wire.
-Scenarios, the `idb describe-all → tap → screenshot` loop, and the tap targets are
-in **`docs/sim_harness.md`**. The harness entrypoint and fakes live outside the app
-(`lib/main_harness.dart`, `lib/harness/`), but the seams they ride are production
-code: this change adds the `Collector` interface in `gather_client` and routes
-`AppState`, `Walk`, `PartyMode` and `DirectCollector` through it. So the production
-presence abstraction changed — the harness is not purely additive.
+walkable Office (tap a tile to walk), party mode, the feed and the Dial directory
+all run with no wire. Scenarios, the `idb describe-all → tap → screenshot` loop, and
+the tap targets are in **`docs/sim_harness.md`**. The harness entrypoint and fakes
+live outside the app (`lib/main_harness.dart`, `lib/harness/`), but the seams they
+ride are production code: this change adds the `Collector` interface in
+`gather_client` and routes `AppState`, `Walk`, `PartyMode` and `DirectCollector`
+through it. So the production presence abstraction changed — the harness is not
+purely additive.
+
+**Working with it, in practice:**
+
+- **`idb` must run under system python 3.9, not `asdf`'s 3.14.** fb-idb 1.1.7 calls
+  `asyncio.get_event_loop()`, which hard-errors on 3.14; and `asdf`'s `idb` shim
+  dies with *"No version is set for command idb"*. Call the real binary directly:
+  `IDB=~/Library/Python/3.9/bin/idb`. `simctl screenshot` is fine from any shell.
+- **Coordinate units differ.** `idb ui tap` takes **logical points**; `simctl`
+  screenshots are **pixels** (×3 on a 3× device, so `point = px / 3`). Read frames
+  straight from `idb ui describe-all` to skip the math.
+- **The call runs in `TARGET=app` too, end to end.** Warp someone on the Dial
+  tab, or walk within `FakeCollector.kCallRange` tiles of them in the Office, and
+  `FakeCollector` puts you both in one cluster while `AppScenarioDriver` drives the
+  injected `ScriptedCall` — so the call screen opens with real faces and a rotating
+  speaking ring, and the Office shows the "In a call with …" banner. `TARGET=call`
+  still exists for the in-call screen in isolation (it mounts `CallScreen` directly
+  on a scripted multi-party call, no office around it); `TARGET=app` is the one that
+  exercises the *paths into* a call.
+- **`simctl privacy grant camera` does not rescue `lib/main.dart`** — the grant
+  does not reliably suppress the pairing dialog, which is why the rule above is
+  "always the harness", not "grant and run the real app".
 
 ### Common Patterns
 

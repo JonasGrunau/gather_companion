@@ -6,6 +6,7 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
 import 'credentials.dart';
+import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
 import 'media/call.dart';
@@ -195,6 +196,161 @@ class AppState extends ChangeNotifier {
     return list;
   }
 
+  // ---- the directory (Warp Dial) ---------------------------------------------
+  //
+  // The Dial tab is a phone-app over the roster: a contact list and the
+  // conversations already happening, each a tap away from being teleported into.
+  // It reads [_roster] directly for the same reason `peopleOnMap` does — the map's
+  // digest drops positions and the offline, and this screen wants both: everyone
+  // in the space, and somewhere to land next to the ones who are here.
+
+  /// Everybody in the space except me, present first and then by name.
+  ///
+  /// Present-before-offline rather than one flat alphabet, because "who can I
+  /// reach right now" is the question the screen answers and a train of greyed-out
+  /// names above the people actually here would bury it. Within each group the
+  /// sort is the same case-insensitive name order [followers] uses, so the list
+  /// keeps its places between the four-a-second rosters instead of flickering as
+  /// Gather reshuffles its map iteration.
+  List<Contact> get directory {
+    final roster = _roster;
+    if (roster == null) return const [];
+    final selfId = roster.selfId;
+    final out = <Contact>[
+      for (final row in roster.rows)
+        if (row.id != selfId) Contact.fromRow(row),
+    ];
+    out.sort((a, b) {
+      if (a.isPresent != b.isPresent) return a.isPresent ? -1 : 1;
+      return a.label.toLowerCase().compareTo(b.label.toLowerCase());
+    });
+    return out;
+  }
+
+  /// Whether [warpToPerson] has somewhere to send you: the contact is here, carries
+  /// a position, and is on your floor. The Dial tab offers the warp only when this
+  /// holds, so a cross-floor or unplaced contact is shown but not called — the same
+  /// answer [warpToPerson] gives, decided once here so the button and the action
+  /// cannot disagree.
+  bool canWarpTo(Contact contact) {
+    if (!contact.isReachable) return false;
+    final myFloor = _myRow()?.floorId;
+    return myFloor == null || contact.floorId == null || contact.floorId == myFloor;
+  }
+
+  /// The conversations happening now — every cluster of two or more connected
+  /// people — the one I am in first, then the largest.
+  ///
+  /// A cluster of only me is not here: `clusterId` is null when I stand alone, and
+  /// a group whose only other members have dropped their sockets is no longer a
+  /// conversation to join. [Meeting.roomName] is filled in when a majority of a
+  /// cluster's members sit inside the same named area, so the card can name the
+  /// room rather than only its people.
+  List<Meeting> get meetings {
+    final roster = _roster;
+    if (roster == null) return const [];
+    final selfId = roster.selfId;
+    final map = this.map;
+
+    final groups = <String, List<RosterRow>>{};
+    for (final row in roster.rows) {
+      final cid = row.clusterId;
+      if (cid == null) continue;
+      // A cluster outlives a dropped socket, and a row that is connected but has
+      // gone Offline is not in the room either — its coordinates are wherever it
+      // logged off. Both read as "not present", the same test the directory and map
+      // use; only a present person is somebody to count. My own row always counts:
+      // it is how `includesMe` knows the conversation is mine, and the roster does
+      // not always carry presence for self.
+      if (row.id != selfId && !row.isPresent) continue;
+      (groups[cid] ??= <RosterRow>[]).add(row);
+    }
+
+    final out = <Meeting>[];
+    groups.forEach((cid, rows) {
+      if (rows.length < 2) return;
+      final includesMe = rows.any((row) => row.id == selfId);
+      final members = [
+        for (final row in rows)
+          if (row.id != selfId) Contact.fromRow(row),
+      ];
+      // Only me left once mine are excluded — nothing to join.
+      if (members.isEmpty) return;
+      // The floor the conversation is on, and the map whose rooms can name it. A
+      // single-floor space carries no floorId at all, so an empty set means "the one
+      // floor" and resolves to the map we are already looking at. One floor names it
+      // off that floor's plan. Members straddling two floors are no single room and
+      // nowhere a one-hop warp can land, so they stay unroomed and unplaced.
+      final floors = <String>{
+        for (final row in rows)
+          if (row.floorId != null && row.x != null && row.y != null && row.x!.isFinite && row.y!.isFinite)
+            row.floorId!,
+      };
+      final floorId = floors.length == 1 ? floors.first : null;
+      final floorMap = floors.length > 1 ? null : (floorId == null ? map : (_collector?.mapFor(floorId) ?? map));
+      out.add(Meeting(
+        clusterId: cid,
+        members: members,
+        roomName: _roomNameFor(rows, floorMap),
+        floorId: floorId,
+        includesMe: includesMe,
+      ));
+    });
+
+    out.sort((a, b) {
+      if (a.includesMe != b.includesMe) return a.includesMe ? -1 : 1;
+      return b.members.length.compareTo(a.members.length);
+    });
+    return out;
+  }
+
+  /// The named area a conversation is in, or null.
+  ///
+  /// Each member is placed in the *innermost* named, non-desk area at their feet —
+  /// the smallest rectangle containing them, so a meeting room wins over the public
+  /// zone it sits inside. The cluster takes a room's name only when a strict majority
+  /// of *all* its members sit in it; a conversation spilling across a doorway has no
+  /// one room and is better named by its people. The denominator is every member,
+  /// not only the placed ones: a member the roster has not located is no evidence
+  /// that a majority is inside, so a cluster that is mostly unplaced stays unnamed.
+  String? _roomNameFor(List<RosterRow> rows, SpaceMap? map) {
+    if (map == null) return null;
+    final counts = <String, int>{};
+    for (final row in rows) {
+      final x = row.x, y = row.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      final name = _innermostNamedRoomAt(map, x.round(), y.round())?.name;
+      if (name != null) counts[name] = (counts[name] ?? 0) + 1;
+    }
+    if (counts.isEmpty) return null;
+    String? best;
+    var bestCount = 0;
+    counts.forEach((name, count) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = name;
+      }
+    });
+    // A strict majority of everyone in the cluster: a conversation split across a
+    // doorway, or mostly made of members the roster has not placed, has no one room
+    // and is better named by its people.
+    return bestCount * 2 > rows.length ? best : null;
+  }
+
+  /// The smallest named, non-desk room containing the tile — the one a person in
+  /// it would say they are in.
+  SpaceRoom? _innermostNamedRoomAt(SpaceMap map, int x, int y) {
+    SpaceRoom? best;
+    for (final room in map.rooms) {
+      if (room.name == null || room.type == 'Desk') continue;
+      if (!room.contains(x, y)) continue;
+      if (best == null || room.width * room.height < best.width * best.height) {
+        best = room;
+      }
+    }
+    return best;
+  }
+
   // ---- the map ---------------------------------------------------------------
 
   /// The last roster, kept whole.
@@ -220,6 +376,19 @@ class AppState extends ChangeNotifier {
   /// nothing.
   Listenable get positions => _positions;
   final _positions = _Ticker();
+
+  /// Ticks when the directory's shape changes — somebody arriving or leaving, a
+  /// conversation forming or breaking up, an availability dot turning.
+  ///
+  /// Its own [Listenable] for the same reason as [positions], and the mirror image of
+  /// it: the Dial tab must wake for these presence folds the shell's own
+  /// [notifyListeners] misses (availability and `clusterId` are not part of the
+  /// presence fold), but it must *not* wake for the footsteps [positions] carries
+  /// four times a second. This is the projection in between — the fields the
+  /// directory sorts and groups on — and nothing else. See [_noteDirectory].
+  Listenable get directoryChanges => _directoryChanges;
+  final _directoryChanges = _Ticker();
+  String? _lastDirectoryDigest;
 
   /// The last hop party mode fired, for the map to draw as a teleport.
   ///
@@ -524,6 +693,48 @@ class AppState extends ChangeNotifier {
     if (mine == _mine) return;
     _mine = mine;
     notifyListeners();
+  }
+
+  /// Wakes [directoryChanges] when the roster's directory-relevant projection moves
+  /// — presence, availability, and conversation membership, the fields the Dial tab
+  /// sorts and groups on. Deliberately not positions: a stranger's step must not
+  /// repaint a contact list. Cheap — a sorted fold of a handful of fields per row,
+  /// compared to the last — so it is fine to run on every roster.
+  void _noteDirectory(Roster roster) {
+    final parts = <String>[
+      for (final row in roster.rows) _directoryDigestPart(row),
+    ]..sort();
+    final digest = parts.join('|');
+    if (digest == _lastDirectoryDigest) return;
+    _lastDirectoryDigest = digest;
+    _directoryChanges.tick();
+  }
+
+  /// One row's contribution to the directory digest: every projected field the Dial
+  /// tab draws off it, and nothing a footstep moves.
+  ///
+  /// Presence, availability and `clusterId` are the sort and the dots. The rest is
+  /// what [directory] and [meetings] *derive* and render: whether there is a finite
+  /// position to warp to ([Contact.isReachable]), the floor that decides a warp is
+  /// reachable, the status line under the name, and — for a row in a cluster — the
+  /// *named room* its tile falls in, the input to [Meeting.roomName]. The room, not
+  /// the raw tile, on purpose: a step inside one room leaves the name unchanged and
+  /// the tab asleep, which is the whole point of this being its own listenable.
+  String _directoryDigestPart(RosterRow row) {
+    final x = row.x, y = row.y;
+    final placed = x != null && y != null && x.isFinite && y.isFinite;
+    // The room label is a meeting's, so only a clustered member can move it; resolving
+    // it for everyone would walk the room list on every roster for no rendered change.
+    var room = '';
+    if (placed && row.clusterId != null) {
+      final map = debugMap ?? _collector?.mapFor(row.floorId);
+      if (map != null) {
+        room = _innermostNamedRoomAt(map, x.round(), y.round())?.name ?? '';
+      }
+    }
+    final status = row.status;
+    return '${row.id}:${row.isPresent ? 1 : 0}:${row.availability ?? ''}:${row.clusterId ?? ''}'
+        ':${placed ? 1 : 0}:${row.floorId ?? ''}:$room:${status?.text ?? ''}';
   }
 
   /// Whether I am in a call: a conversation Gather has put me in, or anybody the
@@ -1176,6 +1387,139 @@ class AppState extends ChangeNotifier {
     _positions.tick();
   }
 
+  // ---- warping (Warp Dial) ----------------------------------------------------
+  //
+  // The commuting surface moves you without you watching the map. Where [goTo]
+  // walks when it can — because on the office screen the walk *is* the point — a
+  // warp always hops: the Dial tab is for arriving, not travelling, and a thumb on
+  // a train has no patience for a camera gliding across the floor.
+
+  /// Teleport to a free tile at or beside ([x], [y]) — always a hop.
+  ///
+  /// The landing rule is [goTo]'s: a tile that cannot be stood on, or one somebody
+  /// is on, is relocated to the nearest free one rather than refused — which is
+  /// what makes "warp to a person" land you *next* to them, since their own tile is
+  /// taken. Unlike [goTo] there is no route search: this is the teleport branch of
+  /// [_travelTo] on its own.
+  Future<String?> warpToTile(int x, int y) async {
+    final map = this.map;
+    final collector = _collector;
+    if (map == null) return 'Still reading the floor plan.';
+    if (collector == null) return 'Not connected to Gather.';
+    // The socket can be open but deaf (offline) or mid-reconnect: a hop started now
+    // only moves the avatar on this phone, into a floor the server is not updating.
+    if (_link.isDisrupted) return 'No connection — waiting for network.';
+
+    final occupied = _occupied();
+    final taken = {for (final tile in occupied) tile.y * map.width + tile.x};
+
+    var goal = (x: x, y: y);
+    if (!map.isWalkable(x, y) || taken.contains(y * map.width + x)) {
+      final free = map.nearestFree(x, y, occupied: taken);
+      if (free == null) return 'There is nowhere to stand there.';
+      goal = free;
+    }
+
+    // Any route still running was aimed somewhere else — stop it before the hop,
+    // the same order [_travelTo] uses.
+    _walk?.release();
+
+    final me = myTile;
+    final sent = collector.teleport(
+      x: goal.x,
+      y: goal.y,
+      direction: me == null
+          ? 'Down'
+          : headingTo(fromX: me.x, fromY: me.y, toX: goal.x, toY: goal.y),
+    );
+    if (!sent.ok) return sent.detail ?? 'Gather refused that.';
+
+    _noteTeleport(goal.x.toDouble(), goal.y.toDouble());
+    notifyListeners();
+    return null;
+  }
+
+  /// Warp next to a person and open your microphone — Warp Dial's "call".
+  ///
+  /// Aimed at their own tile so [warpToTile]'s relocation lands you adjacent;
+  /// proximity is then Gather's to notice, and the roster that follows drives
+  /// [_noteCluster], which wires the audio. The mic is turned on here because a
+  /// phone call connects the microphone rather than merely placing you in earshot —
+  /// but it is best-effort: a denied permission is news on [notices], not a reason
+  /// to report the warp itself as having failed (which would stop the UI opening
+  /// the call).
+  Future<String?> warpToPerson(Contact contact) async {
+    if (!contact.isPresent) return '${contact.label} is not in the office right now.';
+    final x = contact.x, y = contact.y;
+    if (x == null || y == null || !x.isFinite || !y.isFinite) {
+      return "Can't tell where ${contact.label} is yet.";
+    }
+    // A warp is a hop on *this* floor: it teleports to a coordinate on the map the
+    // phone is showing. Applied to someone on another floor it would land on the
+    // same coordinates here — nowhere near them — and falsely report success. There
+    // is no one-hop floor change, so a cross-floor contact is out of reach.
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && contact.floorId != null && contact.floorId != myFloor) {
+      return '${contact.label} is on another floor.';
+    }
+
+    final failed = await warpToTile(x.round(), y.round());
+    if (failed != null) return failed;
+
+    final micFailed = await setMicOn(true);
+    if (micFailed != null) _notices.add(micFailed);
+    return null;
+  }
+
+  /// Join a conversation already happening, and open your microphone.
+  ///
+  /// A conversation I am already in needs no travel. Otherwise, when the cluster
+  /// sits in a named room I can resolve, I *walk in* with [goToRoom] — which lands
+  /// on a seat and respects a shut door the way entering a meeting should — and
+  /// fall back to warping beside a member when there is no room to name. Mic is
+  /// handled as in [warpToPerson].
+  Future<String?> warpToMeeting(Meeting meeting) async {
+    if (meeting.includesMe) return null;
+
+    // On another floor there is no room on this map to walk into and no tile a hop
+    // could reach — the same ceiling [warpToPerson] hits. Refuse rather than walk
+    // into a room that merely shares a name or coordinates on the wrong floor.
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+      return 'That conversation is on another floor.';
+    }
+
+    final map = this.map;
+    final roomName = meeting.roomName;
+    if (map != null && roomName != null) {
+      for (final room in map.rooms) {
+        if (room.name != roomName) continue;
+        final failed = await goToRoom(
+          room,
+          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+        );
+        if (failed != null) return failed;
+        final micFailed = await setMicOn(true);
+        if (micFailed != null) _notices.add(micFailed);
+        return null;
+      }
+    }
+
+    for (final member in meeting.members) {
+      final x = member.x, y = member.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      // Only hop beside a member this hop can actually reach: one on our own floor.
+      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
+      final failed = await warpToTile(x.round(), y.round());
+      if (failed != null) return failed;
+      final micFailed = await setMicOn(true);
+      if (micFailed != null) _notices.add(micFailed);
+      return null;
+    }
+
+    return 'Could not work out where that conversation is.';
+  }
+
   /// Walk into a room, landing on a seat if it has a free one.
   ///
   /// [toward] is the tile that was actually tapped; it only breaks ties between
@@ -1752,6 +2096,7 @@ class AppState extends ChangeNotifier {
           // The collector already coalesces and only publishes when something in the
           // state actually moved, so this is "the map changed", not a clock.
           _positions.tick();
+          _noteDirectory(roster);
           _noteCluster(roster);
           _noteSpeakers(roster);
           final out = _tracker.applyRoster(roster);
@@ -2056,6 +2401,7 @@ class AppState extends ChangeNotifier {
     _positions.tick();
     // Same order as the real listener, and not a shortened version of it: a seam
     // that skips a step is a seam that passes while the app does the wrong thing.
+    _noteDirectory(roster);
     _noteCluster(roster);
     _noteSpeakers(roster);
     _onFold(_tracker.applyRoster(roster));
@@ -2120,6 +2466,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _positions.dispose();
+    _directoryChanges.dispose();
     unawaited(_notices.close());
     unawaited(_followMe.close());
     // A face resolved a millisecond before the app closed would otherwise
