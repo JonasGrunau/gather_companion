@@ -47,6 +47,7 @@ import 'package:gather_client/gather_client.dart' show settableAvailabilities;
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart' show availabilityColor, availabilityLabel, GatherThemeContext;
+import 'call_screen.dart' show callBannerText, openCallScreen;
 
 // The shell's own palette, kept deliberately apart from [GatherTokens]: the
 // office inside the screen must stay the app's normal colours, so the retro
@@ -541,6 +542,95 @@ class _StatusGlyph extends StatelessWidget {
   }
 }
 
+/// The way back to a live call, drawn inside the LCD under the status strip.
+///
+/// Gameboy mode skins only the office, and the office's own [CallBanner] is held
+/// off the screen there (see `map_screen.dart`) so it is not drawn twice nor out
+/// of the LCD's pixel grammar. This is its handheld replacement: a green call
+/// light, who the call is with, and the one line that says how to reach it on a
+/// console — the A button, or a thumb on the strip itself. Both routes land on
+/// [openCallScreen]. Self-listening on [AppState], so it appears and disappears
+/// with the call; the shell holds it down while the Select menu is up.
+class _LcdCallBanner extends StatelessWidget {
+  const _LcdCallBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, _) {
+        if (!state.inCall) return const SizedBox.shrink();
+        // Only the title; the handheld's second line is fixed — how to reach the
+        // call on this device, not the touchscreen's "Tap to see everyone".
+        final title = callBannerText(state.huddle).title;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Semantics(
+            button: true,
+            label: '$title. Press A or tap to open the call.',
+            child: ExcludeSemantics(
+              child: Material(
+                color: _scMid,
+                borderRadius: BorderRadius.circular(6),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () => openCallScreen(context, state),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(6),
+                      // The live-green ring the menu's lit rows use, so "a call is
+                      // on" reads in the same light as "the camera is on".
+                      border: Border.all(color: _online, width: 1.5),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.call_rounded, size: 18, color: _online),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scWhite,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 1),
+                              const Text(
+                                'Press A or tap',
+                                style: TextStyle(
+                                  fontFamily: _pixelFont,
+                                  color: _scGlyphOff,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// The head count, re-cut for the LCD: the same "N here" pill the map's app bar
 /// carried, in the pixel face on the screen's dark. The dot glows the live-green
 /// when anyone is in, so an empty room reads at a glance too.
@@ -689,6 +779,11 @@ class _Screen extends StatelessWidget {
                 children: [
                   _LcdStatusBar(state: state),
                   const SizedBox(height: 6),
+                  // The way back to a live call, inside the LCD and above the
+                  // office. Held down while the Select menu is up: A means
+                  // "choose" there, and the office it would return to is covered
+                  // anyway.
+                  if (menu == null) _LcdCallBanner(state: state),
                   Expanded(
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(4),
@@ -812,20 +907,24 @@ class _ControlsDeck extends StatelessWidget {
                     ),
                   ),
                   // A, raised and to the right: the cart, or — in the menu — the
-                  // choose key. Lit while the cart is latched on; plain in the menu.
+                  // choose key, or — during a call — the way back to the faces, the
+                  // partner to the LCD banner's "Press A or tap". Lit while the cart
+                  // is latched on or a call is live; plain in the menu.
                   Positioned(
                     right: 18,
                     top: 30,
                     child: _GbRoundButton(
                       label: 'A',
                       size: 64,
-                      lit: !menuOpen && state.boost,
+                      lit: !menuOpen && (state.inCall || state.boost),
                       onTap: menuOpen
                           ? onMenuConfirm
-                          : () {
-                              HapticFeedback.selectionClick();
-                              state.boost = !state.boost;
-                            },
+                          : state.inCall
+                              ? () => openCallScreen(context, state)
+                              : () {
+                                  HapticFeedback.selectionClick();
+                                  state.boost = !state.boost;
+                                },
                     ),
                   ),
                   // B, below and left of A: mute. Lit means the mic is live, so the

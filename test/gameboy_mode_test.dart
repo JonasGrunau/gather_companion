@@ -9,10 +9,12 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
+import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
 import 'package:gather_companion/ui/gameboy_shell.dart';
 import 'package:gather_companion/ui/home_shell.dart';
@@ -424,6 +426,69 @@ void main() {
       await tester.tap(find.text('Settings'));
       await tester.pumpAndSettle();
       expect(find.byType(SettingsScreen), findsOneWidget, reason: 'the scrolled-in row was the real, hittable one');
+    });
+  });
+
+  group('the call banner on the LCD', () {
+    /// A live call, the way the roster says so: self and [name] in one cluster.
+    void startCall(AppState state, String name) => state.debugApplyRoster(
+          Roster(selfId: 'me', rows: [
+            const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1'),
+            RosterRow(id: name, name: name, clusterId: 'c1'),
+          ]),
+        );
+
+    testWidgets('a live call lights the LCD, with the way back on it', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      expect(find.text('In a call with Ada'), findsOneWidget);
+      expect(find.text('Press A or tap'), findsOneWidget);
+      // The office's own app-themed banner is held off the LCD — only the pixel
+      // one is drawn, never both.
+      expect(find.byType(CallBanner), findsNothing);
+    });
+
+    testWidgets('A opens the call while one is live', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('A'));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('tapping the LCD banner opens the call', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      startCall(state, 'Ada');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Press A or tap'));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('no call, no banner', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      expect(find.text('Press A or tap'), findsNothing);
     });
   });
 }
