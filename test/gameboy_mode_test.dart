@@ -293,8 +293,16 @@ void main() {
 
       await tester.tap(find.text('Wave at Ada'));
       await tester.pump();
+      await tester.pump();
 
       expect(collector.waves, ['a'], reason: 'the prompt waves at the person in call distance');
+      // The confirmation lands inside the LCD, not on a Scaffold snackbar below the
+      // plastic.
+      expect(
+        find.descendant(of: find.byType(GameboyShell), matching: find.text('👋 Waved at Ada')),
+        findsOneWidget,
+      );
+      expect(find.byType(SnackBar), findsNothing);
     });
 
     testWidgets('double-tapping B sends a wave', (tester) async {
@@ -313,9 +321,15 @@ void main() {
       await tester.pump();
       await tester.tap(find.text('B'));
       await tester.pump();
+      await tester.pump();
 
       expect(collector.waves, ['a'],
           reason: 'a double-tap of B waves at the person in call distance');
+      expect(
+        find.descendant(of: find.byType(GameboyShell), matching: find.text('👋 Waved at Ada')),
+        findsOneWidget,
+      );
+      expect(find.byType(SnackBar), findsNothing);
     });
 
     testWidgets('a single B tap does not wave', (tester) async {
