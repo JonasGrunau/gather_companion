@@ -12,6 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
+import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
@@ -489,6 +490,56 @@ void main() {
       await toOffice(tester);
 
       expect(find.text('Press A or tap'), findsNothing);
+    });
+
+    testWidgets('names the media-only peer, not a bare "In a call"', (tester) async {
+      // The half second at the end of a conversation: the roster cluster has let
+      // go, so there is no huddle, but the SFU is still sending Ada. The LCD and
+      // the office banner both read this off the call's own tiles, so the handheld
+      // names her here rather than falling back to the anonymous title.
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugCall = const CallState(
+          participants: [CallParticipant(srcId: 'acc-ada', hasAudio: true)],
+        )
+        ..debugApplyRoster(const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'Jonas'),
+          // No clusterId — the huddle is empty; only the media plane says Ada is here.
+          RosterRow(id: 'ada', name: 'Ada', userAccountId: 'acc-ada'),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+      await tester.pumpAndSettle();
+
+      expect(state.inHuddle, isFalse, reason: 'no cluster, so no huddle');
+      expect(state.inCall, isTrue, reason: 'but the media plane still has company');
+      expect(find.text('In a call with Ada'), findsOneWidget);
+    });
+  });
+
+  group('the D-pad release', () {
+    testWidgets('always stops walking, even once the Select menu has taken the pad', (tester) async {
+      // Opening the menu with the pad still held once left the walk timer running:
+      // the menu swapped the release to a no-op, so lifting never called
+      // stopWalking and the avatar walked on. Release must always stop walking.
+      final state = configure(_SpyState())
+        ..setGameboyMode(true)
+        ..debugCanWalk = true;
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      await tester.tap(find.text('SELECT'));
+      await tester.pumpAndSettle();
+
+      final pad = tester.getRect(find.byKey(const Key('gb-dpad')));
+      final gesture = await tester.startGesture(Offset(pad.center.dx, pad.top + pad.height * 0.12));
+      await tester.pump();
+      await gesture.up();
+      await tester.pump();
+
+      expect(state.released, greaterThan(0), reason: 'lifting the pad stopped the walk');
     });
   });
 }

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'src/app_state.dart';
+import 'src/fonts_license.dart';
 import 'src/media/live_call.dart';
 import 'src/media/media_log.dart';
 import 'theme/gather_theme.dart';
@@ -27,6 +28,9 @@ Future<void> main() async {
   runZoned(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      // File the bundled fonts' licences with Flutter before the first frame, so
+      // the required OFL notice ships with the app. See [registerFontLicenses].
+      registerFontLicenses();
       // No generated `firebase_options.dart`: on Apple platforms the SDK reads
       // ios/Runner/GoogleService-Info.plist, which is the file the Firebase
       // console hands out and the only place the config should live. One fewer

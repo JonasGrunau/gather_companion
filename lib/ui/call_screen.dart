@@ -1294,10 +1294,7 @@ class CallBanner extends StatelessWidget {
         final t = context.tokens;
         // The call screen's own list, so the banner and the screen it opens can
         // never disagree about who is in the call.
-        final faces = [for (final tile in _tiles(state)) if (!tile.isSelf) tile];
-        final (:title, :subtitle) = callBannerText([
-          for (final face in faces) face.label == _someone ? null : face.label,
-        ]);
+        final (:title, :subtitle) = callBannerTextFor(state);
         final fill = t.card;
 
         return Padding(
@@ -1428,6 +1425,22 @@ class CallBannerHeader extends StatelessWidget {
   };
   return (title: title, subtitle: subtitle);
 }
+
+/// The banner line for [state], resolved from the live call's own participant
+/// tiles — the very list [CallScreen] draws — so every skin of the banner agrees
+/// with the screen it opens about who is in the call.
+///
+/// This is the one right source: [AppState.inCall] stays true for the half second
+/// a media peer outlives the roster cluster, and during that window the roster's
+/// `huddle` is empty while a tile is still present. Titling from the tiles names
+/// that peer instead of falling back to a bare "In a call"; it also maps the
+/// unnamed [_someone] placeholder to null, so an un-landed row reads as "someone"
+/// rather than as a person literally called Someone.
+({String title, String subtitle}) callBannerTextFor(AppState state) =>
+    callBannerText([
+      for (final tile in tilesFor(state))
+        if (!tile.isSelf) tile.label == _someone ? null : tile.label,
+    ]);
 
 String? _firstName(String? name) {
   if (name == null) return null;

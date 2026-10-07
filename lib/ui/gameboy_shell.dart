@@ -47,7 +47,7 @@ import 'package:gather_client/gather_client.dart' show settableAvailabilities;
 
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart' show availabilityColor, availabilityLabel, GatherThemeContext;
-import 'call_screen.dart' show callBannerText, openCallScreen;
+import 'call_screen.dart' show callBannerTextFor, openCallScreen;
 
 // The shell's own palette, kept deliberately apart from [GatherTokens]: the
 // office inside the screen must stay the app's normal colours, so the retro
@@ -167,7 +167,13 @@ class _GameboyShellState extends State<GameboyShell> {
   /// sit below the fold, so a D-pad move has to scroll the lit row back into the
   /// well — otherwise the highlight walks off-screen and A fires a row nobody can
   /// see. The keys hang on the rows in [_GameboyMenu]; [_revealRow] rides them.
-  final List<GlobalKey> _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
+  ///
+  /// Regenerated on every open rather than held for the shell's life: the
+  /// [AnimatedSwitcher] that fades the menu keeps the outgoing instance mounted
+  /// for the length of its transition, so a close-then-reopen inside that window
+  /// would leave two menus alive at once. Sharing one set of [GlobalKey]s across
+  /// both is a duplicate-key crash; a fresh set per open keeps them apart.
+  List<GlobalKey> _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
 
   /// Scroll the focused row into view after a vertical move. Every row is built
   /// eagerly inside the menu's scroll view, so the context is already there; the
@@ -190,6 +196,9 @@ class _GameboyShellState extends State<GameboyShell> {
     setState(() {
       _menuOpen = !_menuOpen;
       if (_menuOpen) {
+        // Fresh keys for this instance, so a reopen while the previous menu is
+        // still fading out never mounts the same GlobalKeys twice.
+        _rowKeys = List.generate(_menuRowCount, (_) => GlobalKey());
         // Open on the status row with its cursor already on the status you are,
         // so the first thing the menu offers is a one-press change away from it.
         _row = _menuRowStatus;
@@ -563,8 +572,12 @@ class _LcdCallBanner extends StatelessWidget {
       builder: (context, _) {
         if (!state.inCall) return const SizedBox.shrink();
         // Only the title; the handheld's second line is fixed — how to reach the
-        // call on this device, not the touchscreen's "Tap to see everyone".
-        final title = callBannerText(state.huddle).title;
+        // call on this device, not the touchscreen's "Tap to see everyone". Drawn
+        // from the call's own tiles via [callBannerTextFor], the same source the
+        // office banner uses, so the two skins name the call the same way — and the
+        // media-only moment, when a peer outlives the roster cluster, still names
+        // that peer instead of a bare "In a call".
+        final title = callBannerTextFor(state).title;
         return Padding(
           padding: const EdgeInsets.only(bottom: 6),
           child: Semantics(
@@ -901,8 +914,16 @@ class _ControlsDeck extends StatelessWidget {
                       builder: (context, _) => _GbDpad(
                         key: const Key('gb-dpad'),
                         enabled: menuOpen || state.canWalk,
+                        // The menu drives the cursor, the office walks — name the
+                        // gesture for whichever the pad is doing right now.
+                        moveVerb: menuOpen ? 'Move' : 'Walk',
                         onPress: menuOpen ? onMenuMove : state.walk,
-                        onRelease: menuOpen ? () {} : state.stopWalking,
+                        // Always stop walking on release. It is idempotent, and the
+                        // case that matters is opening the menu with the pad still
+                        // held: a no-op release there would let the walk timer
+                        // outlive the lift and step the avatar forever. See
+                        // [Walk.release].
+                        onRelease: state.stopWalking,
                       ),
                     ),
                   ),
@@ -917,6 +938,10 @@ class _ControlsDeck extends StatelessWidget {
                       label: 'A',
                       size: 64,
                       lit: !menuOpen && (state.inCall || state.boost),
+                      // A switch only when it means boost. In the menu it chooses,
+                      // during a call it opens the call — both actions, so the glow
+                      // there is not an "on" state the reader should announce.
+                      toggled: (menuOpen || state.inCall) ? null : state.boost,
                       onTap: menuOpen
                           ? onMenuConfirm
                           : state.inCall
@@ -937,6 +962,9 @@ class _ControlsDeck extends StatelessWidget {
                       label: 'B',
                       size: 64,
                       lit: !menuOpen && call.micOn,
+                      // Mute is a real switch; inert in the menu, so no toggle state
+                      // there.
+                      toggled: menuOpen ? null : call.micOn,
                       onTap: menuOpen ? null : () => _run(context, () => state.setMicOn(!call.micOn)),
                     ),
                   ),
@@ -989,11 +1017,17 @@ class _GbDpad extends StatefulWidget {
   const _GbDpad({
     super.key,
     required this.enabled,
+    required this.moveVerb,
     required this.onPress,
     required this.onRelease,
   });
 
   final bool enabled;
+
+  /// What a press does right now, for the screen reader: "Walk" in the office,
+  /// "Move" while the Select menu owns the pad. The arms announce `<verb> up`
+  /// etc., so a reader never hears "Walk" for a gesture that moves the cursor.
+  final String moveVerb;
   final void Function(String direction) onPress;
   final VoidCallback onRelease;
 
@@ -1064,7 +1098,7 @@ class _GbDpadState extends State<_GbDpad> {
                 child: Semantics(
                   button: true,
                   enabled: widget.enabled,
-                  label: 'Walk ${arm.direction.toLowerCase()}',
+                  label: '${widget.moveVerb} ${arm.direction.toLowerCase()}',
                   onTap: widget.enabled
                       ? () {
                           widget.onPress(arm.direction);
@@ -1176,11 +1210,22 @@ class _GbRoundButton extends StatefulWidget {
     required this.size,
     required this.lit,
     required this.onTap,
+    this.toggled,
   });
 
   final String label;
   final double size;
+
+  /// The green glow: purely visual, "this control is live". It is not the same as
+  /// the semantic on/off — A glows during a call, but pressing it then *opens* the
+  /// call, it does not toggle anything. See [toggled].
   final bool lit;
+
+  /// The screen-reader on/off, kept apart from [lit]. Null means the button is an
+  /// action, not a switch, so VoiceOver never announces it as selected; true/false
+  /// is a real toggle (mute, boost). B is always a toggle; A is one only while it
+  /// means boost.
+  final bool? toggled;
   final VoidCallback? onTap;
 
   @override
@@ -1200,7 +1245,7 @@ class _GbRoundButtonState extends State<_GbRoundButton> {
     final lit = widget.lit;
     return Semantics(
       button: true,
-      toggled: lit,
+      toggled: widget.toggled,
       label: widget.label,
       child: GestureDetector(
         onTapDown: widget.onTap == null ? null : (_) => _set(true),
@@ -1428,7 +1473,12 @@ class _GameboyMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cameraOn = state.call.cameraOn;
-    return Stack(
+    // The scrim dims the office but does not take it out of the semantics tree, so
+    // without this a screen reader could still reach and fire the office controls
+    // hidden under the open menu. [BlockSemantics] makes the overlay modal to
+    // assistive tech, matching what the dim already does for sighted eyes.
+    return BlockSemantics(
+      child: Stack(
       key: const ValueKey('gb-menu-open'),
       children: [
         // The scrim: the office dimmed, not hidden, so the menu reads as laid over
@@ -1500,6 +1550,7 @@ class _GameboyMenu extends StatelessWidget {
           ),
         ),
       ],
+      ),
     );
   }
 }
