@@ -1234,7 +1234,13 @@ class AppState extends ChangeNotifier {
   ///
   /// Held rather than tapped: the pad calls this for as long as a thumb is down, and
   /// [Walk] repeats the step at Gather's own walking pace until [stopWalking].
-  void walk(String direction) => _walk?.press(direction);
+  void walk(String direction) {
+    _walk?.press(direction);
+    // Gameboy mode keeps the avatar centred on the little LCD. The lock is otherwise
+    // persistent; this nudge only matters to re-grab it after the user has panned the
+    // floor — see [recentre]. Normal mode never fires it.
+    if (_gameboyMode && !_recentre.isClosed) _recentre.add(null);
+  }
 
   /// How fast we are going, and so whether to draw a go-kart under our own avatar.
   ///
@@ -1836,6 +1842,15 @@ class AppState extends ChangeNotifier {
   /// Broadcast, like [notices]: a walk nobody is watching is owed nothing.
   Stream<void> get followMe => _followMe.stream;
   final _followMe = StreamController<void>.broadcast();
+
+  /// A D-pad walk began in Gameboy mode — the office screen re-centres on the avatar.
+  ///
+  /// The handheld keeps the avatar dead-centre on the LCD at all times, so the camera
+  /// lock is persistent rather than per-walk. This fires only to re-grab that lock after
+  /// the user has panned or pinched the floor away from it (see [walk]); fire-only and
+  /// broadcast, like [followMe], because the office screen is rebuilt with its tab.
+  Stream<void> get recentre => _recentre.stream;
+  final _recentre = StreamController<void>.broadcast();
 
   /// The same request, latched, for a map that was not there to hear it.
   ///
@@ -2469,6 +2484,7 @@ class AppState extends ChangeNotifier {
     _directoryChanges.dispose();
     unawaited(_notices.close());
     unawaited(_followMe.close());
+    unawaited(_recentre.close());
     // A face resolved a millisecond before the app closed would otherwise
     // notify a disposed notifier, which throws.
     _faceNotice?.cancel();

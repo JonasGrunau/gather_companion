@@ -587,4 +587,31 @@ void main() {
       expect(state.released, greaterThan(0), reason: 'lifting the pad stopped the walk');
     });
   });
+
+  group('the camera re-grab signal', () {
+    // The handheld keeps the avatar centred on the LCD; a pan breaks that lock and a
+    // D-pad walk re-grabs it over [AppState.recentre]. Pinned on the real [walk], not
+    // the spy, because the spy overrides [walk] away. The live walk plumbing is null in
+    // a test, so no step is taken — the signal fires regardless, which is the point.
+    test('a walk in Gameboy mode asks the map to re-centre', () async {
+      final state = configure(AppState())..setGameboyMode(true);
+      final seen = <void>[];
+      final sub = state.recentre.listen(seen.add);
+      state.walk('Up');
+      await Future<void>.delayed(Duration.zero);
+      expect(seen, hasLength(1), reason: 'the D-pad re-grabs the centred lock');
+      await sub.cancel();
+    });
+
+    test('a walk in normal mode says nothing', () async {
+      final state = configure(AppState());
+      expect(state.gameboyMode, isFalse);
+      final seen = <void>[];
+      final sub = state.recentre.listen(seen.add);
+      state.walk('Up');
+      await Future<void>.delayed(Duration.zero);
+      expect(seen, isEmpty, reason: 'the normal map owns its own camera');
+      await sub.cancel();
+    });
+  });
 }
