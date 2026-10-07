@@ -96,7 +96,10 @@ class _HomeShellState extends State<HomeShell> {
   /// The office being one tap away costs it nothing. No tab is rebuilt when you
   /// leave it, so it is already drawn, already panned where you left it, and its
   /// artwork is still decoded.
-  _Tab _tab = _Tab.dial;
+  ///
+  /// Gameboy mode is the exception: the handheld wraps the office, so that is the
+  /// screen the retro shell exists to show and the one it opens on.
+  late _Tab _tab = widget.state.gameboyMode ? _Tab.map : _Tab.dial;
 
   /// Built once and held. A fresh `Listenable.merge` on every build would hand
   /// the map's `ListenableBuilder` a new object each frame and make it
@@ -177,6 +180,7 @@ class _HomeShellState extends State<HomeShell> {
                 state: widget.state,
                 onOpenSettings: () => _select(_Tab.settings),
                 onOpenActivity: () => _select(_Tab.activity),
+                onOpenDial: () => _select(_Tab.dial),
                 child: ListenableBuilder(
                   listenable: _tab == _Tab.map ? _mapTick : widget.state,
                   builder: (context, _) => MapScreen(state: widget.state),
@@ -294,7 +298,12 @@ class _Dock extends StatelessWidget {
                 for (final tab in _Tab.values) ...[
                   if (tab != _Tab.values.first) const SizedBox(width: 6),
                   Expanded(
-                    child: _NavItem(tab: tab, selected: selected, onSelect: onSelect),
+                    child: _NavItem(
+                      tab: tab,
+                      selected: selected,
+                      gameboy: state.gameboyMode,
+                      onSelect: onSelect,
+                    ),
                   ),
                 ],
               ],
@@ -323,17 +332,26 @@ class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.tab,
     required this.selected,
+    required this.gameboy,
     required this.onSelect,
   });
 
   final _Tab tab;
   final _Tab selected;
+
+  /// Whether Gameboy mode is on. The office row then wears the handheld's own
+  /// name and glyph: in Gameboy mode the map tab is no longer "the office" you
+  /// scroll, it is the console you power on, so the bar says so.
+  final bool gameboy;
   final ValueChanged<_Tab> onSelect;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
     final on = tab == selected;
+    final retro = gameboy && tab == _Tab.map;
+    final label = retro ? 'Gameboy' : tab.label;
+    final icon = retro ? Icons.videogame_asset_rounded : tab.icon;
     // Concentric with the island: the dock's corner is `t.radius + 10` and the
     // plate sits 6 points inside it, so its corner is the dock's minus that
     // inset. Any other number and the two curves visibly disagree at the
@@ -343,9 +361,9 @@ class _NavItem extends StatelessWidget {
     return Semantics(
       button: true,
       selected: on,
-      label: tab.label,
+      label: label,
       child: Tooltip(
-        message: tab.label,
+        message: label,
         child: Material(
           color: Colors.transparent,
           child: InkWell(
@@ -374,10 +392,10 @@ class _NavItem extends StatelessWidget {
                   builder: (context, colour, _) => Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(tab.icon, size: 22, color: colour),
+                      Icon(icon, size: 22, color: colour),
                       const SizedBox(height: 3),
                       Text(
-                        tab.label,
+                        label,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
