@@ -13,13 +13,17 @@
 /// roster has not placed. That is the point of a directory — you call someone
 /// *because* they are not already in front of you.
 ///
-/// ## Why it listens to nothing of its own
+/// ## What it listens to
 ///
-/// `main.dart` wraps the whole shell in a `ListenableBuilder` on [AppState], so a
-/// presence fold — somebody coming online, a conversation forming — already rebuilds
-/// this screen. It deliberately does **not** ride `AppState.positions` the way the
-/// map does: a contact list has no reason to repaint four times a second because a
-/// stranger took a step.
+/// `main.dart` wraps the whole shell in a `ListenableBuilder` on [AppState], which
+/// catches the presence folds that fire `notifyListeners` — a name, a follow. But
+/// the roster carries more than the fold reports: somebody can go Offline, a
+/// conversation can form or break up, an availability dot can turn, none of which is
+/// part of the fold and so none of which wakes the shell. Those are exactly what this
+/// tab sorts and groups on, so it also rides [AppState.directoryChanges], which ticks
+/// on just that projection. It deliberately does **not** ride [AppState.positions]
+/// the way the map does: a contact list has no reason to repaint four times a second
+/// because a stranger took a step.
 library;
 
 import 'package:flutter/material.dart';
@@ -46,6 +50,24 @@ class _DialScreenState extends State<DialScreen> {
   String? _warping;
 
   AppState get state => widget.state;
+
+  @override
+  void initState() {
+    super.initState();
+    // The shell's own [ListenableBuilder] misses availability and cluster changes;
+    // this is the signal that carries them. See the library comment.
+    state.directoryChanges.addListener(_onDirectoryChanged);
+  }
+
+  @override
+  void dispose() {
+    state.directoryChanges.removeListener(_onDirectoryChanged);
+    super.dispose();
+  }
+
+  void _onDirectoryChanged() {
+    if (mounted) setState(() {});
+  }
 
   /// Warps, then opens the faces on success. The sentence a refusal returns is
   /// shown here rather than swallowed; the async refusals Gather pushes later
@@ -122,19 +144,25 @@ class _DialScreenState extends State<DialScreen> {
             else
               SliverList.builder(
                 itemCount: present.length,
-                itemBuilder: (context, i) => _ContactTile(
-                  state: state,
-                  contact: present[i],
-                  busy: _warping == present[i].id,
-                  onTap: () => _warpToPerson(present[i]),
-                ),
+                itemBuilder: (context, i) {
+                  final c = present[i];
+                  final canWarp = state.canWarpTo(c);
+                  return _ContactTile(
+                    state: state,
+                    contact: c,
+                    busy: _warping == c.id,
+                    canWarp: canWarp,
+                    onTap: canWarp ? () => _warpToPerson(c) : null,
+                  );
+                },
               ),
 
             if (offline.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Away')),
               SliverList.builder(
                 itemCount: offline.length,
-                itemBuilder: (context, i) => _ContactTile(state: state, contact: offline[i], busy: false, onTap: null),
+                itemBuilder: (context, i) =>
+                    _ContactTile(state: state, contact: offline[i], busy: false, canWarp: false, onTap: null),
               ),
             ],
 
@@ -190,7 +218,7 @@ class _RecentsRail extends StatelessWidget {
             itemBuilder: (context, i) {
               final c = contacts[i];
               return GestureDetector(
-                onTap: c.isPresent ? () => onTap(c) : null,
+                onTap: state.canWarpTo(c) ? () => onTap(c) : null,
                 child: Opacity(
                   opacity: c.isPresent ? 1 : 0.45,
                   child: SizedBox(
@@ -324,11 +352,21 @@ class _FacePile extends StatelessWidget {
 /// One person in the directory. Tappable to warp while they are here; dimmed and
 /// inert while they are not.
 class _ContactTile extends StatelessWidget {
-  const _ContactTile({required this.state, required this.contact, required this.busy, required this.onTap});
+  const _ContactTile({
+    required this.state,
+    required this.contact,
+    required this.busy,
+    required this.canWarp,
+    required this.onTap,
+  });
 
   final AppState state;
   final Contact contact;
   final bool busy;
+
+  /// Whether this contact can be warped to — present, placed, and on our floor.
+  /// Drives the pill: a present person on another floor is listed but not called.
+  final bool canWarp;
   final VoidCallback? onTap;
 
   @override
@@ -340,7 +378,7 @@ class _ContactTile extends StatelessWidget {
     return Opacity(
       opacity: present ? 1 : 0.5,
       child: InkWell(
-        onTap: present && !busy ? onTap : null,
+        onTap: canWarp && !busy ? onTap : null,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: kTextGutter, vertical: 10),
           child: Row(
@@ -377,7 +415,7 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              if (present) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
+              if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
           ),
         ),

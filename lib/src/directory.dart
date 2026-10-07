@@ -93,6 +93,7 @@ class Meeting {
     required this.clusterId,
     required this.members,
     this.roomName,
+    this.floorId,
     this.includesMe = false,
   });
 
@@ -105,6 +106,11 @@ class Meeting {
   /// The named room the conversation is in, when a majority of its members sit in
   /// one, else null ("Conversation with …").
   final String? roomName;
+
+  /// The floor the conversation is on, when its placed members agree on one; null
+  /// when they straddle floors or none is placed. A meeting on another floor is not
+  /// one a single warp can reach.
+  final String? floorId;
 
   /// Whether I am already in this conversation. First in the list, and not an
   /// offer to join something I am in.

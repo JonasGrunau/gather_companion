@@ -15,6 +15,8 @@ import 'package:gather_companion/harness/harness_data.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 
+import 'fake_call.dart';
+
 void main() {
   RosterRow row(
     String id, {
@@ -22,6 +24,7 @@ void main() {
     bool connected = true,
     String availability = 'Active',
     String? clusterId,
+    String? floorId,
     num? x,
     num? y,
   }) =>
@@ -32,6 +35,7 @@ void main() {
         availability: availability,
         clusterId: clusterId,
         clusterIdKnown: clusterId != null,
+        floorId: floorId,
         x: x,
         y: y,
       );
@@ -135,6 +139,34 @@ void main() {
       addTearDown(state.dispose);
       expect(state.meetings.single.roomName, isNull);
     });
+
+    test('an unplaced member is no evidence a majority is in the room', () {
+      // One of three sits in the Lounge; the other two have no position. A majority
+      // of *all* members is not inside, so the room must not name the meeting.
+      final state = AppState()
+        ..debugMap = schematicOffice()
+        ..debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You'),
+          row('a', name: 'Ada', clusterId: 'c1', x: 8, y: 10), // Lounge
+          row('b', name: 'Bob', clusterId: 'c1'), // unplaced
+          row('c', name: 'Cal', clusterId: 'c1'), // unplaced
+        ]));
+      addTearDown(state.dispose);
+      expect(state.meetings.single.roomName, isNull);
+    });
+
+    test('a connected row gone Offline is not counted as being in the room', () {
+      // Its socket is still open but its coordinates are wherever it logged off, so
+      // it is not present and leaves a one-person cluster — no meeting to join.
+      final state = AppState()
+        ..debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You'),
+          row('a', name: 'Ada', clusterId: 'c1', x: 1, y: 1),
+          row('b', name: 'Bob', clusterId: 'c1', availability: 'Offline', x: 2, y: 1),
+        ]));
+      addTearDown(state.dispose);
+      expect(state.meetings, isEmpty);
+    });
   });
 
   group('warpToPerson', () {
@@ -186,6 +218,52 @@ void main() {
 
       expect(failed, contains('No connection'));
       expect(collector.teleports, isEmpty);
+    });
+
+    test('refuses someone on another floor and sends nothing', () async {
+      final (:state, :collector) = wired([
+        const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 9, y: 8),
+        row('a', name: 'Ada', floorId: 'first', x: 11, y: 8),
+      ]);
+
+      final ada = state.directory.firstWhere((c) => c.id == 'a');
+      final failed = await state.warpToPerson(ada);
+
+      expect(failed, contains('another floor'));
+      expect(collector.teleports, isEmpty);
+      expect(state.canWarpTo(ada), isFalse, reason: 'the button is withheld too');
+    });
+
+    test('opens the microphone once after a successful warp', () async {
+      final (:state, :collector) = wired([
+        const RosterRow(id: kSelfId, name: 'You', x: 9, y: 8),
+        row('a', name: 'Ada', x: 11, y: 8),
+      ]);
+      final call = FakeCall();
+      state.debugAttachCall(call);
+      addTearDown(call.dispose);
+
+      final ada = state.directory.firstWhere((c) => c.id == 'a');
+      final failed = await state.warpToPerson(ada);
+
+      expect(failed, isNull);
+      expect(call.micCalls, [true], reason: 'a call connects the microphone, once');
+    });
+
+    test('leaves the microphone alone when the warp is refused', () async {
+      final (:state, :collector) = wired([
+        const RosterRow(id: kSelfId, name: 'You', x: 9, y: 8),
+        row('a', name: 'Ada', connected: false, availability: 'Offline', x: 11, y: 8),
+      ]);
+      final call = FakeCall();
+      state.debugAttachCall(call);
+      addTearDown(call.dispose);
+
+      final ada = state.directory.firstWhere((c) => c.id == 'a');
+      final failed = await state.warpToPerson(ada);
+
+      expect(failed, contains('not in the office'));
+      expect(call.micCalls, isEmpty);
     });
   });
 }

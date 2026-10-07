@@ -223,6 +223,17 @@ class AppState extends ChangeNotifier {
     return out;
   }
 
+  /// Whether [warpToPerson] has somewhere to send you: the contact is here, carries
+  /// a position, and is on your floor. The Dial tab offers the warp only when this
+  /// holds, so a cross-floor or unplaced contact is shown but not called — the same
+  /// answer [warpToPerson] gives, decided once here so the button and the action
+  /// cannot disagree.
+  bool canWarpTo(Contact contact) {
+    if (!contact.isReachable) return false;
+    final myFloor = _myRow()?.floorId;
+    return myFloor == null || contact.floorId == null || contact.floorId == myFloor;
+  }
+
   /// The conversations happening now — every cluster of two or more connected
   /// people — the one I am in first, then the largest.
   ///
@@ -241,9 +252,13 @@ class AppState extends ChangeNotifier {
     for (final row in roster.rows) {
       final cid = row.clusterId;
       if (cid == null) continue;
-      // A cluster outlives a dropped socket; a disconnected row is not somebody to
-      // count as being in the room — the same rule `Roster.myCluster` follows.
-      if (row.connected == false) continue;
+      // A cluster outlives a dropped socket, and a row that is connected but has
+      // gone Offline is not in the room either — its coordinates are wherever it
+      // logged off. Both read as "not present", the same test the directory and map
+      // use; only a present person is somebody to count. My own row always counts:
+      // it is how `includesMe` knows the conversation is mine, and the roster does
+      // not always carry presence for self.
+      if (row.id != selfId && !row.isPresent) continue;
       (groups[cid] ??= <RosterRow>[]).add(row);
     }
 
@@ -257,10 +272,23 @@ class AppState extends ChangeNotifier {
       ];
       // Only me left once mine are excluded — nothing to join.
       if (members.isEmpty) return;
+      // The floor the conversation is on, and the map whose rooms can name it. A
+      // single-floor space carries no floorId at all, so an empty set means "the one
+      // floor" and resolves to the map we are already looking at. One floor names it
+      // off that floor's plan. Members straddling two floors are no single room and
+      // nowhere a one-hop warp can land, so they stay unroomed and unplaced.
+      final floors = <String>{
+        for (final row in rows)
+          if (row.floorId != null && row.x != null && row.y != null && row.x!.isFinite && row.y!.isFinite)
+            row.floorId!,
+      };
+      final floorId = floors.length == 1 ? floors.first : null;
+      final floorMap = floors.length > 1 ? null : (floorId == null ? map : (_collector?.mapFor(floorId) ?? map));
       out.add(Meeting(
         clusterId: cid,
         members: members,
-        roomName: _roomNameFor(rows, map),
+        roomName: _roomNameFor(rows, floorMap),
+        floorId: floorId,
         includesMe: includesMe,
       ));
     });
@@ -276,21 +304,21 @@ class AppState extends ChangeNotifier {
   ///
   /// Each member is placed in the *innermost* named, non-desk area at their feet —
   /// the smallest rectangle containing them, so a meeting room wins over the public
-  /// zone it sits inside. The cluster takes a room's name only when a majority of
-  /// its placeable members are in it; a conversation spilling across a doorway has
-  /// no one room and is better named by its people.
+  /// zone it sits inside. The cluster takes a room's name only when a strict majority
+  /// of *all* its members sit in it; a conversation spilling across a doorway has no
+  /// one room and is better named by its people. The denominator is every member,
+  /// not only the placed ones: a member the roster has not located is no evidence
+  /// that a majority is inside, so a cluster that is mostly unplaced stays unnamed.
   String? _roomNameFor(List<RosterRow> rows, SpaceMap? map) {
     if (map == null) return null;
     final counts = <String, int>{};
-    var placed = 0;
     for (final row in rows) {
       final x = row.x, y = row.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      placed++;
       final name = _innermostNamedRoomAt(map, x.round(), y.round())?.name;
       if (name != null) counts[name] = (counts[name] ?? 0) + 1;
     }
-    if (placed == 0) return null;
+    if (counts.isEmpty) return null;
     String? best;
     var bestCount = 0;
     counts.forEach((name, count) {
@@ -299,9 +327,10 @@ class AppState extends ChangeNotifier {
         best = name;
       }
     });
-    // A strict majority: a conversation split evenly across a doorway has no one
-    // room, and is better named by its people.
-    return bestCount * 2 > placed ? best : null;
+    // A strict majority of everyone in the cluster: a conversation split across a
+    // doorway, or mostly made of members the roster has not placed, has no one room
+    // and is better named by its people.
+    return bestCount * 2 > rows.length ? best : null;
   }
 
   /// The smallest named, non-desk room containing the tile — the one a person in
@@ -343,6 +372,19 @@ class AppState extends ChangeNotifier {
   /// nothing.
   Listenable get positions => _positions;
   final _positions = _Ticker();
+
+  /// Ticks when the directory's shape changes — somebody arriving or leaving, a
+  /// conversation forming or breaking up, an availability dot turning.
+  ///
+  /// Its own [Listenable] for the same reason as [positions], and the mirror image of
+  /// it: the Dial tab must wake for these presence folds the shell's own
+  /// [notifyListeners] misses (availability and `clusterId` are not part of the
+  /// presence fold), but it must *not* wake for the footsteps [positions] carries
+  /// four times a second. This is the projection in between — the fields the
+  /// directory sorts and groups on — and nothing else. See [_noteDirectory].
+  Listenable get directoryChanges => _directoryChanges;
+  final _directoryChanges = _Ticker();
+  String? _lastDirectoryDigest;
 
   /// The last hop party mode fired, for the map to draw as a teleport.
   ///
@@ -632,6 +674,22 @@ class AppState extends ChangeNotifier {
     if (mine == _mine) return;
     _mine = mine;
     notifyListeners();
+  }
+
+  /// Wakes [directoryChanges] when the roster's directory-relevant projection moves
+  /// — presence, availability, and conversation membership, the fields the Dial tab
+  /// sorts and groups on. Deliberately not positions: a stranger's step must not
+  /// repaint a contact list. Cheap — a sorted fold of a handful of fields per row,
+  /// compared to the last — so it is fine to run on every roster.
+  void _noteDirectory(Roster roster) {
+    final parts = <String>[
+      for (final row in roster.rows)
+        '${row.id}:${row.isPresent ? 1 : 0}:${row.availability ?? ''}:${row.clusterId ?? ''}',
+    ]..sort();
+    final digest = parts.join('|');
+    if (digest == _lastDirectoryDigest) return;
+    _lastDirectoryDigest = digest;
+    _directoryChanges.tick();
   }
 
   /// Whether I am in a call: a conversation Gather has put me in, or anybody the
@@ -1351,6 +1409,14 @@ class AppState extends ChangeNotifier {
     if (x == null || y == null || !x.isFinite || !y.isFinite) {
       return "Can't tell where ${contact.label} is yet.";
     }
+    // A warp is a hop on *this* floor: it teleports to a coordinate on the map the
+    // phone is showing. Applied to someone on another floor it would land on the
+    // same coordinates here — nowhere near them — and falsely report success. There
+    // is no one-hop floor change, so a cross-floor contact is out of reach.
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && contact.floorId != null && contact.floorId != myFloor) {
+      return '${contact.label} is on another floor.';
+    }
 
     final failed = await warpToTile(x.round(), y.round());
     if (failed != null) return failed;
@@ -1369,6 +1435,14 @@ class AppState extends ChangeNotifier {
   /// handled as in [warpToPerson].
   Future<String?> warpToMeeting(Meeting meeting) async {
     if (meeting.includesMe) return null;
+
+    // On another floor there is no room on this map to walk into and no tile a hop
+    // could reach — the same ceiling [warpToPerson] hits. Refuse rather than walk
+    // into a room that merely shares a name or coordinates on the wrong floor.
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+      return 'That conversation is on another floor.';
+    }
 
     final map = this.map;
     final roomName = meeting.roomName;
@@ -1389,6 +1463,8 @@ class AppState extends ChangeNotifier {
     for (final member in meeting.members) {
       final x = member.x, y = member.y;
       if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      // Only hop beside a member this hop can actually reach: one on our own floor.
+      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
       final failed = await warpToTile(x.round(), y.round());
       if (failed != null) return failed;
       final micFailed = await setMicOn(true);
@@ -1975,6 +2051,7 @@ class AppState extends ChangeNotifier {
           // The collector already coalesces and only publishes when something in the
           // state actually moved, so this is "the map changed", not a clock.
           _positions.tick();
+          _noteDirectory(roster);
           _noteCluster(roster);
           _noteSpeakers(roster);
           final out = _tracker.applyRoster(roster);
