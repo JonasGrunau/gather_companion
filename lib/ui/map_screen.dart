@@ -38,9 +38,11 @@ import 'person_avatar.dart';
 /// 222 KB, which is why "draw all of it" is a reasonable thing to do on a phone. See
 /// `art_cache.dart` for the fetching and `space_art.dart` for where the URLs come
 /// from.
-/// Every map toast goes through here so it floats above the nav rail rather than
-/// docking at the true bottom, where the rail floats over content and would cover
-/// it. Same inset the tabs pad themselves by.
+/// Every map toast goes through here so it sits in the same slot as the selected-
+/// person card — just above the dock island — rather than docking at the true
+/// bottom behind it. The screen's bottom padding already carries the whole island
+/// (the shell's rail inset plus this tab's control-bar inset), so clearing that
+/// plus a gutter lands it exactly where the card does.
 SnackBar _railClearSnack(BuildContext context, String message) => SnackBar(
       content: Text(message),
       behavior: SnackBarBehavior.floating,
@@ -48,7 +50,7 @@ SnackBar _railClearSnack(BuildContext context, String message) => SnackBar(
         kGutter,
         0,
         kGutter,
-        kRailInset + MediaQuery.paddingOf(context).bottom + 8,
+        MediaQuery.paddingOf(context).bottom + kGutter,
       ),
     );
 

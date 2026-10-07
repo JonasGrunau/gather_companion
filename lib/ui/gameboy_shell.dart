@@ -723,11 +723,11 @@ class _LcdWavePrompt extends StatelessWidget {
         final rows = state.huddleRows;
         if (rows.isEmpty) return const SizedBox.shrink();
         final who = rows.length == 1 ? (rows.first.name?.split(' ').first ?? 'them') : 'them';
-        // A small chip at the foot of the LCD, hugged to the right rather than
-        // spanning the screen — it is a prompt, not a banner, and the office
-        // behind it should stay the thing you are looking at.
+        // A small pink-outlined chip centred at the foot of the LCD. No fill of its
+        // own — the screen's own black shows through the outline — so it reads as
+        // drawn on the office rather than a panel dropped over it.
         return Align(
-          alignment: Alignment.centerRight,
+          alignment: Alignment.center,
           child: Padding(
             padding: const EdgeInsets.only(top: 6),
             child: Semantics(
@@ -735,13 +735,11 @@ class _LcdWavePrompt extends StatelessWidget {
               label: 'Wave at $who. Tap to wave.',
               child: ExcludeSemantics(
                 child: Material(
-                  color: _scMid,
-                  borderRadius: BorderRadius.circular(6),
+                  type: MaterialType.transparency,
                   child: InkWell(
                     borderRadius: BorderRadius.circular(6),
                     onTap: onWave,
                     child: Container(
-                      constraints: const BoxConstraints(maxWidth: 170),
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(6),
                         border: Border.all(color: _accentPink, width: 1.5),
