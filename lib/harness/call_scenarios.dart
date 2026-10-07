@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
@@ -266,6 +267,14 @@ class AppScenarioDriver {
   Timer? _timer;
   int _ticks = 0;
 
+  final Random _rng = Random();
+
+  /// Per-person talking bursts, in ticks still to run. A person with a positive
+  /// count is mid-burst; zero means silent and free to start a fresh one. Driving
+  /// speech off this — rather than the tick parity — is what makes talkers come
+  /// and go independently instead of handing the floor round one at a time.
+  final Map<String, int> _speakingTicksLeft = {};
+
   /// Seeds the activity history and, unless the floor is [AppScenario.still],
   /// starts milling the cast about.
   void start() {
@@ -297,9 +306,19 @@ class AppScenarioDriver {
     _ticks++;
     final ids = collector.peopleIds.toList();
     for (var i = 0; i < ids.length; i++) {
-      collector.stepPerson(ids[i], _wander[(_ticks + i) % _wander.length]);
-      // One speaking ring at a time, rotating, so the map shows a live talker.
-      collector.placePerson(ids[i], speaking: _ticks % ids.length == i);
+      final id = ids[i];
+      collector.stepPerson(id, _wander[(_ticks + i) % _wander.length]);
+      // Each person talks in their own random bursts: silent people start one
+      // with a small chance each tick, then hold the floor for a random spell
+      // (2–6 ticks ≈ 1.2–3.6s at the 600ms period). Because the draws are
+      // independent, nobody owns the floor on a rota and several can be lit at
+      // once — a real-looking babble rather than a hand-off round robin.
+      var left = _speakingTicksLeft[id] ?? 0;
+      if (left == 0 && _rng.nextDouble() < 0.18) {
+        left = 2 + _rng.nextInt(5);
+      }
+      collector.placePerson(id, speaking: left > 0);
+      _speakingTicksLeft[id] = left > 0 ? left - 1 : 0;
     }
     collector.publish();
     // A wave into the feed every ~5s.
