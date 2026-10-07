@@ -434,17 +434,19 @@ class DirectCollector implements Collector {
 
   /// Waves at one person.
   ///
-  /// **Unverified, unlike everything else in this file.** Every other action here
-  /// was read off a live capture; an *outgoing* wave never was — only the
-  /// `WaveEvent` it comes back as (`payload.senderId`, `options.targetUserIds`).
-  /// So the action name and the arg key below are a best guess, modelled on
-  /// [broadcastEmote] and the received envelope. If the server refuses, the
-  /// refusal names this action on [refusals]; the knobs to try are the action
-  /// (`wave`/`sendWave`/`waveAt`) and the key (`targetSpaceUserId`/`targetUserId`).
+  /// The action is `sendWave` (SpaceUser), confirmed from the action surface in
+  /// `docs/protocol/client-action-surface.md`; the first guess, `wave`, drew
+  /// `Method wave not found on model SpaceUser`. Unlike every other action here,
+  /// it is **not** addressed to our own avatar: the recipient is the model `id`
+  /// (`args[1]`), and there is **no** third argument at all. The rest-args after
+  /// `[model, id]` are validated as an array that must be empty — both a
+  /// `{targetUserIds:[id]}` object and a `[]` payload drew `Array must contain at
+  /// most 0 element(s)`, so the frame is the bare two-element `[model, id]`, like
+  /// the no-arg actions. The server fans it back as the `WaveEvent` naming us.
   @override
   ({bool ok, String? detail}) wave(String targetSpaceUserId) {
     if (targetSpaceUserId.isEmpty) return (ok: false, detail: 'no target to wave at');
-    return _act('wave', {'targetSpaceUserId': targetSpaceUserId});
+    return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
   /// Puts a hand up, or takes it down. A bare bool, not a map.

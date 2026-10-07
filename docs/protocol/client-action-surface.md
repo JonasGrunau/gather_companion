@@ -417,7 +417,7 @@ name and `args[1]` its id; the argument schema below is the remainder.
 | `saveSpaceOutfit` | SpaceUserPermission.SaveSpaceOutfit | needs args | needs args | `object({skin:zodUuid.optional(),hair:zodUuid.optional(),facialHair:zodUuid.optional(),top:zodUuid.optional(),bottom:zodUuid.option` |
 | `sendMessageMention` | SpaceUserPermission.BroadcastMessage | needs args | needs args | `object({message:string(),userIds:array(zodUuid)})` |
 | `sendUserToDesk` | SpaceUserPermission.SendToDesk | needs args | refused | — |
-| `sendWave` | SpaceUserPermission.SendWave | refused | refused | — |
+| `sendWave` | SpaceUserPermission.SendWave | ran | ran | none — recipient is `args[1]` (the target's spaceUserId), not self; any third element is rejected with `Array must contain at most 0 element(s)` |
 | `setAvailability` | SpaceUserPermission.UpdateAvailability | needs args | needs args | `object({availability:nativeEnum(Availability),debugSource:string().optional()})` |
 | `setCalendarInferredStatus` | SpaceUserPermission.UpdateCustomStatus | needs args | needs args | `object({text:string(),emoji:string(),clearCondition:object({type:literal(SpaceUserStatusClearCondition.DateTime),clearAt:date()}),` |
 | `setCustomStatus` | SpaceUserPermission.UpdateCustomStatus | needs args | needs args | `object({text:string().max(eg).optional(),emoji:string().optional(),clearCondition:union([object({type:literal(SpaceUserStatusClear` |
