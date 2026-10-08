@@ -46,7 +46,9 @@ import 'package:flutter/services.dart';
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
 import 'activity_screen.dart';
+import 'dial_screen.dart';
 import 'control_bar.dart';
+import 'gameboy_shell.dart';
 import 'map_screen.dart';
 import 'settings_screen.dart';
 
@@ -59,18 +61,20 @@ import 'settings_screen.dart';
 /// silently swapped two tabs' bodies — the rail said Activity and the office
 /// appeared. Adding a destination is a case in [_TabView.icon], [_TabView.label]
 /// and `_bodyFor`, which the compiler will demand.
-enum _Tab { activity, map, settings }
+enum _Tab { dial, map, activity, settings }
 
 extension _TabView on _Tab {
   IconData get icon => switch (this) {
         _Tab.activity => Icons.notifications_rounded,
         _Tab.map => Icons.map_outlined,
+        _Tab.dial => Icons.bolt,
         _Tab.settings => Icons.settings_rounded,
       };
 
   String get label => switch (this) {
         _Tab.activity => 'Activity',
         _Tab.map => 'Office',
+        _Tab.dial => 'Warp',
         _Tab.settings => 'Settings',
       };
 }
@@ -86,14 +90,16 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
-  /// Activity opens first: it is the leftmost destination, and it is the one
-  /// screen that can have something waiting on it — "did I miss anything" is
-  /// what somebody unlocking their phone is usually asking.
+  /// Dial opens first: it is the leftmost destination, and it is what somebody
+  /// unlocking a closed app is reaching for — the directory to place a call.
   ///
   /// The office being one tap away costs it nothing. No tab is rebuilt when you
   /// leave it, so it is already drawn, already panned where you left it, and its
   /// artwork is still decoded.
-  _Tab _tab = _Tab.activity;
+  ///
+  /// Gameboy mode is the exception: the handheld wraps the office, so that is the
+  /// screen the retro shell exists to show and the one it opens on.
+  late _Tab _tab = widget.state.gameboyMode ? _Tab.map : _Tab.dial;
 
   /// Built once and held. A fresh `Listenable.merge` on every build would hand
   /// the map's `ListenableBuilder` a new object each frame and make it
@@ -110,6 +116,10 @@ class _HomeShellState extends State<HomeShell> {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final mq = MediaQuery.of(context);
+    // The handheld owns the whole office tab, controls and all, so the floating
+    // dock stands down while it is on screen — its mute, its rail and its
+    // reactions have moved onto the body.
+    final gameboyMap = widget.state.gameboyMode && _tab == _Tab.map;
 
     return Scaffold(
       backgroundColor: t.background,
@@ -122,7 +132,11 @@ class _HomeShellState extends State<HomeShell> {
         children: [
           MediaQuery(
             data: mq.copyWith(
-              padding: mq.padding.copyWith(bottom: mq.padding.bottom + kRailInset),
+              // The rail's strip is reserved only while the dock is up. In Gameboy
+              // mode it stands down (see the `if (!gameboyMap)` below), so the
+              // handheld shell wants the whole height rather than a dock's worth
+              // of dead plastic under it.
+              padding: mq.padding.copyWith(bottom: mq.padding.bottom + (gameboyMap ? 0 : kRailInset)),
               // And see `resizeToAvoidBottomInset`: a tab's own `Scaffold` would
               // otherwise do the resize this one just declined to.
               viewInsets: mq.viewInsets.copyWith(bottom: 0),
@@ -136,41 +150,58 @@ class _HomeShellState extends State<HomeShell> {
               ],
             ),
           ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _Dock(
-              state: widget.state,
-              // The controls are the office's, so they are up only while it is.
-              showingControls: _tab == _Tab.map,
-              selected: _tab,
-              onSelect: _select,
+          if (!gameboyMap)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _Dock(
+                state: widget.state,
+                // The controls are the office's, so they are up only while it is.
+                showingControls: _tab == _Tab.map,
+                selected: _tab,
+                onSelect: _select,
+              ),
             ),
-          ),
         ],
       ),
     );
   }
 
   Widget _bodyFor(_Tab tab) => switch (tab) {
-        // The office alone carries the control bar, so the office alone pays for
-        // it: the same inset trick the shell uses for the rail, one layer in, so
-        // the D-pad and the legend lift above both islands without either
-        // knowing the other is there.
-        _Tab.map => _Inset(
-            bottom: kControlBarInset,
-            child: ListenableBuilder(
-              // `state` for the connection and the party; `positions` for people
-              // walking, which the presence tracker deliberately does not count
-              // as a change because no other screen draws it. Only while the map
-              // is what you are looking at — off the tab it would be four
-              // rebuilds a second behind something else.
-              listenable: _tab == _Tab.map ? _mapTick : widget.state,
-              builder: (context, _) => MapScreen(state: widget.state),
-            ),
-          ),
+        // In Gameboy mode the handheld shell wraps the office and carries the
+        // controls itself; the normal dock is hidden (see `build`), so the map
+        // body skips the control-bar inset. Otherwise the office alone carries the
+        // control bar, so the office alone pays for it: the same inset trick the
+        // shell uses for the rail, one layer in, so the D-pad and the legend lift
+        // above both islands without either knowing the other is there.
+        _Tab.map => widget.state.gameboyMode
+            ? GameboyShell(
+                state: widget.state,
+                onOpenSettings: () => _select(_Tab.settings),
+                onOpenActivity: () => _select(_Tab.activity),
+                onOpenDial: () => _select(_Tab.dial),
+                child: ListenableBuilder(
+                  listenable: _tab == _Tab.map ? _mapTick : widget.state,
+                  builder: (context, _) => MapScreen(state: widget.state),
+                ),
+              )
+            : _Inset(
+                bottom: kControlBarInset,
+                child: ListenableBuilder(
+                  // `state` for the connection and the party; `positions` for
+                  // people walking, which the presence tracker deliberately does
+                  // not count as a change because no other screen draws it. Only
+                  // while the map is what you are looking at — off the tab it would
+                  // be four rebuilds a second behind something else.
+                  listenable: _tab == _Tab.map ? _mapTick : widget.state,
+                  builder: (context, _) => MapScreen(state: widget.state),
+                ),
+              ),
         _Tab.activity => ActivityScreen(state: widget.state),
+        // No control bar, so no `kControlBarInset` layer: the shell's own rail
+        // inset is all a scrolling directory needs to clear the dock.
+        _Tab.dial => DialScreen(state: widget.state, visible: _tab == _Tab.dial),
         _Tab.settings => SettingsScreen(state: widget.state, onUnpair: widget.onUnpair),
       };
 
@@ -267,7 +298,12 @@ class _Dock extends StatelessWidget {
                 for (final tab in _Tab.values) ...[
                   if (tab != _Tab.values.first) const SizedBox(width: 6),
                   Expanded(
-                    child: _NavItem(tab: tab, selected: selected, onSelect: onSelect),
+                    child: _NavItem(
+                      tab: tab,
+                      selected: selected,
+                      gameboy: state.gameboyMode,
+                      onSelect: onSelect,
+                    ),
                   ),
                 ],
               ],
@@ -296,17 +332,26 @@ class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.tab,
     required this.selected,
+    required this.gameboy,
     required this.onSelect,
   });
 
   final _Tab tab;
   final _Tab selected;
+
+  /// Whether Gameboy mode is on. The office row then wears the handheld's own
+  /// name and glyph: in Gameboy mode the map tab is no longer "the office" you
+  /// scroll, it is the console you power on, so the bar says so.
+  final bool gameboy;
   final ValueChanged<_Tab> onSelect;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
     final on = tab == selected;
+    final retro = gameboy && tab == _Tab.map;
+    final label = retro ? 'Gameboy' : tab.label;
+    final icon = retro ? Icons.videogame_asset_rounded : tab.icon;
     // Concentric with the island: the dock's corner is `t.radius + 10` and the
     // plate sits 6 points inside it, so its corner is the dock's minus that
     // inset. Any other number and the two curves visibly disagree at the
@@ -316,9 +361,9 @@ class _NavItem extends StatelessWidget {
     return Semantics(
       button: true,
       selected: on,
-      label: tab.label,
+      label: label,
       child: Tooltip(
-        message: tab.label,
+        message: label,
         child: Material(
           color: Colors.transparent,
           child: InkWell(
@@ -347,10 +392,10 @@ class _NavItem extends StatelessWidget {
                   builder: (context, colour, _) => Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(tab.icon, size: 22, color: colour),
+                      Icon(icon, size: 22, color: colour),
                       const SizedBox(height: 3),
                       Text(
-                        tab.label,
+                        label,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(

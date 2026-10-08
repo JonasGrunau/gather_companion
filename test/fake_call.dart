@@ -64,11 +64,26 @@ class FakeCall implements Call {
   }) async =>
       watching.add((srcIds: srcIds, quality: quality));
 
+  /// The mic toggles we were asked for, in order.
+  final List<bool> micCalls = [];
+
   @override
-  Future<String?> setMicOn(bool on) async => null;
+  Future<String?> setMicOn(bool on) async {
+    micCalls.add(on);
+    return null;
+  }
 
   @override
   Future<String?> setCameraOn(bool on) async => null;
+
+  /// The speaker toggles we were asked for, in order.
+  final List<bool> speakerCalls = [];
+
+  @override
+  Future<String?> setSpeakerOn(bool on) async {
+    speakerCalls.add(on);
+    return null;
+  }
 
   @override
   Future<void> switchCamera() async {}

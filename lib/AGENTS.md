@@ -70,7 +70,16 @@ Widget tests use `AppState`'s `@visibleForTesting` seams (`debugApplySnapshot`,
 `debugApplyEvent`, `debugApplyLink`) rather than a fake bridge. See
 `../test/AGENTS.md`.
 
-While working on the feed, skip the scanner (a simulator has no camera):
+**To run the app on a simulator, use the harness — not `lib/main.dart`.** The real
+entrypoint dead-ends at the pairing screen (no camera, no bridge to scan), so a sim
+always boots `lib/main_harness.dart --dart-define=TARGET=app`, which injects fakes
+and lands in the walkable Office. The full invocation, the `idb` tap loop (run `idb`
+under system python 3.9, not `asdf`'s 3.14), and the call-path caveat are in the
+root `AGENTS.md` "Running the app on the iOS Simulator" section and
+`docs/sim_harness.md`.
+
+`GATHER_PAIR` is a narrower seam: it skips the scanner against a *real* local bridge
+when you need the live wire (e.g. feed work), not the fakes:
 
 ```sh
 flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>

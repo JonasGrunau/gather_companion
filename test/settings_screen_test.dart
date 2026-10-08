@@ -80,6 +80,14 @@ void main() {
     // is a different repair in a different place, which is why they are separate
     // sentences and not one boolean.
     Future<void> pumpReach(WidgetTester tester, PushReach reach, {String? name}) async {
+      // A viewport tall enough to render the whole list — the push card sits
+      // below the Gather, phone and Appearance cards and would otherwise fall
+      // past the default 600px test surface.
+      tester.view.physicalSize = const Size(1200, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
       final state = withLink(const LinkStatus(LinkState.live))
         ..debugApplyPushReach(PushRegistration(reach), bridgeName: name);
       await tester.pumpWidget(wrap(state));
@@ -148,7 +156,7 @@ void main() {
     await tester.pumpWidget(wrap(withLink(const LinkStatus(LinkState.live))));
     await tester.pump();
 
-    expect(find.text('Mic & camera'), findsOneWidget);
+    expect(find.text('Mic, camera & sound'), findsOneWidget);
     // Exactly one chevron on the screen, and it is this row's. Reconnect and
     // "Forget this computer" are tappable but go nowhere, and a chevron next to
     // either would be promising a screen that does not exist.
@@ -202,8 +210,8 @@ void main() {
     await tester.pump();
 
     // Bottom of the list now that it has a section of its own — off the edge of
-    // the test viewport until scrolled to.
-    await tester.ensureVisible(find.text('Forget this computer'));
+    // the test viewport, and past the lazy list's built range, until scrolled to.
+    await tester.scrollUntilVisible(find.text('Forget this computer'), 120);
     await tester.tap(find.text('Forget this computer'));
     await tester.pump();
 

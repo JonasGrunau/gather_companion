@@ -16,7 +16,9 @@ import '../src/map_motion.dart';
 import '../src/map_person.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
+import 'control_bar.dart';
 import 'dpad.dart';
+import 'person_avatar.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -37,6 +39,25 @@ import 'dpad.dart';
 /// 222 KB, which is why "draw all of it" is a reasonable thing to do on a phone. See
 /// `art_cache.dart` for the fetching and `space_art.dart` for where the URLs come
 /// from.
+/// Every map toast goes through here so it sits in the same slot as the selected-
+/// person card — just above the dock island — rather than docking at the true
+/// bottom behind it. The margin is measured from the Scaffold, which re-adds the
+/// home-indicator safe area under the floating bar itself, so the two island
+/// insets alone (rail + control bar) plus a gutter land it exactly where the card
+/// does. Using the tab's own `paddingOf` — which already carries both insets *and*
+/// the safe area — double-counts the safe area and floats it a home-indicator too
+/// high.
+SnackBar _railClearSnack(String message) => SnackBar(
+      content: Text(message),
+      behavior: SnackBarBehavior.floating,
+      margin: const EdgeInsets.fromLTRB(
+        kGutter,
+        0,
+        kGutter,
+        kRailInset + kControlBarInset + kGutter,
+      ),
+    );
+
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key, required this.state});
 
@@ -90,7 +111,16 @@ class _MapScreenState extends State<MapScreen> {
       // Where the space name and the head count live: the map is the screen, and a
       // strip above it repeating what it already shows was costing the map a fifth
       // of a phone.
-      appBar: AppBar(
+      //
+      // In Gameboy mode the whole bar stands down: the handheld draws its own pixel
+      // status strip inside the LCD (space name on the shell header, and a
+      // status/mic/cam/followers/head-count HUD on the screen — see
+      // `gameboy_shell.dart`), so an app-themed bar here would both double the head
+      // count and waste a strip of the LCD. The follower count rides into that HUD
+      // too, so the "someone is following you" signal survives the skin.
+      appBar: widget.state.gameboyMode
+          ? null
+          : AppBar(
         backgroundColor: t.background,
         // Default title spacing, like the other two tabs: the three app bars sit
         // in one shell, and a title that shifts sideways as you change tab reads
@@ -129,7 +159,19 @@ class _MapScreenState extends State<MapScreen> {
                   child: child,
                 ),
               ),
-              child: widget.state.inCall ? CallBanner(key: const ValueKey('call'), state: widget.state) : const SizedBox.shrink(),
+              // A call to get back to wins the slot; otherwise a dropped connection
+              // claims it, because a reconnect is the one thing the office cannot
+              // show on its own — the floor looks the same whether the roster is
+              // live or an hour stale.
+              //
+              // Not in Gameboy mode: the handheld draws its own call banner inside
+              // the LCD (see `gameboy_shell.dart`), so an app-themed pill here would
+              // both double it and sit outside the screen well's pixel grammar.
+              child: widget.state.inCall && !widget.state.gameboyMode
+                  ? CallBanner(key: const ValueKey('call'), state: widget.state)
+                  : widget.state.link.isDisrupted
+                      ? _LinkBanner(key: const ValueKey('link'), offline: widget.state.link.isOffline)
+                      : const SizedBox.shrink(),
             ),
           ),
         ],
@@ -160,6 +202,76 @@ class _Where extends StatelessWidget {
     // time you arrived on the office. Explicit is what the sibling bars do, so
     // explicit is what matches them.
     return Text(space ?? 'The office', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge);
+  }
+}
+
+/// Shown over the floor when the connection to Gather is not carrying the roster.
+///
+/// Two shapes in one slot. A reconnect — a network that exists, a socket coming back —
+/// gets a spinner, because something is actually happening. Being [offline] — flight
+/// mode, a dead zone, no radio at all — gets a static cloud-off glyph instead: a spinner
+/// there would promise progress nothing can make. Either way it lives in the same slot
+/// the call banner does and is mutually exclusive with it, so it never stacks, and is
+/// tinted danger because it is the state where what the map draws is not what is true —
+/// the roster is frozen, proximity is stale, and a call will not start until it clears.
+/// A [liveRegion] so a screen reader says it rather than leaving a blind user wondering
+/// why nobody is answering.
+class _LinkBanner extends StatelessWidget {
+  const _LinkBanner({super.key, required this.offline});
+
+  final bool offline;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final tint = t.danger;
+    // Solid, not a tint: this is the one state where the map is lying, so the banner has
+    // to read against a busy floor plan behind it — a near-transparent pill vanished
+    // into it. White on danger, with a drop shadow to lift it off the map.
+    const ink = Colors.white;
+    final label = offline ? 'No connection' : 'Reconnecting…';
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Center(
+        child: Semantics(
+          liveRegion: true,
+          label: offline ? 'No connection to Gather' : 'Reconnecting to Gather',
+          child: ExcludeSemantics(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+              decoration: BoxDecoration(
+                color: tint,
+                borderRadius: BorderRadius.circular(t.radius),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.28),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: offline
+                        ? const Icon(Icons.cloud_off_rounded, size: 14, color: ink)
+                        : const CircularProgressIndicator(strokeWidth: 2, color: ink),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -359,6 +471,25 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// appears and disappears with it, which is a rebuild by definition.
   ({int x, int y, SpaceRoom? room})? _selected;
 
+  /// The person a tap picked out, shown as a card with a wave on it. Mutually
+  /// exclusive with [_selected] — a tap is either on somebody or on the floor, never
+  /// both — and held here for the same reason: it is not presence, and it should not
+  /// outlive the screen.
+  MapPerson? _selectedPerson;
+
+  /// The person standing under a tap, if any — feet on [at]'s tile, or the tile the
+  /// body rises into (an avatar is a tile wide and about two tall on the glass, so a
+  /// tap on the head reads as them too). Me excluded: [AppState.peopleOnMap] already
+  /// leaves me out, and a wave at myself means nothing.
+  MapPerson? _personAt(({int x, int y}) at) {
+    for (final p in widget.state.peopleOnMap) {
+      final px = p.x.round();
+      final py = p.y.round();
+      if (px == at.x && (py == at.y || py == at.y + 1)) return p;
+    }
+    return null;
+  }
+
   /// Which tile a point on the glass is over, or null when it is off the floor.
   ///
   /// The same inverse the double tap takes, one step further: [_onDoubleTap] wants the
@@ -379,6 +510,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   /// Only ever set between the two halves of a double tap.
   Offset? _firstTap;
   Timer? _tapWindow;
+
+  /// A one-line "why nothing happened" shown in the Go-here pill's slot, and the timer
+  /// that clears it. Set when a destination tap is refused because we are offline — it
+  /// sits where the pill would have been rather than over the bottom controls.
+  String? _blockedNote;
+  Timer? _blockedNoteTimer;
 
   /// What was selected before the tap that is currently provisional.
   ///
@@ -411,8 +548,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (second != null && (point - second).distance <= kDoubleTapSlop) {
       _tapped = point;
       // Put back whatever the first of the pair displaced. Usually null, and either
-      // way not the tile somebody was aiming a pinch at.
-      setState(() => _selected = _beforeTap);
+      // way not the tile somebody was aiming a pinch at. A zoom is never a person
+      // selection, so any card the first tap raised comes down with it.
+      setState(() {
+        _selected = _beforeTap;
+        _selectedPerson = null;
+      });
       _onDoubleTap(viewport, child);
       return;
     }
@@ -422,11 +563,28 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     _firstTap = point;
     _tapWindow = Timer(kDoubleTapTimeout, () => _firstTap = null);
     _beforeTap = _selected;
+    // Cleared up front so every outcome below that does not re-set it — a tile, a
+    // locked room, empty floor — takes the person card down. Only the person branch
+    // puts it back.
+    _selectedPerson = null;
 
     final map = widget.map;
     final at = _tileAt(point, base);
     if (at == null) {
       setState(() => _selected = null);
+      return;
+    }
+
+    // Somebody standing here wins the tap: a wave at a person is the one thing on
+    // this screen you aim at a body rather than a tile. Checked before the floor so a
+    // person on walkable ground is pickable, not swallowed by the Go-here reticle.
+    final person = _personAt(at);
+    if (person != null) {
+      HapticFeedback.selectionClick();
+      setState(() {
+        _selected = null;
+        _selectedPerson = person;
+      });
       return;
     }
 
@@ -453,14 +611,31 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(
-          content: Text('${room.name ?? 'That room'} is locked.'),
-        ));
+        ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
       return;
     }
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
         target.room == null) {
       setState(() => _selected = null);
+      return;
+    }
+
+    // A real destination, but we are offline or mid-reconnect, so there is no route to
+    // lay and the Go-here pill never appears. Rather than swallow the tap in silence,
+    // say why nothing happened — this is the one tap where the floor would otherwise
+    // have moved you.
+    if (widget.state.link.isDisrupted) {
+      final note = widget.state.link.isOffline
+          ? "Can't move — no connection."
+          : "Can't move — reconnecting…";
+      _blockedNoteTimer?.cancel();
+      _blockedNoteTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted) setState(() => _blockedNote = null);
+      });
+      setState(() {
+        _selected = null;
+        _blockedNote = note;
+      });
       return;
     }
 
@@ -526,6 +701,23 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         : state.goToRoom(room, toward: (x: target.x, y: target.y));
   }
 
+  /// Waves at the selected person and takes the card down. There is no feed echo for
+  /// our own wave, so the line shown here is the only confirmation it went — the same
+  /// reason the dial confirms in words.
+  Future<void> _waveAtPerson(MapPerson person) async {
+    final result = await widget.state.sendWave(person.id);
+    if (!mounted) return;
+    setState(() => _selectedPerson = null);
+    final messenger = ScaffoldMessenger.of(context)..hideCurrentSnackBar();
+    if (result.error != null) {
+      messenger.showSnackBar(_railClearSnack(result.error!));
+    } else if (result.sent) {
+      // A cooldown no-op takes the card down without a second "Waved" — only a
+      // frame that actually went is worth confirming.
+      messenger.showSnackBar(_railClearSnack('👋 Waved at ${person.label.split(' ').first}'));
+    }
+  }
+
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
   /// this is a radius and that is a diameter.
   static const _thumb = 22.0;
@@ -553,13 +745,19 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       setState(() => _selected = null);
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(notice)));
+        ..showSnackBar(_railClearSnack(notice));
     });
     _followRequests = widget.state.followMe.listen((_) {
       // Claimed, so the latch below does not ride the same walk a second time
       // when this screen is rebuilt.
       widget.state.takeFollowRequest();
       _startFollowing();
+    });
+    // Gameboy mode's handheld camera. A D-pad walk re-grabs the centred lock after a
+    // pan has broken it; the lock is otherwise engaged on entry (see [_centreOnMe]) and
+    // held for as long as the office is on the little screen.
+    _recentre = widget.state.recentre.listen((_) {
+      if (mounted) _lockCamera();
     });
     // A desk walk asked for while this screen did not exist — from the call
     // screen, whose dock carries the same button, or from another tab. Deferred
@@ -574,6 +772,15 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   // ---- riding along ----------------------------------------------------------
 
   StreamSubscription<void>? _followRequests;
+
+  /// A D-pad walk in Gameboy mode, asking the camera to re-grab the centred lock.
+  StreamSubscription<void>? _recentre;
+
+  /// Whether the Gameboy camera lock is engaged: the avatar is pinned to the centre of
+  /// the LCD and the floor scrolls under it. Persistent while the office is on the
+  /// handheld's screen, dropped the moment the user pans or pinches (see
+  /// [_stopFollowing]) and re-grabbed on the next D-pad walk (see [_recentre]).
+  bool _locked = false;
 
   /// Keeps the camera on my own avatar for the length of a walk — see
   /// [AppState.followMe] for which walks ask for it.
@@ -608,7 +815,21 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   }
 
   void _stopFollowing() {
+    // A pan, a pinch or a double tap takes the camera back — so it also drops the
+    // Gameboy lock, which the next D-pad walk re-grabs.
+    _locked = false;
     if (_follow.isActive) _follow.stop();
+  }
+
+  /// Engage Gameboy mode's centred camera: the avatar is held at the middle of the LCD
+  /// and the floor scrolls under it, eased in to a fixed walking zoom. Idempotent — a
+  /// press while the lock is already running only refreshes it.
+  void _lockCamera() {
+    if (!mounted) return;
+    _zoom.stop();
+    _locked = true;
+    _followLast = Duration.zero;
+    if (!_follow.isActive) _follow.start();
   }
 
   /// Eases the view towards me, and lets go once I have arrived and it has caught up.
@@ -622,6 +843,31 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (me == null || _child.isEmpty) return _stopFollowing();
     final now = _motion.now;
     final at = _motion.positionOf(me, now);
+
+    if (_locked) {
+      // Gameboy camera: ease the zoom toward the fixed walking level, but pin the centre
+      // at that eased zoom every frame, so the avatar stays dead-centre while the floor
+      // scrolls and stops at the office edges ([framedOn] clamps). Easing the translation
+      // instead — the desk-return path below — would let the body drift off centre while
+      // it moves, the opposite of a handheld camera. At min zoom [framedOn] simply shows
+      // the whole floor, so the avatar is in view regardless. Never auto-stops: the lock
+      // is released only by a pan (see [_stopFollowing]).
+      final dt = (elapsed - _followLast).inMicroseconds / Duration.microsecondsPerSecond;
+      _followLast = elapsed;
+      final cur = _view.value.getMaxScaleOnAxis();
+      final z = cur + (_gameboyZoom - cur) * (1 - math.exp(-dt / 0.12));
+      final locked = framedOn(
+        at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base + _covered / 2 / z),
+        viewport: _viewport,
+        child: _child,
+        zoom: z,
+      );
+      // Skip the write — and the InteractiveViewer repaint it triggers — while the avatar
+      // stands still and the zoom has settled, so an idle handheld is not repainting at 60fps.
+      if (_view.value != locked) _view.value = locked;
+      return;
+    }
+
     final target = framedOn(
       at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base + _covered / 2 / _followZoom),
       viewport: _viewport,
@@ -661,8 +907,10 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   void dispose() {
     unawaited(_notices?.cancel());
     unawaited(_followRequests?.cancel());
+    unawaited(_recentre?.cancel());
     _follow.dispose();
     _tapWindow?.cancel();
+    _blockedNoteTimer?.cancel();
     _motion.dispose();
     _zoom.dispose();
     _view.dispose();
@@ -684,6 +932,16 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     if (me == null) return;
     _placed = true;
 
+    // Gameboy mode wants the handheld camera, not a one-shot opening frame: engage the
+    // centred lock the moment there is a position to centre on, and let [_followFrame]
+    // ease the zoom in and keep the avatar on screen from here on. A runtime toggle of
+    // Gameboy mode rebuilds this screen (home_shell swaps the subtree), so `_placed`
+    // resets and this re-runs.
+    if (widget.state.gameboyMode) {
+      _lockCamera();
+      return;
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _view.value = framedOn(at: Offset((me.x + 0.5) * artTileSize * base, (me.y + 0.5) * artTileSize * base), viewport: viewport, child: child, zoom: _openingZoom);
@@ -692,6 +950,11 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
 
   /// Close enough that a desk is a desk, far enough to see the room it is in.
   static const _openingZoom = 3.0;
+
+  /// The fixed zoom the Gameboy handheld camera eases to and holds — a consistent
+  /// walking scale, so a D-pad walk is always framed the same. Separate from
+  /// [_openingZoom] so the two can be tuned apart even though they share a value today.
+  static const _gameboyZoom = 3.0;
 
   /// Double tap zooms in on what was tapped, or back out again if already close.
   ///
@@ -855,7 +1118,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         // because a thumb rolls around a disc and would have caught the rail, and a
         // pill is tapped once. Sitting just above the island reads as the same
         // control surface rather than as something adrift over the floor.
-        if (state.onRoute || (_selected != null && state.canWalk))
+        if (_selectedPerson == null && (state.onRoute || (_selected != null && state.canWalk)))
           Positioned(
             left: 0,
             right: 0,
@@ -893,7 +1156,169 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
               ),
             ),
           ),
+        // The same slot as the Go-here pill, never both at once: offline there is no pill
+        // to go here, so a refused destination tap borrows its place to say why — above
+        // the dock, not a toast flung over it.
+        if (_blockedNote != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(child: _BlockedNote(text: _blockedNote!)),
+            ),
+          ),
+        // A tapped person, in the Go-here pill's slot — you have picked somebody, not
+        // somewhere, so the one offer is a wave rather than a walk.
+        if (_selectedPerson != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: kGutter,
+            child: SafeArea(
+              top: false,
+              child: Center(
+                child: _PersonCard(
+                  state: state,
+                  person: _selectedPerson!,
+                  onWave: () => _waveAtPerson(_selectedPerson!),
+                  onClear: () => setState(() => _selectedPerson = null),
+                ),
+              ),
+            ),
+          ),
       ],
+    );
+  }
+}
+
+/// A tapped person's card: their face and name, a wave, and a way to put it down.
+/// Sits where the Go-here pill sits, and is never shown alongside it.
+class _PersonCard extends StatelessWidget {
+  const _PersonCard({
+    required this.state,
+    required this.person,
+    required this.onWave,
+    required this.onClear,
+  });
+
+  final AppState state;
+  final MapPerson person;
+  final VoidCallback onWave;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Material(
+      color: t.card,
+      borderRadius: BorderRadius.circular(t.radius),
+      elevation: 3,
+      shadowColor: Colors.black.withValues(alpha: 0.28),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            PersonAvatar(
+              id: person.id,
+              label: person.label,
+              photoUrl: state.photoUrlFor(person.id),
+              size: 36,
+              availability: person.availability,
+              dotRing: t.card,
+            ),
+            const SizedBox(width: 10),
+            Flexible(
+              // Flexible, not a fixed max width: the avatar, Wave control, close
+              // button, gaps and padding can already fill a narrow phone, so a long
+              // name has to shrink and ellipsize into what is left rather than claim
+              // its full intrinsic width and overflow the row.
+              child: Text(
+                person.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Material(
+              color: t.brand.withValues(alpha: 0.18),
+              borderRadius: BorderRadius.circular(17),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(17),
+                onTap: onWave,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.waving_hand_rounded, size: 16, color: t.brand),
+                      const SizedBox(width: 6),
+                      Text('Wave', style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            IconButton(
+              icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+              // Names the otherwise icon-only control for a screen reader, as the
+              // rail's own clear control is named.
+              tooltip: 'Dismiss',
+              onPressed: onClear,
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A transient "why that tap did nothing" pill, shown where the Go-here pill sits when a
+/// move is refused for being offline. Danger-tinted and shadowed like [_LinkBanner] so
+/// the two read as the same voice.
+class _BlockedNote extends StatelessWidget {
+  const _BlockedNote({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    const ink = Colors.white;
+    return Semantics(
+      liveRegion: true,
+      label: text,
+      child: ExcludeSemantics(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: t.danger,
+            borderRadius: BorderRadius.circular(t.radius),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.28),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off_rounded, size: 14, color: ink),
+              const SizedBox(width: 8),
+              Text(
+                text,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -989,7 +1414,7 @@ class _GoToState extends State<_GoTo> {
     if (!mounted || failed == null) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(failed)));
+      ..showSnackBar(_railClearSnack(failed));
   }
 
   @override

@@ -34,6 +34,14 @@ enum MediaFailureKind {
   unknown,
 }
 
+/// Where the remote audio is coming out, as the UI needs to name it.
+///
+/// Deliberately the four a person can see on the device, not the plugin's notion
+/// of a route: the button draws a different glyph for each, and `bluetooth` and
+/// `wired` both mean "a headset is in", which is the state that overrides the
+/// speaker/earpiece choice.
+enum AudioOutput { speaker, earpiece, bluetooth, wired }
+
 class MediaFailure implements Exception {
   const MediaFailure(this.kind, this.message);
 
@@ -58,6 +66,7 @@ class LocalMediaState {
     this.audioEnabled = false,
     this.videoEnabled = false,
     this.frontCamera = true,
+    this.audioOutput = AudioOutput.speaker,
     this.videoTrackId,
     this.audioTrackId,
     this.failure,
@@ -67,6 +76,13 @@ class LocalMediaState {
   final bool audioEnabled;
   final bool videoEnabled;
   final bool frontCamera;
+
+  /// Where the sound is coming out. The speaker until routing is applied: that
+  /// is the default [WebrtcMediaEngine] itself settles on (no headset ⇒ speaker,
+  /// the desk-companion route), so starting here means the control shows the real
+  /// route from the first frame instead of flipping earpiece→speaker once the
+  /// session comes up.
+  final AudioOutput audioOutput;
 
   /// Track identities, so a caller can tell one capture session from the next
   /// without holding a native object.
@@ -83,6 +99,7 @@ class LocalMediaState {
     bool? audioEnabled,
     bool? videoEnabled,
     bool? frontCamera,
+    AudioOutput? audioOutput,
     String? videoTrackId,
     String? audioTrackId,
     MediaFailure? failure,
@@ -94,6 +111,7 @@ class LocalMediaState {
         audioEnabled: audioEnabled ?? this.audioEnabled,
         videoEnabled: videoEnabled ?? this.videoEnabled,
         frontCamera: frontCamera ?? this.frontCamera,
+        audioOutput: audioOutput ?? this.audioOutput,
         videoTrackId: clearTracks ? null : (videoTrackId ?? this.videoTrackId),
         audioTrackId: clearTracks ? null : (audioTrackId ?? this.audioTrackId),
         failure: clearFailure ? null : (failure ?? this.failure),
@@ -101,7 +119,8 @@ class LocalMediaState {
 
   @override
   String toString() => 'LocalMediaState(capturing: $capturing, '
-      'audio: $audioEnabled, video: $videoEnabled${failure == null ? '' : ', $failure'})';
+      'audio: $audioEnabled, video: $videoEnabled, out: ${audioOutput.name}'
+      '${failure == null ? '' : ', $failure'})';
 }
 
 /// Holding the hardware, and nothing else.
@@ -124,6 +143,22 @@ abstract class MediaEngine {
 
   /// Mutes without releasing the microphone, so unmuting is instant.
   Future<void> setAudioEnabled(bool enabled);
+
+  /// Configures the platform audio session for a call and applies the initial
+  /// output route. Idempotent, and safe to call while only listening — before
+  /// any capture — because that is when the earpiece-default bug first bites.
+  Future<void> prepareAudioSession();
+
+  /// Forces the loudspeaker on (`true`) or releases the override (`false`),
+  /// letting the system route to a headset if one is connected, otherwise the
+  /// earpiece. The resulting route lands in [LocalMediaState.audioOutput].
+  Future<void> setSpeakerOn(bool on);
+
+  /// Hands the audio session back at the end of a call. Separate from
+  /// [stopCapture] on purpose: capture is torn down and rebuilt mid-call to add
+  /// the camera, and the routing must survive that — it belongs to the call, not
+  /// the capture session.
+  Future<void> releaseAudioSession();
 
   /// Stops sending video without releasing the camera.
   Future<void> setVideoEnabled(bool enabled);

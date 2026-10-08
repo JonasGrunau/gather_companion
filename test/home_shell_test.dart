@@ -16,11 +16,12 @@ import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
-import 'package:gather_companion/ui/activity_screen.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
+import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
+import 'package:gather_companion/ui/media_check_screen.dart';
 import 'package:gather_companion/ui/settings_screen.dart';
 import 'package:gather_events/gather_events.dart';
 
@@ -72,20 +73,66 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('a banner says so on the office, and only there', (tester) async {
+    testWidgets('a banner is one tap from the call on every tab', (tester) async {
       final state = talkingWith(['Ada Lovelace', 'Grace Hopper']);
       await tester.pumpWidget(wrap(state));
       await tester.pumpAndSettle();
-      expect(find.byType(CallBanner), findsNothing, reason: 'not over the activity tab');
 
-      await tester.tap(find.byTooltip('Office'));
-      await tester.pumpAndSettle();
+      // Dial is the home tab: the banner is there the instant the app opens into
+      // a live call, so a warp that drops you back here is never a dead end.
+      expect(find.byType(CallBanner), findsOneWidget, reason: 'over the dial tab');
       expect(find.text('In a call with Ada and Grace'), findsOneWidget);
-      expect(find.text('Tap to see everyone'), findsOneWidget);
+
+      // And on every other tab in turn — the office over its floor, the list tabs
+      // in a strip of their own.
+      for (final tab in const ['Office', 'Activity', 'Settings']) {
+        await tester.tap(find.byTooltip(tab));
+        await tester.pumpAndSettle();
+        expect(find.byType(CallBanner), findsOneWidget, reason: 'over the $tab tab');
+      }
+    });
+
+    testWidgets('on a list tab the banner reserves a strip rather than overlaying',
+        (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
+
+      // Home is Dial, a scrolling directory. The banner sits above the list, not
+      // over it: its bottom is at the list's top, so no row is ever covered.
+      final banner = tester.getRect(find.byType(CallBanner));
+      final list = tester.getRect(find.descendant(
+        of: find.byType(DialScreen),
+        matching: find.byType(CustomScrollView),
+      ));
+      expect(banner.bottom, lessThanOrEqualTo(list.top + 0.5),
+          reason: 'the directory starts below the banner, not behind it');
+    });
+
+    testWidgets('from a list tab the banner reopens the call', (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
+
+      // On Dial, not the office.
+      expect(find.byType(DialScreen), findsOneWidget);
+      await tester.tap(find.byType(CallBanner));
+      await tester.pumpAndSettle();
+      expect(find.byType(CallScreen), findsOneWidget);
+    });
+
+    testWidgets('a deeper screen does not carry the banner', (tester) async {
+      await tester.pumpWidget(wrap(talkingWith(['Ada'])));
+      await tester.pumpAndSettle();
 
       await tester.tap(find.byTooltip('Settings'));
       await tester.pumpAndSettle();
-      expect(find.byType(CallBanner), findsNothing, reason: 'nor over settings');
+      expect(find.byType(CallBanner), findsOneWidget, reason: 'on the settings root');
+
+      await tester.scrollUntilVisible(find.text('Mic, camera & sound'), 120);
+      await tester.tap(find.text('Mic, camera & sound'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaCheckScreen), findsOneWidget);
+      expect(find.byType(CallBanner), findsNothing,
+          reason: 'the device check is a screen of its own, not a tab');
     });
 
     testWidgets('it sits under the title bar, over the floor, in an even margin', (tester) async {
@@ -156,12 +203,13 @@ void main() {
     });
   });
 
-  testWidgets('activity is what the app opens on', (tester) async {
+  testWidgets('dial is what the app opens on', (tester) async {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(find.textContaining('Waves and meeting notes'), findsOneWidget);
-    // The other two are in the tree but not on screen, which is the whole point.
+    expect(find.textContaining("Nobody's in the office right now."), findsOneWidget);
+    // The others are in the tree but not on screen, which is the whole point.
+    expect(find.textContaining('Waves and meeting notes'), findsNothing);
     expect(find.textContaining('Reading the floor plan'), findsNothing);
     expect(find.byType(MapScreen, skipOffstage: false), findsOneWidget);
   });
@@ -174,7 +222,7 @@ void main() {
     await tester.pumpWidget(wrap(state));
     await tester.pump();
 
-    expect(find.byType(ControlBar), findsNothing, reason: 'not on the activity tab');
+    expect(find.byType(ControlBar), findsNothing, reason: 'not on the dial tab');
 
     await tester.tap(find.byTooltip('Office'));
     await tester.pumpAndSettle();
@@ -204,6 +252,7 @@ void main() {
 
     await tester.tap(find.byTooltip('Settings'));
     await tester.pump();
+    await tester.scrollUntilVisible(find.text('Forget this computer'), 120);
     expect(find.text('Forget this computer'), findsOneWidget);
     expect(find.textContaining('Reading the floor plan'), findsNothing);
 
@@ -244,13 +293,13 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isTrue);
+    expect(TickerMode.valuesOf(tester.element(find.byType(DialScreen, skipOffstage: false))).enabled, isTrue);
     expect(TickerMode.valuesOf(tester.element(find.byType(MapScreen, skipOffstage: false))).enabled, isFalse);
 
     await tester.tap(find.byTooltip('Office'));
     await tester.pump();
 
-    expect(TickerMode.valuesOf(tester.element(find.byType(ActivityScreen, skipOffstage: false))).enabled, isFalse);
+    expect(TickerMode.valuesOf(tester.element(find.byType(DialScreen, skipOffstage: false))).enabled, isFalse);
     expect(TickerMode.valuesOf(tester.element(find.byType(MapScreen, skipOffstage: false))).enabled, isTrue);
   });
 
@@ -273,7 +322,7 @@ void main() {
         )
         .listenable;
 
-    // Opening on Activity, so the map is behind another tab: presence only.
+    // Opening on Dial, so the map is behind another tab: presence only.
     expect(identical(feeding(), state), isTrue,
         reason: 'off the map tab, only presence should rebuild it');
 
@@ -289,13 +338,13 @@ void main() {
     await tester.pumpWidget(wrap(connected()));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Activity')), isSemantics(isButton: true, isSelected: true));
+    expect(tester.getSemantics(find.byTooltip('Warp')), isSemantics(isButton: true, isSelected: true));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isButton: true, isSelected: false));
 
     await tester.tap(find.byTooltip('Settings'));
     await tester.pump();
 
-    expect(tester.getSemantics(find.byTooltip('Activity')), isSemantics(isSelected: false));
+    expect(tester.getSemantics(find.byTooltip('Warp')), isSemantics(isSelected: false));
     expect(tester.getSemantics(find.byTooltip('Settings')), isSemantics(isSelected: true));
 
     handle.dispose();
@@ -311,8 +360,14 @@ void main() {
     expect(find.byType(SettingsScreen), findsOneWidget);
 
     // Bottom of the settings list now that it has a section of its own — off
-    // the edge of the test viewport until scrolled to.
+    // the edge of the test viewport, and past the lazy list's built range, until
+    // scrolled to.
+    await tester.scrollUntilVisible(find.text('Forget this computer'), 120);
+    // Fully into view before tapping: with the Appearance section above it the
+    // row can stop at the very bottom edge, where its centre is off-screen and the
+    // tap misses.
     await tester.ensureVisible(find.text('Forget this computer'));
+    await tester.pump();
     await tester.tap(find.text('Forget this computer'));
     await tester.pump();
 

@@ -44,6 +44,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'collector.dart';
 import 'game_protocol.dart';
 import 'gather_auth.dart';
 import 'msgpack.dart';
@@ -101,42 +102,10 @@ const _clientPlatform = 'Desktop';
 /// connection.
 const _maxAwaitingActions = 128;
 
-/// An action the server refused, named.
-///
-/// The whole reason this type exists: a refused action produces **no patch**, and
-/// validation runs before the action does — so a wrong argument executes nothing,
-/// changes nothing, and says nothing on any channel a patch-watching client reads.
-/// The only evidence is `actionReturns`, and it names the transaction rather than
-/// the action, so the two have to be paired up on this side.
-class ActionRefused {
-  const ActionRefused({required this.action, required this.message});
-
-  /// The action's own id — `setCustomStatus`, `teleport`, `enterSpace`.
-  final String action;
-
-  /// One sentence, already unwrapped from a zod issue list where it was one.
-  final String message;
-
-  @override
-  String toString() => 'ActionRefused($action: $message)';
-}
-
-/// Whether the collector is holding state, and what to say if not.
-class CollectorStatus {
-  const CollectorStatus({required this.healthy, this.detail, this.needsPairing = false});
-
-  final bool healthy;
-  final String? detail;
-
-  /// The credential is dead and only re-pairing will fix it. The one status the UI
-  /// must turn into an instruction rather than a spinner.
-  final bool needsPairing;
-
-  @override
-  String toString() => 'CollectorStatus($healthy, $detail)';
-}
-
-class DirectCollector {
+/// [ActionRefused] and [CollectorStatus] moved to `collector.dart`, beside the
+/// [Collector] interface they are part of the surface of, and are re-exported
+/// from there through the package barrel.
+class DirectCollector implements Collector {
   DirectCollector({
     required GatherAuth auth,
     String? spaceId,
@@ -205,10 +174,13 @@ class DirectCollector {
   final _refusals = StreamController<ActionRefused>.broadcast();
 
   /// The roster, coalesced. One event per change worth rendering.
+  @override
   Stream<Roster> get rosters => _rosters.stream;
 
   /// Waves and the rest of Gather's event bus, published the moment they arrive.
+  @override
   Stream<BusEvent> get interactions => _interactions.stream;
+  @override
   Stream<CollectorStatus> get statuses => _statuses.stream;
 
   /// Actions the server would not run.
@@ -217,21 +189,26 @@ class DirectCollector {
   /// perfectly healthy and one thing we asked for did not happen. Broadcast and
   /// unbuffered — a refusal is news, and nothing is owed delivery if nobody is
   /// listening.
+  @override
   Stream<ActionRefused> get refusals => _refusals.stream;
 
+  @override
   bool get healthy => _healthy;
   String? get detail => _lastDetail;
 
   /// Whether we hold state, as opposed to merely being connected. The distinction
   /// matters: an empty roster reported as healthy would let the app render a
   /// confident "nobody is following you" out of nothing.
+  @override
   bool get hasState => reader.userCount > 0;
 
   /// Our own `SpaceUser` id, once the dump has told us which row is us.
+  @override
   String? get selfId => reader.selfId;
 
   /// Our own `UserAccount` id — what the media plane keys on. See
   /// [GameProtocolReader.selfAccountId].
+  @override
   String? get selfAccountId => reader.selfAccountId;
 
   /// The floor plan for a floor, or null until the dump has carried enough of it.
@@ -239,14 +216,17 @@ class DirectCollector {
   /// Read through rather than cached: the builder rebuilds only when a map model
   /// actually changed, so asking repeatedly is cheap and asking early is correct —
   /// it starts returning a map the moment one can be built.
+  @override
   SpaceMap? mapFor(String? floorId) => reader.mapBuilder.forFloor(floorId);
 
   /// The same floor, drawn: floor tiles, wall pieces and furniture sprites, with the
   /// URLs to fetch them from. Read through for the same reason as [mapFor].
+  @override
   SpaceArt? artFor(String? floorId, {bool dark = true}) =>
       reader.mapBuilder.artFor(floorId, dark: dark);
 
   /// Somebody's avatar spritesheet, or null when their outfit is not known.
+  @override
   String? avatarUrlFor(String spaceUserId) => reader.avatarUrlFor(spaceUserId);
 
   Map<String, Object?> stats() => {
@@ -258,6 +238,7 @@ class DirectCollector {
         'entered': _entered,
       };
 
+  @override
   void start() {
     _stopped = false;
     _connectNow();
@@ -269,6 +250,7 @@ class DirectCollector {
     await _closeSocket();
   }
 
+  @override
   Future<void> dispose() async {
     await stop();
     await _rosters.close();
@@ -279,6 +261,7 @@ class DirectCollector {
 
   /// Reconnects, which is all a resync is here: the server replays the full state
   /// dump on every new connection.
+  @override
   Future<({bool ok, String detail})> resync() async {
     if (_stopped) return (ok: false, detail: 'collector stopped');
     _log('direct: reconnecting to force a fresh state dump');
@@ -312,6 +295,7 @@ class DirectCollector {
   /// to `SpaceUser.direction` before the position is touched.
   ///
   /// Fire-and-forget for the same reason [teleport] is.
+  @override
   ({bool ok, String? detail}) move({required String direction}) {
     if (!moveDirections.contains(direction)) {
       return (ok: false, detail: '$direction is not a direction');
@@ -342,6 +326,7 @@ class DirectCollector {
   /// office in an idle pose on everybody else's screen.
   ///
   /// Fire-and-forget for the same reason [move] is.
+  @override
   ({bool ok, String? detail}) setGait(Gait gait) => _act(gait.action);
 
   /// Moves our avatar to a tile. The one thing this collector writes.
@@ -359,6 +344,7 @@ class DirectCollector {
   /// The server does **not** validate walkability: every tile on the grid is
   /// accepted, walls and void included. Picking somewhere sensible is the caller's
   /// job.
+  @override
   ({bool ok, String? detail}) teleport({
     required num x,
     required num y,
@@ -393,6 +379,7 @@ class DirectCollector {
   /// `Offline` is deliberately not offered: it is what the *server* writes when a
   /// connection goes away, and setting it by hand while holding an open socket
   /// claims something contradicted by the socket carrying it.
+  @override
   ({bool ok, String? detail}) setAvailability(String availability) {
     if (!settableAvailabilities.contains(availability)) {
       return (ok: false, detail: '$availability is not an availability');
@@ -406,6 +393,7 @@ class DirectCollector {
   /// [clearCustomStatus] — the capture only ever carried the `DateTime` condition,
   /// so the no-expiry case omits `clearCondition` rather than inventing a shape
   /// for it.
+  @override
   ({bool ok, String? detail}) setCustomStatus({
     required String text,
     String? emoji,
@@ -421,6 +409,7 @@ class DirectCollector {
       });
 
   /// Takes the status line down. Two args, not three.
+  @override
   ({bool ok, String? detail}) clearCustomStatus() => _act('clearCustomStatus');
 
   /// Throws an emoji over the room.
@@ -431,6 +420,7 @@ class DirectCollector {
   /// [count] was `1` on every send in the capture. The field name suggests Gather's
   /// own client bundles a held press into one frame, but a larger value has never
   /// been seen accepted, so the default is the observed one.
+  @override
   ({bool ok, String? detail}) broadcastEmote(String emote, {int count = 1}) {
     if (emote.isEmpty) return (ok: false, detail: 'no emote to send');
     return _act('broadcastEmote', {
@@ -440,6 +430,23 @@ class DirectCollector {
       // at the time — the server evidently works the fan-out out for itself.
       'ambientlyConnectedUserIds': <String>[],
     });
+  }
+
+  /// Waves at one person.
+  ///
+  /// The action is `sendWave` (SpaceUser), confirmed from the action surface in
+  /// `docs/protocol/client-action-surface.md`; the first guess, `wave`, drew
+  /// `Method wave not found on model SpaceUser`. Unlike every other action here,
+  /// it is **not** addressed to our own avatar: the recipient is the model `id`
+  /// (`args[1]`), and there is **no** third argument at all. The rest-args after
+  /// `[model, id]` are validated as an array that must be empty — both a
+  /// `{targetUserIds:[id]}` object and a `[]` payload drew `Array must contain at
+  /// most 0 element(s)`, so the frame is the bare two-element `[model, id]`, like
+  /// the no-arg actions. The server fans it back as the `WaveEvent` naming us.
+  @override
+  ({bool ok, String? detail}) wave(String targetSpaceUserId) {
+    if (targetSpaceUserId.isEmpty) return (ok: false, detail: 'no target to wave at');
+    return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
   /// Puts a hand up, or takes it down. A bare bool, not a map.
@@ -464,6 +471,7 @@ class DirectCollector {
   /// Sent on every change rather than on a timer, so the cost is the number of
   /// times somebody starts and stops talking. The rate limiting that matters
   /// belongs upstream, in the detector's hold, and not here.
+  @override
   ({bool ok, String? detail}) setSpeaking(bool speaking) =>
       _act(speaking ? 'startSpeaking' : 'stopSpeaking');
 
@@ -472,6 +480,7 @@ class DirectCollector {
   /// Gather forms conversations by proximity and remembers them in `clusterId`, so
   /// leaving one and staying where you are is a thing only this action can express.
   /// Two args, not three.
+  @override
   ({bool ok, String? detail}) leaveCluster() => _act('leaveCluster');
 
   /// Turns on the spot, without taking the step [move] would.
@@ -499,6 +508,7 @@ class DirectCollector {
   /// Without the `false` half, `Connection.isActive` stays true for as long as the
   /// socket does, and a phone in a pocket goes on claiming somebody is at their
   /// desk.
+  @override
   ({bool ok, String? detail}) setActive(bool active) =>
       _send('reportActivity', model: 'Connection', id: null, args: {'isActive': active});
 

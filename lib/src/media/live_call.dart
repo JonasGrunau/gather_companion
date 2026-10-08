@@ -215,6 +215,15 @@ class LiveCall implements Call {
   }
 
   @override
+  Future<String?> setSpeakerOn(bool on) => _serialise(() async {
+        // Serialised so it cannot land between a capture restart's stop and
+        // start, where the session it reaches for is momentarily gone. The new
+        // route reaches the UI through the engine-state subscription, not here.
+        await _engine.setSpeakerOn(on);
+        return null;
+      });
+
+  @override
   Future<void> switchCamera() => _engine.switchCamera();
 
   /// Opens a capture session holding exactly the tracks in use, restarting it if
@@ -238,6 +247,10 @@ class LiveCall implements Call {
       _emit(_state.copyWith(publishingAudio: false, publishingVideo: false));
       await _engine.stopCapture();
     }
+
+    // The session and its loudspeaker default, before the capture it will carry.
+    // Idempotent, so the first talker and the first listener can both ask.
+    await _engine.prepareAudioSession();
 
     // Audio unconditionally: a capture session with no microphone in it would
     // have to be torn down again the moment the mic is unmuted, and the mic is
@@ -316,6 +329,10 @@ class LiveCall implements Call {
       await _detach();
       await existing.dispose();
     }
+    // The audio session, before the peer connection that will carry the remote
+    // sound. This is the listen-only path — you hear a conversation you walked
+    // into without unmuting — and it is where the earpiece default bit hardest.
+    await _engine.prepareAudioSession();
     final sfu = _sfu = _buildSfu();
     _remoteSub = sfu.remoteChanges.listen(_onRemotes);
     _noticeSub = sfu.notifications.listen(_onNotice);
@@ -493,6 +510,7 @@ class LiveCall implements Call {
     await _sfu?.dispose();
     _sfu = null;
     _remoteStreams.clear();
+    await _engine.releaseAudioSession();
     await _engine.stopCapture();
     // The desired set survives a hang-up: the cluster has not changed just
     // because we stopped listening to it, and the next tap should pick up the
