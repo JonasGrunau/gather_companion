@@ -1,5 +1,8 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:gather_events/gather_events.dart';
+import 'package:timezone/data/latest_all.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
 
 /// Local notifications for the things worth interrupting you for.
 ///
@@ -38,6 +41,14 @@ class Notifier {
   bool _ready = false;
   int _nextId = 0;
 
+  /// Whether the timezone database is loaded and `tz.local` points at this phone's
+  /// zone. [scheduleReminder] needs it — `zonedSchedule` is the only scheduling API
+  /// the plugin still offers, and it takes a zoned time. Tracked separately from
+  /// [_ready] because the lookup can fail (a platform with no zone plugin) while
+  /// the rest of notifications works fine; a reminder then falls back to UTC rather
+  /// than not scheduling at all.
+  bool _tzReady = false;
+
   Future<void> init() async {
     if (_ready) return;
     const settings = InitializationSettings(
@@ -59,6 +70,71 @@ class Notifier {
     );
     await _plugin.initialize(settings);
     _ready = true;
+    await _initTimezone();
+  }
+
+  /// Loads the zone database and points `tz.local` at this phone, once. Wrapped
+  /// whole: on a platform where the zone plugin is absent (a bare test host) this
+  /// leaves `tz.local` at its UTC default, and [scheduleReminder] still fires — a
+  /// reminder at the wrong offset is a far smaller failure than no reminder, and
+  /// `_tzReady` stays false so it is at least honest about it.
+  Future<void> _initTimezone() async {
+    if (_tzReady) return;
+    try {
+      tzdata.initializeTimeZones();
+      final name = await FlutterTimezone.getLocalTimezone();
+      tz.setLocalLocation(tz.getLocation(name));
+      _tzReady = true;
+    } on Object {
+      /* UTC fallback; reminders still schedule */
+    }
+  }
+
+  /// Schedules a one-off reminder to fire at [when], or shows nothing if [when] is
+  /// already past. Returns silently on a build where notifications never
+  /// initialised (every widget test), the same guard [consider] uses.
+  ///
+  /// This is the app's *own* reminder for a meeting planned in the Plans tab —
+  /// distinct from the `'event reminder'` in [consider], which is Gather's reminder
+  /// for an event on the user's Google/Outlook calendar, scraped from the desktop
+  /// client. The two never collide: Gather does not know about a plan made here
+  /// unless it was mirrored into the phone's calendar, and a mirrored plan carries
+  /// the OS's own alert instead (the Plans tab skips this call for those).
+  Future<void> scheduleReminder({
+    required int id,
+    required DateTime when,
+    required String title,
+    required String body,
+  }) async {
+    if (!_ready) return;
+    if (when.isBefore(DateTime.now())) return;
+    await _initTimezone();
+    try {
+      await _plugin.zonedSchedule(
+        id,
+        title,
+        body,
+        tz.TZDateTime.from(when, tz.local),
+        const NotificationDetails(
+          iOS: DarwinNotificationDetails(presentAlert: true, presentSound: true),
+          android: _android,
+        ),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      );
+    } on Object {
+      /* a reminder that could not be set is not worth crashing a save over */
+    }
+  }
+
+  /// Cancels a previously scheduled reminder. Safe to call for an id that was never
+  /// scheduled — the plugin treats it as a no-op.
+  Future<void> cancelReminder(int id) async {
+    if (!_ready) return;
+    try {
+      await _plugin.cancel(id);
+    } on Object {
+      /* already gone, or the platform has nothing to cancel */
+    }
   }
 
   /// The one channel, declared here so Android has somewhere to put these.

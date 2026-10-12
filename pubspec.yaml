@@ -11,6 +11,13 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
   flutter_local_notifications: ^19.0.0
+  # Scheduled reminders for planned meetings. `flutter_local_notifications` only
+  # schedules against a timezone-aware instant (`zonedSchedule`), so these two
+  # carry the zone database (`timezone`, pure Dart) and this phone's IANA zone name
+  # (`flutter_timezone`). See `Notifier.scheduleReminder`. A plan that cannot be
+  # scheduled still saves — the reminder is a consequence, not a condition.
+  timezone: ^0.10.0
+  flutter_timezone: ^4.1.1
   # The user's whole Gather identity now lives on the phone, so it goes in the
   # keychain rather than in a preferences plist that device backups include.
   flutter_secure_storage: ^11.0.0

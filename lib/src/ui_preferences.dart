@@ -21,6 +21,7 @@ class UiPreferences {
   static const _gameboyKey = 'ui.gameboyMode';
   static const _gameboyThemeKey = 'ui.gameboyTheme';
   static const _soundEffectsKey = 'ui.soundEffects';
+  static const _mirrorCalendarKey = 'calendar.mirrorCalendarId';
 
   Future<SharedPreferences?> _store() async {
     if (_prefs != null) return _prefs;
@@ -85,6 +86,33 @@ class UiPreferences {
       await (await _store())?.setBool(_soundEffectsKey, on);
     } on Object {
       /* nothing useful to do; the next toggle writes it again */
+    }
+  }
+
+  /// Which device calendar planned meetings are mirrored into, or null when
+  /// mirroring is off. A preference, not data: it is the id of a calendar the OS
+  /// owns, cheap to lose (the picker just reads "Off" and the user re-chooses), and
+  /// carries nothing secret — so it sits here beside the look-and-feel switches
+  /// rather than in the keychain with the meetings themselves.
+  Future<String?> loadMirrorCalendarId() async {
+    try {
+      return (await _store())?.getString(_mirrorCalendarKey);
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<void> saveMirrorCalendarId(String? id) async {
+    try {
+      final store = await _store();
+      if (store == null) return;
+      if (id == null || id.isEmpty) {
+        await store.remove(_mirrorCalendarKey);
+      } else {
+        await store.setString(_mirrorCalendarKey, id);
+      }
+    } on Object {
+      /* nothing useful to do; the next pick writes it again */
     }
   }
 }

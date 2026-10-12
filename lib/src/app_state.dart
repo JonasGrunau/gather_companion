@@ -5,6 +5,9 @@ import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
+import 'calendar.dart';
+import 'calendar_mirror.dart';
+import 'calendar_store.dart';
 import 'credentials.dart';
 import 'directory.dart';
 import 'link_status.dart';
@@ -71,6 +74,11 @@ class AppState extends ChangeNotifier {
     // Test seam for the resync cooldown clock. Production reads the wall clock.
     DateTime Function()? now,
     UiPreferences? uiPreferences,
+    CalendarStore? calendarStore,
+    // The device-calendar bridge. Defaulted to a no-op so a widget test — or any
+    // build without the native plugin — never touches a real calendar; `main.dart`
+    // supplies the plugin-backed one.
+    CalendarMirror? calendarMirror,
   }) : _notifier = notifier ?? Notifier(),
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
@@ -82,6 +90,8 @@ class AppState extends ChangeNotifier {
        _bridgeStore = bridge ?? BridgeSettingsStore(),
        _log = log ?? _noop,
        _uiPrefs = uiPreferences ?? UiPreferences(),
+       _calendarStore = calendarStore ?? CalendarStore(),
+       _calendarMirror = calendarMirror ?? const NoopCalendarMirror(),
        _buildCollector = buildCollector ??
            ((auth, spaceId) =>
                DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
@@ -99,6 +109,8 @@ class AppState extends ChangeNotifier {
   final GatherCredentialStore _credentialStore;
   final BridgeSettingsStore _bridgeStore;
   final UiPreferences _uiPrefs;
+  final CalendarStore _calendarStore;
+  final CalendarMirror _calendarMirror;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -745,6 +757,8 @@ class AppState extends ChangeNotifier {
     _gameboyMode = await _uiPrefs.loadGameboyMode();
     _gameboyTheme = GameboyThemeId.fromId(await _uiPrefs.loadGameboyThemeId());
     _soundEffects = await _uiPrefs.loadSoundEffects();
+    _plannedMeetings = await _calendarStore.load();
+    _mirrorCalendarId = await _uiPrefs.loadMirrorCalendarId();
 
     // Launched straight into Gameboy mode with sounds on: no setter ran to warm
     // the SFX player, so do it here while there is no call yet. The restore itself
@@ -766,6 +780,11 @@ class AppState extends ChangeNotifier {
     _loaded = true;
     await _notifier.init();
     notifyListeners();
+
+    // After the notifier is up: scheduled reminders do not survive a reinstall or a
+    // reboot, so the stored plans re-arm theirs here. Unawaited — it is a background
+    // catch-up, not something the first frame waits on.
+    unawaited(_rescheduleAllReminders());
 
     if (_credentials.isComplete) _attach();
   }
@@ -812,6 +831,15 @@ class AppState extends ChangeNotifier {
   Future<void> unpair() async {
     await _bridgeStore.clear();
     await _credentialStore.clear();
+    // The plans go with the pairing. They are pinned to rooms in a specific space,
+    // so a phone re-paired into another one would carry a calendar of places that
+    // are not there. Their reminders go too; the mirrored calendar events are the
+    // user's own account's now and are left alone.
+    for (final meeting in _plannedMeetings) {
+      await _notifier.cancelReminder(_reminderId(meeting));
+    }
+    _plannedMeetings = const [];
+    await _calendarStore.clear();
     _settings = BridgeSettings.empty;
     _credentials = GatherCredentials.empty;
     _spaceId = null;
@@ -2230,6 +2258,243 @@ class AppState extends ChangeNotifier {
     // through somebody else's desk. Arrive at the best of them anyway, the way
     // `shouldTeleport` does.
     return _travelTo(map, walk, at, wanted.first, occupied);
+  }
+
+  // ---- planned meetings ------------------------------------------------------
+  //
+  // A calendar that is entirely this phone's own. Gather has none to read or write
+  // — its Calendar Panel mirrors a Google/Outlook account, and the game socket
+  // carries no scheduled event — so a plan made here is saved in [_calendarStore]
+  // (the keychain) and reaches Gather only if the user opts to mirror it into the
+  // phone's own calendar (see [_calendarMirror] and [setMirrorCalendar]).
+
+  List<PlannedMeeting> _plannedMeetings = const [];
+
+  /// The planned meetings, soonest first. The Plans tab renders straight off this.
+  List<PlannedMeeting> get plannedMeetings {
+    final out = [..._plannedMeetings];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Test seam: lets a widget test stand up the Plans tab without a keychain.
+  @visibleForTesting
+  set debugPlannedMeetings(List<PlannedMeeting> meetings) {
+    _plannedMeetings = meetings;
+    notifyListeners();
+  }
+
+  /// The device calendar plans are mirrored into, or null when mirroring is off.
+  String? _mirrorCalendarId;
+  String? get mirrorCalendarId => _mirrorCalendarId;
+
+  /// A notification id for a meeting's reminder, derived from its stable id. Masked
+  /// to a positive 31-bit int because that is what the platforms accept, and kept a
+  /// pure function of the id so cancelling finds the same slot scheduling used.
+  int _reminderId(PlannedMeeting m) => m.id.hashCode & 0x7fffffff;
+
+  /// Adds a plan: saves it, schedules its reminder, and best-effort mirrors it to
+  /// the phone's calendar. Returns null on success or a sentence for the user.
+  ///
+  /// The local save is the commit — a plan is kept the moment the keychain takes
+  /// it. The reminder and the mirror are consequences of a saved plan, not
+  /// conditions of saving one: a reminder that will not schedule or a calendar that
+  /// refuses the write are not reasons to tell the user their meeting was lost.
+  Future<String?> addMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    var saved = meeting;
+
+    // Mirror first, so the device-event id it hands back is part of the record the
+    // store persists — otherwise a crash between save and mirror would orphan the
+    // calendar event with nothing pointing at it.
+    final mirrored = await _mirror(saved);
+    if (mirrored != null) saved = mirrored;
+
+    _plannedMeetings = [..._plannedMeetings, saved];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that meeting.';
+    }
+
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Replaces a plan with an edited copy, keeping its id. Re-mirrors and
+  /// re-schedules so a moved time carries its reminder and calendar entry with it.
+  Future<String?> updateMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    final at = _plannedMeetings.indexWhere((m) => m.id == meeting.id);
+    if (at < 0) return addMeeting(meeting);
+
+    // Carry the existing device-event id across so the mirror updates in place
+    // rather than leaving the old event behind and creating a second.
+    var saved = meeting.withDeviceEventId(_plannedMeetings[at].deviceEventId);
+    final mirrored = await _mirror(saved);
+    if (mirrored != null) saved = mirrored;
+
+    final next = [..._plannedMeetings];
+    next[at] = saved;
+    _plannedMeetings = next;
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that change.';
+    }
+
+    await _notifier.cancelReminder(_reminderId(saved));
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Removes a plan, its reminder and its mirrored calendar event. Optimistic: the
+  /// row leaves the list at once and is put back only if the store write fails.
+  Future<String?> deleteMeeting(String id) async {
+    final before = _plannedMeetings;
+    final gone = _plannedMeetings.where((m) => m.id == id).toList();
+    if (gone.isEmpty) return null;
+
+    _plannedMeetings = [for (final m in _plannedMeetings) if (m.id != id) m];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not delete that meeting.';
+    }
+
+    for (final m in gone) {
+      await _notifier.cancelReminder(_reminderId(m));
+      if (m.deviceEventId != null && _mirrorCalendarId != null) {
+        await _calendarMirror.delete(m.deviceEventId, calendarId: _mirrorCalendarId!);
+      }
+    }
+    return null;
+  }
+
+  /// Walks (or warps) to where a planned meeting is set to happen.
+  ///
+  /// Resolves [PlannedMeeting.roomStableId] against the live map and walks in with
+  /// [goToRoom], the same machinery the "Go here" card and [warpToMeeting] use.
+  /// Falls back to a tile hop when the plan carries only coordinates, and refuses
+  /// cleanly when the room is on another floor or the map has not arrived — a plan
+  /// can be made offline, but it can only be walked to once there is a floor to
+  /// walk on.
+  Future<String?> walkToMeeting(PlannedMeeting meeting) async {
+    final map = this.map;
+    if (map == null) return 'Still reading the floor plan.';
+
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+      return '${meeting.roomName ?? 'That room'} is on another floor.';
+    }
+
+    final stableId = meeting.roomStableId;
+    if (stableId != null) {
+      for (final room in map.rooms) {
+        if (room.stableId != stableId) continue;
+        return goToRoom(
+          room,
+          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+        );
+      }
+    }
+
+    final x = meeting.x, y = meeting.y;
+    if (x != null && y != null && x.isFinite && y.isFinite) {
+      return warpToTile(x.round(), y.round());
+    }
+
+    return meeting.roomName == null
+        ? 'This meeting has no place set.'
+        : "Can't find ${meeting.roomName} on the floor plan.";
+  }
+
+  /// The rooms a plan can be pinned to, for the create sheet's place picker — every
+  /// named room on the floor I am on, soonest resolved. Empty until the map has
+  /// arrived, which is the same gate [walkToMeeting] enforces.
+  List<SpaceRoom> get plannableRooms {
+    final rooms = map?.rooms ?? const <SpaceRoom>[];
+    return [
+      for (final room in rooms)
+        if (room.name != null && room.name!.isNotEmpty) room,
+    ];
+  }
+
+  /// The device calendars the user could mirror plans into. Empty when permission
+  /// has not been granted or the build has no calendar plugin (the no-op mirror).
+  Future<List<MirrorCalendar>> writableCalendars() => _calendarMirror.writableCalendars();
+
+  /// Chooses the device calendar to mirror plans into, or null to stop mirroring,
+  /// and brings every existing plan into line with the choice: turning mirroring on
+  /// pushes the plans that are not yet there, turning it off leaves the calendar
+  /// events in place (they are the user's now) but forgets their ids.
+  Future<void> setMirrorCalendar(String? calendarId) async {
+    if (_mirrorCalendarId == calendarId) return;
+    _mirrorCalendarId = calendarId;
+    await _uiPrefs.saveMirrorCalendarId(calendarId);
+    notifyListeners();
+
+    if (calendarId == null) return;
+    var changed = false;
+    final next = [..._plannedMeetings];
+    for (var i = 0; i < next.length; i++) {
+      if (next[i].isPast || next[i].deviceEventId != null) continue;
+      final mirrored = await _mirror(next[i]);
+      if (mirrored != null) {
+        next[i] = mirrored;
+        changed = true;
+      }
+    }
+    if (changed) {
+      _plannedMeetings = next;
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+    }
+  }
+
+  /// Writes a plan into the chosen device calendar and returns the copy carrying
+  /// the device-event id, or null when there is nothing to do (mirroring off) or
+  /// the write did not take. Never throws — the mirror's own contract.
+  Future<PlannedMeeting?> _mirror(PlannedMeeting meeting) async {
+    final calendarId = _mirrorCalendarId;
+    if (calendarId == null) return null;
+    final eventId = await _calendarMirror.createOrUpdate(meeting, calendarId: calendarId);
+    if (eventId == null) return null;
+    return meeting.withDeviceEventId(eventId);
+  }
+
+  /// Schedules a meeting's reminder, unless it is mirrored into the device calendar
+  /// — that event carries the OS's own alert, and scheduling ours too would buzz
+  /// the phone twice for one meeting. A past meeting schedules nothing; the notifier
+  /// guards that too, but checking here keeps a reminder id from being spent on it.
+  Future<void> _scheduleReminder(PlannedMeeting meeting) async {
+    if (meeting.isPast) return;
+    if (meeting.deviceEventId != null) return;
+    if (meeting.remindAt.isBefore(_now())) return;
+    await _notifier.scheduleReminder(
+      id: _reminderId(meeting),
+      when: meeting.remindAt,
+      title: 'Upcoming: ${meeting.title}',
+      body: meeting.roomName == null ? 'Starting soon' : 'In ${meeting.roomName}',
+    );
+  }
+
+  /// Re-arms every future meeting's reminder. Scheduled notifications do not
+  /// survive a reinstall or a reboot, so [boot] replays them off the stored list —
+  /// the same reason the list is reloaded there rather than kept only in memory.
+  Future<void> _rescheduleAllReminders() async {
+    for (final meeting in _plannedMeetings) {
+      await _scheduleReminder(meeting);
+    }
   }
 
   /// The desk Gather has given me, or null if it has given me none.
