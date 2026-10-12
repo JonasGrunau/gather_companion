@@ -718,6 +718,19 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     }
   }
 
+  /// Walks to the tapped person and takes the card down. [AppState.goTo] relocates to
+  /// the nearest free tile, so we land *beside* them, not on the tile they occupy. A
+  /// refusal (offline, mid-reconnect, nowhere to stand) comes back as a line to show —
+  /// the same "say why nothing happened" the floor's own refused tap gets.
+  Future<void> _goToPerson(MapPerson person) async {
+    setState(() => _selectedPerson = null);
+    final error = await widget.state.goTo(person.x.round(), person.y.round());
+    if (!mounted || error == null) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(_railClearSnack(error));
+  }
+
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
   /// this is a radius and that is a diameter.
   static const _thumb = 22.0;
@@ -1182,6 +1195,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                 child: _PersonCard(
                   state: state,
                   person: _selectedPerson!,
+                  onGoHere: () => _goToPerson(_selectedPerson!),
                   onWave: () => _waveAtPerson(_selectedPerson!),
                   onClear: () => setState(() => _selectedPerson = null),
                 ),
@@ -1193,18 +1207,20 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   }
 }
 
-/// A tapped person's card: their face and name, a wave, and a way to put it down.
-/// Sits where the Go-here pill sits, and is never shown alongside it.
+/// A tapped person's card: their face and name, a walk over to them, a wave, and a way
+/// to put it down. Sits where the Go-here pill sits, and is never shown alongside it.
 class _PersonCard extends StatelessWidget {
   const _PersonCard({
     required this.state,
     required this.person,
+    required this.onGoHere,
     required this.onWave,
     required this.onClear,
   });
 
   final AppState state;
   final MapPerson person;
+  final VoidCallback onGoHere;
   final VoidCallback onWave;
   final VoidCallback onClear;
 
@@ -1218,59 +1234,94 @@ class _PersonCard extends StatelessWidget {
       shadowColor: Colors.black.withValues(alpha: 0.28),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            PersonAvatar(
-              id: person.id,
-              label: person.label,
-              photoUrl: state.photoUrlFor(person.id),
-              size: 36,
-              availability: person.availability,
-              dotRing: t.card,
-            ),
-            const SizedBox(width: 10),
-            Flexible(
-              // Flexible, not a fixed max width: the avatar, Wave control, close
-              // button, gaps and padding can already fill a narrow phone, so a long
-              // name has to shrink and ellipsize into what is left rather than claim
-              // its full intrinsic width and overflow the row.
-              child: Text(
-                person.label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Material(
-              color: t.brand.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(17),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(17),
-                onTap: onWave,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.waving_hand_rounded, size: 16, color: t.brand),
-                      const SizedBox(width: 6),
-                      Text('Wave', style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
-                    ],
-                  ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // One Wrap over four atomic items — identity, both pills, close. The avatar,
+            // pills and close button are all fixed-width, so at a large text scale on a
+            // narrow phone they outrun a single Row and clip into a RenderFlex overflow;
+            // even the two pills together do not fit one line there. Wrapping each item
+            // independently lets them flow onto further lines as the scale demands, and
+            // leaves the one-line layout untouched at ordinary sizes.
+            return Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 10,
+              runSpacing: 6,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    PersonAvatar(
+                      id: person.id,
+                      label: person.label,
+                      photoUrl: state.photoUrlFor(person.id),
+                      size: 36,
+                      availability: person.availability,
+                      dotRing: t.card,
+                    ),
+                    const SizedBox(width: 10),
+                    ConstrainedBox(
+                      // Bounded by the card's own width (minus the avatar and its gap) so
+                      // a long name ellipsizes within this chunk rather than forcing it
+                      // wider than the card.
+                      constraints: BoxConstraints(maxWidth: constraints.maxWidth - 46),
+                      child: Text(
+                        person.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ),
-            IconButton(
-              icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
-              // Names the otherwise icon-only control for a screen reader, as the
-              // rail's own clear control is named.
-              tooltip: 'Dismiss',
-              onPressed: onClear,
-              visualDensity: VisualDensity.compact,
-            ),
-          ],
+                // Walk over, in the same pill shape as Wave: a person is somewhere you
+                // can go as well as someone you can hail. [_goToPerson] lands beside them.
+                _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
+                _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
+                IconButton(
+                  icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+                  // Names the otherwise icon-only control for a screen reader, as the
+                  // rail's own clear control is named.
+                  tooltip: 'Dismiss',
+                  onPressed: onClear,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+/// One brand-tinted pill on the person card — an icon and a word. Wave and Go here are
+/// the same control twice, so they share a shape rather than each spelling it out.
+class _CardAction extends StatelessWidget {
+  const _CardAction({required this.icon, required this.label, required this.onTap});
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Material(
+      color: t.brand.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(17),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(17),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: t.brand),
+              const SizedBox(width: 6),
+              Text(label, style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+            ],
+          ),
         ),
       ),
     );
