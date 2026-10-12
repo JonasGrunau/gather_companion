@@ -250,8 +250,16 @@ class FakeCollector implements Collector {
   // callers (status sheet, control bar) resolve instead of throwing.
   @override
   ({bool ok, String? detail}) setGait(Gait gait) => (ok: true, detail: null);
+
+  /// Availability values we were told to set, in order — so the issue #41
+  /// self-heal's re-assert can be asserted.
+  final List<String> availabilitiesSet = [];
   @override
-  ({bool ok, String? detail}) setAvailability(String availability) => (ok: true, detail: null);
+  ({bool ok, String? detail}) setAvailability(String availability) {
+    availabilitiesSet.add(availability);
+    return (ok: true, detail: null);
+  }
+
   @override
   ({bool ok, String? detail}) setCustomStatus({required String text, String? emoji, DateTime? clearAt}) => (ok: true, detail: null);
   @override
@@ -276,8 +284,14 @@ class FakeCollector implements Collector {
 
   @override
   ({bool ok, String? detail}) leaveCluster() => (ok: true, detail: null);
+
+  /// Active flags we were told, in order — the other half of the #41 re-assert.
+  final List<bool> activesSet = [];
   @override
-  ({bool ok, String? detail}) setActive(bool active) => (ok: true, detail: null);
+  ({bool ok, String? detail}) setActive(bool active) {
+    activesSet.add(active);
+    return (ok: true, detail: null);
+  }
 
   /// How many times [notePresenceDoubt] has been raised, so a test can assert the
   /// walk engine's stall signal reached the collector.

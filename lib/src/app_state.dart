@@ -859,6 +859,28 @@ class AppState extends ChangeNotifier {
   /// My availability and status line as the tree last heard about them.
   ({String? availability, String? text, String? emoji})? _mine;
 
+  /// The last availability we saw that was not `Offline`, so the issue #41 self-heal
+  /// can restore Busy or Away rather than stomping everyone back to Active.
+  String? _lastOnlineAvailability;
+
+  /// Whether the phone is foregrounded, as the lifecycle last reported via
+  /// [setActive]. The self-heal only defends a call the person is actually sitting
+  /// in: a backgrounded phone going Offline is correct, not something to fight.
+  bool _active = false;
+
+  /// Issue #41 self-heal ladder state: the cooldown between re-asserts (a Timer so
+  /// it rides the same fake clock the cluster hold is tested on), how many times
+  /// this episode, and whether the media rebuild has already fired. See
+  /// [_noteSelfHealth].
+  Timer? _selfHealCooldown;
+  bool _selfHealCooling = false;
+  int _selfHealStrikes = 0;
+  bool _selfHealRebuilt = false;
+
+  /// How many times we re-assert against an external Offline before standing down,
+  /// so a Mac that stays asleep cannot keep us in a reconnect loop forever.
+  static const _selfHealMaxStrikes = 4;
+
   /// Wakes the tree when my own availability or status line changes.
   ///
   /// The presence tracker judges everybody else's rows and deliberately not mine, so
@@ -873,10 +895,77 @@ class AppState extends ChangeNotifier {
     _refreshHeldMap();
     final row = _myRow();
     final status = row?.status;
-    final mine = (availability: row?.availability, text: status?.text, emoji: status?.emoji);
+    final availability = row?.availability;
+    // Remember the last real availability, so a later Offline forced on us by another
+    // device (issue #41) is undone back to what the person actually chose.
+    if (availability != null && availability != 'Offline') {
+      _lastOnlineAvailability = availability;
+    }
+    final mine = (availability: availability, text: status?.text, emoji: status?.emoji);
     if (mine == _mine) return;
     _mine = mine;
     notifyListeners();
+  }
+
+  /// Fight an external device hanging up our call (issue #41).
+  ///
+  /// The phone and the desktop client log in as one shared `SpaceUser`. When the
+  /// desktop locks or sleeps, its `AutoOfflineService` flips that shared user to
+  /// `availability: Offline` and suspends its WebRTC transports, and the server
+  /// tears the phone's call down with it — a hang-up nobody on the phone asked for.
+  ///
+  /// The phone has no control that sets itself Offline, so an Offline reading while
+  /// we are foreground and in a call is always some other device's doing. Re-assert
+  /// our presence and availability to undo it, and rebuild the media session the
+  /// suspend killed server-side. Bounded: a Mac that stays asleep cannot keep us in
+  /// a reconnect loop — after [_selfHealMaxStrikes] tries we stand down and let the
+  /// next genuine wake or tap bring the call back.
+  void _noteSelfHealth() {
+    if (myAvailability != 'Offline') {
+      // Healthy again, or never Offline: reset the ladder so the next episode starts
+      // its count from scratch.
+      _selfHealCooldown?.cancel();
+      _selfHealCooldown = null;
+      _selfHealCooling = false;
+      _selfHealStrikes = 0;
+      _selfHealRebuilt = false;
+      return;
+    }
+    // Only our own, in-call, foreground presence is ours to defend.
+    if (!_active || !inCall) return;
+
+    // One re-assert per cooldown, so a roster four times a second does not become a
+    // re-assert four times a second.
+    if (_selfHealCooling) return;
+    if (_selfHealStrikes >= _selfHealMaxStrikes) return;
+
+    _selfHealStrikes++;
+    _selfHealCooling = true;
+    _selfHealCooldown?.cancel();
+    _selfHealCooldown = Timer(const Duration(seconds: 3), () {
+      _selfHealCooling = false;
+    });
+    if (_selfHealStrikes >= _selfHealMaxStrikes) {
+      _log('self-heal: an external device set us Offline mid-call — re-asserting '
+          '(final try $_selfHealStrikes), standing down after this');
+    } else {
+      _log('self-heal: an external device set us Offline mid-call — re-asserting '
+          '(try $_selfHealStrikes)');
+    }
+
+    unawaited(setActive(true));
+    unawaited(setAvailability(_lastOnlineAvailability ?? 'Active'));
+    unawaited(reconnect());
+
+    // Once per episode: the media session the desktop's suspendWebRTCTransports
+    // killed server-side can still believe it is connected, so the resync above
+    // would re-subscribe onto a dead session and wait out the deaf-timer. Force a
+    // fresh one. Guarded so the re-assert tries do not tear the media plane down
+    // again and again.
+    if (!_selfHealRebuilt) {
+      _selfHealRebuilt = true;
+      unawaited(_call?.rebuild() ?? Future<void>.value());
+    }
   }
 
   /// Wakes [directoryChanges] when the roster's directory-relevant projection moves
@@ -2371,6 +2460,7 @@ class AppState extends ChangeNotifier {
   /// reports on every idle and focus change; the phone's equivalent is the
   /// lifecycle, which is where this is called from.
   Future<void> setActive(bool active) async {
+    _active = active;
     _collector?.setActive(active);
   }
 
@@ -2480,6 +2570,9 @@ class AppState extends ChangeNotifier {
           final out = _tracker.applyRoster(roster);
           _onFold(out);
           _noteMine();
+          // After `_noteMine`, so it reads this roster's availability and the held
+          // cluster `_noteCluster` just settled.
+          _noteSelfHealth();
         }),
       )
       ..add(
@@ -2784,6 +2877,7 @@ class AppState extends ChangeNotifier {
     _noteSpeakers(roster);
     _onFold(_tracker.applyRoster(roster));
     _noteMine();
+    _noteSelfHealth();
   }
 
   /// Feeds a feed in as though Gather had answered, so the activity screen can be
@@ -2858,6 +2952,8 @@ class AppState extends ChangeNotifier {
     _clusterDebounce = null;
     _clusterHoldTimer?.cancel();
     _clusterHoldTimer = null;
+    _selfHealCooldown?.cancel();
+    _selfHealCooldown = null;
     unawaited(_detach());
     // After `_detach`, which clears it: a `ChangeNotifier` notified after it has
     // been disposed throws, and `_detach` reaches that line before its first

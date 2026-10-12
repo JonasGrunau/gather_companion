@@ -236,5 +236,16 @@ abstract class Call {
   /// Puts the hardware down and stops publishing. The call can be restarted.
   Future<void> hangUp();
 
+  /// Throws away the current media session and builds a fresh one, putting back
+  /// whatever we were listening to and publishing.
+  ///
+  /// For the case a socket close never signals: an external device on this same
+  /// account (the desktop client, issue #41) locks or sleeps, and the server tears
+  /// our shared media session down with it — but this session can still believe it
+  /// is connected, so pointing it at the cluster again would re-subscribe onto a
+  /// dead session and wait out the deaf-timer. A rebuild is the recovery a dropped
+  /// socket gets, fired without waiting for the person to tap anything.
+  Future<void> rebuild();
+
   Future<void> dispose();
 }
