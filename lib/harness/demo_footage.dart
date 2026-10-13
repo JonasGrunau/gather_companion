@@ -68,13 +68,26 @@ class _DemoFootageState extends State<DemoFootage>
     super.dispose();
   }
 
+  /// The camera shapes a real room mixes — a widescreen laptop, a phone held
+  /// upright, an old 4:3 webcam, a square crop. Picked by [seed] so each person
+  /// keeps one, and the layout is seen cutting every aspect, not just 16:9.
+  static const _aspects = <Size>[
+    Size(1600, 900), // 16:9 widescreen
+    Size(900, 1600), // 9:16 phone upright
+    Size(1200, 900), // 4:3 webcam
+    Size(900, 1200), // 3:4 phone-ish
+    Size(1080, 1080), // 1:1 square
+  ];
+
   @override
   Widget build(BuildContext context) {
-    // A fixed 16:9 source card, scaled to *cover* the tile (cropping the long
-    // edge) and made zoomable — the two behaviours the user wants to eyeball.
+    // A source card in this person's camera shape, scaled to *cover* the tile
+    // (cropping the long edge) and made zoomable — the two behaviours the user
+    // wants to eyeball, now across a mix of aspects.
+    final shape = _aspects[widget.seed.hashCode.abs() % _aspects.length];
     final card = SizedBox(
-      width: 1600,
-      height: 900,
+      width: shape.width,
+      height: shape.height,
       child: AnimatedBuilder(
         animation: _t,
         builder: (context, _) => CustomPaint(
