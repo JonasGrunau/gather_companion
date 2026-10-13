@@ -441,5 +441,111 @@ void main() {
       expect(failed, contains('another floor'));
       expect(collector.teleports, isEmpty);
     });
+
+    // A sparse post-reconnect meeting names no floor, so the entry floor-check waves
+    // it through. If it then places onto another floor that happens to hold a room of
+    // the same name as one on our floor, the name-only room match must not walk us
+    // into the wrong room — the floor is revalidated against the live meeting.
+    test('revalidates the floor when a sparse meeting places onto another one', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 10, y: 7),
+          row('a', name: 'Ada', clusterId: 'c1', floorId: 'first'), // present, unplaced
+          row('b', name: 'Bob', clusterId: 'c1', floorId: 'first'),
+        ]);
+        final meeting = state.meetings.single;
+        expect(meeting.floorId, isNull, reason: 'unplaced members name no floor');
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(meeting).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        // Placement streams in — onto the first floor, inside Huddle, a room name this
+        // floor's schematic also carries.
+        state.debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 10, y: 7),
+          row('a', name: 'Ada', clusterId: 'c1', floorId: 'first', x: 3, y: 3),
+          row('b', name: 'Bob', clusterId: 'c1', floorId: 'first', x: 4, y: 3),
+        ]));
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue);
+        expect(result, contains('another floor'));
+        expect(collector.teleports, isEmpty,
+            reason: 'must not walk into the same-named room on this floor');
+      });
+    });
+
+    // The cluster ending mid-wait is a terminal state, not something to sit out the
+    // full five seconds for.
+    test('stops waiting the moment the cluster ends', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'),
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(state.meetings.single).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        // Everybody leaves — the cluster is gone.
+        state.debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+        ]));
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue, reason: 'ended cluster is terminal, not a five-second wait');
+        expect(result, contains('just ended'));
+        expect(collector.teleports, isEmpty);
+      });
+    });
+
+    // The link dropping mid-wait is the other terminal state: a walk started now
+    // would only move this phone's avatar into a floor the server is not updating.
+    test('stops waiting when the link drops mid-wait', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'),
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(state.meetings.single).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        state.debugApplyLink(
+          const LinkStatus(LinkState.offline, 'No connection — waiting for network.'),
+        );
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue, reason: 'dropped link is terminal, not a five-second wait');
+        expect(result, contains('No connection'));
+        expect(collector.teleports, isEmpty);
+      });
+    });
   });
 }

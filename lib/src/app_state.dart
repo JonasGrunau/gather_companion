@@ -2055,9 +2055,15 @@ class AppState extends ChangeNotifier {
 
     // On another floor there is no room on this map to walk into and no tile a hop
     // could reach — the same ceiling [warpToPerson] hits. Refuse rather than walk
-    // into a room that merely shares a name or coordinates on the wrong floor.
+    // into a room that merely shares a name or coordinates on the wrong floor. The
+    // test is applied to the *live* meeting again after the wait below: a sparse
+    // snapshot names no floor, so the conversation can place onto another one while
+    // we wait, and [_meetingRoom] matches purely by name and would otherwise walk us
+    // into a same-named room on this floor.
     final myFloor = _myRow()?.floorId;
-    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+    bool onAnotherFloor(Meeting m) =>
+        myFloor != null && m.floorId != null && m.floorId != myFloor;
+    if (onAnotherFloor(meeting)) {
       return 'That conversation is on another floor.';
     }
 
@@ -2079,13 +2085,23 @@ class AppState extends ChangeNotifier {
     // room is walkable off static geometry with no roster dependency.
     if (_meetingRoom(meeting) == null && _meetingMemberTile(meeting) == null) {
       if (_link.isDisrupted) return 'No connection — waiting for network.';
-      final ready = await _pollUntil(() {
+      // The wait ends the moment the question is settled, which includes the two
+      // terminal ways it can settle against us: the link dropping (a walk started
+      // now would only move this phone's avatar) and the cluster ending (nothing
+      // left to travel to). Folding those into the predicate makes them early-outs
+      // rather than a full five-second stall before the same verdict.
+      await _pollUntil(() {
+        if (_link.isDisrupted) return true;
         final m = live();
-        return m != null &&
-            (m.includesMe || _meetingRoom(m) != null || _meetingMemberTile(m) != null);
+        if (m == null) return true;
+        return m.includesMe || _meetingRoom(m) != null || _meetingMemberTile(m) != null;
       }, timeout: const Duration(seconds: 5));
-      if (!ready) {
-        if (live() == null) return 'That conversation just ended.';
+      if (_link.isDisrupted) return 'No connection — waiting for network.';
+      final settled = live();
+      if (settled == null) return 'That conversation just ended.';
+      if (!settled.includesMe &&
+          _meetingRoom(settled) == null &&
+          _meetingMemberTile(settled) == null) {
         return 'Still finding a way in — open the map and walk into the room.';
       }
     }
@@ -2093,6 +2109,8 @@ class AppState extends ChangeNotifier {
     final m = live() ?? meeting;
     // Pulled into it while we waited — nothing left to travel to.
     if (m.includesMe) return null;
+    // Placement may have landed the conversation on another floor while we waited.
+    if (onAnotherFloor(m)) return 'That conversation is on another floor.';
 
     final room = _meetingRoom(m);
     if (room != null) {
