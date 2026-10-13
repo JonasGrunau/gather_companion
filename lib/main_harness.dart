@@ -35,6 +35,7 @@ import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart';
 
 import 'harness/call_scenarios.dart';
+import 'harness/demo_footage.dart';
 import 'harness/fake_collector.dart';
 import 'harness/scripted_call.dart';
 import 'src/app_state.dart';
@@ -104,8 +105,64 @@ class _CallHarnessState extends State<_CallHarness> {
       title: 'Gather Companion — Harness',
       debugShowCheckedModeBanner: false,
       theme: buildGatherTheme(),
-      // Straight into the faces: no pairing, no home shell, no network boot.
-      home: CallScreen(state: widget.state),
+      // A stand-in "office" sits under the call so the door and the back arrow
+      // have somewhere to pop to — on the real app the call is pushed over the
+      // home shell, but this target boots straight into the faces, so without a
+      // route beneath it `Navigator.pop` is a no-op and there is no way out. The
+      // office auto-pushes the call on first frame, so you still land in it.
+      home: _HarnessOffice(state: widget.state),
+    );
+  }
+}
+
+/// The floor the simulated call stands on, so leaving it lands somewhere. It
+/// pushes the call itself on first frame — matching the app, where you are in the
+/// call when the screen appears — and offers a button to walk back in after you
+/// have left, so the leave/return loop can be driven on a bare simulator.
+class _HarnessOffice extends StatefulWidget {
+  const _HarnessOffice({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_HarnessOffice> createState() => _HarnessOfficeState();
+}
+
+class _HarnessOfficeState extends State<_HarnessOffice> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _enterCall());
+  }
+
+  void _enterCall() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        // The demo footage is wired in here, not in the app target: stand-in
+        // video for every face, since the simulator has no camera to fill them.
+        builder: (_) => CallScreen(state: widget.state, buildTile: demoFootageTile),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF171A23),
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Office (sim)', style: TextStyle(color: Colors.white70, fontSize: 18)),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _enterCall,
+              icon: const Icon(Icons.videocam),
+              label: const Text('Enter call'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
