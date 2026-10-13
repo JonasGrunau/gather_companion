@@ -64,6 +64,18 @@ dependencies:
   # session at all, so `record` owns it alone and nothing flaps. The real call
   # path still uses flutter_webrtc; only this isolated check uses `camera`.
   camera: ^0.11.0
+  # Suspends the OS idle timer while in a call so the screen does not auto-lock
+  # mid-conversation (the same contract as watching a video). Toggled off
+  # `AppState.inCall` in `lib/main.dart`. Chosen over the alternatives because it
+  # ships `ios/wakelock_plus/Package.swift` and stays on Swift Package Manager — it
+  # does NOT reintroduce pods, the same constraint the flutter_webrtc and
+  # connectivity_plus pins guard.
+  #
+  # Capped below 1.8.1: that release bumped its transitive `dbus` to ^0.8.0, which
+  # collides with the ^0.7.8 that flutter_local_notifications 19's Linux half pins,
+  # and version solving fails. 1.8.0 keeps `dbus` on 0.7.x and still ships the SPM
+  # Package.swift. Revisit when flutter_local_notifications moves to 22+.
+  wakelock_plus: '>=1.8.0 <1.8.1'
 
 dev_dependencies:
   flutter_test:
