@@ -431,11 +431,18 @@ class _MeetingEditorState extends State<_MeetingEditor> {
   }
 
   Future<void> _pickWhen() async {
+    // The usual range is yesterday to a year out, but a meeting being edited can sit
+    // outside it — an old one from before yesterday, or (in theory) one beyond the
+    // year. showDatePicker asserts initialDate is within [firstDate, lastDate], so
+    // the window is widened to take in the existing value rather than crash on it.
+    final now = DateTime.now();
+    final low = now.subtract(const Duration(days: 1));
+    final high = now.add(const Duration(days: 365));
     final date = await showDatePicker(
       context: context,
       initialDate: _start,
-      firstDate: DateTime.now().subtract(const Duration(days: 1)),
-      lastDate: DateTime.now().add(const Duration(days: 365)),
+      firstDate: _start.isBefore(low) ? _start : low,
+      lastDate: _start.isAfter(high) ? _start : high,
     );
     if (date == null || !mounted) return;
     final time = await showTimePicker(
@@ -462,14 +469,30 @@ class _MeetingEditorState extends State<_MeetingEditor> {
     // the plan — the map may be gone by the time the meeting is walked to.
     final room = _resolveRoom(_roomStableId);
     final existing = widget.existing;
+
+    // A chosen room the live map cannot resolve right now (the map is gone, or the
+    // room is on a floor not loaded) must not silently wipe the place an edited
+    // meeting already carried. Clearing the location is reserved for the user
+    // explicitly picking "No place" — which is `_roomStableId == null`. So when the
+    // picker still names the same id the meeting was saved with but it will not
+    // resolve, keep the stored room, floor and fallback coordinates untouched.
+    final keepSaved = room == null &&
+        _roomStableId != null &&
+        existing != null &&
+        existing.roomStableId == _roomStableId;
+
     final meeting = PlannedMeeting(
       id: existing?.id ?? _newId(),
       title: title,
       startsAt: _start,
       endsAt: _start.add(Duration(minutes: _durationMinutes)),
-      roomStableId: room?.stableId,
-      roomName: room?.name,
-      floorId: room == null ? null : widget.state.map?.floorId,
+      roomStableId: keepSaved ? existing.roomStableId : room?.stableId,
+      roomName: keepSaved ? existing.roomName : room?.name,
+      floorId: keepSaved
+          ? existing.floorId
+          : (room == null ? null : widget.state.map?.floorId),
+      x: keepSaved ? existing.x : null,
+      y: keepSaved ? existing.y : null,
       remindMinutesBefore: _remindMinutes,
       deviceEventId: existing?.deviceEventId,
     );
@@ -676,12 +699,23 @@ String _durationLabel(int minutes) {
   return '${h}h ${m}m';
 }
 
+/// Whole calendar days from today to [at]'s date, counted as calendar ordinals.
+///
+/// The dates are rebuilt in UTC purely to subtract them: a local-midnight
+/// subtraction measures elapsed *duration*, and a spring-forward day is only 23
+/// hours, so `inDays` truncates tomorrow to 0 and the header says TODAY. UTC days
+/// are all 24 hours, so the difference is the number of calendar days regardless of
+/// any daylight-saving step in between.
+int _calendarDaysUntil(DateTime at) {
+  final day = DateTime.utc(at.year, at.month, at.day);
+  final now = DateTime.now();
+  final today = DateTime.utc(now.year, now.month, now.day);
+  return day.difference(today).inDays;
+}
+
 /// Short day label for the list headers — TODAY / TOMORROW / weekday / date.
 String _dayLabel(DateTime at) {
-  final day = DateTime(at.year, at.month, at.day);
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final delta = day.difference(today).inDays;
+  final delta = _calendarDaysUntil(at);
   if (delta == 0) return 'TODAY';
   if (delta == 1) return 'TOMORROW';
   if (delta > 1 && delta < 7) return _weekdays[at.weekday - 1].toUpperCase();
@@ -690,10 +724,7 @@ String _dayLabel(DateTime at) {
 
 /// Longer day label for the editor's When button — "Today", "Tomorrow", or a date.
 String _dayLabelFull(DateTime at) {
-  final day = DateTime(at.year, at.month, at.day);
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final delta = day.difference(today).inDays;
+  final delta = _calendarDaysUntil(at);
   if (delta == 0) return 'Today';
   if (delta == 1) return 'Tomorrow';
   return '${_weekdays[at.weekday - 1]} ${at.day} ${_months[at.month - 1]}';

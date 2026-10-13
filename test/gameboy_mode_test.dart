@@ -22,6 +22,7 @@ import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
+import 'package:gather_companion/ui/calendar_screen.dart';
 import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/gameboy_shell.dart';
 import 'package:gather_companion/ui/gameboy_theme.dart';
@@ -651,8 +652,30 @@ void main() {
 
       expect(find.text('Dial'), findsOneWidget);
       expect(find.text('Activity'), findsOneWidget);
+      // Every non-map tab the dock holds has to be reachable here — the menu is the
+      // only way to the other tabs while the handheld hides the dock — so Plans,
+      // added to the dock, has to have its row too.
+      expect(find.text('Plans'), findsOneWidget);
       expect(find.text('Settings'), findsOneWidget);
       expect(find.textContaining('camera'), findsOneWidget);
+    });
+
+    testWidgets('the Plans row leaves the office for the plans tab', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      await tester.tap(find.text('SELECT'));
+      await tester.pumpAndSettle();
+      // The menu scrolls inside the LCD, so the Plans row can sit below the fold on a
+      // short screen — bring it up before choosing it.
+      await tester.ensureVisible(find.text('Plans'));
+      await tester.tap(find.text('Plans'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CalendarScreen), findsOneWidget);
+      expect(find.byType(GameboyShell), findsNothing, reason: 'left the office for plans');
     });
 
     testWidgets('the Select menu switches tab', (tester) async {
@@ -862,11 +885,11 @@ void main() {
       await tester.pumpAndSettle();
 
       // Walk the cursor down to the last row (Settings). Pressing the bottom of the
-      // cross is a Down; from the status row it is five of them past Camera, Emotes,
-      // Dial and Activity onto Settings.
+      // cross is a Down; from the status row it is six of them past Camera, Emotes,
+      // Dial, Activity and Plans onto Settings.
       final pad = tester.getRect(find.byKey(const Key('gb-dpad')));
       final down = Offset(pad.center.dx, pad.top + pad.height * 0.88);
-      for (var i = 0; i < 5; i++) {
+      for (var i = 0; i < 6; i++) {
         final g = await tester.startGesture(down);
         await tester.pump();
         await g.up();

@@ -183,6 +183,7 @@ class _HomeShellState extends State<HomeShell> {
                 state: widget.state,
                 onOpenSettings: () => _select(_Tab.settings),
                 onOpenActivity: () => _select(_Tab.activity),
+                onOpenPlans: () => _select(_Tab.plans),
                 onOpenDial: () => _select(_Tab.dial),
                 child: ListenableBuilder(
                   listenable: _tab == _Tab.map ? _mapTick : widget.state,

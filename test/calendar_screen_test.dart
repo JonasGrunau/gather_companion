@@ -23,7 +23,11 @@ void main() {
   PlannedMeeting meeting({
     String id = 'm1',
     String title = 'Standup',
-    Duration fromNow = const Duration(hours: 2),
+    // Starts now rather than hours out, so the meeting's date is always today
+    // whatever the clock reads — a two-hour offset ran into tomorrow (and failed the
+    // TODAY assertion) when the suite happened to run in the last two hours of a day.
+    // The 30-minute end still sits in the future, so it reads as upcoming.
+    Duration fromNow = Duration.zero,
     String? roomName = 'Lounge',
   }) {
     final start = DateTime.now().add(fromNow);
@@ -56,7 +60,7 @@ void main() {
 
     expect(find.text('Design review'), findsOneWidget);
     expect(find.text('Lounge'), findsOneWidget);
-    // Two hours out is still today.
+    // Starting now, it is by definition today.
     expect(find.text('TODAY'), findsOneWidget);
     expect(find.text('Walk here'), findsOneWidget);
   });

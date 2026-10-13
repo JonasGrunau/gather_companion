@@ -43,6 +43,21 @@ class FakeCalendarMirror implements CalendarMirror {
   }
 }
 
+/// A mirror whose write never lands — [createOrUpdate] always returns null, as a
+/// denied permission or a vanished calendar would. Used to prove a plan is still
+/// kept, and left un-suppressed, when the calendar refuses it.
+class _FailingMirror implements CalendarMirror {
+  @override
+  Future<List<MirrorCalendar>> writableCalendars() async =>
+      const [MirrorCalendar(id: 'work', name: 'Work')];
+
+  @override
+  Future<String?> createOrUpdate(PlannedMeeting meeting, {required String calendarId}) async => null;
+
+  @override
+  Future<void> delete(String? deviceEventId, {required String calendarId}) async {}
+}
+
 void main() {
   setUp(() {
     FlutterSecureStorage.setMockInitialValues({});
@@ -145,6 +160,58 @@ void main() {
 
     expect(mirror.created.map((m) => m.id).toSet(), {'a', 'b'});
     expect(state.plannedMeetings.every((m) => m.deviceEventId != null), isTrue);
+  });
+
+  test('turning mirroring off forgets the device ids but keeps the plans', () async {
+    final mirror = FakeCalendarMirror();
+    final state = appState(mirror: mirror);
+    await state.setMirrorCalendar('work');
+    await state.addMeeting(meeting());
+    expect(state.plannedMeetings.single.deviceEventId, isNotNull);
+
+    await state.setMirrorCalendar(null);
+
+    // The plan stays; its calendar event is left in place (not deleted) but its id is
+    // forgotten, so the app's own reminder is free to fire for it again.
+    expect(state.plannedMeetings, hasLength(1));
+    expect(state.plannedMeetings.single.deviceEventId, isNull);
+    expect(mirror.deleted, isEmpty);
+    // It survives a reload — the cleared id was persisted, not just dropped in memory.
+    final reloaded = await CalendarStore(storage: const FlutterSecureStorage()).load();
+    expect(reloaded.single.deviceEventId, isNull);
+  });
+
+  test('switching calendars re-mirrors every future plan into the new one', () async {
+    final mirror = FakeCalendarMirror()
+      ..calendars = const [
+        MirrorCalendar(id: 'work', name: 'Work'),
+        MirrorCalendar(id: 'home', name: 'Home'),
+      ];
+    final state = appState(mirror: mirror);
+    await state.setMirrorCalendar('work');
+    await state.addMeeting(meeting());
+    mirror.created.clear();
+
+    await state.setMirrorCalendar('home');
+
+    // The old id named an event in Work, so switching pushes the plan into Home
+    // afresh rather than leaving it behind — the stale-id skip that used to strand it
+    // is gone.
+    expect(mirror.created.map((m) => m.id), ['m1']);
+    expect(state.plannedMeetings.single.deviceEventId, isNotNull);
+  });
+
+  test('a mirror write that fails to return an id does not suppress the plan', () async {
+    final mirror = _FailingMirror();
+    final state = appState(mirror: mirror);
+    await state.setMirrorCalendar('work');
+
+    final error = await state.addMeeting(meeting());
+
+    // The plan is kept regardless, and carries no device id — so nothing thinks a
+    // calendar alert exists for it and its own reminder stands.
+    expect(error, isNull);
+    expect(state.plannedMeetings.single.deviceEventId, isNull);
   });
 
   test('deleting a mirrored meeting removes its calendar event too', () async {

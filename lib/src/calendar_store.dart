@@ -52,8 +52,14 @@ class CalendarStore {
     }
   }
 
+  /// Deliberately not wrapped: a write that fails has to reach the caller. The
+  /// lifecycle methods on [AppState] roll their optimistic in-memory list back when
+  /// save throws, and swallowing the error here would make them report success and
+  /// keep a change that vanishes on the next launch. The empty-on-failure grace is a
+  /// read-path thing only — a reachable keychain is a precondition of keeping a plan,
+  /// not of showing the ones already kept.
   Future<void> save(List<PlannedMeeting> meetings) =>
-      _write(_key, jsonEncode([for (final m in meetings) m.toJson()]));
+      _storage.write(key: _key, value: jsonEncode([for (final m in meetings) m.toJson()]));
 
   Future<void> clear() => _delete(_key);
 
@@ -62,14 +68,6 @@ class CalendarStore {
       return await _storage.read(key: key);
     } on Object {
       return null;
-    }
-  }
-
-  Future<void> _write(String key, String value) async {
-    try {
-      await _storage.write(key: key, value: value);
-    } on Object {
-      /* nothing useful to do; the next save writes it again */
     }
   }
 

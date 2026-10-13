@@ -2288,10 +2288,23 @@ class AppState extends ChangeNotifier {
   String? _mirrorCalendarId;
   String? get mirrorCalendarId => _mirrorCalendarId;
 
-  /// A notification id for a meeting's reminder, derived from its stable id. Masked
-  /// to a positive 31-bit int because that is what the platforms accept, and kept a
-  /// pure function of the id so cancelling finds the same slot scheduling used.
-  int _reminderId(PlannedMeeting m) => m.id.hashCode & 0x7fffffff;
+  /// A notification id for a meeting's reminder, derived from its stable id. A
+  /// positive 31-bit int because that is what the platforms accept, and kept a pure
+  /// function of the id so cancelling finds the same slot scheduling used.
+  ///
+  /// Hashed by hand rather than with [String.hashCode]: the Dart VM seeds string
+  /// hashes randomly per process, so `id.hashCode` returns a different number on the
+  /// next launch. That id has to survive a restart — boot reschedules from it, and
+  /// an edit or delete cancels by it — so a hash that moved would orphan the old
+  /// notification and schedule a duplicate. This FNV-1a over the id's code units is
+  /// deterministic across launches and platforms.
+  int _reminderId(PlannedMeeting m) {
+    var hash = 0x811c9dc5;
+    for (final unit in m.id.codeUnits) {
+      hash = ((hash ^ unit) * 0x01000193) & 0xffffffff;
+    }
+    return hash & 0x7fffffff;
+  }
 
   /// Adds a plan: saves it, schedules its reminder, and best-effort mirrors it to
   /// the phone's calendar. Returns null on success or a sentence for the user.
@@ -2307,8 +2320,7 @@ class AppState extends ChangeNotifier {
     // Mirror first, so the device-event id it hands back is part of the record the
     // store persists — otherwise a crash between save and mirror would orphan the
     // calendar event with nothing pointing at it.
-    final mirrored = await _mirror(saved);
-    if (mirrored != null) saved = mirrored;
+    saved = await _mirror(saved);
 
     _plannedMeetings = [..._plannedMeetings, saved];
     notifyListeners();
@@ -2332,10 +2344,11 @@ class AppState extends ChangeNotifier {
     if (at < 0) return addMeeting(meeting);
 
     // Carry the existing device-event id across so the mirror updates in place
-    // rather than leaving the old event behind and creating a second.
+    // rather than leaving the old event behind and creating a second. A failed
+    // re-mirror clears that id (see [_mirror]) so the local reminder arms as the
+    // fallback instead of staying suppressed behind an event that never moved.
     var saved = meeting.withDeviceEventId(_plannedMeetings[at].deviceEventId);
-    final mirrored = await _mirror(saved);
-    if (mirrored != null) saved = mirrored;
+    saved = await _mirror(saved);
 
     final next = [..._plannedMeetings];
     next[at] = saved;
@@ -2436,22 +2449,50 @@ class AppState extends ChangeNotifier {
   /// Chooses the device calendar to mirror plans into, or null to stop mirroring,
   /// and brings every existing plan into line with the choice: turning mirroring on
   /// pushes the plans that are not yet there, turning it off leaves the calendar
-  /// events in place (they are the user's now) but forgets their ids.
+  /// events in place (they are the user's now) but forgets their ids and re-arms the
+  /// app's own reminders; switching between calendars does both — forgets the ids
+  /// into the calendar being left, then pushes every future plan into the new one.
   Future<void> setMirrorCalendar(String? calendarId) async {
     if (_mirrorCalendarId == calendarId) return;
+    final leavingACalendar = _mirrorCalendarId != null;
     _mirrorCalendarId = calendarId;
     await _uiPrefs.saveMirrorCalendarId(calendarId);
     notifyListeners();
 
+    // Leaving a calendar (turning off, or switching away): the stored device-event
+    // ids name events in the calendar we just left, so they mean nothing here now.
+    // Forget them — the events themselves stay put, they are the user's — and re-arm
+    // the local reminder for every future plan, which those ids had been suppressing.
+    // Without this the plans go silent: no app reminder, and no alert in the new
+    // calendar either, because the backfill below skips anything that still looks
+    // mirrored.
+    if (leavingACalendar) {
+      _plannedMeetings = [
+        for (final m in _plannedMeetings)
+          m.deviceEventId == null ? m : m.withDeviceEventId(null),
+      ];
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+      for (final m in _plannedMeetings) {
+        await _scheduleReminder(m);
+      }
+    }
+
     if (calendarId == null) return;
+
+    // Mirroring is on now (freshly, or onto a different calendar): push every future
+    // plan not already in this calendar. When a write lands, cancel the app's own
+    // reminder for it — the calendar event carries the OS's alert, and keeping ours
+    // would buzz the phone twice for one meeting.
     var changed = false;
     final next = [..._plannedMeetings];
     for (var i = 0; i < next.length; i++) {
       if (next[i].isPast || next[i].deviceEventId != null) continue;
       final mirrored = await _mirror(next[i]);
-      if (mirrored != null) {
+      if (mirrored.deviceEventId != null) {
         next[i] = mirrored;
         changed = true;
+        await _notifier.cancelReminder(_reminderId(mirrored));
       }
     }
     if (changed) {
@@ -2461,14 +2502,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Writes a plan into the chosen device calendar and returns the copy carrying
-  /// the device-event id, or null when there is nothing to do (mirroring off) or
-  /// the write did not take. Never throws — the mirror's own contract.
-  Future<PlannedMeeting?> _mirror(PlannedMeeting meeting) async {
+  /// Writes a plan into the chosen device calendar and returns the copy to store.
+  ///
+  /// Mirroring off: the meeting is returned unchanged. Mirroring on: the returned
+  /// copy carries the new device-event id on success, or has any stale id *cleared*
+  /// on failure — so an update whose write did not land falls back to the app's own
+  /// reminder rather than being suppressed by an id pointing at an event that was
+  /// never (re)written. Never throws — the mirror's own contract.
+  Future<PlannedMeeting> _mirror(PlannedMeeting meeting) async {
     final calendarId = _mirrorCalendarId;
-    if (calendarId == null) return null;
+    if (calendarId == null) return meeting;
     final eventId = await _calendarMirror.createOrUpdate(meeting, calendarId: calendarId);
-    if (eventId == null) return null;
     return meeting.withDeviceEventId(eventId);
   }
 

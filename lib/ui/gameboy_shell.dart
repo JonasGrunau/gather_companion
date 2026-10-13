@@ -115,16 +115,18 @@ const _emotes = ['👋', '❤️', '🎉', '👍️', '🤣', '👏', '💯', '�
 
 /// The Select menu's rows, in D-pad order top to bottom. Two of them — the
 /// status choices and the emote strip — are rows the D-pad walks left/right
-/// inside; the other four are single targets, one per tab the menu can leave to
-/// (Dial, Activity, Settings) plus the camera toggle. Kept as a count so the cursor can
-/// clamp without the menu and the router disagreeing about how many rows there are.
+/// inside; the other five are single targets, one per tab the menu can leave to
+/// (Dial, Activity, Plans, Settings) plus the camera toggle. Kept as a count so the
+/// cursor can clamp without the menu and the router disagreeing about how many rows
+/// there are.
 const int _menuRowStatus = 0;
 const int _menuRowCamera = 1;
 const int _menuRowEmotes = 2;
 const int _menuRowDial = 3;
 const int _menuRowActivity = 4;
-const int _menuRowSettings = 5;
-const int _menuRowCount = 6;
+const int _menuRowPlans = 5;
+const int _menuRowSettings = 6;
+const int _menuRowCount = 7;
 
 /// Wraps [child] (the office) in the handheld. [onOpenDial]/[onOpenActivity]/
 /// [onOpenSettings] are how the Select menu leaves for another tab — the shell
@@ -144,6 +146,7 @@ class GameboyShell extends StatefulWidget {
     required this.child,
     required this.onOpenSettings,
     required this.onOpenActivity,
+    required this.onOpenPlans,
     required this.onOpenDial,
   });
 
@@ -151,6 +154,7 @@ class GameboyShell extends StatefulWidget {
   final Widget child;
   final VoidCallback onOpenSettings;
   final VoidCallback onOpenActivity;
+  final VoidCallback onOpenPlans;
   final VoidCallback onOpenDial;
 
   @override
@@ -339,6 +343,11 @@ class _GameboyShellState extends State<GameboyShell> {
     widget.onOpenActivity();
   }
 
+  void _doPlans() {
+    _closeMenu();
+    widget.onOpenPlans();
+  }
+
   void _doSettings() {
     _closeMenu();
     widget.onOpenSettings();
@@ -362,6 +371,8 @@ class _GameboyShellState extends State<GameboyShell> {
         _doDial();
       case _menuRowActivity:
         _doActivity();
+      case _menuRowPlans:
+        _doPlans();
       case _menuRowSettings:
         _doSettings();
     }
@@ -420,6 +431,7 @@ class _GameboyShellState extends State<GameboyShell> {
                         onReact: _doReact,
                         onDial: _doDial,
                         onActivity: _doActivity,
+                        onPlans: _doPlans,
                         onSettings: _doSettings,
                         onDismiss: _closeMenu,
                       )
@@ -2092,6 +2104,7 @@ class _GameboyMenu extends StatelessWidget {
     required this.onReact,
     required this.onDial,
     required this.onActivity,
+    required this.onPlans,
     required this.onSettings,
     required this.onDismiss,
   });
@@ -2109,6 +2122,7 @@ class _GameboyMenu extends StatelessWidget {
   final ValueChanged<String> onReact;
   final VoidCallback onDial;
   final VoidCallback onActivity;
+  final VoidCallback onPlans;
   final VoidCallback onSettings;
   final VoidCallback onDismiss;
 
@@ -2185,6 +2199,16 @@ class _GameboyMenu extends StatelessWidget {
                     title: 'Activity',
                     focused: focusedRow == _menuRowActivity,
                     onTap: onActivity,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                KeyedSubtree(
+                  key: rowKeys[_menuRowPlans],
+                  child: _MenuRow(
+                    icon: Icons.event_rounded,
+                    title: 'Plans',
+                    focused: focusedRow == _menuRowPlans,
+                    onTap: onPlans,
                   ),
                 ),
                 const SizedBox(height: 8),
