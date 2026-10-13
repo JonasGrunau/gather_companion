@@ -1306,4 +1306,93 @@ void main() {
       expect(cam.getTranslation().y, closeTo(want.getTranslation().y, 0.5));
     });
   });
+
+  // A pan can carry your own avatar clean off the floor. The "Back to me" pill is the
+  // way back: present only while the avatar is off screen and nothing else holds the
+  // bottom slot, and it recentres the camera when tapped. Works the same in the office
+  // and inside the Gameboy LCD, since both render the one map.
+  group('back to me', () {
+    const viewport = Size(390, 780);
+
+    /// The office with me in the top-left corner, so a drag to the far corner can push
+    /// me fully off the glass. Not Gameboy mode: the plain office camera.
+    AppState office() => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugCanWalk = true
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+
+    Future<void> mount(WidgetTester tester, AppState state) async {
+      tester.view.physicalSize = viewport;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump(); // layout
+      await tester.pump(); // the post-frame opening shot centres me
+    }
+
+    /// Drag the floor far enough that the edge clamp strands my corner off screen.
+    Future<void> panAway(WidgetTester tester) async {
+      await tester.drag(find.byType(InteractiveViewer), const Offset(-4000, -4000));
+      await tester.pump();
+    }
+
+    testWidgets('is absent while my avatar is on screen', (tester) async {
+      await mount(tester, office());
+      expect(find.text('Back to me'), findsNothing);
+    });
+
+    testWidgets('appears once a pan carries my avatar off screen', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget);
+    });
+
+    testWidgets('yields the slot the moment something is selected', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget, reason: 'off screen, so offered');
+
+      // A tap in the middle of the glass picks a tile — me is off in the corner, so it
+      // is not the clear-the-selection tile. The selection owns the slot now.
+      await tester.tapAt(const Offset(195, 390));
+      await tester.pump();
+      expect(find.text('Back to me'), findsNothing);
+    });
+
+    testWidgets('tapping it brings the camera back and takes itself down', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget);
+
+      await tester.tap(find.text('Back to me'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400)); // the eased camera arrives
+      expect(find.text('Back to me'), findsNothing,
+          reason: 'the avatar is back on screen, so there is nothing to go back to');
+    });
+
+    testWidgets('works inside the Gameboy LCD: a broken lock, then a tap re-grabs it',
+        (tester) async {
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugCanWalk = true
+        ..debugMap = _map()
+        ..setGameboyMode(true)
+        ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+      await mount(tester, state);
+      await tester.pump(const Duration(seconds: 1)); // the lock eases home first
+
+      // The pan drops the Gameboy lock and strands the avatar off the LCD.
+      await panAway(tester);
+      await tester.pump(const Duration(seconds: 1)); // a still-locked ticker would yank it back
+      expect(find.text('Back to me'), findsOneWidget);
+
+      await tester.tap(find.text('Back to me'));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1)); // the re-grabbed lock re-settles
+      expect(find.text('Back to me'), findsNothing,
+          reason: 'the lock re-centred the avatar');
+    });
+  });
 }
