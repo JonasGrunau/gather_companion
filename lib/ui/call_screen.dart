@@ -826,16 +826,21 @@ class _Grid extends StatelessWidget {
       );
     }
     // A crowd: two columns scrolling down a portrait, two rows scrolling off the
-    // right across a landscape. The aspect flips with it — 3:4 upright, 4:3 on its
-    // side — so a tile keeps a face's shape instead of being squeezed into the one
-    // the other orientation wants.
+    // right across a landscape. The tile wants the orientation's own shape — a
+    // 3:4 upright plate, a 4:3 one on its side — so a face keeps its proportions
+    // instead of being squeezed into the shape the other orientation wants.
+    //
+    // `childAspectRatio` is cross-axis÷main-axis, and the scroll axis flips with
+    // the orientation, so the same 3/4 yields opposite tile shapes: upright the
+    // main axis is vertical, so 3/4 = width÷height → a 3:4 tall plate; on its
+    // side the main axis is horizontal, so 3/4 = height÷width → a 4:3 wide one.
     return GridView.count(
       padding: _edges,
       scrollDirection: landscape ? Axis.horizontal : Axis.vertical,
       crossAxisCount: 2,
       mainAxisSpacing: 8,
       crossAxisSpacing: 8,
-      childAspectRatio: landscape ? 4 / 3 : 3 / 4,
+      childAspectRatio: 3 / 4,
       children: [for (final tile in tiles) wrap(tile)],
     );
   }

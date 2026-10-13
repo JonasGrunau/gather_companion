@@ -435,7 +435,13 @@ class _GameboyShellState extends State<GameboyShell> {
               final landscape =
                   MediaQuery.orientationOf(context) == Orientation.landscape;
 
-              final deck = _ControlsDeck(
+              // The deck is always the builder's root — upright it stacks the LCD,
+              // the brand band and the controls; on its side it wraps the LCD between
+              // the thumbs. Keeping it the root means a rotation only relays the same
+              // `_ControlsDeck` element to a new layout instead of swapping the root
+              // type (Column ⇄ deck), which would dispose and rebuild its State and
+              // drop a pending B double-tap timer mid-gesture.
+              return _ControlsDeck(
                 state: widget.state,
                 menuOpen: _menuOpen,
                 onMenuMove: _move,
@@ -447,24 +453,11 @@ class _GameboyShellState extends State<GameboyShell> {
                 onWave: _doWave,
                 // Refusals (mute, the door) land in the LCD, not on the plastic.
                 onMessage: _say,
-                // Non-null only on its side, where the deck wraps the LCD rather than
-                // sitting below it.
-                landscapeScreen: landscape ? screen : null,
-              );
-
-              if (landscape) return deck;
-
-              return Column(
-                children: [
-                  Expanded(child: screen),
-                  // The band between the screen and the controls. Measured off the
-                  // mock: the gap there is ~10% of the screen width, which lands at
-                  // ~40 logical pixels on a phone — a deliberate breath between the
-                  // LCD and the D-pad, not the tight 8px of before. A theme may print
-                  // its brand here (the DMG wordmark spot); a bare theme keeps the gap.
-                  _BrandBand(theme: theme),
-                  deck,
-                ],
+                landscape: landscape,
+                screen: screen,
+                // The band between the screen and the controls upright — a theme may
+                // print its brand here (the DMG wordmark spot); dropped on its side.
+                brand: _BrandBand(theme: theme),
               );
             },
           ),
@@ -1169,16 +1162,26 @@ class _ControlsDeck extends StatefulWidget {
     required this.onMenuToggle,
     required this.onWave,
     required this.onMessage,
-    this.landscapeScreen,
+    required this.landscape,
+    required this.screen,
+    required this.brand,
   });
 
   final AppState state;
   final bool menuOpen;
 
-  /// The LCD to wrap when the handheld is on its side — the D-pad goes to its left,
-  /// A/B to its right, Select/Start below. Null upright, where the deck is just the
-  /// stacked controls below a screen the shell places itself.
-  final Widget? landscapeScreen;
+  /// Whether the handheld is held on its side. The deck owns both arrangements so it
+  /// stays one element across a rotation, keeping its B double-tap timer alive.
+  final bool landscape;
+
+  /// The LCD. Upright the deck stacks it over the brand band and the controls; on
+  /// its side it wraps it between the thumbs — D-pad left, A/B right, Select/Start
+  /// below.
+  final Widget screen;
+
+  /// The band printed below the LCD upright (the DMG wordmark spot); dropped on its
+  /// side, where there is no room for it.
+  final Widget brand;
   final void Function(String direction) onMenuMove;
   final VoidCallback onMenuConfirm;
   final VoidCallback onMenuClose;
@@ -1406,14 +1409,27 @@ class _ControlsDeckState extends State<_ControlsDeck> {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) {
-        if (widget.landscapeScreen != null) return _landscape(context);
+        if (widget.landscape) return _landscape(context);
 
-        // Two packed zones rather than one tall box with the keys pinned to its
-        // edges: the cross and the A/B pair share an upper band, the SELECT/START
-        // pair and the grille a lower one, with no dead plastic in between. The
-        // buttons sit low against the cross's centre so the right of the body fills
-        // the way the left does.
+        // Upright: the LCD on top, the brand band, then the controls below.
         return Column(
+          children: [
+            Expanded(child: widget.screen),
+            widget.brand,
+            _portraitControls(),
+          ],
+        );
+      },
+    );
+  }
+
+  /// The upright thumb deck below the LCD. Two packed zones rather than one tall box
+  /// with the keys pinned to its edges: the cross and the A/B pair share an upper
+  /// band, the SELECT/START pair and the grille a lower one, with no dead plastic in
+  /// between. The buttons sit low against the cross's centre so the right of the body
+  /// fills the way the left does.
+  Widget _portraitControls() {
+    return Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             SizedBox(
@@ -1447,8 +1463,6 @@ class _ControlsDeckState extends State<_ControlsDeck> {
             ),
           ],
         );
-      },
-    );
   }
 
   /// The handheld on its side, laid out like the GBA it is modelled on: the LCD
@@ -1516,7 +1530,7 @@ class _ControlsDeckState extends State<_ControlsDeck> {
           padding: const EdgeInsets.only(right: 20),
           child: Center(child: left),
         ),
-        Expanded(child: widget.landscapeScreen!),
+        Expanded(child: widget.screen),
         Padding(padding: const EdgeInsets.only(left: 20), child: right),
       ],
     );

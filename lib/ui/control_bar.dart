@@ -189,16 +189,23 @@ class DockIsland extends StatelessWidget {
     );
 
     return SafeArea(
-      // Flat it clears the home indicator below; on its side it clears the
-      // notch/rounded corner on the right the screen is pinned to.
+      // Flat it clears the home indicator below; on its side the rail still runs
+      // down to the bottom edge, where the landscape home indicator sits, so the
+      // bottom inset is kept in both orientations — and the right inset is added
+      // on its side to clear the notch/rounded corner the screen is pinned to.
       top: false,
       right: vertical,
-      bottom: !vertical,
       child: Padding(
         padding: vertical
             ? const EdgeInsets.only(right: kRailGap)
             : const EdgeInsets.only(bottom: kRailGap),
-        child: Center(child: island),
+        // On its side the rail only drops its `left` constraint, so its box spans
+        // the full width; pin the island to the right edge rather than letting a
+        // plain centre float it back toward the middle of the screen.
+        child: Align(
+          alignment: vertical ? Alignment.centerRight : Alignment.center,
+          child: island,
+        ),
       ),
     );
   }

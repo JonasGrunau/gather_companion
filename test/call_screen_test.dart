@@ -1096,6 +1096,13 @@ void main() {
 
       final grid = tester.widget<GridView>(find.byType(GridView));
       expect(grid.scrollDirection, Axis.horizontal);
+
+      // And the tiles are wide 4:3 plates, not the narrow portrait slivers an
+      // un-flipped childAspectRatio would cut. Guards the cross-axis÷main-axis
+      // inversion that bites when the grid's scroll axis turns on its side.
+      final tile = tester.getRect(find.byType(TileFrame).first);
+      expect(tile.width, greaterThan(tile.height),
+          reason: 'a landscape tile is wider than it is tall');
     });
 
     testWidgets('two faces split side by side, not stacked', (tester) async {

@@ -550,6 +550,44 @@ void main() {
           reason: 'the pending mute tap, not the live mic flag, decides the second tap');
     });
 
+    testWidgets('a B double-tap survives a rotation between the two taps',
+        (tester) async {
+      // Regression: the deck must stay one `State` across an orientation change, or
+      // rotating between the two B taps would dispose it — cancelling the pending
+      // mute and losing the first tap's timestamp, so the second tap no longer
+      // waves. Upright and sideways the deck is the same element; only its layout
+      // turns.
+      tester.view.physicalSize = const Size(400, 800); // upright
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // First tap upright.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      // Turn the handheld on its side between the taps.
+      tester.view.physicalSize = const Size(800, 400); // on its side
+      await tester.pump();
+
+      // Second tap sideways, still inside the wall-clock double-tap window.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'the deck kept its double-tap state across the rotation');
+    });
+
     testWidgets('a single B tap does not wave', (tester) async {
       final collector = FakeCollector();
       final state = configure(AppState())
