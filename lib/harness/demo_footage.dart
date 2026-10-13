@@ -131,10 +131,62 @@ class _DemoFootageState extends State<DemoFootage>
     // Double-tap toggles cover/letterbox. Behaviour.opaque so the whole tile is
     // the target; InteractiveViewer keeps the drag/pinch, which it does not use
     // double-tap for.
-    return GestureDetector(
+    final tappable = GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onDoubleTap: () => setState(() => _contain = !_contain),
+      onDoubleTap: _toggleFit,
       child: mirrored,
+    );
+    // The Fit/Fill button, top-right, standing in for the app's own — which only
+    // shows over a real video stream the simulator cannot make. Only on a big
+    // tile (the grid thumbnails are too small for it, and the app puts it on the
+    // spotlight alone), gated by width so a thumbnail stays clean.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 220) return tappable;
+        return Stack(
+          children: [
+            Positioned.fill(child: tappable),
+            Positioned(top: 8, right: 8, child: _fitButton()),
+          ],
+        );
+      },
+    );
+  }
+
+  void _toggleFit() => setState(() => _contain = !_contain);
+
+  /// Names the result of the tap, like the app's: "Fit" while cropped offers the
+  /// whole frame; "Fill" while letterboxed offers the crop back.
+  Widget _fitButton() {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.55),
+      borderRadius: BorderRadius.circular(8),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: _toggleFit,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 48),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_contain ? Icons.crop_free : Icons.fit_screen,
+                    size: 15, color: Colors.white),
+                const SizedBox(width: 6),
+                Text(
+                  _contain ? 'Fill' : 'Fit',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
