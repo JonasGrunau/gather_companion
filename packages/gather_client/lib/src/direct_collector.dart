@@ -300,6 +300,9 @@ class DirectCollector implements Collector {
         ...reader.stats(),
         'frames': _frames,
         'connects': _connects,
+        // The current reconnect delay. Exposed so a test can prove the backoff climbs
+        // across frameless connects and resets on a frame — the whole of issue #8.
+        'backoffMs': _backoff.inMilliseconds,
         'spaceId': spaceId,
         'authUserId': reader.authUserId,
         'entered': _entered,
@@ -347,6 +350,12 @@ class DirectCollector implements Collector {
   /// to spare. Going offline tears the socket down and stands still; a returning
   /// transport reconnects at once. [AppState] also calls [resync] on a transport
   /// change, and the `_retryTimer` guard keeps the two from firing twice.
+  ///
+  /// Tearing the socket down here is not the whole of it: an [_openConnection]
+  /// already awaiting auth or the WebSocket handshake would otherwise complete and
+  /// install a live socket *after* this ran. `_reachable` is re-checked past every
+  /// await in that path, so an in-flight open begun while reachable closes itself
+  /// rather than slip a connection past the stand-down (issue #8).
   @override
   void setReachable(bool reachable) {
     if (reachable == _reachable) return;
@@ -778,15 +787,22 @@ class DirectCollector implements Collector {
     return (id: spaces.first.id, spaceUserId: spaces.first.spaceUserId);
   }
 
+  /// Opens a connection unless we are stopped or the device has no transport.
+  ///
+  /// Every connect funnels through here — [start], [resync] and the retry timer —
+  /// so the offline gate lives here rather than at each caller. Without it a
+  /// `resync()` (which `AppState.verifyLink()` fires on app resume) would open a
+  /// socket straight into no network, defeating the stand-down (issue #8).
   void _connectNow() {
+    if (_stopped || !_reachable) return;
     unawaited(_openConnection());
   }
 
   Future<void> _openConnection() async {
-    if (_stopped) return;
+    if (_stopped || !_reachable) return;
     _clearTimers();
     await _closeSocket();
-    if (_stopped) return;
+    if (_stopped || !_reachable) return;
 
     final String token;
     final ({String id, String? spaceUserId})? resolved;
@@ -805,7 +821,9 @@ class DirectCollector implements Collector {
       _scheduleRetry();
       return;
     }
-    if (_stopped) return;
+    // The transport may have dropped while we were awaiting auth: a connect begun
+    // while reachable must not install a socket after the offline signal (issue #8).
+    if (_stopped || !_reachable) return;
 
     if (resolved == null) {
       _setHealth(false, 'no space to join — open a space in Gather once');
@@ -842,7 +860,11 @@ class DirectCollector implements Collector {
       _scheduleRetry();
       return;
     }
-    if (_stopped) {
+    // The socket opened, but the WebSocket handshake may have outlived a transport
+    // drop. Close it rather than install a live connection the stand-down thought it
+    // had prevented — the `onDone` guard keys on `_ws`, which is still null here, so
+    // nothing reschedules (issue #8).
+    if (_stopped || !_reachable) {
       await ws.close();
       return;
     }

@@ -43,6 +43,7 @@ void main() {
 
   DirectCollector build({
     String? spaceId = 'space-1',
+    String? socketUrl,
     Duration? silenceLimit,
     Duration? selfAbsentLimit,
     Duration? reenterGrace,
@@ -55,7 +56,7 @@ void main() {
     return collector = DirectCollector(
       auth: auth,
       spaceId: spaceId,
-      socketUrl: gather.url,
+      socketUrl: socketUrl ?? gather.url,
       log: log,
       silenceLimit: silenceLimit ?? const Duration(seconds: 45),
       // Short by default so the presence ladder's two stages are observable inside
@@ -627,6 +628,59 @@ void main() {
           .timeout(const Duration(seconds: 5));
       expect(gather.connections.length, greaterThan(connectsAtOffline),
           reason: 'a returning transport reconnects');
+    });
+
+    test('a resync while unreachable makes no connect attempt', () async {
+      // Issue #8, finding 1: every connect funnels through `_connectNow`, so the
+      // offline gate has to live there — not only in the deaf watchdog. `AppState`
+      // calls `resync()` on app resume (verifyLink). Resumed while offline, that must
+      // not open a socket into no network and defeat the stand-down.
+      final c = build(silenceLimit: const Duration(milliseconds: 300))..start();
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the first dump');
+
+      c.setReachable(false);
+      final connectsAtOffline = gather.connections.length;
+
+      final result = await c.resync();
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(gather.connections.length, connectsAtOffline,
+          reason: 'resync must not connect while offline, got ${result.detail}');
+    });
+
+    test('frameless reconnects grow the backoff, and a frame resets it', () async {
+      // The primary regression issue #8 fixed: the backoff reset used to live on
+      // socket-open, so in a dead zone every connect-then-deaf cycle pinned it at the
+      // 1s floor and the retry never backed off. The reset now lives on a received
+      // frame, so repeated frameless connects must climb — and a frame must still drop
+      // it back to the floor. A silent server is the dead zone: it accepts the socket
+      // and says nothing.
+      final silent = await FakeGatherServer.start(silent: true);
+      addTearDown(silent.close);
+      final c = build(
+        socketUrl: silent.url,
+        silenceLimit: const Duration(milliseconds: 60),
+      )..start();
+
+      Future<void> waitUntil(bool Function() cond, {String reason = 'a condition'}) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!cond()) {
+          if (DateTime.now().isAfter(deadline)) throw StateError('timed out: $reason');
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      }
+
+      // First connect fell deaf and the retry fired a second. With the reset off
+      // socket-open, that second connect must have let the backoff double past the
+      // floor rather than resetting it.
+      await waitUntil(() => silent.connections.length >= 2, reason: 'a second connect');
+      expect(c.stats()['backoffMs'] as int, greaterThan(1000),
+          reason: 'a frameless reconnect must let the backoff grow');
+
+      // A frame lands on the live socket — proof the pipe carries data — so the next
+      // retry drops back to the floor.
+      silent.latest!.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      await waitUntil(() => c.stats()['backoffMs'] == 1000,
+          reason: 'a received frame resets the backoff to the floor');
     });
   });
 
