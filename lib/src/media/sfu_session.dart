@@ -1859,8 +1859,16 @@ class SfuSession {
   /// throw a never-connected transport raises on close. Leaves `_sendTransport`
   /// null and `_sendState` cleared so a fresh transport cannot inherit a stale
   /// "connected".
+  ///
+  /// Order matters: close the transport *before* dropping the producers. The
+  /// transport's `@close` listener queues a `stopSending` task — which runs
+  /// `createOffer` on the handler's peer connection — but only while the
+  /// transport is still open. Closing the transport first disposes the handler
+  /// (nulling the pc) and tears its producers down via `transportClosed()`, the
+  /// path that never emits `@close`. By the time `_dropProducers` runs, each
+  /// producer is already closed, so `producer.close()` is a no-op: no `@close`,
+  /// no task queued against a pc that is about to vanish (issue #7).
   void _closeSendTransportQuietly() {
-    _dropProducers();
     final transport = _sendTransport;
     _sendTransport = null;
     _sendState = null;
@@ -1871,6 +1879,7 @@ class SfuSession {
         _log('sfu: closing the send transport threw (ignored): $error');
       }
     }
+    _dropProducers();
   }
 
   void _announceRepublish() {
