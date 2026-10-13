@@ -1061,8 +1061,12 @@ class SfuSession {
   /// built on the first successful consume, so a join where the SFU denies every
   /// consume builds no transport and stays deaf for the whole call. This notices
   /// the "subscribed to peers but holding no consumers, and denials are why"
-  /// state and rebuilds the receive path, retrying with growing backoff until a
-  /// consumer finally lands (which cancels it from the success hook).
+  /// state and heals the receive path, retrying with growing backoff until the
+  /// stranded peers finally land (which cancels it from the success hook).
+  ///
+  /// The unit is the peer, not the room. A denial for one colleague strands only
+  /// them, so a busy call where everyone else has sound still heals that one — it
+  /// does not stand down just because some other consumer exists.
   void _scheduleRecvHeal() {
     if (_recvHealTimer != null || _stopped) return;
     _recvHealTimer = Timer(_recvHealBackoff, () async {
@@ -1074,27 +1078,71 @@ class SfuSession {
       // healthy in-flight receive path for the peer that replaced it.
       _consumeDenied.removeWhere((srcId) => !_subscribed.contains(srcId));
 
-      // Re-evaluate against current state, not the state that armed us. If a
-      // consumer has since been built, or we are no longer subscribed to
-      // anyone, or the denials have cleared, there is nothing to heal — reset
-      // the backoff and stand down.
-      if (_stopped ||
-          _subscribed.isEmpty ||
-          _consumers.isNotEmpty ||
-          _consumeDenied.isEmpty) {
+      // Re-evaluate against current state, not the state that armed us. Nothing
+      // to heal if we were stopped or no subscribed peer is stranded — a peer is
+      // stranded only when it was denied and we still hold no consumer for it, so
+      // a denial that has since been consumed, or one left by a departed peer,
+      // does not count. Reset the backoff and stand down.
+      final stranded = _strandedPeers();
+      if (_stopped || stranded.isEmpty) {
         _recvHealBackoff = const Duration(seconds: 5);
         return;
       }
 
-      await _rebuildReceive();
+      // A fully deaf room (no consumer at all) takes the global rebuild, which
+      // also clears a recv transport that came up poisoned. A partial failure —
+      // the room has sound and only some peers are stranded — re-requests just
+      // those peers, leaving every working transport and consumer untouched.
+      if (_consumers.isEmpty) {
+        await _rebuildReceive();
+      } else {
+        await _healStranded(stranded);
+      }
 
-      // Grow the backoff and re-arm. The rebuild re-issues consumes but does not
+      // Grow the backoff and re-arm. The heal re-issues consumes but does not
       // guarantee one succeeds, so the watchdog keeps trying for the life of the
-      // call; a successful consume is the only thing that cancels it.
+      // call; a successful consume that leaves no peer stranded is the only thing
+      // that cancels it.
       final next = _recvHealBackoff.inSeconds * 2;
       _recvHealBackoff = Duration(seconds: next > 30 ? 30 : next);
       _scheduleRecvHeal();
     });
+  }
+
+  /// Whether we hold a consumer for [srcId] on any tag.
+  bool _hasConsumer(String srcId) =>
+      SfuTag.values.any((tag) => _consumers.containsKey('$srcId|${tag.wire}'));
+
+  /// Subscribed peers the SFU denied and for whom we still hold no consumer.
+  ///
+  /// The denial is the fault signal and the missing consumer is the symptom;
+  /// both have to hold for a peer to need healing. Filtering on [_subscribed]
+  /// keeps a departed peer's stale denial from counting.
+  Set<String> _strandedPeers() => _subscribed
+      .where((srcId) => _consumeDenied.contains(srcId) && !_hasConsumer(srcId))
+      .toSet();
+
+  /// Re-request the receive path for a handful of stranded peers.
+  ///
+  /// The partial-failure twin of [_rebuildReceive]: same per-peer clear and
+  /// re-request, but it touches no transport, so the colleagues who already have
+  /// sound never glitch. The denial is left in place deliberately — if the
+  /// re-request is denied again the peer stays stranded and the watchdog climbs;
+  /// a built consumer is what clears it, in [_consume].
+  Future<void> _healStranded(Set<String> stranded) async {
+    _log('sfu: ${stranded.length} subscribed peer(s) denied while the room is '
+        'receiving; re-requesting them');
+    for (final srcId in stranded) {
+      _peerNode.remove(srcId);
+      _announced.remove(srcId);
+      for (final tag in SfuTag.values) {
+        _closeConsumer(srcId, tag);
+      }
+      // Re-assert the standing the SFU authorises consumes against, the same
+      // grant subscribe() makes before asking.
+      allow(srcId, allowed: true);
+      unawaited(_requestPeer(srcId));
+    }
   }
 
   /// Tear down and rebuild the receive path for every subscribed peer.
@@ -1273,6 +1321,14 @@ class SfuSession {
       case 'consume-try':
         final srcId = n.data['srcId'];
         if (srcId is! String) return;
+        // The full-state announcement is the SFU answering for this peer, so it
+        // resolves any earlier denial even when it carries no tracks: a peer
+        // denied and then legitimately muted publishes an empty map, and leaving
+        // the denial behind would strand it forever — _strandedPeers() would see
+        // "denied, no consumer" and the watchdog would re-request it every
+        // 5–30s. A consume with tracks clears the denial in _consume anyway;
+        // this covers the empty case that never builds a consumer.
+        _consumeDenied.remove(srcId);
         final map = _map(n.data['producerIdMap']);
         _announced[srcId] = {
           for (final entry in map.entries)
@@ -1589,14 +1645,18 @@ class SfuSession {
       );
       _consumers[key] = consumer;
 
-      // One consumer proves the receive path works, so the fault signal and the
-      // watchdog it arms are stale now: clear the denials, cancel any pending
-      // heal, and reset the backoff so a later cascade starts from the full
-      // grace window rather than mid-climb.
-      _consumeDenied.clear();
-      _recvHealTimer?.cancel();
-      _recvHealTimer = null;
-      _recvHealBackoff = const Duration(seconds: 5);
+      // This consumer clears its own peer's fault signal — but only its own. A
+      // consumer for one colleague says nothing about another's denial, so
+      // clearing the whole set here would erase a still-stranded peer's evidence
+      // before the watchdog could act on it. Cancel the heal and reset the
+      // backoff only once nothing is left stranded, so a later cascade starts
+      // from the full grace window rather than mid-climb.
+      _consumeDenied.remove(srcId);
+      if (_strandedPeers().isEmpty) {
+        _recvHealTimer?.cancel();
+        _recvHealTimer = null;
+        _recvHealBackoff = const Duration(seconds: 5);
+      }
 
       // Unusual, and easy to miss: the SFU wants telling that the consumer was
       // actually built. Measured going *back* to the server after its own ack.

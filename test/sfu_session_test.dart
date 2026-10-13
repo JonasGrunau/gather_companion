@@ -715,6 +715,95 @@ void main() {
         clock.elapse(const Duration(seconds: 1));
       });
     });
+
+    test('heals one denied peer while the room already has sound', () {
+      // Issue #52: a single colleague denied in an otherwise-healthy call. The
+      // room has consumers, so the old room-level watchdog stood down and the
+      // denied peer stayed silent for the whole call. The per-peer heal must
+      // re-request that one peer without disturbing the working one.
+      fakeAsync((clock) {
+        const other = 'acct-other';
+        rig.addresses[other] = nodeA;
+
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // Peer A joins and is consumed: the room now holds a consumer.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes, isNotEmpty,
+            reason: 'peer A should be receiving, so the room has sound');
+
+        // Peer B joins but the SFU denies the consume.
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node().push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+        rig.node().drain();
+
+        // The grace window passes. Despite A's live consumer, the watchdog must
+        // re-request the stranded B rather than stand down.
+        clock.elapse(const Duration(seconds: 6));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), other), greaterThan(0),
+            reason: 'the stranded peer must be re-requested even with the '
+                'room already receiving');
+
+        // B is announced this time and a consumer is built; both peers receive.
+        rig.announce(other, {'audio': 'p-audio-2'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes.map((r) => r.srcId),
+            containsAll(<String>[them, other]));
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('an empty announce after denial stops the retries', () {
+      // Issue #52 follow-up: the SFU may answer a denial with an empty
+      // `consume-try` — the peer is legitimately muted and publishes nothing.
+      // That full-state announcement resolves the denial even though it builds
+      // no consumer, so the peer must not stay "stranded" and be re-requested
+      // every 5–30s for the life of the call.
+      fakeAsync((clock) {
+        const other = 'acct-other';
+        rig.addresses[other] = nodeA;
+
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // Peer A receives, so the room has sound and the heal runs per-peer.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+
+        // Peer B is denied, then announces an empty producer map — muted.
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node().push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+        rig.announce(other, <String, String>{});
+        clock.flushMicrotasks();
+        rig.node().drain();
+
+        // The denial is resolved, so no watchdog re-request should fire for B.
+        final asked = consumeRequestsFor(rig.node(), other);
+        clock.elapse(const Duration(seconds: 40));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), other), asked,
+            reason: 'a muted peer that announced empty is not stranded and must '
+                'not be re-requested');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
   });
 
   group('send-side stall', () {
