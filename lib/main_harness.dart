@@ -75,6 +75,14 @@ Widget _buildCall(String scenarioName, int participants) {
   // seam, driven here on purpose: this harness target exists for it.
   // ignore: invalid_use_of_visible_for_testing_member
   state.debugAttachCall(call);
+  // The scripted roster seats us in a huddle, and the call screen's control bar
+  // offers the real Leave door. Without a collector behind it that door calls
+  // `leaveHuddle()` on nothing and pops a spurious "Not connected to Gather." —
+  // a harness exit reporting itself as a failure. Stand a [FakeCollector] in so
+  // `leaveCluster()` resolves cleanly; it is attached, not started, so it never
+  // emits a roster of its own to fight the scripted one the driver pushes.
+  // ignore: invalid_use_of_visible_for_testing_member
+  state.debugAttachCollector(FakeCollector(participants: participants));
 
   final driver = CallScenarioDriver(
     state: state,

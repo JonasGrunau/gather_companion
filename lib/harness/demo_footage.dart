@@ -4,10 +4,11 @@
 /// The iOS simulator has no capture device, so `getUserMedia` fails and every
 /// harness tile would otherwise fall through to the avatar placeholder — leaving
 /// nothing to judge how the call layout *cuts* a frame (cover vs contain) or how
-/// it zooms. This paints a moving test card into each tile instead: a wide 16:9
-/// card with a grid, edge labels and a bouncing dot, so the crop is obvious (the
-/// edges a cover-fit eats are the labelled ones) and the pinch-zoom has something
-/// to bite on.
+/// it zooms. This paints a moving test card into each tile instead — a grid with
+/// edge labels and a bouncing dot, so the crop is obvious (the edges a cover-fit
+/// eats are the labelled ones) and the pinch-zoom has something to bite on. Each
+/// person's card is a different aspect (16:9, 9:16, 4:3, 3:4, 1:1; see [_aspects]),
+/// so the layout is seen cutting portrait and square sources, not just landscape.
 ///
 /// It is wired in only by `main_harness.dart` via [CallScreen.buildTile]; the real
 /// app never builds this, and the production tile path is untouched.
