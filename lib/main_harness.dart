@@ -35,6 +35,7 @@ import 'package:flutter/services.dart';
 import 'package:gather_client/gather_client.dart';
 
 import 'harness/call_scenarios.dart';
+import 'harness/demo_footage.dart';
 import 'harness/fake_collector.dart';
 import 'harness/scripted_call.dart';
 import 'src/app_state.dart';
@@ -50,12 +51,17 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light);
 
-  const target = String.fromEnvironment('TARGET', defaultValue: 'call');
-  const scenarioName = String.fromEnvironment('SCENARIO', defaultValue: 'group');
+  // One harness, the whole app, by default: the real pair→home→office flow with a
+  // fake backend, so the office is walkable, Dial warps into a real call, Gameboy
+  // mode opens, and the call's door walks you back to your desk. `TARGET=call`
+  // still boots straight into the call-only scene for a quick spotlight look.
+  const target = String.fromEnvironment('TARGET', defaultValue: 'app');
+  const callScenario = String.fromEnvironment('SCENARIO', defaultValue: 'group');
+  const appScenario = String.fromEnvironment('SCENARIO', defaultValue: 'office');
   const participantsRaw = int.fromEnvironment('PARTICIPANTS');
   final participants = participantsRaw == 0 ? 4 : participantsRaw;
 
-  runApp(target == 'app' ? _buildApp(scenarioName, participants) : _buildCall(scenarioName, participants));
+  runApp(target == 'app' ? _buildApp(appScenario, participants) : _buildCall(callScenario, participants));
 }
 
 // ---- the call target --------------------------------------------------------
@@ -69,6 +75,14 @@ Widget _buildCall(String scenarioName, int participants) {
   // seam, driven here on purpose: this harness target exists for it.
   // ignore: invalid_use_of_visible_for_testing_member
   state.debugAttachCall(call);
+  // The scripted roster seats us in a huddle, and the call screen's control bar
+  // offers the real Leave door. Without a collector behind it that door calls
+  // `leaveHuddle()` on nothing and pops a spurious "Not connected to Gather." —
+  // a harness exit reporting itself as a failure. Stand a [FakeCollector] in so
+  // `leaveCluster()` resolves cleanly; it is attached, not started, so it never
+  // emits a roster of its own to fight the scripted one the driver pushes.
+  // ignore: invalid_use_of_visible_for_testing_member
+  state.debugAttachCollector(FakeCollector(participants: participants));
 
   final driver = CallScenarioDriver(
     state: state,
@@ -104,8 +118,64 @@ class _CallHarnessState extends State<_CallHarness> {
       title: 'Gather Companion — Harness',
       debugShowCheckedModeBanner: false,
       theme: buildGatherTheme(),
-      // Straight into the faces: no pairing, no home shell, no network boot.
-      home: CallScreen(state: widget.state),
+      // A stand-in "office" sits under the call so the door and the back arrow
+      // have somewhere to pop to — on the real app the call is pushed over the
+      // home shell, but this target boots straight into the faces, so without a
+      // route beneath it `Navigator.pop` is a no-op and there is no way out. The
+      // office auto-pushes the call on first frame, so you still land in it.
+      home: _HarnessOffice(state: widget.state),
+    );
+  }
+}
+
+/// The floor the simulated call stands on, so leaving it lands somewhere. It
+/// pushes the call itself on first frame — matching the app, where you are in the
+/// call when the screen appears — and offers a button to walk back in after you
+/// have left, so the leave/return loop can be driven on a bare simulator.
+class _HarnessOffice extends StatefulWidget {
+  const _HarnessOffice({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_HarnessOffice> createState() => _HarnessOfficeState();
+}
+
+class _HarnessOfficeState extends State<_HarnessOffice> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _enterCall());
+  }
+
+  void _enterCall() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        // The demo footage is wired in here, not in the app target: stand-in
+        // video for every face, since the simulator has no camera to fill them.
+        builder: (_) => CallScreen(state: widget.state, buildTile: demoFootageTile),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF171A23),
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Office (sim)', style: TextStyle(color: Colors.white70, fontSize: 18)),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _enterCall,
+              icon: const Icon(Icons.videocam),
+              label: const Text('Enter call'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -113,6 +183,12 @@ class _CallHarnessState extends State<_CallHarness> {
 // ---- the app target ---------------------------------------------------------
 
 Widget _buildApp(String scenarioName, int participants) {
+  // Every call opened from the walkable office — Dial warp, proximity huddle —
+  // gets stand-in footage in its tiles, since the simulator has no camera to fill
+  // them. One assignment, read by every `openCallScreen`.
+  // ignore: invalid_use_of_visible_for_testing_member
+  debugCallTileBuilder = demoFootageTile;
+
   final fake = FakeCollector(participants: participants);
   // One [ScriptedCall], held here so the driver can push call state onto the very
   // instance `AppState` builds on the first warp or proximity huddle — a warp's

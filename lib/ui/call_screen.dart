@@ -54,8 +54,16 @@ enum SpotlightMode { manual, auto }
 /// while nobody else is in the call, the control bar's own camera button.
 Future<void> openCallScreen(BuildContext context, AppState state) =>
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => CallScreen(state: state)),
+      MaterialPageRoute<void>(
+        builder: (_) => CallScreen(state: state, buildTile: debugCallTileBuilder),
+      ),
     );
+
+/// Harness-only override every [openCallScreen] picks up. The simulator has no
+/// camera, so the whole-app harness sets this to paint stand-in footage into the
+/// tiles; null in production, where the real `_VideoTile` renders real streams.
+@visibleForTesting
+CallTileBuilder? debugCallTileBuilder;
 
 /// One face to draw, resolved from call state and the roster.
 class CallTile {
