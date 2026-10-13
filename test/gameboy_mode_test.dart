@@ -247,6 +247,15 @@ void main() {
     });
 
     testWidgets('picking SafeNow prints its brand below the LCD; purple prints none', (tester) async {
+      // The brandmark rides the band below the LCD — a detail of the upright
+      // handheld, which the sideways (GBA) layout has no room for. Pin a portrait
+      // surface so the band is in the tree to assert on; the default test window is
+      // landscape.
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
       final state = configure(AppState())..setGameboyMode(true);
       await tester.pumpWidget(wrap(state));
       await tester.pumpAndSettle();
@@ -972,6 +981,38 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(seen, isEmpty, reason: 'the normal map owns its own camera');
       await sub.cancel();
+    });
+  });
+
+  group('held sideways, the handheld turns into a landscape console', () {
+    // Pinned explicitly even though the default window is already landscape, so the
+    // GBA layout the test asserts is the one it means and not an accident of the
+    // default surface.
+    void landscape(WidgetTester tester) {
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+    }
+
+    testWidgets('D-pad to the left of the LCD, A/B to the right, Select/Start below',
+        (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      landscape(tester);
+      await tester.pumpWidget(wrap(state));
+      await toOffice(tester);
+
+      final mid = tester.getRect(find.byType(GameboyShell)).center.dx;
+      final dpad = tester.getRect(find.byKey(const Key('gb-dpad'))).center.dx;
+      final a = tester.getRect(find.text('A')).center.dx;
+      final b = tester.getRect(find.text('B')).center.dx;
+
+      expect(dpad, lessThan(mid), reason: 'the cross is the left thumb');
+      expect(a, greaterThan(mid), reason: 'A is the right thumb');
+      expect(b, greaterThan(mid), reason: 'and so is B');
+      // Still reachable, just moved onto the chin below the screen.
+      expect(find.text('SELECT'), findsOneWidget);
+      expect(find.text('START'), findsOneWidget);
     });
   });
 }

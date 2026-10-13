@@ -18,6 +18,7 @@ import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
+import 'package:gather_companion/ui/control_bar.dart';
 import 'package:gather_companion/ui/person_avatar.dart';
 
 import 'fake_call.dart';
@@ -1055,6 +1056,65 @@ void main() {
         tile(videoLive: true, sharingScreen: true, stream: null).showsVideo,
         isFalse,
       );
+    });
+  });
+
+  group('held sideways, the faces take the width and the controls the edge', () {
+    // The default test window is already landscape (800×600); pin it explicitly so
+    // the intent is on the page and a future default change does not quietly flip
+    // these to portrait.
+    void landscape(WidgetTester tester) {
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+    }
+
+    testWidgets('the controls stand on the right as a rail, not across the bottom',
+        (tester) async {
+      landscape(tester);
+      await show(tester, stateWith(const CallState()));
+
+      final rect = tester.getRect(find.byType(ControlBar));
+      expect(rect.height, greaterThan(rect.width),
+          reason: 'the bar is stacked into a column, taller than it is wide');
+      expect(rect.center.dx, greaterThan(400),
+          reason: 'and sits against the right edge, not the middle');
+    });
+
+    testWidgets('a crowd scrolls off the right in wide tiles, not down the page',
+        (tester) async {
+      landscape(tester);
+      await show(
+        tester,
+        stateWith(const CallState(participants: [
+          CallParticipant(srcId: 'a', hasAudio: true),
+          CallParticipant(srcId: 'b', hasAudio: true),
+          CallParticipant(srcId: 'c', hasAudio: true),
+        ])),
+      );
+
+      final grid = tester.widget<GridView>(find.byType(GridView));
+      expect(grid.scrollDirection, Axis.horizontal);
+    });
+
+    testWidgets('two faces split side by side, not stacked', (tester) async {
+      landscape(tester);
+      await show(
+        tester,
+        stateWith(const CallState(
+            participants: [CallParticipant(srcId: 'a', hasAudio: true)])),
+      );
+
+      // Self plus one other: two tiles, and in landscape they divide the width.
+      final tiles = find.byType(TileFrame);
+      expect(tiles, findsNWidgets(2));
+      final a = tester.getRect(tiles.at(0));
+      final b = tester.getRect(tiles.at(1));
+      expect((a.center.dy - b.center.dy).abs(), lessThan(1),
+          reason: 'level with each other — a row, not a column');
+      expect((a.center.dx - b.center.dx).abs(), greaterThan(100),
+          reason: 'and set apart across the width');
     });
   });
 }

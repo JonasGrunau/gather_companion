@@ -393,45 +393,49 @@ class _GameboyShellState extends State<GameboyShell> {
       child: SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-          child: Column(
-            children: [
-              Expanded(
-                child: _Screen(
-                  state: widget.state,
-                  // The handheld's own snackbar, shown inside the LCD.
-                  toast: _toast,
-                  // Only live while somebody is in call distance; the prompt itself
-                  // decides when to show, this just gives it the action.
-                  onWave: _doWave,
-                  // The Select menu is the screen's overlay, not the device's: it
-                  // is handed in here so it clips to the LCD well and leaves the
-                  // plastic body showing around it.
-                  menu: _menuOpen
-                      ? _GameboyMenu(
-                          state: widget.state,
-                          rowKeys: _rowKeys,
-                          focusedRow: _row,
-                          focusedStatus: _status,
-                          focusedEmote: _emote,
-                          onStatus: _doStatus,
-                          onCamera: _doCamera,
-                          onReact: _doReact,
-                          onDial: _doDial,
-                          onActivity: _doActivity,
-                          onSettings: _doSettings,
-                          onDismiss: _closeMenu,
-                        )
-                      : null,
-                  child: widget.child,
-                ),
-              ),
-              // The band between the screen and the controls. Measured off the
-              // mock: the gap there is ~10% of the screen width, which lands at ~40
-              // logical pixels on a phone — a deliberate breath between the LCD and
-              // the D-pad, not the tight 8px of before. A theme may print its brand
-              // here (the DMG wordmark spot); a bare theme keeps the plain gap.
-              _BrandBand(theme: theme),
-              _ControlsDeck(
+          child: Builder(
+            builder: (context) {
+              // The LCD, built once and placed either above the controls (upright)
+              // or between the two thumbs (on its side). Same screen, same menu and
+              // toast, whichever way it is held.
+              final screen = _Screen(
+                state: widget.state,
+                // The handheld's own snackbar, shown inside the LCD.
+                toast: _toast,
+                // Only live while somebody is in call distance; the prompt itself
+                // decides when to show, this just gives it the action.
+                onWave: _doWave,
+                // The Select menu is the screen's overlay, not the device's: it
+                // is handed in here so it clips to the LCD well and leaves the
+                // plastic body showing around it.
+                menu: _menuOpen
+                    ? _GameboyMenu(
+                        state: widget.state,
+                        rowKeys: _rowKeys,
+                        focusedRow: _row,
+                        focusedStatus: _status,
+                        focusedEmote: _emote,
+                        onStatus: _doStatus,
+                        onCamera: _doCamera,
+                        onReact: _doReact,
+                        onDial: _doDial,
+                        onActivity: _doActivity,
+                        onSettings: _doSettings,
+                        onDismiss: _closeMenu,
+                      )
+                    : null,
+                child: widget.child,
+              );
+
+              // Held sideways there is no vertical room to stack LCD over controls,
+              // so the handheld turns into its landscape cousin: the D-pad to the
+              // left of the screen, A/B to the right, Select/Start below. The deck
+              // owns that arrangement — it is handed the [screen] to place between the
+              // thumbs — so its one B double-tap timer stays a single instance.
+              final landscape =
+                  MediaQuery.orientationOf(context) == Orientation.landscape;
+
+              final deck = _ControlsDeck(
                 state: widget.state,
                 menuOpen: _menuOpen,
                 onMenuMove: _move,
@@ -443,8 +447,26 @@ class _GameboyShellState extends State<GameboyShell> {
                 onWave: _doWave,
                 // Refusals (mute, the door) land in the LCD, not on the plastic.
                 onMessage: _say,
-              ),
-            ],
+                // Non-null only on its side, where the deck wraps the LCD rather than
+                // sitting below it.
+                landscapeScreen: landscape ? screen : null,
+              );
+
+              if (landscape) return deck;
+
+              return Column(
+                children: [
+                  Expanded(child: screen),
+                  // The band between the screen and the controls. Measured off the
+                  // mock: the gap there is ~10% of the screen width, which lands at
+                  // ~40 logical pixels on a phone — a deliberate breath between the
+                  // LCD and the D-pad, not the tight 8px of before. A theme may print
+                  // its brand here (the DMG wordmark spot); a bare theme keeps the gap.
+                  _BrandBand(theme: theme),
+                  deck,
+                ],
+              );
+            },
           ),
         ),
       ),
@@ -1147,10 +1169,16 @@ class _ControlsDeck extends StatefulWidget {
     required this.onMenuToggle,
     required this.onWave,
     required this.onMessage,
+    this.landscapeScreen,
   });
 
   final AppState state;
   final bool menuOpen;
+
+  /// The LCD to wrap when the handheld is on its side — the D-pad goes to its left,
+  /// A/B to its right, Select/Start below. Null upright, where the deck is just the
+  /// stacked controls below a screen the shell places itself.
+  final Widget? landscapeScreen;
   final void Function(String direction) onMenuMove;
   final VoidCallback onMenuConfirm;
   final VoidCallback onMenuClose;
@@ -1295,12 +1323,76 @@ class _ControlsDeckState extends State<_ControlsDeck> {
     }
   }
 
+  /// The D-pad, walking the office or driving the menu cursor. Its own listener on
+  /// [AppState.positions] so it dims exactly when there is nowhere to walk.
+  Widget _dpad() => ListenableBuilder(
+        listenable: state.positions,
+        builder: (context, _) => _GbDpad(
+          key: const Key('gb-dpad'),
+          enabled: menuOpen || state.canWalk,
+          // The menu drives the cursor, the office walks — name the gesture for
+          // whichever the pad is doing right now.
+          moveVerb: menuOpen ? 'Move' : 'Walk',
+          onPress: menuOpen ? onMenuMove : state.walk,
+          // Always stop walking on release. It is idempotent, and the case that
+          // matters is opening the menu with the pad still held: a no-op release
+          // there would let the walk timer outlive the lift and step the avatar
+          // forever. See [Walk.release].
+          onRelease: state.stopWalking,
+        ),
+      );
+
+  /// A: the cart, or — in the menu — the choose key, or — during a call — the way
+  /// back to the faces, the partner to the LCD banner's "Press A or tap". Lit while
+  /// the cart is latched on or a call is live; plain in the menu.
+  Widget _aButton(BuildContext context) => _GbRoundButton(
+        label: 'A',
+        size: 64,
+        lit: !menuOpen && (state.inCall || state.boost),
+        // A switch only when it means boost. In the menu it chooses, during a call
+        // it opens the call — both actions, so the glow there is not an "on" state
+        // the reader should announce.
+        toggled: (menuOpen || state.inCall) ? null : state.boost,
+        onTap: menuOpen
+            ? onMenuConfirm
+            : state.inCall
+                ? () => openCallScreen(context, state)
+                : () {
+                    HapticFeedback.selectionClick();
+                    state.boost = !state.boost;
+                    // Up for latched on, down for released.
+                    _sfx(state.boost ? GbSound.toggleOn : GbSound.toggleOff);
+                  },
+      );
+
+  /// B: mute, and — double-tapped while somebody is in call distance — a wave. Lit
+  /// means the mic is live. Inert in the menu, where a stray mute would surprise.
+  Widget _bButton() => _GbRoundButton(
+        label: 'B',
+        size: 64,
+        lit: !menuOpen && state.call.micOn,
+        toggled: menuOpen ? null : state.call.micOn,
+        onTap: menuOpen ? null : _tapB,
+      );
+
+  /// Select opens/closes the menu; Start goes home in the office and backs out of
+  /// the menu while it is up.
+  Widget _selectStart() => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _GbPill(label: 'SELECT', onTap: onMenuToggle),
+          const SizedBox(width: 22),
+          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+        ],
+      );
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) {
-        final call = state.call;
+        if (widget.landscapeScreen != null) return _landscape(context);
+
         // Two packed zones rather than one tall box with the keys pinned to its
         // edges: the cross and the A/B pair share an upper band, the SELECT/START
         // pair and the grille a lower one, with no dead plastic in between. The
@@ -1313,75 +1405,12 @@ class _ControlsDeckState extends State<_ControlsDeck> {
               height: _dpadSize,
               child: Stack(
                 children: [
-                  // D-pad, bottom-left. In the office it walks and dims when there
-                  // is nowhere to go; while the menu is up it drives the cursor
-                  // instead and is always live, because there is always a row to
-                  // move to.
-                  Positioned(
-                    left: 2,
-                    top: 0,
-                    child: ListenableBuilder(
-                      listenable: state.positions,
-                      builder: (context, _) => _GbDpad(
-                        key: const Key('gb-dpad'),
-                        enabled: menuOpen || state.canWalk,
-                        // The menu drives the cursor, the office walks — name the
-                        // gesture for whichever the pad is doing right now.
-                        moveVerb: menuOpen ? 'Move' : 'Walk',
-                        onPress: menuOpen ? onMenuMove : state.walk,
-                        // Always stop walking on release. It is idempotent, and the
-                        // case that matters is opening the menu with the pad still
-                        // held: a no-op release there would let the walk timer
-                        // outlive the lift and step the avatar forever. See
-                        // [Walk.release].
-                        onRelease: state.stopWalking,
-                      ),
-                    ),
-                  ),
-                  // A, raised and to the right: the cart, or — in the menu — the
-                  // choose key, or — during a call — the way back to the faces, the
-                  // partner to the LCD banner's "Press A or tap". Lit while the cart
-                  // is latched on or a call is live; plain in the menu.
-                  Positioned(
-                    right: 18,
-                    top: 30,
-                    child: _GbRoundButton(
-                      label: 'A',
-                      size: 64,
-                      lit: !menuOpen && (state.inCall || state.boost),
-                      // A switch only when it means boost. In the menu it chooses,
-                      // during a call it opens the call — both actions, so the glow
-                      // there is not an "on" state the reader should announce.
-                      toggled: (menuOpen || state.inCall) ? null : state.boost,
-                      onTap: menuOpen
-                          ? onMenuConfirm
-                          : state.inCall
-                              ? () => openCallScreen(context, state)
-                              : () {
-                                  HapticFeedback.selectionClick();
-                                  state.boost = !state.boost;
-                                  // Up for latched on, down for released.
-                                  _sfx(state.boost ? GbSound.toggleOn : GbSound.toggleOff);
-                                },
-                    ),
-                  ),
-                  // B, below and left of A: mute, and — double-tapped while somebody
-                  // is in call distance — a wave. Lit means the mic is live, so the
-                  // button glows when you are the one being heard. Inert in the
-                  // menu — it has no job there, and a stray mute mid-menu surprises.
-                  Positioned(
-                    right: 98,
-                    top: 66,
-                    child: _GbRoundButton(
-                      label: 'B',
-                      size: 64,
-                      lit: !menuOpen && call.micOn,
-                      // Mute is a real switch; inert in the menu, so no toggle state
-                      // there.
-                      toggled: menuOpen ? null : call.micOn,
-                      onTap: menuOpen ? null : _tapB,
-                    ),
-                  ),
+                  // D-pad, bottom-left.
+                  Positioned(left: 2, top: 0, child: _dpad()),
+                  // A, raised and to the right.
+                  Positioned(right: 18, top: 30, child: _aButton(context)),
+                  // B, below and left of A.
+                  Positioned(right: 98, top: 66, child: _bButton()),
                 ],
               ),
             ),
@@ -1397,28 +1426,57 @@ class _ControlsDeckState extends State<_ControlsDeck> {
                     bottom: 2,
                     child: _SpeakerGrille(),
                   ),
-                  Positioned.fill(
-                    child: Center(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Select opens the menu, and closes it again — a thumb
-                          // that opened it reaches for the same key to put it away.
-                          _GbPill(label: 'SELECT', onTap: onMenuToggle),
-                          const SizedBox(width: 22),
-                          // Start goes home in the office, and backs out of the menu
-                          // while it is up.
-                          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
-                        ],
-                      ),
-                    ),
-                  ),
+                  Positioned.fill(child: Center(child: _selectStart())),
                 ],
               ),
             ),
           ],
         );
       },
+    );
+  }
+
+  /// The handheld on its side: the LCD between the thumbs, D-pad left and A/B right,
+  /// Select/Start on the chin below. The same controls and the same B double-tap
+  /// timer as upright — only their arrangement turns ninety degrees. Each thumb
+  /// cluster is wrapped in a [FittedBox] so a short landscape phone scales the fixed
+  /// 135px cross and 64px keys down beside a full-height LCD rather than overflowing.
+  Widget _landscape(BuildContext context) {
+    Widget fit(Widget child) => FittedBox(fit: BoxFit.scaleDown, child: child);
+
+    final dpad = fit(
+      SizedBox(width: _dpadSize, height: _dpadSize, child: _dpad()),
+    );
+    // A upper-right, B lower-left — the same diagonal the upright deck has, laid out
+    // in a box the two 64px keys sit inside.
+    final ab = fit(
+      SizedBox(
+        width: 150,
+        height: 150,
+        child: Stack(
+          children: [
+            Positioned(top: 0, right: 0, child: _aButton(context)),
+            Positioned(bottom: 0, left: 0, child: _bButton()),
+          ],
+        ),
+      ),
+    );
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Padding(padding: const EdgeInsets.only(right: 8), child: dpad),
+        Expanded(
+          child: Column(
+            children: [
+              Expanded(child: widget.landscapeScreen!),
+              const SizedBox(height: 6),
+              _selectStart(),
+            ],
+          ),
+        ),
+        Padding(padding: const EdgeInsets.only(left: 8), child: ab),
+      ],
     );
   }
 }

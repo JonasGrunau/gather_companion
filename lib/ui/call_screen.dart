@@ -410,14 +410,22 @@ class _CallScreenState extends State<CallScreen> {
           final tiles = _tiles(widget.state);
           final spotlight = _effectiveSpotlight(tiles);
           final build = widget.buildTile ?? _defaultTile;
+          // Held sideways, the faces want the width and the controls move off the
+          // bottom onto a right-edge rail — otherwise the dock eats the little
+          // height there is and the tiles squish. Portrait is left exactly as it was.
+          final landscape =
+              MediaQuery.orientationOf(context) == Orientation.landscape;
           return Stack(
             children: [
               SafeArea(
                 child: Padding(
-                  // Clear of the island below, the way the shell's tabs clear the
-                  // rail. The reaction tray is not counted — it is up for a second
-                  // and may sit over the bottom of a face while it is.
-                  padding: const EdgeInsets.only(bottom: kControlDockInset),
+                  // Clear of the island, the way the shell's tabs clear the rail —
+                  // below it in portrait, beside it on the right in landscape. The
+                  // reaction tray is not counted: it is up for a second and may sit
+                  // over the edge of a face while it is.
+                  padding: landscape
+                      ? const EdgeInsets.only(right: kControlDockRailInset)
+                      : const EdgeInsets.only(bottom: kControlDockInset),
                   child: Column(
                     children: [
                       _Header(
@@ -433,6 +441,7 @@ class _CallScreenState extends State<CallScreen> {
                                     tiles: tiles,
                                     buildTile: build,
                                     onTapTile: _onTapTile,
+                                    landscape: landscape,
                                   )
                                 : _Spotlight(
                                     tiles: tiles,
@@ -448,6 +457,7 @@ class _CallScreenState extends State<CallScreen> {
                                     cropOn: _cropBig(_tileFor(tiles, spotlight)),
                                     onToggleCrop: () =>
                                         _toggleCrop(_tileFor(tiles, spotlight)),
+                                    landscape: landscape,
                                   ),
                       ),
                     ],
@@ -456,13 +466,22 @@ class _CallScreenState extends State<CallScreen> {
               ),
               // The controls follow you onto the faces — muting is the thing a
               // person looking at a call most wants — and the navigation does not:
-              // this is a place you go back from, not a fourth tab.
+              // this is a place you go back from, not a fourth tab. Along the bottom
+              // in portrait; stood on its side against the right edge in landscape.
               Positioned(
-                left: 0,
+                left: landscape ? null : 0,
                 right: 0,
+                top: landscape ? 0 : null,
                 bottom: 0,
                 child: DockIsland(
-                  children: [ControlBar(state: widget.state, onCallScreen: true)],
+                  vertical: landscape,
+                  children: [
+                    ControlBar(
+                      state: widget.state,
+                      onCallScreen: true,
+                      vertical: landscape,
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -753,6 +772,7 @@ class _Grid extends StatelessWidget {
     required this.tiles,
     required this.buildTile,
     required this.onTapTile,
+    this.landscape = false,
   });
 
   /// Nothing on top: the first face starts directly under the header, which
@@ -765,6 +785,12 @@ class _Grid extends StatelessWidget {
 
   /// Tapping a face enlarges it. See [_CallScreenState._onTapTile].
   final void Function(CallTile) onTapTile;
+
+  /// Whether the phone is held sideways. Two faces go side by side rather than
+  /// stacked, and a crowd scrolls off the right edge in wide tiles rather than
+  /// down the page in narrow ones — a landscape screen is short and wide, so the
+  /// portrait splits (stack two, two columns at 3:4) squish every face.
+  final bool landscape;
 
   @override
   Widget build(BuildContext context) {
@@ -785,23 +811,31 @@ class _Grid extends StatelessWidget {
       );
     }
     if (tiles.length == 2) {
+      // Two faces split the long axis: stacked up a tall portrait, side by side
+      // across a wide landscape — either way two halves rather than two slivers.
+      final children = [
+        Expanded(child: wrap(tiles.first)),
+        const SizedBox(width: 8, height: 8),
+        Expanded(child: wrap(tiles.last)),
+      ];
       return Padding(
         padding: _edges,
-        child: Column(
-          children: [
-            Expanded(child: wrap(tiles.first)),
-            const SizedBox(height: 8),
-            Expanded(child: wrap(tiles.last)),
-          ],
-        ),
+        child: landscape
+            ? Row(children: children)
+            : Column(children: children),
       );
     }
+    // A crowd: two columns scrolling down a portrait, two rows scrolling off the
+    // right across a landscape. The aspect flips with it — 3:4 upright, 4:3 on its
+    // side — so a tile keeps a face's shape instead of being squeezed into the one
+    // the other orientation wants.
     return GridView.count(
       padding: _edges,
+      scrollDirection: landscape ? Axis.horizontal : Axis.vertical,
       crossAxisCount: 2,
       mainAxisSpacing: 8,
       crossAxisSpacing: 8,
-      childAspectRatio: 3 / 4,
+      childAspectRatio: landscape ? 4 / 3 : 3 / 4,
       children: [for (final tile in tiles) wrap(tile)],
     );
   }
@@ -825,11 +859,17 @@ class _Spotlight extends StatelessWidget {
     required this.onReturn,
     required this.cropOn,
     required this.onToggleCrop,
+    this.landscape = false,
   });
 
   final List<CallTile> tiles;
   final String spotlightId;
   final CallTileBuilder buildTile;
+
+  /// Whether the phone is held sideways. The strip of other faces runs down the
+  /// right of the big face rather than across its foot — on a short wide screen a
+  /// horizontal strip under the big tile would halve what little height it has.
+  final bool landscape;
 
   /// The builder for the big face. Separate from [buildTile] so the big view can
   /// carry the fit toggle and pinch-zoom the strip does not.
@@ -856,72 +896,85 @@ class _Spotlight extends StatelessWidget {
       }
     }
 
+    // A 3:4 thumbnail either way; the strip's cross-thickness is [_stripHeight] and
+    // the thumbnail's other side follows from it.
+    const thumb = _stripHeight * 3 / 4;
+
+    final bigStack = Stack(
+      children: [
+        Positioned.fill(
+          child: KeyedSubtree(
+            key: ValueKey('big-${big.id}'),
+            child: buildBig(context, big),
+          ),
+        ),
+        // Back to the grid. Over the top-left of the big face, where it
+        // sits clear of the name plate along the bottom.
+        Positioned(
+          top: 8,
+          left: 8,
+          child: _OverviewButton(onTap: onReturn),
+        ),
+        // Crop/letterbox, top-right, opposite the way-out button. Only on
+        // a face with a frame on screen — there is nothing to fit over an
+        // avatar, whether the camera is off, paused, or never opened.
+        if (big.showsVideo)
+          Positioned(
+            top: 8,
+            right: 8,
+            child: _CropButton(cropOn: cropOn, onTap: onToggleCrop),
+          ),
+      ],
+    );
+
+    final strip = ListView.separated(
+      // Down the right in landscape, across the foot in portrait.
+      scrollDirection: landscape ? Axis.vertical : Axis.horizontal,
+      // Yourself first — the order [_tiles] already builds — so your own
+      // face is always where you reach for it, at the front of the strip.
+      itemCount: tiles.length,
+      separatorBuilder: (_, _) =>
+          SizedBox(width: landscape ? 0 : 8, height: landscape ? 8 : 0),
+      itemBuilder: (context, i) {
+        final tile = tiles[i];
+        final selected = tile.id == spotlightId;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => onTapTile(tile),
+          child: Container(
+            // Set the thumbnail's free side; the other is pinned by the strip's
+            // cross-axis. Upright the width is fixed and the height fills; on its
+            // side the height is fixed and the width fills.
+            width: landscape ? null : thumb,
+            height: landscape ? _stripHeight : null,
+            foregroundDecoration: selected
+                ? BoxDecoration(
+                    borderRadius: BorderRadius.circular(t.radius),
+                    border: Border.all(color: t.brand, width: 2),
+                  )
+                : null,
+            child: KeyedSubtree(
+              key: ValueKey('strip-${tile.id}'),
+              child: buildTile(context, tile),
+            ),
+          ),
+        );
+      },
+    );
+
+    final stripBox = landscape
+        ? SizedBox(width: thumb, child: strip)
+        : SizedBox(height: _stripHeight, child: strip);
+
+    final children = [
+      Expanded(child: bigStack),
+      SizedBox(width: landscape ? 8 : 0, height: landscape ? 0 : 8),
+      stripBox,
+    ];
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-      child: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: KeyedSubtree(
-                    key: ValueKey('big-${big.id}'),
-                    child: buildBig(context, big),
-                  ),
-                ),
-                // Back to the grid. Over the top-left of the big face, where it
-                // sits clear of the name plate along the bottom.
-                Positioned(
-                  top: 8,
-                  left: 8,
-                  child: _OverviewButton(onTap: onReturn),
-                ),
-                // Crop/letterbox, top-right, opposite the way-out button. Only on
-                // a face with a frame on screen — there is nothing to fit over an
-                // avatar, whether the camera is off, paused, or never opened.
-                if (big.showsVideo)
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: _CropButton(cropOn: cropOn, onTap: onToggleCrop),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: _stripHeight,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              // Yourself first — the order [_tiles] already builds — so your own
-              // face is always where you reach for it, at the front of the strip.
-              itemCount: tiles.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 8),
-              itemBuilder: (context, i) {
-                final tile = tiles[i];
-                final selected = tile.id == spotlightId;
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => onTapTile(tile),
-                  child: Container(
-                    width: _stripHeight * 3 / 4,
-                    foregroundDecoration: selected
-                        ? BoxDecoration(
-                            borderRadius: BorderRadius.circular(t.radius),
-                            border: Border.all(color: t.brand, width: 2),
-                          )
-                        : null,
-                    child: KeyedSubtree(
-                      key: ValueKey('strip-${tile.id}'),
-                      child: buildTile(context, tile),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
+      child: landscape ? Row(children: children) : Column(children: children),
     );
   }
 }
