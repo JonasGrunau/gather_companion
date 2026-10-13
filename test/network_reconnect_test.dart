@@ -117,4 +117,23 @@ void main() {
     state.debugNoteConnectivity([ConnectivityResult.wifi]);
     expect(collector.resyncs, base + 2);
   });
+
+  test('offline suspends the collector and a returning transport resumes it', () {
+    // Issue #8: the fix is not just raising the badge — it is telling the collector
+    // to stop trying. Offline, the collector must be suspended so it makes no
+    // reconnect attempts into the void; a returning transport resumes it.
+    final (:state, :collector, :tick) = wired();
+
+    state.debugNoteConnectivity([ConnectivityResult.wifi]);
+    tick(const Duration(seconds: 6));
+    collector.reachablesSet.clear(); // drop the baseline online signal
+
+    state.debugNoteConnectivity(const []); // flight mode
+    expect(collector.reachablesSet, [false],
+        reason: 'offline must suspend the collector, not just flag the badge');
+
+    state.debugNoteConnectivity([ConnectivityResult.wifi]); // transport back
+    expect(collector.reachablesSet, [false, true],
+        reason: 'a returning transport resumes reconnect attempts');
+  });
 }

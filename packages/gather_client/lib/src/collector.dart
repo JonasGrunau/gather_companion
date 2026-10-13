@@ -171,4 +171,9 @@ abstract interface class Collector {
   /// Reconnects, which is all a resync is here: the server replays the full state
   /// dump on every new connection.
   Future<({bool ok, String detail})> resync();
+
+  /// Suspends all reconnect attempts while the device reports no transport, and
+  /// resumes — reconnecting from the backoff floor — when one returns. Offline is a
+  /// known dead end: retrying into it only burns CPU and battery (issue #8).
+  void setReachable(bool reachable);
 }

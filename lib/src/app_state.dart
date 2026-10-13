@@ -2743,6 +2743,9 @@ class AppState extends ChangeNotifier {
       // by the now-stale baseline. Only adopt the probe if nothing arrived first.
       final seen = await _connectivityNow();
       _lastConnectivity ??= seen;
+      // Suspend the collector up front if we launched with no transport, so a phone
+      // opened in flight mode never starts the deaf-timer spin (issue #8).
+      _collector?.setReachable(!_isOffline());
     } on Object {
       // The watcher degrades to the deaf-timer, which is where we started.
     }
@@ -2792,6 +2795,9 @@ class AppState extends ChangeNotifier {
       // cooldown and fall back to the 45s deaf-timer — the very wait this watcher exists to avoid.
       _lastNetResync = null;
       final collector = _collector;
+      // Suspend reconnects outright: offline is a dead end and the deaf-timer would
+      // otherwise spin connect attempts that cannot succeed (issue #8). Idempotent.
+      collector?.setReachable(false);
       if (collector != null && !_link.isOffline) {
         _link = const LinkStatus(LinkState.offline, 'No connection — waiting for network.');
         _suspendOnlineActivity('no network');
@@ -2799,6 +2805,10 @@ class AppState extends ChangeNotifier {
       }
       return;
     }
+    // A transport is present again: lift the offline suspend before anything else, so
+    // the resync below — or the deaf-timer, if this event is filtered out as a repeat —
+    // is allowed to reconnect (issue #8). Idempotent while already reachable.
+    _collector?.setReachable(true);
     if (before != null &&
         before.length == now.length &&
         before.toSet().containsAll(now)) {
