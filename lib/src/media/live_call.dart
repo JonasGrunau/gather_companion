@@ -519,6 +519,27 @@ class LiveCall implements Call {
   }
 
   @override
+  Future<void> rebuild() async {
+    // Serialised like every other session-touching path, so a rebuild landing in
+    // the middle of a tap cannot interleave a capture restart with a produce.
+    await _serialise(() async {
+      // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
+      // cluster or tap builds one from scratch, which is the right amount of work.
+      if (_sfu == null && _listeningTo.isEmpty && !_wantMic && !_wantCamera) {
+        return null;
+      }
+      _log('call: rebuilding the media session after an external teardown');
+      // `_start` disposes the stale session, opens fresh transports, and replays
+      // the allow list, the conversation and the subscriptions — but not our
+      // producers, since only this class holds the tracks to put back.
+      await _start();
+      if (_wantMic) await _publish(SfuTag.audio);
+      if (_wantCamera) await _publish(SfuTag.video);
+      return null;
+    });
+  }
+
+  @override
   Future<void> dispose() async {
     await _engineSub?.cancel();
     _engineSub = null;

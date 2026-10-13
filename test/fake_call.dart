@@ -91,6 +91,12 @@ class FakeCall implements Call {
   @override
   Future<void> hangUp() async {}
 
+  /// How many times a media rebuild was forced on us (issue #41 self-heal).
+  int rebuilds = 0;
+
+  @override
+  Future<void> rebuild() async => rebuilds++;
+
   @override
   Future<void> dispose() async {
     await _states.close();

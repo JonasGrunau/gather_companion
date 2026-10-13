@@ -90,6 +90,9 @@ class ScriptedCall implements Call {
   Future<void> hangUp() async {}
 
   @override
+  Future<void> rebuild() async {}
+
+  @override
   Future<void> dispose() async {
     await _states.close();
     await _speaking.close();
