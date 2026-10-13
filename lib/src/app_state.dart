@@ -17,6 +17,7 @@ import 'push.dart';
 import 'reactions.dart';
 import 'settings.dart';
 import 'ui_preferences.dart';
+import '../ui/gameboy_theme.dart' show GameboyThemeId;
 
 /// Everything the UI reads. One object, so the whole app is a single
 /// `ListenableBuilder` away from being correct.
@@ -564,6 +565,11 @@ class AppState extends ChangeNotifier {
   /// Where I am, in tiles, or null before the first roster. Rounded, because its
   /// callers ask questions about tiles — which room am I in — rather than drawing.
   ({int x, int y})? get myTile {
+    // The optimistic tile while a walk is in flight, so room-and-ping questions
+    // agree with the avatar the map is actually drawing. Null at rest, when it
+    // falls through to the roster. See [Walk.leadTile] and [mePerson].
+    final lead = _walk?.leadTile;
+    if (lead != null) return lead;
     final me = _myRow();
     final x = me?.x, y = me?.y;
     if (x == null || y == null || !x.isFinite || !y.isFinite) return null;
@@ -578,18 +584,24 @@ class AppState extends ChangeNotifier {
     final me = _myRow();
     final x = me?.x, y = me?.y;
     if (me == null || x == null || y == null || !x.isFinite || !y.isFinite) return null;
+    // Drawn from the optimistic walk while steps are unconfirmed, so a press moves
+    // the body at once rather than after the round-trip that the roster takes to
+    // echo it back. Null at rest, where this falls through to the roster tile; the
+    // same deference [Walk.noteRoster] already pays, and the reason [gait] below is
+    // read off [Walk] too. See [Walk.leadTile].
+    final lead = _walk?.leadTile;
     return MapPerson(
       id: me.id,
       label: me.name ?? 'You',
-      x: x.toDouble(),
-      y: y.toDouble(),
+      x: (lead?.x ?? x).toDouble(),
+      y: (lead?.y ?? y).toDouble(),
       isFollowingMe: false,
       // Ours, not the roster's. See [amSpeaking] — the roster agrees a beat
       // later, and a beat is visible on your own avatar.
       speaking: _amSpeaking,
       dancing: me.dancing == true,
       avatarUrl: _collector?.avatarUrlFor(me.id),
-      direction: me.direction,
+      direction: _walk?.facing ?? me.direction,
       // Mine off [Walk] and not off the row. The gait changes twice inside a single
       // route and the roster is coalesced to a quarter of a second, so reading my own
       // back off the wire would show me climbing into the kart two tiles after the
@@ -683,6 +695,21 @@ class AppState extends ChangeNotifier {
     await _uiPrefs.saveGameboyMode(on);
   }
 
+  /// Which hardware skin Gameboy mode wears. A pure look preference — it swaps
+  /// only the handheld's plastic palette and the brand printed on it, never the
+  /// office inside the screen nor any behaviour — so it sits beside [gameboyMode]
+  /// as one more switch the app owns, read back at [boot] and persisted the moment
+  /// it changes. Silent: a theme earns no boot chime.
+  GameboyThemeId _gameboyTheme = GameboyThemeId.purple;
+  GameboyThemeId get gameboyTheme => _gameboyTheme;
+
+  Future<void> setGameboyTheme(GameboyThemeId id) async {
+    if (_gameboyTheme == id) return;
+    _gameboyTheme = id;
+    notifyListeners();
+    await _uiPrefs.saveGameboyThemeId(id.id);
+  }
+
   /// Whether the app's sound effects play — the handheld's blips, the boot
   /// jingle, and the speaker-test chime. On by default. This never touches
   /// in-call voice; it is a UI-sound switch only, read back at [boot] and
@@ -716,6 +743,7 @@ class AppState extends ChangeNotifier {
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
     _gameboyMode = await _uiPrefs.loadGameboyMode();
+    _gameboyTheme = GameboyThemeId.fromId(await _uiPrefs.loadGameboyThemeId());
     _soundEffects = await _uiPrefs.loadSoundEffects();
 
     // Launched straight into Gameboy mode with sounds on: no setter ran to warm
@@ -1190,6 +1218,39 @@ class AppState extends ChangeNotifier {
     return sendEmote(emote);
   }
 
+  /// Whether our own hand is up, as this phone has it.
+  ///
+  /// Local-first like [amSpeaking]: the button reflects the press at once and the
+  /// roster echo — `handRaisedAt` arriving on our own row — only confirms it. The
+  /// call tiles read this for our own face; everybody else's hand comes off the
+  /// roster, which is the only source there is for them.
+  bool get myHandRaised => _myHandRaised;
+  bool _myHandRaised = false;
+
+  /// Raises or lowers our hand in the meeting, showing it here before the wire
+  /// agrees. A no-op if it is already where asked, so the roster echo and the
+  /// speak-lowering below cannot stutter the button.
+  Future<void> setHandRaised(bool raised) async {
+    if (raised == _myHandRaised) return;
+    _myHandRaised = raised;
+    notifyListeners();
+    _collector?.setHandRaised(raised);
+  }
+
+  /// Flips the hand — the raise/lower toggle that lives in the React tray.
+  Future<void> toggleHandRaised() => setHandRaised(!_myHandRaised);
+
+  /// Drops our own hand once we are no longer in a meeting.
+  ///
+  /// The hand is a meetings-only gesture and the button that raises it is gone
+  /// the moment the call is, so a hand left up would have no way down from the UI
+  /// — and worse, it would ride into the next meeting. Walking out of a huddle is
+  /// the common case no explicit Lower press ever covers, which is why this hangs
+  /// off the roster fold rather than off [leaveHuddle].
+  void _lowerHandIfOutOfMeeting() {
+    if (_myHandRaised && !inCall) setHandRaised(false);
+  }
+
   /// When we last waved at each person, to hold the button back.
   ///
   /// The server does *not* rate-limit this — `presence_tracker` measured 41
@@ -1258,6 +1319,50 @@ class AppState extends ChangeNotifier {
 
   Set<String> _speakers = const {};
 
+  /// Wakes the call screen when a hand goes up or down in our conversation, and
+  /// reconciles our own hand against the roster the desktop also writes.
+  ///
+  /// The same narrow question as [_noteSpeakers], for the same reason: the
+  /// presence fold does not count a raised hand as a state change, so without this
+  /// a colleague's badge would hang at whatever it was when some unrelated frame
+  /// last woke the screen. Bounded to the huddle we are in, not the whole space.
+  ///
+  /// Our own hand is local-first in [setHandRaised], but the roster is the
+  /// authority the *desktop* writes to as well: raising or lowering the hand on the
+  /// computer moves our own row under us, and this phone must follow it or its
+  /// button and self tile go stale. We follow an actual transition on our own row
+  /// and ignore a roster that merely repeats the value we already hold, so the
+  /// optimistic press is confirmed by its own echo rather than stuttered by it.
+  void _noteHands(Roster roster) {
+    final mine = _myRow()?.clusterId;
+    final hands = <String>{
+      if (mine != null)
+        for (final row in roster.rows)
+          if (row.id != roster.selfId && row.clusterId == mine && row.handRaised)
+            row.id,
+    };
+
+    final ownHand = _myRow()?.handRaised ?? false;
+    var ownChanged = false;
+    if (ownHand != _rosterHandRaised) {
+      _rosterHandRaised = ownHand;
+      if (ownHand != _myHandRaised) {
+        _myHandRaised = ownHand;
+        ownChanged = true;
+      }
+    }
+
+    if (setEquals(hands, _handsUp) && !ownChanged) return;
+    _handsUp = hands;
+    notifyListeners();
+  }
+
+  Set<String> _handsUp = const {};
+
+  /// Our own hand as the last roster had it, to tell a desktop raise or lower from
+  /// a roster that only echoes the value this phone already holds. See [_noteHands].
+  bool _rosterHandRaised = false;
+
   /// Whether *we* are talking, measured from our own microphone.
   ///
   /// Read here rather than off the roster, even though the roster carries it
@@ -1281,6 +1386,11 @@ class AppState extends ChangeNotifier {
     // Locally first. The ring on this phone should not wait for Gather to agree.
     notifyListeners();
     _collector?.setSpeaking(speaking);
+    // Starting to talk lowers your hand: the raised hand was a request to speak,
+    // and now you are. Gather's own client does the same, and it saves the one
+    // person in the meeting who most needs their hand down from having to find
+    // the button for it.
+    if (speaking && _myHandRaised) setHandRaised(false);
   }
 
   /// Steps out of the conversation without walking away from it.
@@ -2561,6 +2671,10 @@ class AppState extends ChangeNotifier {
       // again — the one proof a walk-triggered recovery took, since we stayed
       // reported-connected throughout. Clears the recovery before its grace reconnects.
       onMovesConfirmed: () => _collector?.noteMovesConfirmed(),
+      // The movement wake, fired on each optimistic step so the avatar leaves on
+      // the press rather than on the roster that confirms it a round-trip later —
+      // the same `_positions.tick()` a roster and a party hop already pump.
+      onStepped: _positions.tick,
       log: _log,
     )..boost = _boost;
 
@@ -2580,12 +2694,16 @@ class AppState extends ChangeNotifier {
           _noteDirectory(roster);
           _noteCluster(roster);
           _noteSpeakers(roster);
+          _noteHands(roster);
           final out = _tracker.applyRoster(roster);
           _onFold(out);
           _noteMine();
           // After `_noteMine`, so it reads this roster's availability and the held
           // cluster `_noteCluster` just settled.
           _noteSelfHealth();
+          // After the fold, when `inCall` reflects this roster: a hand raised in a
+          // meeting we have since walked out of comes down here.
+          _lowerHandIfOutOfMeeting();
         }),
       )
       ..add(
@@ -2742,6 +2860,7 @@ class AppState extends ChangeNotifier {
     // inherited by whoever pairs this phone next.
     reactions.clear();
     _amSpeaking = false;
+    _myHandRaised = false;
 
     for (final sub in subs) {
       await sub.cancel();
@@ -2888,9 +3007,11 @@ class AppState extends ChangeNotifier {
     _noteDirectory(roster);
     _noteCluster(roster);
     _noteSpeakers(roster);
+    _noteHands(roster);
     _onFold(_tracker.applyRoster(roster));
     _noteMine();
     _noteSelfHealth();
+    _lowerHandIfOutOfMeeting();
   }
 
   /// Feeds a feed in as though Gather had answered, so the activity screen can be
