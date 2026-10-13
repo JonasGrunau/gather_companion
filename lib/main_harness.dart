@@ -51,12 +51,17 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light);
 
-  const target = String.fromEnvironment('TARGET', defaultValue: 'call');
-  const scenarioName = String.fromEnvironment('SCENARIO', defaultValue: 'group');
+  // One harness, the whole app, by default: the real pair→home→office flow with a
+  // fake backend, so the office is walkable, Dial warps into a real call, Gameboy
+  // mode opens, and the call's door walks you back to your desk. `TARGET=call`
+  // still boots straight into the call-only scene for a quick spotlight look.
+  const target = String.fromEnvironment('TARGET', defaultValue: 'app');
+  const callScenario = String.fromEnvironment('SCENARIO', defaultValue: 'group');
+  const appScenario = String.fromEnvironment('SCENARIO', defaultValue: 'office');
   const participantsRaw = int.fromEnvironment('PARTICIPANTS');
   final participants = participantsRaw == 0 ? 4 : participantsRaw;
 
-  runApp(target == 'app' ? _buildApp(scenarioName, participants) : _buildCall(scenarioName, participants));
+  runApp(target == 'app' ? _buildApp(appScenario, participants) : _buildCall(callScenario, participants));
 }
 
 // ---- the call target --------------------------------------------------------
@@ -170,6 +175,12 @@ class _HarnessOfficeState extends State<_HarnessOffice> {
 // ---- the app target ---------------------------------------------------------
 
 Widget _buildApp(String scenarioName, int participants) {
+  // Every call opened from the walkable office — Dial warp, proximity huddle —
+  // gets stand-in footage in its tiles, since the simulator has no camera to fill
+  // them. One assignment, read by every `openCallScreen`.
+  // ignore: invalid_use_of_visible_for_testing_member
+  debugCallTileBuilder = demoFootageTile;
+
   final fake = FakeCollector(participants: participants);
   // One [ScriptedCall], held here so the driver can push call state onto the very
   // instance `AppState` builds on the first warp or proximity huddle — a warp's
