@@ -1245,8 +1245,11 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         // Lost yourself off the edge of the floor? One tap brings the camera back. Shares
         // the bottom slot with the pills above, and defers to all of them — a selection
         // or a walk already has the slot and the camera's attention. Recomputed on every
-        // pan via [_view]; the [Positioned] is always mounted but collapses to nothing
-        // while there is no avatar to chase off screen.
+        // pan via [_view] and on every footstep via [_motion] — the avatar can leave the
+        // frame by the floor moving under it or by walking off the edge, and [_motion]'s
+        // interpolated legs notify only from its own ticker, not from [update]. The
+        // [Positioned] is always mounted but collapses to nothing while there is no
+        // avatar to chase off screen.
         Positioned(
           left: 0,
           right: 0,
@@ -1255,7 +1258,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
             top: false,
             child: Center(
               child: ListenableBuilder(
-                listenable: _view,
+                listenable: Listenable.merge([_view, _motion]),
                 builder: (_, _) {
                   final show = _selected == null &&
                       _selectedPerson == null &&
@@ -1451,37 +1454,37 @@ class _BackToMe extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
+    // Shape, colour and clip all on the [Material], with no [ClipRRect] or wrapping
+    // [ExcludeSemantics] — the same pattern as [_Kart], and for the same two reasons:
+    // ink is painted by the nearest Material in its own box, so a clip *below* it never
+    // catches the splash and the ripple spreads past the rounded corners; and excluding
+    // the descendants to hand the label to the outer node takes the [InkWell]'s tap
+    // action with them, leaving assistive tech a labelled button it cannot press.
     return Semantics(
       button: true,
       label: 'Back to me',
-      child: ExcludeSemantics(
-        child: Material(
-          color: Colors.transparent,
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(t.radius + 4),
-            child: Container(
-              color: t.card,
-              child: InkWell(
-                onTap: onTap,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.my_location_rounded, size: 18, color: t.foreground),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Back to me',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: t.foreground,
-                        ),
-                      ),
-                    ],
+      child: Material(
+        color: t.card,
+        borderRadius: BorderRadius.circular(t.radius + 4),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.my_location_rounded, size: 18, color: t.foreground),
+                const SizedBox(width: 8),
+                Text(
+                  'Back to me',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: t.foreground,
                   ),
                 ),
-              ),
+              ],
             ),
           ),
         ),
