@@ -247,6 +247,15 @@ void main() {
     });
 
     testWidgets('picking SafeNow prints its brand below the LCD; purple prints none', (tester) async {
+      // The brandmark rides the band below the LCD — a detail of the upright
+      // handheld, which the sideways (GBA) layout has no room for. Pin a portrait
+      // surface so the band is in the tree to assert on; the default test window is
+      // landscape.
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
       final state = configure(AppState())..setGameboyMode(true);
       await tester.pumpWidget(wrap(state));
       await tester.pumpAndSettle();
@@ -539,6 +548,44 @@ void main() {
 
       expect(collector.waves, ['a'],
           reason: 'the pending mute tap, not the live mic flag, decides the second tap');
+    });
+
+    testWidgets('a B double-tap survives a rotation between the two taps',
+        (tester) async {
+      // Regression: the deck must stay one `State` across an orientation change, or
+      // rotating between the two B taps would dispose it — cancelling the pending
+      // mute and losing the first tap's timestamp, so the second tap no longer
+      // waves. Upright and sideways the deck is the same element; only its layout
+      // turns.
+      tester.view.physicalSize = const Size(400, 800); // upright
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // First tap upright.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      // Turn the handheld on its side between the taps.
+      tester.view.physicalSize = const Size(800, 400); // on its side
+      await tester.pump();
+
+      // Second tap sideways, still inside the wall-clock double-tap window.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'the deck kept its double-tap state across the rotation');
     });
 
     testWidgets('a single B tap does not wave', (tester) async {
@@ -972,6 +1019,46 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(seen, isEmpty, reason: 'the normal map owns its own camera');
       await sub.cancel();
+    });
+  });
+
+  group('held sideways, the handheld turns into a landscape console', () {
+    // Pinned explicitly even though the default window is already landscape, so the
+    // GBA layout the test asserts is the one it means and not an accident of the
+    // default surface.
+    void landscape(WidgetTester tester) {
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+    }
+
+    testWidgets('D-pad and Select/Start left, A/B and the grille right, as the GBA lays them',
+        (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      landscape(tester);
+      await tester.pumpWidget(wrap(state));
+      await toOffice(tester);
+
+      final mid = tester.getRect(find.byType(GameboyShell)).center.dx;
+      final dpad = tester.getRect(find.byKey(const Key('gb-dpad'))).center.dx;
+      final a = tester.getRect(find.text('A')).center;
+      final b = tester.getRect(find.text('B')).center;
+      final select = tester.getRect(find.text('SELECT')).center.dx;
+      final start = tester.getRect(find.text('START')).center.dx;
+
+      expect(dpad, lessThan(mid), reason: 'the cross is the left thumb');
+      expect(a.dx, greaterThan(mid), reason: 'A is the right thumb');
+      expect(b.dx, greaterThan(mid), reason: 'and so is B');
+      // START/SELECT have left the chin and joined the D-pad on the left thumb, the
+      // way the GBA stacks them in the lower-left corner.
+      expect(select, lessThan(mid), reason: 'SELECT moved to the left side');
+      expect(start, lessThan(mid), reason: 'START moved to the left side');
+      // A high-right, B low-left, but tucked close — not the tall diagonal they had.
+      expect((a.dy - b.dy).abs(), lessThan(80),
+          reason: 'A and B sit nearly on one line, tight together');
+      // The horizontal speaker moulding fills the lower-right corner under A/B.
+      expect(find.byKey(const Key('gb-grille-landscape')), findsOneWidget);
     });
   });
 }

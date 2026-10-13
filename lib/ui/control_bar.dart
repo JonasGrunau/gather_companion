@@ -83,6 +83,10 @@ const _emotes = ['👋', '❤️', '🎉', '👍️', '🤣', '👏', '💯', '�
 /// system.
 const double _barHeight = 56;
 
+/// The control rail's thickness when the dock stands on its side in landscape —
+/// the width a vertical column of [_BarButton]s needs, mirroring [_barHeight].
+const double _barWidth = 56;
+
 /// How much taller the dock is while the office is carrying these.
 ///
 /// The shell already hands every tab the rail's height as bottom padding, which
@@ -99,6 +103,12 @@ const double kControlBarInset = _barHeight + 1;
 /// control row — the call screen's version of `kRailInset`, built the same way:
 /// the row, the island's border, the gap under it and the same eight of air.
 const double kControlDockInset = _barHeight + 2 + kRailGap + 8;
+
+/// The room a landscape screen leaves on its right for the [DockIsland] stood on
+/// its side as a rail — the width counterpart of [kControlDockInset], built the
+/// same way: the column's thickness, the island's border, the gap beside it and
+/// the same eight of air.
+const double kControlDockRailInset = _barWidth + 2 + kRailGap + 8;
 
 /// The floating island the dock's rows sit in.
 ///
@@ -120,38 +130,50 @@ const double kControlDockInset = _barHeight + 2 + kRailGap + 8;
 /// [AnimatedSize] anchored at the bottom does that, and the reaction tray, which is a
 /// row too, pushes the island upwards rather than floating over it.
 class DockIsland extends StatelessWidget {
-  const DockIsland({super.key, required this.children});
+  const DockIsland({super.key, required this.children, this.vertical = false});
 
   final List<Widget> children;
+
+  /// Whether the island stands on its side as a right-edge rail (landscape),
+  /// rather than lying flat at the bottom. The same pill and the same children;
+  /// only the axis it sizes and stacks along flips. See [ControlBar], which is the
+  /// one caller that passes its rows pre-arranged into a column for this.
+  final bool vertical;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
 
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.only(bottom: kRailGap),
-        child: Center(
-          child: Container(
-            decoration: BoxDecoration(
-              // Solid, unlike the legend it otherwise copies. The legend is a
-              // hint that sits over floor and is allowed to let the floor
-              // through; this is navigation, it sits wherever the office
-              // happens to be busiest, and at 0.92 the desks and chairs came
-              // through it and read as dirt on the glass.
-              color: t.card,
-              border: Border.all(color: t.border),
-              borderRadius: BorderRadius.circular(t.radius + 10),
-            ),
-            // So a row on its way out is clipped by the island's own corners
-            // rather than spilling past them mid-animation.
-            clipBehavior: Clip.antiAlias,
-            child: AnimatedSize(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.bottomCenter,
-              child: IntrinsicWidth(
+    final island = Container(
+      decoration: BoxDecoration(
+        // Solid, unlike the legend it otherwise copies. The legend is a
+        // hint that sits over floor and is allowed to let the floor
+        // through; this is navigation, it sits wherever the office
+        // happens to be busiest, and at 0.92 the desks and chairs came
+        // through it and read as dirt on the glass.
+        color: t.card,
+        border: Border.all(color: t.border),
+        borderRadius: BorderRadius.circular(t.radius + 10),
+      ),
+      // So a row on its way out is clipped by the island's own corners
+      // rather than spilling past them mid-animation.
+      clipBehavior: Clip.antiAlias,
+      child: AnimatedSize(
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+        // Grows up from the floor flat, and in from the right edge on its side.
+        alignment: vertical ? Alignment.centerRight : Alignment.bottomCenter,
+        // On its side the island hugs its content's height and is handed a single
+        // pre-built child; flat it sizes to its widest row with a floor under it so
+        // it does not lurch as rows come and go.
+        child: vertical
+            ? IntrinsicHeight(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: children,
+                ),
+              )
+            : IntrinsicWidth(
                 // Inside the IntrinsicWidth, so a control row that genuinely
                 // outgrows the floor can still widen the whole island.
                 child: ConstrainedBox(
@@ -163,8 +185,26 @@ class DockIsland extends StatelessWidget {
                   ),
                 ),
               ),
-            ),
-          ),
+      ),
+    );
+
+    return SafeArea(
+      // Flat it clears the home indicator below; on its side the rail still runs
+      // down to the bottom edge, where the landscape home indicator sits, so the
+      // bottom inset is kept in both orientations — and the right inset is added
+      // on its side to clear the notch/rounded corner the screen is pinned to.
+      top: false,
+      right: vertical,
+      child: Padding(
+        padding: vertical
+            ? const EdgeInsets.only(right: kRailGap)
+            : const EdgeInsets.only(bottom: kRailGap),
+        // On its side the rail only drops its `left` constraint, so its box spans
+        // the full width; pin the island to the right edge rather than letting a
+        // plain centre float it back toward the middle of the screen.
+        child: Align(
+          alignment: vertical ? Alignment.centerRight : Alignment.center,
+          child: island,
         ),
       ),
     );
@@ -172,13 +212,24 @@ class DockIsland extends StatelessWidget {
 }
 
 class ControlBar extends StatefulWidget {
-  const ControlBar({super.key, required this.state, this.onCallScreen = false});
+  const ControlBar({
+    super.key,
+    required this.state,
+    this.onCallScreen = false,
+    this.vertical = false,
+  });
 
   final AppState state;
 
   /// Whether this bar is already sitting on the faces, where a button leading to
   /// them would open the screen on top of itself.
   final bool onCallScreen;
+
+  /// Whether the controls stack into a right-edge rail (landscape) instead of
+  /// spreading along the bottom. The same buttons in the same order; only the axis
+  /// flips, and the reaction tray opens to the left of the rail rather than above
+  /// it. Set by [CallScreen] when the faces are held sideways. See [DockIsland].
+  final bool vertical;
 
   @override
   State<ControlBar> createState() => _ControlBarState();
@@ -281,7 +332,7 @@ class _ControlBarState extends State<ControlBar> {
   /// one is a guided flow over a map you cannot edit from a phone. So with no desk
   /// the door exists only while there is a conversation to leave — dimming it would
   /// tell somebody who has never had a desk that they are sitting at it.
-  Widget _doorButton(BuildContext context, AppState state) {
+  Widget _doorButton(BuildContext context, AppState state, {bool vertical = false}) {
     final hasDesk = state.myDesk != null;
     final inHuddle = state.inHuddle;
     if (!hasDesk && !inHuddle) return const SizedBox.shrink();
@@ -290,10 +341,11 @@ class _ControlBarState extends State<ControlBar> {
     // The hairline travels with the door rather than sitting in the bar's own
     // row, so it exists exactly when the door does: a rule with nothing after it
     // would be a group with no members.
-    return Row(
+    return Flex(
+      direction: vertical ? Axis.vertical : Axis.horizontal,
       mainAxisSize: MainAxisSize.min,
       children: [
-        const _Rule(),
+        _Rule(forColumn: vertical),
         _BarButton(
           icon: Icons.logout_rounded,
           label: inHuddle
@@ -316,137 +368,162 @@ class _ControlBarState extends State<ControlBar> {
     final t = context.tokens;
     final state = widget.state;
     final call = state.call;
+    final vertical = widget.vertical;
 
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      // The dock stretches this to the island's width; this passes that width on
-      // to both rows, so the tray's eight reactions and the controls above the
-      // navigation all divide the same span instead of each finding their own.
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // A row of the same island rather than a thing floating over it: the tray
-        // pushes the dock upwards when it opens and lets it back down when the
-        // React button closes it, so nothing ever overlaps anything.
-        AnimatedSize(
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-          alignment: Alignment.bottomCenter,
-          child: _tray
-              ? _Tray(
-                  onPick: _send,
-                  // Only while there is a meeting to raise a hand in — the tray is
-                  // eight reactions and nothing else over the map, as it always was.
-                  showHand: state.inCall,
-                  handRaised: state.myHandRaised,
-                  onToggleHand: _toggleHand,
-                )
-              : const SizedBox(width: double.infinity),
+    // The same buttons in the same order whichever way the bar faces — only the
+    // dividers lie flat instead of standing up, and the door folds itself the same
+    // way below.
+    final controls = <Widget>[
+      _SelfButton(state: state, onTap: () => showStatusSheet(context, state)),
+      _Rule(forColumn: vertical),
+      _BarButton(
+        icon: call.micOn ? Icons.mic_rounded : Icons.mic_off_rounded,
+        label: call.micOn ? 'Mute' : 'Unmute',
+        // Brand while it is live, and the bar's ordinary resting grey once
+        // it is not. See the header: the crossed-out glyph is the state.
+        tint: call.micOn ? t.brand : t.mutedForeground,
+        onTap: () => _run(() => state.setMicOn(!call.micOn)),
+      ),
+      _BarButton(
+        icon: call.cameraOn ? Icons.videocam_rounded : Icons.videocam_off_rounded,
+        label: call.cameraOn ? 'Turn the camera off' : 'Turn the camera on',
+        tint: call.cameraOn ? t.brand : t.mutedForeground,
+        onTap: () => _run(() => state.setCameraOn(!call.cameraOn)),
+      ),
+      // Only on the faces, and only once there is a camera running to flip.
+      // Flipping is something you do while looking at your own picture;
+      // over the map there is no picture, so the button was a guess at
+      // which way the camera now faced. Absent rather than dimmed, like
+      // everything else here.
+      if (call.cameraOn && widget.onCallScreen)
+        _BarButton(
+          icon: Icons.cameraswitch_rounded,
+          label: 'Switch camera',
+          onTap: state.switchCamera,
         ),
-        SizedBox(
-          height: _barHeight,
-          child: Row(
-            // Spread across the dock's width rather than bunched at the left, so
-            // the row reads as the island's contents and not as a strip taped to
-            // one end of it.
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              _SelfButton(state: state, onTap: () => showStatusSheet(context, state)),
-              const _Rule(),
-              _BarButton(
-                icon: call.micOn ? Icons.mic_rounded : Icons.mic_off_rounded,
-                label: call.micOn ? 'Mute' : 'Unmute',
-                // Brand while it is live, and the bar's ordinary resting grey once
-                // it is not. See the header: the crossed-out glyph is the state.
-                tint: call.micOn ? t.brand : t.mutedForeground,
-                onTap: () => _run(() => state.setMicOn(!call.micOn)),
-              ),
-              _BarButton(
-                icon: call.cameraOn ? Icons.videocam_rounded : Icons.videocam_off_rounded,
-                label: call.cameraOn ? 'Turn the camera off' : 'Turn the camera on',
-                tint: call.cameraOn ? t.brand : t.mutedForeground,
-                onTap: () => _run(() => state.setCameraOn(!call.cameraOn)),
-              ),
-              // Only on the faces, and only once there is a camera running to flip.
-              // Flipping is something you do while looking at your own picture;
-              // over the map there is no picture, so the button was a guess at
-              // which way the camera now faced. Absent rather than dimmed, like
-              // everything else here.
-              if (call.cameraOn && widget.onCallScreen)
-                _BarButton(
-                  icon: Icons.cameraswitch_rounded,
-                  label: 'Switch camera',
-                  onTap: state.switchCamera,
-                ),
-              // The way to your own picture while nobody else is in the call.
-              // Turning the camera on and having nowhere to see it reads as the
-              // camera not working, which is exactly how this was first
-              // reported. In a call the banner across the top of the shell is
-              // the way to the faces instead, so this goes — two doors to one
-              // room, one of them in the bar you are trying to mute from.
-              if (call.cameraOn && !state.inCall && !widget.onCallScreen)
-                _BarButton(
-                  icon: Icons.groups_rounded,
-                  label: 'See your camera',
-                  onTap: () => openCallScreen(context, state),
-                ),
-              // The sound's way out. Present only while there is sound to route —
-              // somebody else in the call, or your own hardware live. The
-              // loudspeaker is the resting-on-a-desk default and wears the brand;
-              // the earpiece is the ordinary grey. A headset, once it is in, owns
-              // the route and the glyph, and a tap still forces the speaker over it.
-              if (call.live || state.inCall)
-                _BarButton(
-                  icon: switch (call.audioOutput) {
-                    AudioOutput.speaker => Icons.volume_up_rounded,
-                    AudioOutput.earpiece => Icons.phone_in_talk_rounded,
-                    AudioOutput.bluetooth => Icons.bluetooth_audio_rounded,
-                    AudioOutput.wired => Icons.headset_rounded,
-                  },
-                  label: switch (call.audioOutput) {
-                    AudioOutput.speaker => 'Use the earpiece',
-                    AudioOutput.earpiece => 'Use the speaker',
-                    AudioOutput.bluetooth => 'On Bluetooth — tap for the speaker',
-                    AudioOutput.wired => 'On headphones — tap for the speaker',
-                  },
-                  tint: call.audioOutput == AudioOutput.speaker
-                      ? t.brand
-                      : t.mutedForeground,
-                  onTap: () => _run(() =>
-                      state.setSpeakerOn(call.audioOutput != AudioOutput.speaker)),
-                ),
-              const _Rule(),
-              // React and raise-hand are one button now. Raise-hand used to sit
-              // beside React as a tenth control, and on a phone the bar ran out of
-              // width for it: the gaps collapsed and the door was crushed against
-              // the right edge. Both are the same gesture to the same room — "look
-              // at me for a second" — so the hand moved into the tray React already
-              // opens. What is lost by hiding it there is the at-a-glance raised
-              // state, so the amber the tile wears rides back up onto this button:
-              // a dot while the tray is closed, the switch itself once it is open.
-              _BarButton(
-                icon: Icons.add_reaction_outlined,
-                label: state.inCall && state.myHandRaised
-                    ? 'React, hand raised'
-                    : 'React',
-                on: _tray,
-                badge: state.inCall && state.myHandRaised,
-                onTap: _toggleTray,
-              ),
-              // Its own listener. Walking is deliberately not a `notifyListeners`
-              // — movement must not wake the whole tree — and this is the one
-              // control in the bar whose answer changes as you walk. Without it the
-              // button stays red under the thumb that pressed it until something
-              // unrelated happens to rebuild the bar. A conversation starting or
-              // ending does notify, so that half of its answer needs no listener.
-              ListenableBuilder(
-                listenable: state.positions,
-                builder: (context, _) => _doorButton(context, state),
-              ),
-            ],
-          ),
+      // The way to your own picture while nobody else is in the call.
+      // Turning the camera on and having nowhere to see it reads as the
+      // camera not working, which is exactly how this was first
+      // reported. In a call the banner across the top of the shell is
+      // the way to the faces instead, so this goes — two doors to one
+      // room, one of them in the bar you are trying to mute from.
+      if (call.cameraOn && !state.inCall && !widget.onCallScreen)
+        _BarButton(
+          icon: Icons.groups_rounded,
+          label: 'See your camera',
+          onTap: () => openCallScreen(context, state),
         ),
-      ],
+      // The sound's way out. Present only while there is sound to route —
+      // somebody else in the call, or your own hardware live. The
+      // loudspeaker is the resting-on-a-desk default and wears the brand;
+      // the earpiece is the ordinary grey. A headset, once it is in, owns
+      // the route and the glyph, and a tap still forces the speaker over it.
+      if (call.live || state.inCall)
+        _BarButton(
+          icon: switch (call.audioOutput) {
+            AudioOutput.speaker => Icons.volume_up_rounded,
+            AudioOutput.earpiece => Icons.phone_in_talk_rounded,
+            AudioOutput.bluetooth => Icons.bluetooth_audio_rounded,
+            AudioOutput.wired => Icons.headset_rounded,
+          },
+          label: switch (call.audioOutput) {
+            AudioOutput.speaker => 'Use the earpiece',
+            AudioOutput.earpiece => 'Use the speaker',
+            AudioOutput.bluetooth => 'On Bluetooth — tap for the speaker',
+            AudioOutput.wired => 'On headphones — tap for the speaker',
+          },
+          tint: call.audioOutput == AudioOutput.speaker
+              ? t.brand
+              : t.mutedForeground,
+          onTap: () => _run(() =>
+              state.setSpeakerOn(call.audioOutput != AudioOutput.speaker)),
+        ),
+      _Rule(forColumn: vertical),
+      // React and raise-hand are one button now. Raise-hand used to sit
+      // beside React as a tenth control, and on a phone the bar ran out of
+      // width for it: the gaps collapsed and the door was crushed against
+      // the right edge. Both are the same gesture to the same room — "look
+      // at me for a second" — so the hand moved into the tray React already
+      // opens. What is lost by hiding it there is the at-a-glance raised
+      // state, so the amber the tile wears rides back up onto this button:
+      // a dot while the tray is closed, the switch itself once it is open.
+      _BarButton(
+        icon: Icons.add_reaction_outlined,
+        label: state.inCall && state.myHandRaised
+            ? 'React, hand raised'
+            : 'React',
+        on: _tray,
+        badge: state.inCall && state.myHandRaised,
+        onTap: _toggleTray,
+      ),
+      // Its own listener. Walking is deliberately not a `notifyListeners`
+      // — movement must not wake the whole tree — and this is the one
+      // control in the bar whose answer changes as you walk. Without it the
+      // button stays red under the thumb that pressed it until something
+      // unrelated happens to rebuild the bar. A conversation starting or
+      // ending does notify, so that half of its answer needs no listener.
+      ListenableBuilder(
+        listenable: state.positions,
+        builder: (context, _) => _doorButton(context, state, vertical: vertical),
+      ),
+    ];
+
+    // The controls themselves: spread along the bottom flat, stacked snug in the
+    // rail on their side.
+    final bar = vertical
+        ? SizedBox(
+            width: _barWidth,
+            child: Column(mainAxisSize: MainAxisSize.min, children: controls),
+          )
+        : SizedBox(
+            height: _barHeight,
+            child: Row(
+              // Spread across the dock's width rather than bunched at the left, so
+              // the row reads as the island's contents and not as a strip taped to
+              // one end of it.
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: controls,
+            ),
+          );
+
+    // The reaction tray, a row of the same island rather than a thing floating over
+    // it: flat it pushes the dock upwards when it opens; in the rail it grows out to
+    // the left. [_Tray] divides a width across its eight, so on its side it is handed
+    // a fixed span to split rather than the island's own (which is only a button wide).
+    final tray = AnimatedSize(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      alignment: vertical ? Alignment.centerRight : Alignment.bottomCenter,
+      child: _tray
+          ? SizedBox(
+              width: vertical ? kRailMinWidth : double.infinity,
+              child: _Tray(
+                onPick: _send,
+                // Only while there is a meeting to raise a hand in — the tray is
+                // eight reactions and nothing else over the map, as it always was.
+                showHand: state.inCall,
+                handRaised: state.myHandRaised,
+                onToggleHand: _toggleHand,
+              ),
+            )
+          : SizedBox(width: vertical ? 0 : double.infinity),
     );
+
+    return vertical
+        ? Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [tray, bar],
+          )
+        : Column(
+            mainAxisSize: MainAxisSize.min,
+            // The dock stretches this to the island's width; this passes that width
+            // on to both rows, so the tray's eight reactions and the controls above
+            // the navigation all divide the same span instead of each finding their
+            // own.
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [tray, bar],
+          );
   }
 }
 
@@ -615,13 +692,19 @@ class _BarButton extends StatelessWidget {
 /// of it. The last one is drawn by [_ControlBarState._doorButton] itself, so it
 /// comes and goes with the door.
 class _Rule extends StatelessWidget {
-  const _Rule();
+  const _Rule({this.forColumn = false});
+
+  /// Whether the divider lies flat between stacked buttons (the landscape rail)
+  /// rather than standing upright between buttons in a row. Same hairline, rotated.
+  final bool forColumn;
 
   @override
   Widget build(BuildContext context) => Container(
-        width: 1,
-        height: 24,
-        margin: const EdgeInsets.symmetric(horizontal: 5),
+        width: forColumn ? 24 : 1,
+        height: forColumn ? 1 : 24,
+        margin: forColumn
+            ? const EdgeInsets.symmetric(vertical: 5)
+            : const EdgeInsets.symmetric(horizontal: 5),
         color: context.tokens.border,
       );
 }
