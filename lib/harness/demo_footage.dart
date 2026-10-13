@@ -79,11 +79,17 @@ class _DemoFootageState extends State<DemoFootage>
     Size(1080, 1080), // 1:1 square
   ];
 
+  /// Cover (crop the long edge) vs contain (letterbox, bars on the short edge).
+  /// The app's own Fit/Fill button only shows over a real video stream, which the
+  /// simulator cannot make — so the toggle lives here, on a double-tap, to make
+  /// the letterbox behaviour reachable on a bare sim.
+  bool _contain = false;
+
   @override
   Widget build(BuildContext context) {
-    // A source card in this person's camera shape, scaled to *cover* the tile
-    // (cropping the long edge) and made zoomable — the two behaviours the user
-    // wants to eyeball, now across a mix of aspects.
+    // A source card in this person's camera shape, scaled to cover or letterbox
+    // the tile and made zoomable — the behaviours the user wants to eyeball,
+    // across a mix of aspects.
     final shape = _aspects[widget.seed.hashCode.abs() % _aspects.length];
     final card = SizedBox(
       width: shape.width,
@@ -99,24 +105,37 @@ class _DemoFootageState extends State<DemoFootage>
         ),
       ),
     );
-    final fitted = ClipRect(
-      child: SizedBox.expand(
-        child: FittedBox(
-          fit: BoxFit.cover,
-          clipBehavior: Clip.hardEdge,
-          child: card,
+    final fitted = ColoredBox(
+      // The letterbox bars: black shows through wherever a contained frame does
+      // not reach, top-and-bottom or side, exactly as a real video would bar.
+      color: Colors.black,
+      child: ClipRect(
+        child: SizedBox.expand(
+          child: FittedBox(
+            fit: _contain ? BoxFit.contain : BoxFit.cover,
+            clipBehavior: Clip.hardEdge,
+            child: card,
+          ),
         ),
       ),
     );
     final zoomable =
         InteractiveViewer(minScale: 1, maxScale: 5, child: fitted);
-    return widget.mirror
+    final mirrored = widget.mirror
         ? Transform(
             alignment: Alignment.center,
             transform: Matrix4.identity()..scaleByDouble(-1.0, 1.0, 1.0, 1.0),
             child: zoomable,
           )
         : zoomable;
+    // Double-tap toggles cover/letterbox. Behaviour.opaque so the whole tile is
+    // the target; InteractiveViewer keeps the drag/pinch, which it does not use
+    // double-tap for.
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onDoubleTap: () => setState(() => _contain = !_contain),
+      child: mirrored,
+    );
   }
 }
 
@@ -158,6 +177,14 @@ class _TestCardPainter extends CustomPainter {
     _edge(canvas, 'LEFT', Offset(70, size.height / 2), line);
     _edge(canvas, 'RIGHT', Offset(size.width - 70, size.height / 2), line);
 
+    // A bright band sweeping left→right, so the motion reads at a glance even on
+    // a thumbnail — bigger and faster than the dot alone.
+    final sweepX = size.width * ((phase * 1.0) % 1);
+    canvas.drawRect(
+      Rect.fromLTWH(sweepX - size.width * 0.04, 0, size.width * 0.08, size.height),
+      Paint()..color = Colors.white.withValues(alpha: 0.12),
+    );
+
     // A bouncing dot, so the feed is unmistakably moving rather than a still.
     final dx = size.width * (0.1 + 0.8 * _tri(phase));
     final dy = size.height * (0.15 + 0.7 * _tri((phase + 0.33) % 1));
@@ -170,6 +197,12 @@ class _TestCardPainter extends CustomPainter {
     // The name, big, dead centre.
     _text(canvas, label, size.center(Offset.zero), line.withValues(alpha: 0.9),
         64, FontWeight.w700);
+
+    // A running frame counter, bottom-left, so "live" is unambiguous — a still
+    // would freeze it.
+    final frame = (phase * 120).floor().toString().padLeft(3, '0');
+    _text(canvas, '#$frame', Offset(70, size.height - 80),
+        line.withValues(alpha: 0.9), 28, FontWeight.w700);
   }
 
   /// Triangle wave 0..1..0, for a bounce that turns around rather than jumping.
