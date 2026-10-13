@@ -682,6 +682,53 @@ void main() {
         clock.elapse(const Duration(seconds: 1));
       });
     });
+
+    test('heals one denied peer while the room already has sound', () {
+      // Issue #52: a single colleague denied in an otherwise-healthy call. The
+      // room has consumers, so the old room-level watchdog stood down and the
+      // denied peer stayed silent for the whole call. The per-peer heal must
+      // re-request that one peer without disturbing the working one.
+      fakeAsync((clock) {
+        const other = 'acct-other';
+        rig.addresses[other] = nodeA;
+
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // Peer A joins and is consumed: the room now holds a consumer.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes, isNotEmpty,
+            reason: 'peer A should be receiving, so the room has sound');
+
+        // Peer B joins but the SFU denies the consume.
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node().push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+        rig.node().drain();
+
+        // The grace window passes. Despite A's live consumer, the watchdog must
+        // re-request the stranded B rather than stand down.
+        clock.elapse(const Duration(seconds: 6));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), other), greaterThan(0),
+            reason: 'the stranded peer must be re-requested even with the '
+                'room already receiving');
+
+        // B is announced this time and a consumer is built; both peers receive.
+        rig.announce(other, {'audio': 'p-audio-2'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes.map((r) => r.srcId),
+            containsAll(<String>[them, other]));
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
   });
 
   group('send-side stall', () {
