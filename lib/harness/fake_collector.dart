@@ -326,4 +326,12 @@ class FakeCollector implements Collector {
     publish();
     return (ok: true, detail: 'simulator; a fresh roster follows');
   }
+
+  /// Reachability flags we were told, in order — so a test can assert AppState's
+  /// connectivity signal reached the collector (issue #8). A no-op otherwise: the
+  /// simulator has no socket to suspend.
+  final List<bool> reachablesSet = [];
+
+  @override
+  void setReachable(bool reachable) => reachablesSet.add(reachable);
 }

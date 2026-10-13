@@ -187,6 +187,12 @@ class DirectCollector implements Collector {
   Timer? _heartbeatTimer;
   Duration _backoff = const Duration(seconds: 1);
   bool _stopped = false;
+
+  /// Whether the device reports a usable transport. False suspends every
+  /// reconnect: offline is a known dead end, and retrying into it only spins the
+  /// CPU and burns battery (issue #8). Defaults true so nothing changes until
+  /// [AppState] seeds it from `connectivity_plus`.
+  bool _reachable = true;
   bool _healthy = false;
   String? _lastDetail;
   bool _dirty = false;
@@ -331,6 +337,29 @@ class DirectCollector implements Collector {
     _backoff = const Duration(seconds: 1);
     _connectNow();
     return (ok: true, detail: 'reconnecting; a full state dump follows immediately');
+  }
+
+  /// Suspends every reconnect while the device has no transport, and resumes from
+  /// the backoff floor when one returns (issue #8).
+  ///
+  /// Offline is a known dead end: the deaf-watchdog would otherwise spin connect
+  /// attempts that cannot succeed, which is exactly when the phone has least battery
+  /// to spare. Going offline tears the socket down and stands still; a returning
+  /// transport reconnects at once. [AppState] also calls [resync] on a transport
+  /// change, and the `_retryTimer` guard keeps the two from firing twice.
+  @override
+  void setReachable(bool reachable) {
+    if (reachable == _reachable) return;
+    _reachable = reachable;
+    if (_stopped) return;
+    if (!reachable) {
+      _clearTimers();
+      unawaited(_closeSocket());
+      _setHealth(false, 'offline — waiting for a network');
+      return;
+    }
+    _backoff = const Duration(seconds: 1);
+    _scheduleRetry();
   }
 
   /// Takes one step. What the D-pad sends.
@@ -718,7 +747,7 @@ class DirectCollector implements Collector {
   }
 
   void _scheduleRetry() {
-    if (_stopped || _retryTimer != null) return;
+    if (_stopped || !_reachable || _retryTimer != null) return;
     final wait = _backoff;
     final next = _backoff * 2;
     _backoff = next > _maxBackoff ? _maxBackoff : next;
@@ -820,7 +849,11 @@ class DirectCollector implements Collector {
 
     _ws = ws;
     _connects++;
-    _backoff = const Duration(seconds: 1);
+    // Backoff is NOT reset here. An open socket is not a working one: in a dead
+    // zone the connect succeeds and the socket is immediately deaf, so resetting
+    // on connect pinned the retry at 1s forever (issue #8). The floor is restored
+    // only once a frame actually arrives — see [_onFrame] — so repeated
+    // connect-then-deaf cycles keep climbing 1s→2s→…→30s.
     _entered = false;
     // A fresh socket owes its own presence proof; last connection's doubt or
     // outstanding re-enter must not carry over and reconnect a healthy new one.
@@ -966,6 +999,7 @@ class DirectCollector implements Collector {
   /// `onDone`, because [_closeSocket] nulls `_ws` first and the `onDone` handler
   /// guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
   bool _isSilent() {
+    if (!_reachable) return false;
     final last = _lastFrameAt;
     if (last == null) return false;
     final since = DateTime.now().difference(last);
@@ -1032,6 +1066,9 @@ class DirectCollector implements Collector {
     // watchdog asks is whether the socket still carries anything at all, not whether
     // anything interesting happened.
     _lastFrameAt = DateTime.now();
+    // A frame is proof the pipe carries data: this is the honest moment to reset
+    // the reconnect backoff, not the bare socket-open (issue #8).
+    _backoff = const Duration(seconds: 1);
     if (reader.ingest(frame)) _dirty = true;
 
     // The state dump is what names us, so this is the first moment the late path

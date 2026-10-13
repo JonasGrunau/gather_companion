@@ -598,6 +598,36 @@ void main() {
       expect(gather.connections, hasLength(1), reason: 'a live socket must not be reconnected');
       expect(c.healthy, isTrue);
     });
+
+    test('while unreachable the deaf socket stands down and makes no attempt', () async {
+      // Issue #8: offline is a dead end. Before this, the deaf watchdog kept tearing
+      // the socket down and reconnecting into no network — ~14 attempts a second —
+      // burning battery exactly when there is least to spare. Told it is unreachable,
+      // the collector must sit still: no reconnect, no "went deaf", until a transport
+      // returns.
+      final lines = <String>[];
+      final c = build(silenceLimit: const Duration(milliseconds: 300), log: lines.add)..start();
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the first dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      // The radio drops — what AppState signals the instant connectivity reports offline.
+      c.setReachable(false);
+      final connectsAtOffline = gather.connections.length;
+
+      // Well past the deaf limit: a reachable collector would have reconnected by now.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(gather.connections.length, connectsAtOffline,
+          reason: 'no reconnect may be attempted while offline');
+      expect(lines.any((l) => l.contains('went deaf')), isFalse,
+          reason: 'the deaf watchdog stands down while offline, got $lines');
+
+      // A transport returns: reconnect from the backoff floor, at once.
+      c.setReachable(true);
+      await firstWhere(gather.onDumped, (_) => true, reason: 'a reconnect once back online')
+          .timeout(const Duration(seconds: 5));
+      expect(gather.connections.length, greaterThan(connectsAtOffline),
+          reason: 'a returning transport reconnects');
+    });
   });
 
   group('staying visible to other people', () {
