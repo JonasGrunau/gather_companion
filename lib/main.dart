@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'src/app_state.dart';
 import 'src/fonts_license.dart';
@@ -87,6 +88,11 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
     log: mediaLog,
   );
 
+  /// The wakelock state we last pushed to the OS, so [_syncWakelock] toggles the
+  /// idle timer only on a real `inCall` transition and not on every socket-frame
+  /// notification `AppState` fires.
+  bool _wakelockOn = false;
+
   @override
   void initState() {
     super.initState();
@@ -94,14 +100,43 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
     // The app is dark-only, so the status bar has to be told once rather than
     // inferred from a light theme that does not exist.
     SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light);
+    // Hold the screen awake for as long as a call lasts, like watching a video,
+    // so the idle timer cannot lock the phone mid-conversation. Driven off the
+    // same `inCall` boolean every widget already listens to.
+    _state.addListener(_syncWakelock);
     _state.boot();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _state.removeListener(_syncWakelock);
+    // Never leave the idle timer suspended past the app: if we were still holding
+    // the screen awake, hand it back on the way out.
+    if (_wakelockOn) {
+      unawaited(WakelockPlus.disable().catchError((Object e) {
+        debugPrint('wakelock: $e');
+      }));
+    }
     _state.dispose();
     super.dispose();
+  }
+
+  /// Mirror `AppState.inCall` onto the OS idle timer: enabled while in a call,
+  /// released the moment it ends (hang-up, roster empties, network drop, unpair).
+  void _syncWakelock() {
+    final shouldHold = _state.inCall;
+    if (shouldHold == _wakelockOn) return;
+    _wakelockOn = shouldHold;
+    // Enhancement, not a requirement: a platform without a wakelock (or a test
+    // host) must degrade to normal auto-lock, not crash — the same posture as the
+    // Firebase.initializeApp guard in main().
+    unawaited(
+      (shouldHold ? WakelockPlus.enable() : WakelockPlus.disable())
+          .catchError((Object e) {
+        debugPrint('wakelock: $e');
+      }),
+    );
   }
 
   @override
