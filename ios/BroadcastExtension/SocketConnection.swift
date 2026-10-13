@@ -38,8 +38,6 @@ class SocketConnection: NSObject, StreamDelegate {
     guard connectSocket() == true else { return false }
 
     setupStreams()
-    inputStream?.open()
-    outputStream?.open()
     return true
   }
 
@@ -101,24 +99,41 @@ class SocketConnection: NSObject, StreamDelegate {
     inputStream?.delegate = self
     inputStream?.setProperty(kCFBooleanTrue,
                              forKey: Stream.PropertyKey(rawValue: kCFStreamPropertyShouldCloseNativeSocket as String))
-    inputStream?.schedule(in: .current, forMode: .common)
 
     outputStream = writeStream?.takeRetainedValue()
     outputStream?.delegate = self
     outputStream?.setProperty(kCFBooleanTrue,
                               forKey: Stream.PropertyKey(rawValue: kCFStreamPropertyShouldCloseNativeSocket as String))
-    outputStream?.schedule(in: .current, forMode: .common)
+
+    // Schedule and open on the extension's main run loop. open() runs on the
+    // connect-retry GCD queue (see SampleHandler.openConnection), which has no
+    // running run loop, so streams scheduled on `.current` there would never
+    // deliver `.openCompleted`/`.hasSpaceAvailable` — isReady would stay false and
+    // every frame would be dropped. The extension's main run loop is serviced by
+    // ReplayKit, so events land there.
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.inputStream?.schedule(in: .main, forMode: .common)
+      self.outputStream?.schedule(in: .main, forMode: .common)
+      self.inputStream?.open()
+      self.outputStream?.open()
+    }
   }
 
   private func cleanup() {
-    inputStream?.remove(from: .current, forMode: .common)
-    outputStream?.remove(from: .current, forMode: .common)
-    inputStream?.delegate = nil
-    outputStream?.delegate = nil
-    inputStream?.close()
-    outputStream?.close()
+    let input = inputStream
+    let output = outputStream
     inputStream = nil
     outputStream = nil
+    // Unschedule on the same (main) run loop the streams were scheduled on.
+    DispatchQueue.main.async {
+      input?.remove(from: .main, forMode: .common)
+      output?.remove(from: .main, forMode: .common)
+      input?.delegate = nil
+      output?.delegate = nil
+      input?.close()
+      output?.close()
+    }
     if socketHandle != -1 {
       Darwin.close(socketHandle)
       socketHandle = -1

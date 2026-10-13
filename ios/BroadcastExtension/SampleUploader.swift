@@ -40,6 +40,13 @@ class SampleUploader {
     dataToSend = prepare(sample: buffer)
     byteIndex = 0
 
+    guard dataToSend != nil else {
+      // Encoding failed for this one frame. Stay ready so the next frame still
+      // sends — a transient failure must not wedge the whole broadcast.
+      isReady = true
+      return false
+    }
+
     serialQueue.async { [weak self] in
       self?.sendDataChunk()
     }

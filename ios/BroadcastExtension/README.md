@@ -49,10 +49,12 @@ The app Info.plist keys and the App Group entitlement on Runner (both
 3. **App Groups capability** on *both* Runner and BroadcastExtension, with the
    group id above. (Already in the entitlements files — this is the provisioning
    side.)
-4. **Link WebRTC** into the extension: it needs `WebRTC` (same framework the app
-   uses) for the `RTCCVPixelBuffer`/HTTP framing. Add it to the extension's
-   "Frameworks and Libraries", or add the extension to the `flutter_webrtc` /
-   `WebRTC` pod target in the `Podfile` (`use_frameworks!` is already on).
+4. **No third-party linking.** These extension sources import only Apple
+   frameworks (`ReplayKit`, `CoreImage`, `Accelerate`, `Foundation`) and do the
+   JPEG/HTTP framing themselves — they never touch `WebRTC`, so there is nothing
+   to add under "Frameworks and Libraries". There is also no `Podfile`: this repo
+   builds iOS with Swift Package Manager, so ignore any CocoaPods step. The
+   `WebRTC` frame *reader* lives in Runner, not in the extension.
 5. **Signing.** This repo signs manually (see `../ExportOptions.plist` and the
    device-build notes). The extension needs its own provisioning profile for
    `com.jonasgrunau.gatherCompanion.Broadcast` with the App Groups entitlement.
