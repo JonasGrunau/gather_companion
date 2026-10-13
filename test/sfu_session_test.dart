@@ -219,6 +219,39 @@ void main() {
               'holds the tracks to put them back');
     });
 
+    test('a reconnect tears the send transport down before its producers, so no '
+        'createOffer is queued against a dying peer connection', () async {
+      await rig.session.start();
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      rig.node().drain();
+
+      // The send transport is the one SfuSession registered a producer callback
+      // on. Arm its producers to throw the issue-#7 `createOffer` the moment they
+      // are closed while the peer connection is still live.
+      final send = rig.device.transports
+          .firstWhere((t) => t.producerCallback != null);
+      expect(send.producers, isNotEmpty);
+      for (final producer in send.producers) {
+        producer.throwOnClose = true;
+      }
+      final before = rig.republishes;
+
+      rig.node().drop();
+      rig.node().comeBack();
+      await settle();
+      await settle();
+
+      expect(send.offerAttempts, 0,
+          reason: 'closing the transport first disposes the pc, so the producer '
+              'tears down via transportClosed() and never runs createOffer');
+      expect(send.closed, isTrue);
+      expect(rig.session.publishing(SfuTag.audio), isFalse,
+          reason: 'the producer went with the socket');
+      expect(rig.republishes, greaterThan(before),
+          reason: 'the caller is asked to put the producer back');
+    });
+
     test('a drained node is left for the one the router names next', () async {
       await rig.session.start();
       await rig.session.subscribe(them);

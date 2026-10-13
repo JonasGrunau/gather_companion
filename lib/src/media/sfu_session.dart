@@ -1859,8 +1859,23 @@ class SfuSession {
   /// throw a never-connected transport raises on close. Leaves `_sendTransport`
   /// null and `_sendState` cleared so a fresh transport cannot inherit a stale
   /// "connected".
+  ///
+  /// Order matters: close the transport *before* dropping the producers. The
+  /// transport's `@close` listener queues a `stopSending` task — which runs
+  /// `createOffer` on the handler's peer connection — but it is guarded by
+  /// `if (_closed) return;` and only queues while the transport is still open.
+  ///
+  /// `Transport.close()` is `async` and we do not await it, so it runs only up
+  /// to its first `await` before yielding back here: it sets `_closed = true`
+  /// synchronously, then suspends at `await _handler.close()` — the producers
+  /// are *not* yet torn down via `transportClosed()` when `_dropProducers`
+  /// runs. So `_dropProducers` still calls `producer.close()` on live
+  /// producers and the `@close` listener still fires. The fix is safe because
+  /// `_closed` is already `true` by then: the listener removes the producer and
+  /// returns early, never queuing `stopSending` against a pc about to vanish.
+  /// Calling `_dropProducers` first (the old order) left `_closed` false, so
+  /// the listener queued `stopSending`, which later hit the nulled pc (#7).
   void _closeSendTransportQuietly() {
-    _dropProducers();
     final transport = _sendTransport;
     _sendTransport = null;
     _sendState = null;
@@ -1871,6 +1886,7 @@ class SfuSession {
         _log('sfu: closing the send transport threw (ignored): $error');
       }
     }
+    _dropProducers();
   }
 
   void _announceRepublish() {
