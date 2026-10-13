@@ -20,4 +20,8 @@ class FakeCaptureEngine extends FakeMediaEngine implements CaptureEngine {
           video: state.videoTrackId != null,
         )
       : null;
+
+  @override
+  MediaStream? get screenStream =>
+      state.screenCapturing ? FakeStream(audio: false, video: true) : null;
 }

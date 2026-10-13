@@ -16,6 +16,13 @@
          the app. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Screen sharing (issue #43). getDisplayMedia drives MediaProjection, which
+         on Android 10+ must run under a foreground service, and on Android 14+ that
+         service must be typed `mediaProjection` and hold its own permission. The
+         consent dialog itself is the system's; these are what let the capture keep
+         running once it is granted. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
 
     <!-- Declared, not required: a tablet with no camera should still be able to
          install this and join a call with its microphone. -->

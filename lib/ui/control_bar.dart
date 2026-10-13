@@ -10,8 +10,15 @@
 ///
 /// ## What is here, and what is deliberately not
 ///
-/// Gather's bar also carries a screen-share button. It does not survive the trip
-/// to a phone: there is nothing on a phone worth sharing a window of.
+/// Gather's bar carries a screen-share button; this one does **not**, and the
+/// reason is the worst-case row below rather than the feature. A phone can share
+/// its whole screen now (issue #43), but this island is already at its plate
+/// budget — self, mic, camera, camera-switch, speaker, React and the door fill a
+/// 360-point phone, and an eighth fixed-width plate is exactly the overflow the
+/// `worst-case row` test in `control_bar_test.dart` was written to catch. So the
+/// share toggle lives in the call screen's header (`_Header` in `call_screen.dart`),
+/// which is call-only chrome with room to spare — the one place a broadcast picker
+/// belongs anyway, since there is nothing to share from over the map.
 ///
 /// Gather's door does survive, and it is **one** door, as it is on the desktop.
 /// This bar briefly had three ways out — a desk button, a *leave* button beside it

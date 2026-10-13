@@ -35,6 +35,7 @@ class CallState {
     this.media = const LocalMediaState(),
     this.publishingAudio = false,
     this.publishingVideo = false,
+    this.publishingScreen = false,
     this.participants = const [],
     this.detail,
   });
@@ -54,12 +55,23 @@ class CallState {
   final bool publishingAudio;
   final bool publishingVideo;
 
+  /// Whether the room is receiving our screen share. Separate from the capture
+  /// flag in [media]: the broadcast can be running on the device while the SFU
+  /// has not picked the producer up yet, exactly as [publishingVideo] is separate
+  /// from the camera being open.
+  final bool publishingScreen;
+
   /// What went wrong, if the last thing asked for did not happen. A sentence, for
   /// putting in front of a person.
   final String? detail;
 
   bool get micOn => media.capturing && media.audioEnabled;
   bool get cameraOn => media.hasVideo;
+
+  /// Whether the screen share is live, as the button reflects it. Driven off the
+  /// capture flag so the tap registers the instant the broadcast starts, the same
+  /// way [cameraOn] follows the camera rather than the producer.
+  bool get screenOn => media.hasScreen;
 
   /// Where the sound is coming out, for the button that switches it.
   AudioOutput get audioOutput => media.audioOutput;
@@ -75,6 +87,7 @@ class CallState {
     LocalMediaState? media,
     bool? publishingAudio,
     bool? publishingVideo,
+    bool? publishingScreen,
     List<CallParticipant>? participants,
     String? detail,
     bool clearDetail = false,
@@ -83,6 +96,7 @@ class CallState {
         media: media ?? this.media,
         publishingAudio: publishingAudio ?? this.publishingAudio,
         publishingVideo: publishingVideo ?? this.publishingVideo,
+        publishingScreen: publishingScreen ?? this.publishingScreen,
         participants: participants ?? this.participants,
         detail: clearDetail ? null : (detail ?? this.detail),
       );
@@ -92,6 +106,7 @@ class CallState {
       'publishing: ${[
         if (publishingAudio) 'audio',
         if (publishingVideo) 'video',
+        if (publishingScreen) 'screen',
       ].join('+')})';
 }
 
@@ -188,6 +203,11 @@ abstract class Call {
   Future<String?> setMicOn(bool on);
 
   Future<String?> setCameraOn(bool on);
+
+  /// Starts or stops sharing the phone's screen into the room, as a producer
+  /// separate from the camera. Opens the system broadcast picker the first time.
+  /// Same null-or-a-sentence contract as [setMicOn].
+  Future<String?> setScreenShareOn(bool on);
 
   /// Sends the sound to the loudspeaker (`true`) or back to the earpiece —
   /// or to a headset if one is connected. Same null-or-a-sentence contract as

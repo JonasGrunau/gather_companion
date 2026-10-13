@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	The extension joins the same App Group as Runner so the two processes can share
+	the socket file the captured frames cross on. The identifier must match
+	Runner.entitlements and Runner's RTCAppGroupIdentifier Info.plist key exactly.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.jonasgrunau.gatherCompanion.screenshare</string>
+	</array>
+</dict>
+</plist>

@@ -66,7 +66,24 @@ class LiveCall implements Call {
                 )) {
     _engineSub = _engine.states.listen((media) {
       _emit(_state.copyWith(media: media));
+      _noticeScreenEnded(media);
     });
+  }
+
+  /// The OS owns the "Stop" control for a system broadcast, so a share can end
+  /// without a tap in this app: the engine reports the screen capture gone while
+  /// [_wantScreen] still believes it is on. Catch that, drop the producer, and
+  /// clear the intent so the button falls back rather than offering to "stop" a
+  /// share that is already over.
+  void _noticeScreenEnded(LocalMediaState media) {
+    if (!_wantScreen || media.hasScreen) return;
+    _log('call: the screen share ended outside the app; dropping the producer');
+    unawaited(_serialise(() async {
+      _wantScreen = false;
+      await _sfu?.unpublish(SfuTag.screen);
+      _emit(_state.copyWith(publishingScreen: false));
+      return null;
+    }));
   }
 
   static void _noop(String _) {}
@@ -128,6 +145,7 @@ class LiveCall implements Call {
   /// reach, and these are what the retry on the next tap is judged against.
   bool _wantMic = false;
   bool _wantCamera = false;
+  bool _wantScreen = false;
 
   /// Serialises the whole thing. Two taps in quick succession would otherwise
   /// interleave a capture restart with a publish and produce on a dead track.
@@ -195,6 +213,64 @@ class LiveCall implements Call {
         return detail;
       });
 
+  @override
+  Future<String?> setScreenShareOn(bool on) => _serialise(() async {
+        _wantScreen = on;
+        if (!on) {
+          // Unpublish before stopping the capture: the producer should go off the
+          // wire while its track is still alive, rather than the SFU holding a
+          // sender onto a track that is being torn down underneath it.
+          await _sfu?.unpublish(SfuTag.screen);
+          await _engine.stopScreenCapture();
+          _emit(_state.copyWith(publishingScreen: false, clearDetail: true));
+          return null;
+        }
+
+        // A second, independent capture — the system picker — that does not touch
+        // the camera/mic session. On denial the engine throws and the button
+        // falls back, the same shape as a refused camera.
+        try {
+          await _engine.startScreenCapture();
+        } on MediaFailure catch (failure) {
+          _wantScreen = false;
+          return _fail(SfuTag.screen, failure.message);
+        }
+        return _publishScreen();
+      });
+
+  /// Puts the screen-share track on the wire, from its own capture stream.
+  ///
+  /// The twin of [_publish], but it pulls the track from [CaptureEngine.screenStream]
+  /// rather than the camera/mic `localStream` — the whole point of a separate
+  /// capture is a separate track, published as its own [SfuTag.screen] producer.
+  Future<String?> _publishScreen() async {
+    final stream = _engine.screenStream;
+    final track = stream?.getVideoTracks().firstOrNull;
+    if (stream == null || track == null) {
+      _wantScreen = false;
+      return _fail(SfuTag.screen, 'The screen share did not open.');
+    }
+
+    try {
+      final sfu = await _sfuOrStart();
+      if (sfu.publishing(SfuTag.screen)) {
+        sfu.resume(SfuTag.screen);
+      } else {
+        await sfu.publish(track, stream, tag: SfuTag.screen);
+      }
+    } on Object catch (error) {
+      _log('call: publishing the screen failed: $error');
+      // The broadcast is live and only the wire failed, so the button stays on
+      // and the sentence says the room cannot see it yet — same stance as a
+      // camera that captured but did not reach the SFU.
+      return _fail(SfuTag.screen,
+          'You are sharing, but Gather has not picked up the screen yet.');
+    }
+
+    _emit(_state.copyWith(publishingScreen: true, clearDetail: true));
+    return null;
+  }
+
   /// Put back whatever a capture restart took with it.
   ///
   /// [_ensureCapture] closes both producers before it reopens the hardware,
@@ -211,6 +287,14 @@ class LiveCall implements Call {
     }
     if (_wantCamera && just != SfuTag.video && !sfu.publishing(SfuTag.video)) {
       await _publish(SfuTag.video);
+    }
+    // The screen rides its own capture, untouched by a camera restart, so this is
+    // only reached when the heal is for something else — but it belongs here for
+    // the same reason the others do: a republish that forgets a tag drops it.
+    if (_wantScreen &&
+        just != SfuTag.screen &&
+        !sfu.publishing(SfuTag.screen)) {
+      await _publishScreen();
     }
   }
 
@@ -268,7 +352,10 @@ class LiveCall implements Call {
     final stream = _engine.localStream;
     final track = switch (tag) {
       SfuTag.audio => stream?.getAudioTracks().firstOrNull,
-      SfuTag.video || SfuTag.screen => stream?.getVideoTracks().firstOrNull,
+      SfuTag.video => stream?.getVideoTracks().firstOrNull,
+      // Screen capture is a separate stream with its own publish path
+      // ([_publishScreen]); it never comes through here.
+      SfuTag.screen => null,
     };
     if (stream == null || track == null) {
       return _fail(tag, 'The ${tag == SfuTag.audio ? 'microphone' : 'camera'} '
@@ -362,12 +449,13 @@ class LiveCall implements Call {
   /// `_ensureCapture` is restarting the session would produce on a track that is
   /// about to be stopped.
   void _onNeedsRepublish(void _) {
-    if (!_wantMic && !_wantCamera) return;
+    if (!_wantMic && !_wantCamera && !_wantScreen) return;
     _log('call: the SFU lost our producers; putting them back');
     unawaited(_serialise(() async {
       if (_sfu == null) return null;
       if (_wantMic) await _publish(SfuTag.audio);
       if (_wantCamera) await _publish(SfuTag.video);
+      if (_wantScreen) await _publishScreen();
       return null;
     }));
   }
@@ -506,11 +594,13 @@ class LiveCall implements Call {
   Future<void> hangUp() async {
     _wantMic = false;
     _wantCamera = false;
+    _wantScreen = false;
     await _detach();
     await _sfu?.dispose();
     _sfu = null;
     _remoteStreams.clear();
     await _engine.releaseAudioSession();
+    await _engine.stopScreenCapture();
     await _engine.stopCapture();
     // The desired set survives a hang-up: the cluster has not changed just
     // because we stopped listening to it, and the next tap should pick up the
@@ -525,7 +615,11 @@ class LiveCall implements Call {
     await _serialise(() async {
       // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
       // cluster or tap builds one from scratch, which is the right amount of work.
-      if (_sfu == null && _listeningTo.isEmpty && !_wantMic && !_wantCamera) {
+      if (_sfu == null &&
+          _listeningTo.isEmpty &&
+          !_wantMic &&
+          !_wantCamera &&
+          !_wantScreen) {
         return null;
       }
       _log('call: rebuilding the media session after an external teardown');
@@ -535,6 +629,7 @@ class LiveCall implements Call {
       await _start();
       if (_wantMic) await _publish(SfuTag.audio);
       if (_wantCamera) await _publish(SfuTag.video);
+      if (_wantScreen) await _publishScreen();
       return null;
     });
   }
