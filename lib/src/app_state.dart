@@ -897,8 +897,12 @@ class AppState extends ChangeNotifier {
     final status = row?.status;
     final availability = row?.availability;
     // Remember the last real availability, so a later Offline forced on us by another
-    // device (issue #41) is undone back to what the person actually chose.
-    if (availability != null && availability != 'Offline') {
+    // device (issue #41) is undone back to what the person actually chose. Only a
+    // *sendable* one: the self-heal restore goes back out through `setAvailability`,
+    // which rejects anything but Active/Busy/Away wholesale, so a Focused or
+    // FocusedCoworking the desktop set on the shared user would be discarded and leave
+    // us stuck Offline. Keep the last user-selectable state instead.
+    if (availability != null && settableAvailabilities.contains(availability)) {
       _lastOnlineAvailability = availability;
     }
     final mine = (availability: availability, text: status?.text, emoji: status?.emoji);
@@ -921,9 +925,18 @@ class AppState extends ChangeNotifier {
   /// a reconnect loop — after [_selfHealMaxStrikes] tries we stand down and let the
   /// next genuine wake or tap bring the call back.
   void _noteSelfHealth() {
-    if (myAvailability != 'Offline') {
-      // Healthy again, or never Offline: reset the ladder so the next episode starts
-      // its count from scratch.
+    final availability = myAvailability;
+    // Unknown, not recovered: a reconnect installs a fresh reader and the collector
+    // emits partial state-dump chunks the moment any user exists, so an early roster
+    // can carry no self row at all and leave this null before our own row lands.
+    // Resetting the ladder on that would clear the strike cap and the once-per-episode
+    // rebuild guard mid-episode — and if the self row then arrives still Offline, the
+    // same episode would start over and reconnect/rebuild without bound. Only a *known*
+    // availability tells us anything; wait for one.
+    if (availability == null) return;
+    if (availability != 'Offline') {
+      // Healthy again: reset the ladder so the next episode starts its count from
+      // scratch.
       _selfHealCooldown?.cancel();
       _selfHealCooldown = null;
       _selfHealCooling = false;

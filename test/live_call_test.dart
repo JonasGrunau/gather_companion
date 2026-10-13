@@ -319,6 +319,77 @@ void main() {
     });
   });
 
+  group('rebuilding a torn-down session (issue #41 safety net)', () {
+    test('throws the stale session away and restores everything on a fresh one',
+        () async {
+      // The self-heal's safety net, driven through a real [SfuSession] rather than a
+      // counter: the desktop's `suspendWebRTCTransports` kills the session
+      // server-side, so `rebuild()` must dispose the stale one and stand a fresh one
+      // back up with everything the suspend took — the allow list, the conversation,
+      // the subscriptions, and both producers. Each `buildSfu` hands out its own rig,
+      // so the before and the after are separate wires we can compare.
+      final rigs = <Rig>[];
+      final localEngine = FakeCaptureEngine();
+      final localCall = LiveCall(
+        auth: GatherAuth(
+          credentials: const GatherCredentials(refreshToken: 'unused'),
+        ),
+        spaceId: spaceId,
+        srcId: me,
+        engine: localEngine,
+        buildSfu: () {
+          final rig = Rig();
+          rigs.add(rig);
+          return rig.session;
+        },
+        voice: VoiceActivity(hold: Duration.zero),
+      );
+      addTearDown(() async {
+        await localCall.dispose();
+        for (final rig in rigs) {
+          await rig.close();
+        }
+      });
+
+      // A full call: visible to them, in a conversation, listening, mic + camera live.
+      await localCall.setVisibleTo({them});
+      await localCall.setConversation('bubble-1');
+      await localCall.setListeningTo({them});
+      await localCall.setMicOn(true);
+      await localCall.setCameraOn(true);
+      await settle();
+      expect(rigs, hasLength(1), reason: 'one session built so far');
+
+      // The suspend tore it down server-side. Rebuild.
+      await localCall.rebuild();
+      await settle();
+
+      // A second session was built, and the stale one's socket was disposed rather
+      // than left dangling — the whole point, since a resync alone would re-subscribe
+      // onto the dead one and wait out the deaf-timer.
+      expect(rigs, hasLength(2));
+      expect(rigs[0].node().disposed, isTrue,
+          reason: 'the stale session was thrown away');
+
+      // The fresh node replays everything the suspend took with it.
+      final fresh = rigs[1].node();
+      expect(fresh.has('consume-allow'), isTrue, reason: 'allow list replayed');
+      expect(fresh.argsFor('set-player-conversation-metadata'),
+          {'meetingId': '', 'clusterId': 'bubble-1'},
+          reason: 'conversation replayed');
+      expect(fresh.has('consume-request'), isTrue,
+          reason: 'subscriptions replayed');
+      final produced = fresh.sent
+          .where((f) => f.method == 'produce')
+          .map((f) => f.args['tag'])
+          .toList();
+      expect(produced, containsAll(<String>['audio', 'video']),
+          reason: 'mic and camera republished onto the fresh session');
+      expect(localCall.state.publishingAudio, isTrue);
+      expect(localCall.state.publishingVideo, isTrue);
+    });
+  });
+
   test('hanging up releases the hardware and the session', () async {
     await call.setMicOn(true);
 

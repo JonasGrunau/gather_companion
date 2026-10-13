@@ -194,6 +194,55 @@ void main() {
     });
   });
 
+  test('a partial roster without our row does not reset the episode', () {
+    withClock((clock) {
+      // Held in the cluster so the call never tears down under us, isolating the
+      // self-heal bound from the 12s cluster hold.
+      final (:state, :call, :collector) = inACall(clock);
+
+      // The lock lands: fought once, the dead session rebuilt once.
+      state.debugApplyRoster(offlineRoster(stillClustered: true));
+      clock.flushMicrotasks();
+      expect(call.rebuilds, 1);
+      clock.elapse(const Duration(seconds: 3));
+
+      // A reconnect's fresh reader emits a partial dump before our own row lands:
+      // `them` is there, we are not, so `myAvailability` reads null. This must not be
+      // mistaken for recovery — resetting here would clear the once-per-episode
+      // rebuild guard and let the next Offline rebuild all over again, unbounded.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        placed('them', cluster: 'c1', account: 'acct-them', x: 1),
+      ]));
+      clock.flushMicrotasks();
+      clock.elapse(const Duration(seconds: 3));
+
+      // Our row arrives, still Offline — the same episode, not a new one.
+      state.debugApplyRoster(offlineRoster(stillClustered: true));
+      clock.flushMicrotasks();
+
+      // Still one rebuild: the partial roster did not reopen the episode.
+      expect(call.rebuilds, 1);
+    });
+  });
+
+  test('a focus-area availability is not restored as an unsendable write', () {
+    withClock((clock) {
+      // The desktop put the shared user in a focus area — a real availability that
+      // `setAvailability` refuses to send (only Active/Busy/Away are sendable).
+      final (:state, :call, :collector) =
+          inACall(clock, selfAvailability: 'Focused');
+
+      state.debugApplyRoster(offlineRoster());
+      clock.flushMicrotasks();
+
+      // The restore must be a sendable value, not the discarded 'Focused' that would
+      // leave us stuck Offline. With no sendable state seen, it falls back to Active.
+      expect(collector.availabilitiesSet, ['Active']);
+      expect(collector.availabilitiesSet, isNot(contains('Focused')));
+      expect(call.rebuilds, 1);
+    });
+  });
+
   test('Offline while not in a call does nothing', () {
     withClock((clock) {
       final call = FakeCall();
