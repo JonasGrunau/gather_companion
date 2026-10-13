@@ -729,6 +729,48 @@ void main() {
         clock.elapse(const Duration(seconds: 1));
       });
     });
+
+    test('an empty announce after denial stops the retries', () {
+      // Issue #52 follow-up: the SFU may answer a denial with an empty
+      // `consume-try` — the peer is legitimately muted and publishes nothing.
+      // That full-state announcement resolves the denial even though it builds
+      // no consumer, so the peer must not stay "stranded" and be re-requested
+      // every 5–30s for the life of the call.
+      fakeAsync((clock) {
+        const other = 'acct-other';
+        rig.addresses[other] = nodeA;
+
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // Peer A receives, so the room has sound and the heal runs per-peer.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+
+        // Peer B is denied, then announces an empty producer map — muted.
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node().push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+        rig.announce(other, <String, String>{});
+        clock.flushMicrotasks();
+        rig.node().drain();
+
+        // The denial is resolved, so no watchdog re-request should fire for B.
+        final asked = consumeRequestsFor(rig.node(), other);
+        clock.elapse(const Duration(seconds: 40));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), other), asked,
+            reason: 'a muted peer that announced empty is not stranded and must '
+                'not be re-requested');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
   });
 
   group('send-side stall', () {

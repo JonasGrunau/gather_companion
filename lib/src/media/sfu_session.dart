@@ -1321,6 +1321,14 @@ class SfuSession {
       case 'consume-try':
         final srcId = n.data['srcId'];
         if (srcId is! String) return;
+        // The full-state announcement is the SFU answering for this peer, so it
+        // resolves any earlier denial even when it carries no tracks: a peer
+        // denied and then legitimately muted publishes an empty map, and leaving
+        // the denial behind would strand it forever — _strandedPeers() would see
+        // "denied, no consumer" and the watchdog would re-request it every
+        // 5–30s. A consume with tracks clears the denial in _consume anyway;
+        // this covers the empty case that never builds a consumer.
+        _consumeDenied.remove(srcId);
         final map = _map(n.data['producerIdMap']);
         _announced[srcId] = {
           for (final entry in map.entries)
