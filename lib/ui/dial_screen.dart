@@ -201,10 +201,10 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
             child: CustomScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
               slivers: [
-            SliverToBoxAdapter(child: _SearchField(controller: _search, active: searching)),
-
             if (!searching && recents.isNotEmpty)
               SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson)),
+
+            SliverToBoxAdapter(child: _SearchField(controller: _search, active: searching)),
 
             if (noMatches)
               SliverToBoxAdapter(child: _Empty('No one matches "$_query".')),
