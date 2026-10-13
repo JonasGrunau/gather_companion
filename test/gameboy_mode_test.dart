@@ -995,7 +995,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
     }
 
-    testWidgets('D-pad to the left of the LCD, A/B to the right, Select/Start below',
+    testWidgets('D-pad and Select/Start left, A/B and the grille right, as the GBA lays them',
         (tester) async {
       final state = configure(AppState())..setGameboyMode(true);
       landscape(tester);
@@ -1004,15 +1004,23 @@ void main() {
 
       final mid = tester.getRect(find.byType(GameboyShell)).center.dx;
       final dpad = tester.getRect(find.byKey(const Key('gb-dpad'))).center.dx;
-      final a = tester.getRect(find.text('A')).center.dx;
-      final b = tester.getRect(find.text('B')).center.dx;
+      final a = tester.getRect(find.text('A')).center;
+      final b = tester.getRect(find.text('B')).center;
+      final select = tester.getRect(find.text('SELECT')).center.dx;
+      final start = tester.getRect(find.text('START')).center.dx;
 
       expect(dpad, lessThan(mid), reason: 'the cross is the left thumb');
-      expect(a, greaterThan(mid), reason: 'A is the right thumb');
-      expect(b, greaterThan(mid), reason: 'and so is B');
-      // Still reachable, just moved onto the chin below the screen.
-      expect(find.text('SELECT'), findsOneWidget);
-      expect(find.text('START'), findsOneWidget);
+      expect(a.dx, greaterThan(mid), reason: 'A is the right thumb');
+      expect(b.dx, greaterThan(mid), reason: 'and so is B');
+      // START/SELECT have left the chin and joined the D-pad on the left thumb, the
+      // way the GBA stacks them in the lower-left corner.
+      expect(select, lessThan(mid), reason: 'SELECT moved to the left side');
+      expect(start, lessThan(mid), reason: 'START moved to the left side');
+      // A high-right, B low-left, but tucked close — not the tall diagonal they had.
+      expect((a.dy - b.dy).abs(), lessThan(80),
+          reason: 'A and B sit nearly on one line, tight together');
+      // The horizontal speaker moulding fills the lower-right corner under A/B.
+      expect(find.byKey(const Key('gb-grille-landscape')), findsOneWidget);
     });
   });
 }

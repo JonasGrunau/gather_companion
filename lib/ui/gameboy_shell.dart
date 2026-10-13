@@ -1376,15 +1376,30 @@ class _ControlsDeckState extends State<_ControlsDeck> {
       );
 
   /// Select opens/closes the menu; Start goes home in the office and backs out of
-  /// the menu while it is up.
-  Widget _selectStart() => Row(
+  /// the menu while it is up. Upright, the pair are the DMG's flat pills side by
+  /// side on the chin; in landscape they become the GBA's round knobs, each with
+  /// its name printed to the left, stacked START-over-SELECT down the left thumb.
+  Widget _selectStart({bool vertical = false}) {
+    if (vertical) {
+      return Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          _GbPill(label: 'SELECT', onTap: onMenuToggle),
-          const SizedBox(width: 22),
-          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+          _GbRoundKey(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+          const SizedBox(height: 16),
+          _GbRoundKey(label: 'SELECT', onTap: onMenuToggle),
         ],
       );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _GbPill(label: 'SELECT', onTap: onMenuToggle),
+        const SizedBox(width: 22),
+        _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+      ],
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1436,46 +1451,73 @@ class _ControlsDeckState extends State<_ControlsDeck> {
     );
   }
 
-  /// The handheld on its side: the LCD between the thumbs, D-pad left and A/B right,
-  /// Select/Start on the chin below. The same controls and the same B double-tap
-  /// timer as upright — only their arrangement turns ninety degrees. Each thumb
-  /// cluster is wrapped in a [FittedBox] so a short landscape phone scales the fixed
-  /// 135px cross and 64px keys down beside a full-height LCD rather than overflowing.
+  /// The handheld on its side, laid out like the GBA it is modelled on: the LCD
+  /// full-height in the middle, the D-pad high on the left with START/SELECT stacked
+  /// in the corner below it, and A/B tucked tight together on the right with the
+  /// speaker grille in the lower corner under them. The same controls and the same B
+  /// double-tap timer as upright — only their arrangement turns ninety degrees. Each
+  /// thumb column is wrapped in a [FittedBox] so a short landscape phone scales the
+  /// fixed 135px cross and 64px keys down beside a full-height LCD rather than
+  /// overflowing.
   Widget _landscape(BuildContext context) {
     Widget fit(Widget child) => FittedBox(fit: BoxFit.scaleDown, child: child);
 
-    final dpad = fit(
-      SizedBox(width: _dpadSize, height: _dpadSize, child: _dpad()),
-    );
-    // A upper-right, B lower-left — the same diagonal the upright deck has, laid out
-    // in a box the two 64px keys sit inside.
-    final ab = fit(
+    // Left thumb: the cross riding high, START over SELECT in the corner below —
+    // `spaceBetween` pushes them to the top and bottom the way the mock sets them.
+    final left = fit(
       SizedBox(
-        width: 150,
-        height: 150,
-        child: Stack(
+        width: _dpadSize,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Positioned(top: 0, right: 0, child: _aButton(context)),
-            Positioned(bottom: 0, left: 0, child: _bButton()),
+            SizedBox(width: _dpadSize, height: _dpadSize, child: _dpad()),
+            const SizedBox(height: 28),
+            _selectStart(vertical: true),
           ],
         ),
       ),
     );
 
-    return Row(
+    // A high-right, B low-left — the same diagonal the upright deck has, but tucked
+    // tight so the pair sits nearly on one line, as the mock draws them.
+    final ab = fit(
+      SizedBox(
+        width: 150,
+        height: 96,
+        child: Stack(
+          children: [
+            Positioned(top: 0, right: 0, child: _aButton(context)),
+            Positioned(top: 32, left: 0, child: _bButton()),
+          ],
+        ),
+      ),
+    );
+
+    // The right thumb runs the full LCD height: A/B float in the upper middle, and
+    // the speaker moulding drops to the lower corner — sitting just shy of the LCD's
+    // bottom edge, the way the GBA flanks the screen — rather than hugging A/B.
+    final right = Column(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Padding(padding: const EdgeInsets.only(right: 8), child: dpad),
-        Expanded(
-          child: Column(
-            children: [
-              Expanded(child: widget.landscapeScreen!),
-              const SizedBox(height: 6),
-              _selectStart(),
-            ],
-          ),
+        Expanded(child: Center(child: ab)),
+        fit(const _SpeakerGrille(key: Key('gb-grille-landscape'), horizontal: true)),
+        const SizedBox(height: 10),
+      ],
+    );
+
+    // Wide gaps between each thumb and the LCD, so the D-pad and B sit well off the
+    // screen the way they do on the hardware. `stretch` lets the side columns run the
+    // LCD's full height so the grille can ride down near its bottom.
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(right: 20),
+          child: Center(child: left),
         ),
-        Padding(padding: const EdgeInsets.only(left: 8), child: ab),
+        Expanded(child: widget.landscapeScreen!),
+        Padding(padding: const EdgeInsets.only(left: 20), child: right),
       ],
     );
   }
@@ -1861,32 +1903,128 @@ class _GbPillState extends State<_GbPill> {
   }
 }
 
-/// The moulded grille in the corner. Identical upright slots — every one the same
-/// length and width, each perfectly vertical — stepped up to the right so the
-/// block reads as an angled speaker moulding while no single slot is itself
-/// slanted, the way the mock draws it. Hidden from the reader: it is decoration,
-/// not a control.
+/// A round Select/Start knob with its name printed to its *left*, the way the GBA
+/// sets the pair in the lower corner — the upright DMG uses the flat [_GbPill]
+/// instead. A small moulded charcoal knob that sinks into its own hard shadow on
+/// press; the label is engraved grey, right-aligned in a fixed box so START and
+/// SELECT line their knobs up in a column.
+class _GbRoundKey extends StatefulWidget {
+  const _GbRoundKey({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  State<_GbRoundKey> createState() => _GbRoundKeyState();
+}
+
+class _GbRoundKeyState extends State<_GbRoundKey> {
+  bool _down = false;
+
+  void _set(bool down) {
+    if (_down == down) return;
+    setState(() => _down = down);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: widget.label,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        onTapDown: (_) => _set(true),
+        onTapUp: (_) => _set(false),
+        onTapCancel: () => _set(false),
+        behavior: HitTestBehavior.opaque,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 72,
+              child: Text(
+                widget.label,
+                textAlign: TextAlign.right,
+                style: const TextStyle(
+                  fontFamily: _pixelFont,
+                  fontWeight: FontWeight.w700,
+                  color: _n700,
+                  fontSize: 14,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 90),
+              curve: Curves.easeOut,
+              transform: Matrix4.translationValues(0, _down ? 2 : 0, 0),
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                // The same charcoal moulding as the pill and the D-pad, domed with a
+                // touch of top light; the depth is the hard drop below, not gloss.
+                gradient: const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [_n700, _n800],
+                ),
+                border: Border.all(color: _n950, width: 1),
+                boxShadow: [
+                  BoxShadow(color: _n900, blurRadius: 0, offset: Offset(0, _down ? 1 : 4)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The moulded grille in the corner. Identical slots — every one the same length
+/// and width — stepped so the block reads as an angled speaker moulding while no
+/// single slot is itself slanted, the way the mock draws it. Upright (the portrait
+/// shell) the slots stand vertical and march up to the right; [horizontal] (the
+/// landscape GBA) turns the same moulding on its side — the slots lie flat and
+/// march inward as the body does. Hidden from the reader: it is decoration, not a
+/// control.
 class _SpeakerGrille extends StatelessWidget {
-  const _SpeakerGrille();
+  const _SpeakerGrille({super.key, this.horizontal = false});
+
+  /// The sideways cut, for the landscape body — flat slots instead of upright ones.
+  final bool horizontal;
 
   @override
   Widget build(BuildContext context) {
     return ExcludeSemantics(
       child: SizedBox(
-        width: 74,
-        height: 60,
-        child: CustomPaint(painter: _GrillePainter(barColor: context.gbHardware.hw990)),
+        // The box turns with the slots: tall-and-narrow upright, wide-and-short flat.
+        // The landscape vents run wider than the upright grille, the way the GBA
+        // stretches them along its lower-right flank.
+        width: horizontal ? 104 : 74,
+        height: horizontal ? 74 : 60,
+        child: CustomPaint(
+          painter: _GrillePainter(
+            barColor: context.gbHardware.hw990,
+            horizontal: horizontal,
+          ),
+        ),
       ),
     );
   }
 }
 
 class _GrillePainter extends CustomPainter {
-  const _GrillePainter({required this.barColor});
+  const _GrillePainter({required this.barColor, this.horizontal = false});
 
   /// The deepest hardware value (`hw990`) of the active theme, so the moulded
   /// grille sinks into whichever body it sits on.
   final Color barColor;
+
+  /// Flat slots marching down, for the landscape body; upright slots otherwise.
+  final bool horizontal;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1895,20 +2033,31 @@ class _GrillePainter extends CustomPainter {
       ..strokeWidth = 5
       ..strokeCap = StrokeCap.round;
     const count = 6;
-    const barLen = 32.0; // every slot the same height
-    const stepX = 11.0; // march to the right
-    const stepY = 3.0; // and climb, so the cluster reads as an angled moulding
+    // The flat landscape vents run long across the flank; the upright slots are the
+    // short original.
+    final barLen = horizontal ? 84.0 : 32.0;
+    const step = 11.0; // the march along the stack
+    const skew = 3.0; // and the small climb, so the cluster reads as angled
     for (var i = 0; i < count; i++) {
-      final x = 8 + i * stepX;
-      final bottom = size.height - 4 - i * stepY;
-      // A straight up-and-down slot: same endpoints' x, so it is never angled —
-      // only its position moves, in both axes.
-      canvas.drawLine(Offset(x, bottom), Offset(x, bottom - barLen), paint);
+      if (horizontal) {
+        // A straight left-to-right slot: same endpoints' y, so it is never angled —
+        // the stack marches down the right edge and eases inward as it goes.
+        final y = 8 + i * step;
+        final right = size.width - 4 - i * skew;
+        canvas.drawLine(Offset(right, y), Offset(right - barLen, y), paint);
+      } else {
+        // A straight up-and-down slot: same endpoints' x, so it is never angled —
+        // only its position moves, in both axes.
+        final x = 8 + i * step;
+        final bottom = size.height - 4 - i * skew;
+        canvas.drawLine(Offset(x, bottom), Offset(x, bottom - barLen), paint);
+      }
     }
   }
 
   @override
-  bool shouldRepaint(_GrillePainter old) => old.barColor != barColor;
+  bool shouldRepaint(_GrillePainter old) =>
+      old.barColor != barColor || old.horizontal != horizontal;
 }
 
 /// The Select menu, drawn inside the LCD: the controls that are not one of the
