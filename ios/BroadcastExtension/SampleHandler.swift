@@ -60,15 +60,17 @@ class SampleHandler: RPBroadcastSampleHandler {
   // MARK: - Connection
 
   private func setupConnection() {
-    clientConnection?.didClose = { [weak self] error in
-      if let error = error {
-        self?.finishBroadcastWithError(error)
-      } else {
-        // The app closed the socket cleanly — it tore the share down on its end.
-        let userInfo = [NSLocalizedDescriptionKey: "Screen sharing stopped"]
-        self?.finishBroadcastWithError(
-          NSError(domain: "BroadcastExtension", code: 0, userInfo: userInfo))
-      }
+    clientConnection?.didClose = { [weak self] _ in
+      // The app dropping the socket is the in-app Stop, not a fault — whether it
+      // arrives as a clean EOF (stream idle) or a broken-pipe write error (a frame
+      // was mid-flight when the app tore down its end). Either way, finish with the
+      // same user-readable reason: ReplayKit always shows an end-of-broadcast alert
+      // for an extension-initiated finish, and surfacing the raw socket error made
+      // it read "Broken pipe" ("Defekte Pipe") as if something had failed. The stop
+      // itself is intentional, so say so.
+      let userInfo = [NSLocalizedDescriptionKey: "Screen sharing stopped"]
+      self?.finishBroadcastWithError(
+        NSError(domain: "BroadcastExtension", code: 0, userInfo: userInfo))
     }
   }
 
