@@ -58,34 +58,44 @@ class SampleUploader {
   private func setupConnection() {
     connection.didOpen = { [weak self] in self?.isReady = true }
     connection.didClose = { [weak self] _ in self?.isReady = false }
+    // A single screen frame is far larger than one stream write, so it goes out in
+    // chunks: write until the stream reports no space, then wait. The output
+    // stream's `hasSpaceAvailable` is what resumes the rest — without this wiring a
+    // frame stalls after its first chunk and the message never completes (the
+    // receiver shows a permanent black tile). Runs on the same serial queue as the
+    // initial send so byteIndex/dataToSend are never touched from two threads.
+    connection.streamHasSpaceAvailable = { [weak self] in
+      self?.serialQueue.async { self?.sendDataChunk() }
+    }
   }
 
   private func sendDataChunk() {
     guard let dataToSend = dataToSend else { return }
 
-    var bytesLeft = dataToSend.count - byteIndex
-    var length = bytesLeft > Constants.bufferMaxLength ? Constants.bufferMaxLength : bytesLeft
+    // Write as many chunks as the stream will take right now. A short write (0)
+    // means the stream is momentarily full; stop and let `hasSpaceAvailable` call
+    // us back to finish the *same* frame rather than dropping it.
+    while byteIndex < dataToSend.count {
+      let bytesLeft = dataToSend.count - byteIndex
+      let chunk = bytesLeft > Constants.bufferMaxLength ? Constants.bufferMaxLength : bytesLeft
 
-    length = dataToSend[byteIndex..<(byteIndex + length)].withUnsafeBytes {
-      guard let ptr = $0.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
-      return connection.writeToStream(buffer: ptr, maxLength: length)
-    }
-
-    if length > 0 {
-      byteIndex += length
-      bytesLeft -= length
-      if bytesLeft == 0 {
-        self.dataToSend = nil
-        byteIndex = 0
-        isReady = true
+      let written = dataToSend[byteIndex..<(byteIndex + chunk)].withUnsafeBytes {
+        guard let ptr = $0.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        return connection.writeToStream(buffer: ptr, maxLength: chunk)
       }
-    } else {
-      // Back-pressure: the stream had no space. Drop the rest of this frame and be
-      // ready for the next — a stale frame is worse than a dropped one.
-      self.dataToSend = nil
-      byteIndex = 0
-      isReady = true
+
+      if written > 0 {
+        byteIndex += written
+      } else {
+        // Stream full — resume on the next hasSpaceAvailable.
+        return
+      }
     }
+
+    // Whole frame delivered; accept the next one.
+    self.dataToSend = nil
+    byteIndex = 0
+    isReady = true
   }
 
   private func prepare(sample buffer: CMSampleBuffer) -> Data? {

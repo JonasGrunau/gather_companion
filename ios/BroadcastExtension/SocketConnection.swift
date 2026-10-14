@@ -13,6 +13,10 @@ import Foundation
 class SocketConnection: NSObject, StreamDelegate {
   var didOpen: (() -> Void)?
   var didClose: ((Error?) -> Void)?
+  /// Fired when the output stream can accept more bytes. The uploader uses it to
+  /// push the remaining chunks of a frame that didn't fit in one write — without
+  /// it, frames larger than one write (i.e. all of them) stall half-sent.
+  var streamHasSpaceAvailable: (() -> Void)?
 
   private let filePath: String
   private var socketHandle: Int32 = -1
@@ -21,7 +25,7 @@ class SocketConnection: NSObject, StreamDelegate {
   private var inputStream: InputStream?
   private var outputStream: OutputStream?
 
-  private var networkQueue: DispatchQueue?
+  private var networkThread: Thread?
   private var shouldKeepRunning = false
 
   init(filePath path: String) {
@@ -55,7 +59,7 @@ class SocketConnection: NSObject, StreamDelegate {
     case .openCompleted:
       didOpen?()
     case .hasSpaceAvailable:
-      break
+      streamHasSpaceAvailable?()
     case .errorOccurred:
       close()
       didClose?(aStream.streamError)
@@ -105,35 +109,56 @@ class SocketConnection: NSObject, StreamDelegate {
     outputStream?.setProperty(kCFBooleanTrue,
                               forKey: Stream.PropertyKey(rawValue: kCFStreamPropertyShouldCloseNativeSocket as String))
 
-    // Schedule and open on the extension's main run loop. open() runs on the
-    // connect-retry GCD queue (see SampleHandler.openConnection), which has no
-    // running run loop, so streams scheduled on `.current` there would never
-    // deliver `.openCompleted`/`.hasSpaceAvailable` — isReady would stay false and
-    // every frame would be dropped. The extension's main run loop is serviced by
-    // ReplayKit, so events land there.
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      self.inputStream?.schedule(in: .main, forMode: .common)
-      self.outputStream?.schedule(in: .main, forMode: .common)
-      self.inputStream?.open()
-      self.outputStream?.open()
+    // Run the streams on a dedicated thread with a *running* run loop, mirroring
+    // the app side (FlutterSocketConnection's `networkThread`). open() is called
+    // from the connect-retry GCD queue (SampleHandler.openConnection), which has no
+    // run loop. Scheduling on `.main` instead was the earlier attempt, but a
+    // broadcast upload extension has no guarantee ReplayKit is spinning the main
+    // run loop — when it isn't, `.openCompleted` never arrives, `didOpen` never
+    // fires, `isReady` stays false, and every frame is dropped (the socket connects
+    // but no bytes are ever written). A thread we own and spin ourselves removes
+    // that dependency.
+    let thread = Thread { [weak self] in
+      while self?.shouldKeepRunning == true && !Thread.current.isCancelled {
+        autoreleasepool {
+          RunLoop.current.run(mode: .default, before: .distantFuture)
+        }
+      }
     }
+    thread.qualityOfService = .userInitiated
+    networkThread = thread
+    shouldKeepRunning = true
+    thread.start()
+
+    perform(#selector(scheduleStreams), on: thread, with: nil, waitUntilDone: true)
+    inputStream?.open()
+    outputStream?.open()
+  }
+
+  @objc private func scheduleStreams() {
+    inputStream?.schedule(in: .current, forMode: .common)
+    outputStream?.schedule(in: .current, forMode: .common)
+  }
+
+  @objc private func unscheduleStreams() {
+    inputStream?.remove(from: .current, forMode: .common)
+    outputStream?.remove(from: .current, forMode: .common)
   }
 
   private func cleanup() {
-    let input = inputStream
-    let output = outputStream
+    // Unschedule on the same thread the streams were scheduled on, then let its
+    // run loop fall out (shouldKeepRunning is already false) and cancel it.
+    if let thread = networkThread, thread.isExecuting {
+      perform(#selector(unscheduleStreams), on: thread, with: nil, waitUntilDone: true)
+    }
+    inputStream?.delegate = nil
+    outputStream?.delegate = nil
+    inputStream?.close()
+    outputStream?.close()
     inputStream = nil
     outputStream = nil
-    // Unschedule on the same (main) run loop the streams were scheduled on.
-    DispatchQueue.main.async {
-      input?.remove(from: .main, forMode: .common)
-      output?.remove(from: .main, forMode: .common)
-      input?.delegate = nil
-      output?.delegate = nil
-      input?.close()
-      output?.close()
-    }
+    networkThread?.cancel()
+    networkThread = nil
     if socketHandle != -1 {
       Darwin.close(socketHandle)
       socketHandle = -1
