@@ -32,38 +32,45 @@ class SampleUploader {
     setupConnection()
   }
 
-  @discardableResult
-  func send(sample buffer: CMSampleBuffer) -> Bool {
-    guard isReady else { return false }
-    isReady = false
-
-    dataToSend = prepare(sample: buffer)
-    byteIndex = 0
-
-    guard dataToSend != nil else {
-      // Encoding failed for this one frame. Stay ready so the next frame still
-      // sends — a transient failure must not wedge the whole broadcast.
-      isReady = true
-      return false
-    }
+  func send(sample buffer: CMSampleBuffer) {
+    // Encode on the ReplayKit callback thread while `buffer` is guaranteed valid,
+    // then hand the finished bytes to `serialQueue`. Every mutation of the shared
+    // state (`isReady`, `dataToSend`, `byteIndex`) happens on that one queue — the
+    // readiness gate, the chunk writer, and the didOpen/didClose callbacks — so no
+    // field is ever touched from two threads.
+    let data = prepare(sample: buffer)
 
     serialQueue.async { [weak self] in
-      self?.sendDataChunk()
+      guard let self = self, self.isReady else { return }
+
+      guard let data = data else {
+        // Encoding failed for this one frame. Stay ready so the next frame still
+        // sends — a transient failure must not wedge the whole broadcast.
+        return
+      }
+
+      self.isReady = false
+      self.dataToSend = data
+      self.byteIndex = 0
+      self.sendDataChunk()
     }
-    return true
   }
 
   // MARK: - Private
 
   private func setupConnection() {
-    connection.didOpen = { [weak self] in self?.isReady = true }
-    connection.didClose = { [weak self] _ in self?.isReady = false }
+    connection.didOpen = { [weak self] in
+      self?.serialQueue.async { self?.isReady = true }
+    }
+    connection.didClose = { [weak self] _ in
+      self?.serialQueue.async { self?.isReady = false }
+    }
     // A single screen frame is far larger than one stream write, so it goes out in
     // chunks: write until the stream reports no space, then wait. The output
     // stream's `hasSpaceAvailable` is what resumes the rest — without this wiring a
     // frame stalls after its first chunk and the message never completes (the
-    // receiver shows a permanent black tile). Runs on the same serial queue as the
-    // initial send so byteIndex/dataToSend are never touched from two threads.
+    // receiver shows a permanent black tile). Hops onto `serialQueue` like every
+    // other access so byteIndex/dataToSend are never touched from two threads.
     connection.streamHasSpaceAvailable = { [weak self] in
       self?.serialQueue.async { self?.sendDataChunk() }
     }
