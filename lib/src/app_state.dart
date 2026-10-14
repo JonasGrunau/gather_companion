@@ -1475,6 +1475,14 @@ class AppState extends ChangeNotifier {
     return failed;
   }
 
+  Future<String?> setScreenShareOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setScreenShareOn(on);
+    notifyListeners();
+    return failed;
+  }
+
   Future<void> switchCamera() async {
     await _call?.switchCamera();
     notifyListeners();

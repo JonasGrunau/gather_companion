@@ -76,6 +76,15 @@ class FakeCall implements Call {
   @override
   Future<String?> setCameraOn(bool on) async => null;
 
+  /// The screen-share toggles we were asked for, in order.
+  final List<bool> screenCalls = [];
+
+  @override
+  Future<String?> setScreenShareOn(bool on) async {
+    screenCalls.add(on);
+    return null;
+  }
+
   /// The speaker toggles we were asked for, in order.
   final List<bool> speakerCalls = [];
 
