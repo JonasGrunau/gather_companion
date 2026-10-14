@@ -58,6 +58,11 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   /// One at a time — a second tap mid-warp is ignored rather than queued.
   String? _warping;
 
+  /// The search box's text and its trimmed, lower-cased-at-match query. Typing
+  /// here narrows the directory in place; empty means show everything.
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
+
   /// Drives the subtitle's warp-in. Restarted whenever the tab becomes visible,
   /// which is free to tick exactly then: the shell wraps each tab in a
   /// `TickerMode` that enables in the same frame the tab is selected.
@@ -74,6 +79,9 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
     // The shell's own [ListenableBuilder] misses availability and cluster changes;
     // this is the signal that carries them. See the library comment.
     state.directoryChanges.addListener(_onDirectoryChanged);
+    // The list already rebuilds on directory churn; re-filtering on each keystroke
+    // is the same cheap setState.
+    _search.addListener(() => setState(() => _query = _search.text.trim()));
     if (widget.visible) _warp.forward(from: 0);
   }
 
@@ -87,12 +95,23 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   @override
   void dispose() {
     state.directoryChanges.removeListener(_onDirectoryChanged);
+    _search.dispose();
     _warp.dispose();
     super.dispose();
   }
 
   void _onDirectoryChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// Whether a contact survives the current search. An empty query keeps
+  /// everyone; otherwise their name or their status line must contain it.
+  bool _matches(Contact c) {
+    if (_query.isEmpty) return true;
+    final q = _query.toLowerCase();
+    if (c.label.toLowerCase().contains(q)) return true;
+    final s = c.status?.text;
+    return s != null && s.toLowerCase().contains(q);
   }
 
   /// Warps, then opens the faces on success. The sentence a refusal returns is
@@ -152,12 +171,18 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
     final t = context.tokens;
     final bottomInset = MediaQuery.paddingOf(context).bottom;
 
+    final searching = _query.isNotEmpty;
     final contacts = state.directory;
-    final meetings = state.meetings;
     final recents = _recentContacts(contacts);
 
-    final present = contacts.where((c) => c.isPresent).toList(growable: false);
-    final offline = contacts.where((c) => !c.isPresent).toList(growable: false);
+    final meetings = state.meetings
+        .where((m) => !searching || m.members.any(_matches))
+        .toList(growable: false);
+    final present =
+        contacts.where((c) => c.isPresent && _matches(c)).toList(growable: false);
+    final offline =
+        contacts.where((c) => !c.isPresent && _matches(c)).toList(growable: false);
+    final noMatches = searching && meetings.isEmpty && present.isEmpty && offline.isEmpty;
 
     return Scaffold(
       backgroundColor: t.background,
@@ -176,8 +201,13 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
             child: CustomScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
               slivers: [
-            if (recents.isNotEmpty)
+            if (!searching && recents.isNotEmpty)
               SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson)),
+
+            SliverToBoxAdapter(child: _SearchField(controller: _search, active: searching)),
+
+            if (noMatches)
+              SliverToBoxAdapter(child: _Empty('No one matches "$_query".')),
 
             if (meetings.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Happening now')),
@@ -192,25 +222,30 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
               ),
             ],
 
-            SliverToBoxAdapter(child: _SectionHeader(present.isEmpty ? 'Nobody here' : 'In the office')),
-            if (present.isEmpty)
-              const SliverToBoxAdapter(child: _Empty("Nobody's in the office right now."))
-            else
-              SliverList.builder(
-                itemCount: present.length,
-                itemBuilder: (context, i) {
-                  final c = present[i];
-                  final canWarp = state.canWarpTo(c);
-                  return _ContactTile(
-                    state: state,
-                    contact: c,
-                    busy: _warping == c.id,
-                    canWarp: canWarp,
-                    onTap: canWarp ? () => _warpToPerson(c) : null,
-                    onWave: () => _waveAt(c),
-                  );
-                },
-              ),
+            // While searching, the people list is purely the matches — the
+            // "Nobody here" prompt belongs to the unfiltered tab, not a query that
+            // simply found no present people (the no-match line above covers that).
+            if (!noMatches) ...[
+              SliverToBoxAdapter(child: _SectionHeader(present.isEmpty ? 'Nobody here' : 'In the office')),
+              if (present.isEmpty && !searching)
+                const SliverToBoxAdapter(child: _Empty("Nobody's in the office right now."))
+              else
+                SliverList.builder(
+                  itemCount: present.length,
+                  itemBuilder: (context, i) {
+                    final c = present[i];
+                    final canWarp = state.canWarpTo(c);
+                    return _ContactTile(
+                      state: state,
+                      contact: c,
+                      busy: _warping == c.id,
+                      canWarp: canWarp,
+                      onTap: canWarp ? () => _warpToPerson(c) : null,
+                      onWave: () => _waveAt(c),
+                    );
+                  },
+                ),
+            ],
 
             if (offline.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Away')),
@@ -323,8 +358,13 @@ class _MeetingCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final title = meeting.roomName ?? _conversationLabel(meeting.members);
-    final subtitle = '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
-        '${meeting.includesMe ? ' · you' : ''}';
+    // While a tap is resolving, the subtitle narrates the wait: warpToMeeting may
+    // spend a few seconds letting a freshly-reconnected roster place the room before
+    // it can walk in. See AppState.warpToMeeting.
+    final subtitle = busy
+        ? 'Finding directions…'
+        : '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
+            '${meeting.includesMe ? ' · you' : ''}';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(kTextGutter, 4, kTextGutter, 8),
@@ -554,6 +594,50 @@ class _JoinButton extends StatelessWidget {
                 Text(label, style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
               ],
             ),
+    );
+  }
+}
+
+/// The search box at the top of the directory. Narrows the list as you type;
+/// matches a person on their name or their status line. Styled off the same theme
+/// tokens as the status sheet's field so the two inputs read as one app.
+class _SearchField extends StatelessWidget {
+  const _SearchField({required this.controller, required this.active});
+
+  final TextEditingController controller;
+
+  /// Whether there is a query — gates the trailing clear button so an empty box
+  /// shows only the search glyph.
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(kTextGutter, 12, kTextGutter, 4),
+      child: TextField(
+        controller: controller,
+        textInputAction: TextInputAction.search,
+        decoration: InputDecoration(
+          isDense: true,
+          filled: true,
+          fillColor: t.card,
+          hintText: 'Search people',
+          hintStyle: TextStyle(color: t.mutedForeground),
+          prefixIcon: Icon(Icons.search_rounded, color: t.mutedForeground),
+          suffixIcon: active
+              ? IconButton(
+                  onPressed: controller.clear,
+                  icon: Icon(Icons.close_rounded, color: t.mutedForeground),
+                  tooltip: 'Clear',
+                )
+              : null,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(t.radius),
+            borderSide: BorderSide.none,
+          ),
+        ),
+      ),
     );
   }
 }

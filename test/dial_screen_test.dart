@@ -28,6 +28,7 @@ void main() {
     String? clusterId,
     num? x,
     num? y,
+    PersonStatus? status,
   }) =>
       RosterRow(
         id: id,
@@ -38,6 +39,7 @@ void main() {
         clusterIdKnown: clusterId != null,
         x: x,
         y: y,
+        status: status,
       );
 
   /// A roster with a conversation in the Lounge (Ada + Bob), a lone present
@@ -46,7 +48,7 @@ void main() {
         const RosterRow(id: kSelfId, name: 'You', x: 10, y: 7),
         row('a', name: 'Ada', clusterId: 'c1', x: 8, y: 10),
         row('b', name: 'Bob', clusterId: 'c1', x: 9, y: 11),
-        row('z', name: 'Zoe', x: 15, y: 7),
+        row('z', name: 'Zoe', x: 15, y: 7, status: const PersonStatus(text: 'out to lunch', type: 'Custom')),
         row('x', name: 'Xander', connected: false, availability: 'Offline', x: 3, y: 3),
       ]);
 
@@ -153,6 +155,63 @@ void main() {
     await tester.pump();
 
     expect(collector.waves, hasLength(1), reason: 'the press reached the wave action');
+  });
+
+  Future<void> typeSearch(WidgetTester tester, String query) async {
+    await tester.enterText(find.widgetWithText(TextField, 'Search people'), query);
+    await tester.pump();
+  }
+
+  testWidgets('a name search narrows to the matching people and hides the rest', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    await typeSearch(tester, 'ada');
+
+    expect(find.text('Ada'), findsOneWidget);
+    expect(find.text('Zoe'), findsNothing, reason: 'a non-match drops out of the list');
+    expect(find.text('Xander'), findsNothing);
+  });
+
+  testWidgets('a meeting survives search when one of its members matches', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // Ada is in the Lounge conversation; searching her keeps the card.
+    await typeSearch(tester, 'ada');
+    expect(find.text('Lounge'), findsOneWidget, reason: 'the meeting matches on a member name');
+  });
+
+  testWidgets('search matches on the status line, not just the name', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    // Zoe's name does not contain "lunch"; her status does.
+    await typeSearch(tester, 'lunch');
+    expect(find.text('Zoe'), findsOneWidget);
+    expect(find.text('Ada'), findsNothing);
+  });
+
+  testWidgets('a query with no matches shows the empty line, and clearing restores all', (tester) async {
+    final state = peopled();
+    addTearDown(state.dispose);
+    await tester.pumpWidget(wrap(state));
+    await tester.pump();
+
+    await typeSearch(tester, 'nobodyhere');
+    expect(find.text('No one matches "nobodyhere".'), findsOneWidget);
+    expect(find.text('Ada'), findsNothing);
+
+    await tester.tap(find.byIcon(Icons.close_rounded));
+    await tester.pump();
+    expect(find.text('Ada'), findsOneWidget, reason: 'clearing the box brings everyone back');
+    expect(find.text('Zoe'), findsOneWidget);
   });
 
   testWidgets('replays the codename flourish each time the tab becomes visible', (tester) async {

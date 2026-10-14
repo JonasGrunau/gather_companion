@@ -8,6 +8,7 @@
 /// and that warping to a person hops the avatar and leaves the offline unreachable.
 library;
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/harness/fake_collector.dart';
@@ -341,6 +342,210 @@ void main() {
 
       expect(failed, contains('not in the office'));
       expect(call.micCalls, isEmpty);
+    });
+  });
+
+  group('warpToMeeting', () {
+    ({AppState state, FakeCollector collector}) wired(List<RosterRow> rows) {
+      final collector = FakeCollector();
+      final state = AppState()
+        ..debugMap = schematicOffice()
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(rosterOf(rows));
+      addTearDown(state.dispose);
+      return (state: state, collector: collector);
+    }
+
+    // (1,1) and (1,2) are open floor on the schematic office — in no named room — so
+    // the meeting stays unroomed and warpToMeeting hops beside a member rather than
+    // walking a room, a teleport we can count.
+    test('hops beside a placed member when the roster already has them', () async {
+      final (:state, :collector) = wired([
+        const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+        row('a', name: 'Ada', clusterId: 'c1', x: 1, y: 1),
+        row('b', name: 'Bob', clusterId: 'c1', x: 1, y: 2),
+      ]);
+      final before = collector.teleports.length;
+      final failed = await state.warpToMeeting(state.meetings.single);
+      expect(failed, isNull);
+      expect(collector.teleports.length, before + 1);
+    });
+
+    test('waits for a sparse post-reconnect roster, then warps in', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'), // present, not placed yet
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+        final meeting = state.meetings.single;
+        expect(meeting.roomName, isNull, reason: 'nothing placed, nothing to name it');
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(meeting).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse, reason: 'finding directions while the roster is sparse');
+        expect(collector.teleports, isEmpty);
+
+        // Placement streams in, the way the live socket fills a cluster after a reconnect.
+        state.debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1', x: 1, y: 1),
+          row('b', name: 'Bob', clusterId: 'c1', x: 1, y: 2),
+        ]));
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue);
+        expect(result, isNull, reason: 'resolved once the members were placed');
+        expect(collector.teleports, hasLength(1));
+      });
+    });
+
+    test('gives up after a few seconds and sends the user to the map', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'), // never placed
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(state.meetings.single).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+
+        expect(done, isTrue);
+        expect(result, contains('walk into the room'));
+        expect(collector.teleports, isEmpty);
+      });
+    });
+
+    test('refuses a conversation on another floor and waits for nothing', () async {
+      final (:state, :collector) = wired([
+        const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 2, y: 2),
+        row('a', name: 'Ada', clusterId: 'c1', floorId: 'first', x: 1, y: 1),
+        row('b', name: 'Bob', clusterId: 'c1', floorId: 'first', x: 1, y: 2),
+      ]);
+      final failed = await state.warpToMeeting(state.meetings.single);
+      expect(failed, contains('another floor'));
+      expect(collector.teleports, isEmpty);
+    });
+
+    // A sparse post-reconnect meeting names no floor, so the entry floor-check waves
+    // it through. If it then places onto another floor that happens to hold a room of
+    // the same name as one on our floor, the name-only room match must not walk us
+    // into the wrong room — the floor is revalidated against the live meeting.
+    test('revalidates the floor when a sparse meeting places onto another one', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 10, y: 7),
+          row('a', name: 'Ada', clusterId: 'c1', floorId: 'first'), // present, unplaced
+          row('b', name: 'Bob', clusterId: 'c1', floorId: 'first'),
+        ]);
+        final meeting = state.meetings.single;
+        expect(meeting.floorId, isNull, reason: 'unplaced members name no floor');
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(meeting).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        // Placement streams in — onto the first floor, inside Huddle, a room name this
+        // floor's schematic also carries.
+        state.debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You', floorId: 'ground', x: 10, y: 7),
+          row('a', name: 'Ada', clusterId: 'c1', floorId: 'first', x: 3, y: 3),
+          row('b', name: 'Bob', clusterId: 'c1', floorId: 'first', x: 4, y: 3),
+        ]));
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue);
+        expect(result, contains('another floor'));
+        expect(collector.teleports, isEmpty,
+            reason: 'must not walk into the same-named room on this floor');
+      });
+    });
+
+    // The cluster ending mid-wait is a terminal state, not something to sit out the
+    // full five seconds for.
+    test('stops waiting the moment the cluster ends', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'),
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(state.meetings.single).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        // Everybody leaves — the cluster is gone.
+        state.debugApplyRoster(rosterOf([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+        ]));
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue, reason: 'ended cluster is terminal, not a five-second wait');
+        expect(result, contains('just ended'));
+        expect(collector.teleports, isEmpty);
+      });
+    });
+
+    // The link dropping mid-wait is the other terminal state: a walk started now
+    // would only move this phone's avatar into a floor the server is not updating.
+    test('stops waiting when the link drops mid-wait', () {
+      fakeAsync((async) {
+        final (:state, :collector) = wired([
+          const RosterRow(id: kSelfId, name: 'You', x: 2, y: 2),
+          row('a', name: 'Ada', clusterId: 'c1'),
+          row('b', name: 'Bob', clusterId: 'c1'),
+        ]);
+
+        String? result;
+        var done = false;
+        state.warpToMeeting(state.meetings.single).then((r) {
+          result = r;
+          done = true;
+        });
+
+        async.elapse(const Duration(milliseconds: 100));
+        expect(done, isFalse);
+
+        state.debugApplyLink(
+          const LinkStatus(LinkState.offline, 'No connection — waiting for network.'),
+        );
+        async.elapse(const Duration(milliseconds: 300));
+        async.flushMicrotasks();
+
+        expect(done, isTrue, reason: 'dropped link is terminal, not a five-second wait');
+        expect(result, contains('No connection'));
+        expect(collector.teleports, isEmpty);
+      });
     });
   });
 }

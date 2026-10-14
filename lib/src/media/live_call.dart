@@ -147,6 +147,13 @@ class LiveCall implements Call {
   bool _wantCamera = false;
   bool _wantScreen = false;
 
+  /// Reentrancy guard for the bad-auth token heal in [_publish]. A stale SFU
+  /// token (after a transport change the socket slept through) is refused with
+  /// `TokenVerificationFailed`; the heal rebuilds the session to mint a fresh
+  /// one and retries the publish exactly once. Without this flag a token that is
+  /// still bad after the rebuild would rebuild-and-retry forever (#57).
+  bool _authHealing = false;
+
   /// Serialises the whole thing. Two taps in quick succession would otherwise
   /// interleave a capture restart with a publish and produce on a dead track.
   Future<void> _work = Future.value();
@@ -378,6 +385,26 @@ class LiveCall implements Call {
           'your microphone on again here.',
         );
       }
+      // A stale SFU token — the socket slept through a transport change and the
+      // server now refuses every produce `bad auth / TokenVerificationFailed`,
+      // which no restart-free path recovers on its own (#57). Rebuild the
+      // session to mint a fresh token and retry the publish once. The guard
+      // stops a token that is still bad after the rebuild from looping; it falls
+      // through to the ordinary failure message instead.
+      if (_isStaleAuth(error) && !_authHealing) {
+        _authHealing = true;
+        _log('call: SFU refused bad-auth — rebuilding to mint a fresh token (#57)');
+        try {
+          // `_rebuild`, not the public `rebuild`: we are already inside the
+          // serialise job, so taking the lock again would deadlock. It republishes
+          // this tag onto the fresh session itself, so we return *that* result —
+          // a second `_publish(tag)` here would be a duplicate produce the fresh
+          // session also refuses on a still-bad token.
+          return await _rebuild(report: tag);
+        } finally {
+          _authHealing = false;
+        }
+      }
       // The hardware is live and only the wire failed, so the button stays on:
       // the person is unmuted, and the sentence says the room cannot hear them
       // yet. Silently flipping it back would read as the tap not registering.
@@ -392,6 +419,16 @@ class LiveCall implements Call {
     ));
     return null;
   }
+
+  /// A produce refusal that means the SFU token is stale, not that the track or
+  /// the transport is wrong. The server sends `bad auth` with
+  /// `{reason: TokenVerificationFailed}`, which `SfuSignalling` surfaces as the
+  /// message of an [SfuException]. Keyed on both strings because only the reason
+  /// is stable across Gather's error shapes.
+  bool _isStaleAuth(Object error) =>
+      error is SfuException &&
+      (error.message.contains('TokenVerificationFailed') ||
+          error.message.contains('bad auth'));
 
   /// The connected session, connecting it if this is the first thing to need one.
   ///
@@ -621,25 +658,48 @@ class LiveCall implements Call {
     // Serialised like every other session-touching path, so a rebuild landing in
     // the middle of a tap cannot interleave a capture restart with a produce.
     await _serialise(() async {
-      // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
-      // cluster or tap builds one from scratch, which is the right amount of work.
-      if (_sfu == null &&
-          _listeningTo.isEmpty &&
-          !_wantMic &&
-          !_wantCamera &&
-          !_wantScreen) {
-        return null;
-      }
-      _log('call: rebuilding the media session after an external teardown');
-      // `_start` disposes the stale session, opens fresh transports, and replays
-      // the allow list, the conversation and the subscriptions — but not our
-      // producers, since only this class holds the tracks to put back.
-      await _start();
-      if (_wantMic) await _publish(SfuTag.audio);
-      if (_wantCamera) await _publish(SfuTag.video);
-      if (_wantScreen) await _publishScreen();
+      await _rebuild();
       return null;
     });
+  }
+
+  /// The rebuild itself, already holding the queue.
+  ///
+  /// Split out from [rebuild] because the bad-auth heal in [_publish] runs
+  /// *inside* a `_serialise` job already: calling the public [rebuild] from there
+  /// would queue behind the job it is part of and deadlock. This takes no lock,
+  /// so it may only be called from a path that already holds one.
+  ///
+  /// [report] names the track whose republish result the caller wants back — the
+  /// bad-auth heal passes the tag it was trying to publish, because the republish
+  /// below *is* its single retry: a second `_publish(tag)` on the fresh session
+  /// would send a duplicate produce (refused twice on a still-bad token). Returns
+  /// that tag's detail (`null` on success), or `null` when nobody is asking.
+  Future<String?> _rebuild({SfuTag? report}) async {
+    // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
+    // cluster or tap builds one from scratch, which is the right amount of work.
+    if (_sfu == null &&
+        _listeningTo.isEmpty &&
+        !_wantMic &&
+        !_wantCamera &&
+        !_wantScreen) {
+      return null;
+    }
+    _log('call: rebuilding the media session after an external teardown');
+    // `_start` disposes the stale session, opens fresh transports, and replays
+    // the allow list, the conversation and the subscriptions — but not our
+    // producers, since only this class holds the tracks to put back.
+    await _start();
+    String? audioDetail;
+    String? videoDetail;
+    if (_wantMic) audioDetail = await _publish(SfuTag.audio);
+    if (_wantCamera) videoDetail = await _publish(SfuTag.video);
+    if (_wantScreen) await _publishScreen();
+    return switch (report) {
+      SfuTag.audio => audioDetail,
+      SfuTag.video || SfuTag.screen => videoDetail,
+      null => null,
+    };
   }
 
   @override
