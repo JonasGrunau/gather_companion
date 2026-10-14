@@ -19,6 +19,7 @@ import 'package:gather_client/gather_client.dart';
 
 import '../src/app_state.dart';
 import '../src/calendar.dart';
+import '../src/google_calendar.dart';
 import '../theme/gather_theme.dart';
 
 class CalendarScreen extends StatelessWidget {
@@ -40,6 +41,11 @@ class CalendarScreen extends StatelessWidget {
         backgroundColor: t.background,
         title: const Text('Plans'),
         titleTextStyle: Theme.of(context).textTheme.titleLarge,
+        actions: [
+          // Only shown when this build carries an OAuth client — otherwise there is
+          // nothing to connect to and the action would mislead.
+          if (state.googleAvailable) _GoogleButton(state: state),
+        ],
       ),
       floatingActionButton: Padding(
         // Lifts the FAB above the floating rail it would otherwise sit under.
@@ -54,25 +60,44 @@ class CalendarScreen extends StatelessWidget {
       body: ListenableBuilder(
         listenable: state,
         builder: (context, _) {
-          final meetings = state.plannedMeetings;
           final now = DateTime.now();
-          final upcoming = [for (final m in meetings) if (!m.endsAt.isBefore(now)) m];
+          // One timeline, two sources: plans this phone owns and read-only Google
+          // events it only mirrors. Merged and sorted together so a 10am standup from
+          // Google and an 11am plan made here sit in one day in the right order.
+          final entries = <_Entry>[
+            for (final m in state.plannedMeetings) _Entry.plan(state, m),
+            for (final e in state.googleEvents) _Entry.google(e),
+          ];
+          final upcoming = [for (final e in entries) if (!e.endsAt.isBefore(now)) e]
+            ..sort((a, b) => a.startsAt.compareTo(b.startsAt));
           // Past descending: the most recent is the one worth seeing first.
-          final past = [for (final m in meetings) if (m.endsAt.isBefore(now)) m]
-              .reversed
-              .toList();
+          final past = [for (final e in entries) if (e.endsAt.isBefore(now)) e]
+            ..sort((a, b) => b.startsAt.compareTo(a.startsAt));
 
-          if (meetings.isEmpty) {
-            return _Empty(bottomInset: bottomInset);
+          // Offered whenever a Google account could be connected but is not — above
+          // the list so it reads as the next thing to do, not buried under it. The
+          // app-bar icon does the same, but a tappable row naming what it is for is
+          // the discoverable hint; the icon alone is a guess.
+          final showConnect = state.googleAvailable && !state.googleConnected;
+
+          if (entries.isEmpty) {
+            return ListView(
+              padding: EdgeInsets.only(top: 8, bottom: bottomInset + 96),
+              children: [
+                if (showConnect) _ConnectGoogleBanner(state: state),
+                _Empty(bottomInset: bottomInset),
+              ],
+            );
           }
 
           return ListView(
             padding: EdgeInsets.only(top: 8, bottom: bottomInset + 96),
             children: [
-              ..._withDayHeaders(context, state, upcoming),
+              if (showConnect) _ConnectGoogleBanner(state: state),
+              ..._withDayHeaders(context, upcoming),
               if (past.isNotEmpty) ...[
                 const _SectionHeader('EARLIER'),
-                for (final m in past) _MeetingCard(state: state, meeting: m, past: true),
+                for (final e in past) e.build(context, past: true),
               ],
             ],
           );
@@ -82,21 +107,186 @@ class CalendarScreen extends StatelessWidget {
   }
 }
 
-/// Upcoming meetings, split by day the way the Activity feed is — a wall of times
+/// Upcoming entries, split by day the way the Activity feed is — a wall of times
 /// with no dates stops being readable past the first screen.
-List<Widget> _withDayHeaders(BuildContext context, AppState state, List<PlannedMeeting> meetings) {
+List<Widget> _withDayHeaders(BuildContext context, List<_Entry> entries) {
   final out = <Widget>[];
   String? current;
-  for (final m in meetings) {
-    final label = _dayLabel(m.startsAt);
+  for (final e in entries) {
+    final label = _dayLabel(e.startsAt);
     if (label != current) {
       out.add(_SectionHeader(label));
       current = label;
     }
-    out.add(_MeetingCard(state: state, meeting: m, past: false));
+    out.add(e.build(context, past: false));
   }
   return out;
 }
+
+/// One row in the merged Plans timeline: either a [PlannedMeeting] this phone owns
+/// or a read-only [GoogleEvent] it mirrors. Carries just enough — a start, an end and
+/// a card builder — for the screen to sort and group the two kinds as one list.
+class _Entry {
+  _Entry._(this.startsAt, this.endsAt, this._build);
+
+  factory _Entry.plan(AppState state, PlannedMeeting m) =>
+      _Entry._(m.startsAt, m.endsAt, (context, {required past}) => _MeetingCard(state: state, meeting: m, past: past));
+
+  factory _Entry.google(GoogleEvent e) =>
+      _Entry._(e.startsAt, e.endsAt, (context, {required past}) => _GoogleEventCard(event: e, past: past));
+
+  final DateTime startsAt;
+  final DateTime endsAt;
+  final Widget Function(BuildContext context, {required bool past}) _build;
+
+  Widget build(BuildContext context, {required bool past}) => _build(context, past: past);
+}
+
+/// The Plans tab's Google connection, as an app-bar action. A cloud-off icon offers
+/// to connect; once connected it turns to a menu that refreshes or disconnects. A
+/// spinner while the consent sheet or a refresh is in flight.
+class _GoogleButton extends StatefulWidget {
+  const _GoogleButton({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_GoogleButton> createState() => _GoogleButtonState();
+}
+
+class _GoogleButtonState extends State<_GoogleButton> {
+  bool _busy = false;
+
+  Future<void> _connect() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    final error = await widget.state.connectGoogle();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _busy = true);
+    await widget.state.refreshGoogleEvents();
+    if (mounted) setState(() => _busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    if (_busy) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 16),
+        child: Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+      );
+    }
+    if (!widget.state.googleConnected) {
+      return IconButton(
+        tooltip: 'Connect Google Calendar',
+        icon: const Icon(Icons.event_available_outlined),
+        onPressed: _connect,
+      );
+    }
+    return PopupMenuButton<String>(
+      tooltip: 'Google Calendar',
+      icon: Icon(Icons.event_available, color: t.brand),
+      color: t.popover,
+      onSelected: (value) {
+        if (value == 'refresh') _refresh();
+        if (value == 'disconnect') widget.state.disconnectGoogle();
+      },
+      itemBuilder: (context) => [
+        PopupMenuItem(value: 'refresh', child: Text('Refresh', style: TextStyle(color: t.foreground))),
+        PopupMenuItem(value: 'disconnect', child: Text('Disconnect Google', style: TextStyle(color: t.foreground))),
+      ],
+    );
+  }
+}
+
+/// A read-only Google event. Shaped like [_MeetingCard] so the two read as one list,
+/// but with no walk and no delete — this phone does not own it — and a small Google
+/// marker so it is clear where it came from. All-day events show their day, not a
+/// 00:00 time.
+class _GoogleEventCard extends StatelessWidget {
+  const _GoogleEventCard({required this.event, required this.past});
+
+  final GoogleEvent event;
+  final bool past;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final hasPlace = event.location != null && event.location!.isNotEmpty;
+
+    return Opacity(
+      opacity: past ? 0.55 : 1,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(kTextGutter, 4, kTextGutter, 4),
+        child: Material(
+          color: t.card,
+          borderRadius: BorderRadius.circular(t.radius),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        event.title,
+                        style: TextStyle(color: t.foreground, fontSize: 16, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      event.allDay ? 'All day' : _googleTimeRange(event),
+                      style: TextStyle(
+                        color: t.faint,
+                        fontSize: 13,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                if (hasPlace) ...[
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.place_outlined, size: 15, color: t.mutedForeground),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          event.location!,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: t.mutedForeground, fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.event_available, size: 13, color: t.faint),
+                    const SizedBox(width: 4),
+                    Text('Google Calendar', style: TextStyle(color: t.faint, fontSize: 12)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String _googleTimeRange(GoogleEvent e) => '${_time(e.startsAt)}–${_time(e.endsAt)}';
 
 class _Empty extends StatelessWidget {
   const _Empty({required this.bottomInset});
@@ -113,6 +303,78 @@ class _Empty extends StatelessWidget {
           'No plans yet.\nTap + to schedule a meeting and get a reminder before it starts.',
           textAlign: TextAlign.center,
           style: TextStyle(color: t.mutedForeground, height: 1.5),
+        ),
+      ),
+    );
+  }
+}
+
+/// The tappable hint shown in the Plans tab when a Google account could be connected
+/// but is not. The app-bar icon connects too, but this row names what it does — the
+/// discoverable version of the same action. Carries its own busy state so the whole
+/// row shows a spinner while the consent sheet is up.
+class _ConnectGoogleBanner extends StatefulWidget {
+  const _ConnectGoogleBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_ConnectGoogleBanner> createState() => _ConnectGoogleBannerState();
+}
+
+class _ConnectGoogleBannerState extends State<_ConnectGoogleBanner> {
+  bool _busy = false;
+
+  Future<void> _connect() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    final error = await widget.state.connectGoogle();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(kTextGutter, 8, kTextGutter, 8),
+      child: Material(
+        color: t.card,
+        borderRadius: BorderRadius.circular(t.radius),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(t.radius),
+          onTap: _busy ? null : _connect,
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(
+              children: [
+                Icon(Icons.event_available_outlined, color: t.brand, size: 22),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Connect Google Calendar',
+                        style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'See the meetings you already have, right here.',
+                        style: TextStyle(color: t.mutedForeground, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                if (_busy)
+                  const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                else
+                  Icon(Icons.chevron_right_rounded, color: t.mutedForeground),
+              ],
+            ),
+          ),
         ),
       ),
     );

@@ -7,6 +7,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'src/app_state.dart';
 import 'src/fonts_license.dart';
+import 'src/google_calendar.dart';
 import 'src/media/live_call.dart';
 import 'src/media/media_log.dart';
 import 'theme/gather_theme.dart';
@@ -61,6 +62,28 @@ Future<void> main() async {
   );
 }
 
+/// The Google OAuth iOS client id, supplied at build time rather than committed:
+/// `flutter run --dart-define=GOOGLE_CLIENT_ID=NNN-xxx.apps.googleusercontent.com`.
+/// Empty in a plain build, which leaves the Plans tab's Google connection hidden.
+const _googleClientId = String.fromEnvironment('GOOGLE_CLIENT_ID');
+
+/// Builds the read-only Google Calendar connection, or null when no client id was
+/// defined. The reversed-domain form Google wants for the redirect/callback scheme
+/// is derived from the id, so only the one value need be supplied.
+GoogleCalendar? _buildGoogleCalendar() {
+  if (_googleClientId.isEmpty) return null;
+  const suffix = '.apps.googleusercontent.com';
+  final base = _googleClientId.endsWith(suffix)
+      ? _googleClientId.substring(0, _googleClientId.length - suffix.length)
+      : _googleClientId;
+  return GoogleCalendar(
+    config: GoogleOAuthConfig(
+      clientId: _googleClientId,
+      reversedClientId: 'com.googleusercontent.apps.$base',
+    ),
+  );
+}
+
 class GatherCompanionApp extends StatefulWidget {
   const GatherCompanionApp({super.key});
 
@@ -86,6 +109,10 @@ class _GatherCompanionAppState extends State<GatherCompanionApp> with WidgetsBin
     // build keeps and `devicectl` can copy off. Without this the collector and walk
     // log into a `_noop` and a desk-desync leaves no trace.
     log: mediaLog,
+    // The read-only Google Calendar connection, or null when this build carries no
+    // OAuth client id — see [_buildGoogleCalendar]. The one place it is named, like
+    // the media engine above it.
+    googleCalendar: _buildGoogleCalendar(),
   );
 
   /// The wakelock state we last pushed to the OS, so [_syncWakelock] toggles the

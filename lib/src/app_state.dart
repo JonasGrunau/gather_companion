@@ -9,6 +9,7 @@ import 'calendar.dart';
 import 'calendar_mirror.dart';
 import 'calendar_store.dart';
 import 'credentials.dart';
+import 'google_calendar.dart';
 import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
@@ -79,6 +80,10 @@ class AppState extends ChangeNotifier {
     // build without the native plugin — never touches a real calendar; `main.dart`
     // supplies the plugin-backed one.
     CalendarMirror? calendarMirror,
+    // The read-only Google Calendar connection, or null when this build has no OAuth
+    // client configured (every test, and a placeholder build). Null reads as "not
+    // offered": the Plans tab shows local plans only and never tries to connect.
+    GoogleCalendar? googleCalendar,
   }) : _notifier = notifier ?? Notifier(),
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
@@ -92,6 +97,8 @@ class AppState extends ChangeNotifier {
        _uiPrefs = uiPreferences ?? UiPreferences(),
        _calendarStore = calendarStore ?? CalendarStore(),
        _calendarMirror = calendarMirror ?? const NoopCalendarMirror(),
+       // ignore: prefer_initializing_formals
+       _googleCalendar = googleCalendar,
        _buildCollector = buildCollector ??
            ((auth, spaceId) =>
                DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
@@ -111,6 +118,7 @@ class AppState extends ChangeNotifier {
   final UiPreferences _uiPrefs;
   final CalendarStore _calendarStore;
   final CalendarMirror _calendarMirror;
+  final GoogleCalendar? _googleCalendar;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -759,6 +767,10 @@ class AppState extends ChangeNotifier {
     _soundEffects = await _uiPrefs.loadSoundEffects();
     _plannedMeetings = await _calendarStore.load();
     _mirrorCalendarId = await _uiPrefs.loadMirrorCalendarId();
+    // Fire-and-forget: a connected Google account fills the Plans tab a beat after
+    // launch, and a failed read just leaves it empty. Not awaited — it must not hold
+    // boot behind a network round trip.
+    unawaited(_restoreGoogle());
 
     // Launched straight into Gameboy mode with sounds on: no setter ran to warm
     // the SFX player, so do it here while there is no call yet. The restore itself
@@ -2440,6 +2452,76 @@ class AppState extends ChangeNotifier {
       for (final room in rooms)
         if (room.name != null && room.name!.isNotEmpty) room,
     ];
+  }
+
+  // ---- Google Calendar (read-only) -------------------------------------------
+  //
+  // The events the desktop Calendar Panel shows, read from the source Gather itself
+  // reads — a connected Google account — rather than from Gather, which carries no
+  // scheduled event on the wire. Separate from [_plannedMeetings] because it is the
+  // opposite kind of thing: not a plan this phone owns and can edit, but one it only
+  // mirrors. The Plans tab renders both, the Google ones read-only.
+
+  List<GoogleEvent> _googleEvents = const [];
+
+  /// The upcoming Google Calendar events, soonest first. Empty when no account is
+  /// connected or the build has no OAuth client. The Plans tab renders these beside
+  /// the local plans, without the walk/delete a plan carries.
+  List<GoogleEvent> get googleEvents {
+    final out = [..._googleEvents];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Whether a Google account is connected. Drives the Plans tab's connect/disconnect
+  /// action. Updated by [connectGoogle]/[disconnectGoogle] and seeded at boot.
+  bool _googleConnected = false;
+  bool get googleConnected => _googleConnected;
+
+  /// Whether this build can offer a Google connection at all — false when no OAuth
+  /// client was compiled in (every test, a placeholder build), so the UI can hide
+  /// the action rather than offer one that cannot work.
+  bool get googleAvailable => _googleCalendar != null;
+
+  /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
+  /// batch of events. Called from [boot]; best-effort, never fails the launch.
+  Future<void> _restoreGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return;
+    _googleConnected = await google.isConnected;
+    if (_googleConnected) await refreshGoogleEvents();
+  }
+
+  /// Runs the Google consent flow and, on success, pulls the events in. Returns null
+  /// on success or a cancel, or a sentence for the user on a real failure.
+  Future<String?> connectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return 'Google Calendar is not set up in this build.';
+    final error = await google.connect();
+    if (error != null) return error;
+    _googleConnected = await google.isConnected;
+    notifyListeners();
+    await refreshGoogleEvents();
+    return null;
+  }
+
+  /// Forgets the Google account and clears its events from the tab.
+  Future<void> disconnectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return;
+    await google.disconnect();
+    _googleConnected = false;
+    _googleEvents = const [];
+    notifyListeners();
+  }
+
+  /// Re-reads the upcoming Google events. A no-op when disconnected; swallows a
+  /// failed read (the service returns an empty list) rather than surfacing it.
+  Future<void> refreshGoogleEvents() async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return;
+    _googleEvents = await google.fetchUpcoming();
+    notifyListeners();
   }
 
   /// The device calendars the user could mirror plans into. Empty when permission
