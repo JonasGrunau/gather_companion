@@ -488,6 +488,14 @@ class LiveCall implements Call {
       // Nobody left to hear. The session stays up if it exists — we may still be
       // publishing, and tearing it down over an empty cluster would cost a full
       // reconnection the moment somebody walks back.
+      //
+      // A screen share is the exception. Unlike the mic/camera it is a
+      // heavyweight, user-visible system broadcast — the iOS red indicator, the
+      // whole device captured — and it makes no sense to keep it running with
+      // nobody watching. Walking out of the conversation should end it, exactly
+      // as tapping Stop would; otherwise the broadcast keeps going back at your
+      // desk. Mic/camera stay as they are, so walking back is still cheap.
+      if (_wantScreen) await setScreenShareOn(false);
       final sfu = _sfu;
       if (sfu != null && sfu.ready) await sfu.setSubscriptions(const {});
       return;
