@@ -72,5 +72,28 @@ void main() {
     test('is host-case-insensitive', () {
       expect(GatherLink.tryParse('https://APP.V2.GATHER.TOWN/app/spc/X')?.spaceId, 'spc');
     });
+
+    test('reads the opaque code from a /m/ short link', () {
+      final link = GatherLink.tryParse('https://app.v2.gather.town/m/ktvILgXphb');
+      expect(link, isNotNull);
+      expect(link!.meetingLinkId, 'ktvILgXphb');
+      // No ids in the URL: the space is not known until the code is resolved.
+      expect(link.spaceId, isEmpty);
+      expect(link.roomHint, isNull);
+    });
+
+    test('an /app/ link carries no meeting link id', () {
+      final link = GatherLink.tryParse('https://app.v2.gather.town/app/spc/Office');
+      expect(link?.meetingLinkId, isNull);
+    });
+
+    test('returns null for a /m/ path with no code', () {
+      expect(GatherLink.tryParse('https://app.v2.gather.town/m'), isNull);
+      expect(GatherLink.tryParse('https://app.v2.gather.town/m/'), isNull);
+    });
+
+    test('a /m/ short link is still gated on the host', () {
+      expect(GatherLink.tryParse('https://gather.town.evil.com/m/ktvILgXphb'), isNull);
+    });
   });
 }

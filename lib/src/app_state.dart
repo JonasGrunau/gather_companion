@@ -2653,16 +2653,79 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
+  /// Whether the Plans tab should offer a "Go to meeting" button for [event].
+  ///
+  /// True when the location is a Gather link this phone can act on: either an
+  /// `/app/<spaceId>/…` link naming a room in this space, resolvable against the live
+  /// map right now ([gatherRoomFor]), or a `/m/<code>` short link, whose space and
+  /// room are not in the URL and are resolved on tap by [walkToGoogleEvent]. A short
+  /// link to another space answers true here and explains itself on tap, because the
+  /// only way to know where it points is to ask.
+  bool canGoToMeeting(GoogleEvent event) {
+    if (gatherRoomFor(event) != null) return true;
+    return GatherLink.tryParse(event.location)?.meetingLinkId != null;
+  }
+
   /// Walks into the Gather room a Google event names, the same routing "Walk here"
-  /// and [walkToMeeting] use. Returns a sentence when the room can no longer be
-  /// resolved (the map changed since the card was built), else null on success.
+  /// and [walkToMeeting] use. A `/m/<code>` short link is resolved over REST first.
+  /// Returns null on success, or a sentence to show the user: a failure, or — when
+  /// the room is locked and we are not admitted — word that we have asked to be let
+  /// in rather than set off on a walk the server would silently refuse.
   Future<String?> walkToGoogleEvent(GoogleEvent event) async {
     final room = gatherRoomFor(event);
+    if (room != null) return _enterOrAsk(room);
+
+    final linkId = GatherLink.tryParse(event.location)?.meetingLinkId;
+    if (linkId != null) return _walkToMeetingLink(linkId);
+
+    return "Can't find that room on the floor plan.";
+  }
+
+  /// Resolves a `/m/<code>` short link to its room on *this* floor, then walks in or
+  /// asks to be let in. The code carries no ids, so this is the one step that must
+  /// reach the network; a link to another space is as far as a single walk goes.
+  Future<String?> _walkToMeetingLink(String linkId) async {
+    final auth = _auth;
+    if (auth == null) return 'Not connected to Gather.';
+
+    final MeetingLinkInfo info;
+    try {
+      info = await resolveMeetingLink(auth, linkId);
+    } on Object {
+      return "Couldn't open that meeting link.";
+    }
+
+    final here = _currentMapSpaceId;
+    if (here == null || info.spaceId != here) {
+      return 'That meeting is in another Gather space.';
+    }
+
+    final room = map?.rooms.where((r) => r.id == info.areaId).firstOrNull;
     if (room == null) return "Can't find that room on the floor plan.";
+
+    return _enterOrAsk(room);
+  }
+
+  /// Walks into [room], or — when it is locked and we are not admitted — asks to be
+  /// let in instead. The second case is the one the floor plan cannot act on alone:
+  /// a locked door is opened by the host accepting an `AreaAccessRequest`, and once
+  /// they do the map lets us walk in on the next try.
+  Future<String?> _enterOrAsk(SpaceRoom room) {
+    if (room.locked && !canEnter(room)) return Future.value(_askToEnter(room));
     return goToRoom(
       room,
       toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
     );
+  }
+
+  /// Asks the host to be let into a locked [room]. Fire-and-forget: the acceptance,
+  /// when it comes, arrives as a patch the map already reads.
+  String _askToEnter(SpaceRoom room) {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    final sent = collector.requestToAccess(room.id);
+    if (!sent.ok) return sent.detail ?? "Couldn't ask to join.";
+    return 'Asked to join ${room.name ?? 'the meeting'} — walk in once you are let in.';
   }
 
   /// The device calendars the user could mirror plans into. Empty when permission

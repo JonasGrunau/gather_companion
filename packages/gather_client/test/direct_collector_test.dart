@@ -258,6 +258,27 @@ void main() {
       expect(sent['args'], ['SpaceUser', 'me-1']);
     });
 
+    test('requestToAccess addresses a MapArea by id, with no arguments', () async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      expect(c.requestToAccess('area-9').ok, isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      final sent = await conn.waitFor('requestToAccess');
+      // Unlike every other action, addressed to the area and not our own avatar —
+      // and no third element, like the no-arg actions.
+      expect(sent['args'], ['MapArea', 'area-9']);
+    });
+
+    test('requestToAccess refuses an empty area id before sending', () {
+      final c = build()..start();
+      final sent = c.requestToAccess('');
+      expect(sent.ok, isFalse);
+      expect(sent.detail, contains('no area'));
+    });
+
     test('each gait names its own action', () async {
       final c = build()..start();
       final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');

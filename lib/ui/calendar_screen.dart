@@ -226,7 +226,7 @@ class _GoogleEventCard extends StatelessWidget {
     final isLive = !past &&
         !event.startsAt.isAfter(now) &&
         event.endsAt.isAfter(now);
-    final canWarp = isLive && state.gatherRoomFor(event) != null;
+    final canWarp = isLive && state.canGoToMeeting(event);
 
     return Opacity(
       opacity: past ? 0.55 : 1,

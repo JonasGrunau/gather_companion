@@ -16,12 +16,22 @@ library;
 /// A Gather link recognised in an event's location: the space it points at and,
 /// when the link carries one, a hint at the room within it.
 class GatherLink {
-  const GatherLink({required this.spaceId, this.roomHint});
+  const GatherLink({required this.spaceId, this.roomHint, this.meetingLinkId});
 
   /// The `SpaceUser` space id from the `/app/<spaceId>/…` path. Compared against the
   /// space this phone is connected to; a link to a different space is not one a
   /// single walk can reach, so the caller declines it.
+  ///
+  /// Empty for a `/m/<code>` short link, whose space is not in the URL — see
+  /// [meetingLinkId]. Resolving one needs a REST round-trip (`resolveMeetingLink`),
+  /// which hands back the real space and room.
   final String spaceId;
+
+  /// The opaque code of a `/m/<code>` short link, or null for the long
+  /// `/app/<spaceId>/…` form this parser reads whole. A meeting short link carries
+  /// no ids itself; the caller resolves this against Gather's REST API to learn the
+  /// space, room and host it stands for.
+  final String? meetingLinkId;
 
   /// A loose name for the room/area within the space, when the link carries one —
   /// from a recognised query parameter or the path tail past the space name. Matched
@@ -51,6 +61,15 @@ class GatherLink {
     if (host != 'gather.town' && !host.endsWith('.gather.town')) return null;
 
     final segments = [for (final s in uri.pathSegments) if (s.isNotEmpty) s];
+
+    // `/m/<code>` — a meeting short link. The code is opaque: no space, no room in
+    // the URL, so this carries only the code and the caller resolves it over REST.
+    final mAt = segments.indexOf('m');
+    if (mAt == 0 && segments.length > 1) {
+      final code = Uri.decodeComponent(segments[1]).trim();
+      if (code.isNotEmpty) return GatherLink(spaceId: '', meetingLinkId: code);
+    }
+
     final appAt = segments.indexOf('app');
     if (appAt < 0 || appAt + 1 >= segments.length) return null;
 
