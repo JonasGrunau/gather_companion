@@ -2648,33 +2648,50 @@ class AppState extends ChangeNotifier {
     };
   }
 
-  /// The upcoming events on the calendar matched to [label] — a person's shared Google
-  /// calendar, found by name — soonest first. Returns null when no calendar matches,
-  /// distinct from an empty list, which is a matched-but-clear calendar. Powers the
-  /// "their plans" sheet, reached from both the map's person card (which has only a
-  /// label) and the Dial.
-  Future<List<GoogleEvent>?> calendarForLabel(String label) async {
+  /// The Google calendar id to read for a colleague, preferring the exact calendar
+  /// [email] Gather hands us on the wire over a guessed name match.
+  ///
+  /// The email is the strong key: `fetchEventsFor` passes it straight to Google, which
+  /// answers free/busy for any address inside the same Workspace domain without the
+  /// colleague sharing anything by name — the mechanism the desktop uses. Only when no
+  /// email arrived (a colleague who never connected a calendar to Gather) does it fall
+  /// back to matching their Gather label against a calendar shared directly with this
+  /// account. Null when disconnected or neither key resolves.
+  String? _calendarKeyFor(String label, String? email) {
+    if (!_googleConnected) return null;
+    final trimmed = email?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+    return _calendarIdForLabel(label);
+  }
+
+  /// The upcoming events on a colleague's calendar — keyed by their wire [email] when
+  /// Gather gave us one, else matched to [label] — soonest first. Returns null when no
+  /// calendar resolves, distinct from an empty list, which is a matched-but-clear
+  /// calendar. Powers the "their plans" sheet, reached from the map's person card
+  /// (label only) and the Dial (which also has the email).
+  Future<List<GoogleEvent>?> calendarForLabel(String label, {String? email}) async {
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return null;
-    final calendarId = _calendarIdForLabel(label);
+    final calendarId = _calendarKeyFor(label, email);
     if (calendarId == null) return null;
     final events = await _fetchPeopleEvents(calendarId);
     return events ?? const [];
   }
 
-  /// Whether a person named [label] has a shared calendar this account can read —
-  /// the gate the UI uses to offer a "Plans" affordance only where it will land on
-  /// something. Cheap and synchronous: a lookup in the already-built index.
-  bool hasCalendarFor(String label) {
-    final key = label.trim().toLowerCase();
-    final calendarId = _googleConnected ? _calendarIdForLabel(label) : null;
-    // Log each distinct colleague once: shows the Gather name we looked up and the
-    // calendar it resolved to, so a mismatch — or a loosened match landing wrong — is
-    // visible in a pulled log rather than guessed at.
-    if (_googleConnected && _gcalMatchLogged.add(key)) {
-      _log('gcal: dial match — "$key" -> '
-          '${calendarId == null ? 'MISS' : 'HIT ($calendarId)'} '
-          '(index has ${_calendarIndex.length})');
+  /// Whether a colleague has a calendar this account can ask about — the gate the UI
+  /// uses to offer a "Plans" affordance only where it will land on something. True as
+  /// soon as Gather gave us their [email]; otherwise a name match against a directly
+  /// shared calendar. Cheap and synchronous.
+  bool hasCalendarFor(String label, {String? email}) {
+    final logKey = label.trim().toLowerCase();
+    final calendarId = _calendarKeyFor(label, email);
+    // Log each distinct colleague once: whether we resolved by email or name (or
+    // missed), visible in a pulled log rather than guessed at.
+    if (_googleConnected && _gcalMatchLogged.add(logKey)) {
+      final how = calendarId == null
+          ? 'MISS'
+          : (email != null && email.trim().isNotEmpty ? 'HIT email' : 'HIT name');
+      _log('gcal: dial match — "$logKey" -> $how (index has ${_calendarIndex.length})');
     }
     return calendarId != null;
   }
@@ -2713,7 +2730,7 @@ class AppState extends ChangeNotifier {
 
   Duration? _freeInFor(Contact c) {
     if (!_googleConnected) return null;
-    final calendarId = _calendarIdForLabel(c.label);
+    final calendarId = _calendarKeyFor(c.label, c.calendarEmail);
     if (calendarId == null) return null;
 
     final at = _peopleEventsAt[calendarId];

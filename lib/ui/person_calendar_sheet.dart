@@ -22,23 +22,33 @@ import '../theme/gather_theme.dart';
 Future<void> showPersonCalendar(
   BuildContext context,
   AppState state,
-  String label,
-) {
+  String label, {
+  String? email,
+}) {
   final t = context.tokens;
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: t.card,
     showDragHandle: true,
     isScrollControlled: true,
-    builder: (context) => _PersonCalendarSheet(state: state, label: label),
+    builder: (context) =>
+        _PersonCalendarSheet(state: state, label: label, email: email),
   );
 }
 
 class _PersonCalendarSheet extends StatelessWidget {
-  const _PersonCalendarSheet({required this.state, required this.label});
+  const _PersonCalendarSheet({
+    required this.state,
+    required this.label,
+    this.email,
+  });
 
   final AppState state;
   final String label;
+
+  /// The colleague's wire calendar email, when the Dial had one — the strong key the
+  /// sheet reads by, falling back to the label the map's person card can offer.
+  final String? email;
 
   @override
   Widget build(BuildContext context) {
@@ -61,7 +71,7 @@ class _PersonCalendarSheet extends StatelessWidget {
               const SizedBox(height: 12),
               Flexible(
                 child: FutureBuilder<List<GoogleEvent>?>(
-                  future: state.calendarForLabel(label),
+                  future: state.calendarForLabel(label, email: email),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState != ConnectionState.done) {
                       return const Padding(

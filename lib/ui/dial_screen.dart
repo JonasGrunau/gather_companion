@@ -482,7 +482,8 @@ class _ContactTile extends StatelessWidget {
     // they free up. Only drawn for a present row — a badge on an offline person would
     // claim a liveness we do not have.
     final presence = present ? state.presenceFor(contact) : const PersonPresence(inMeeting: false);
-    final showCalendar = state.googleAvailable && state.hasCalendarFor(contact.label);
+    final showCalendar = state.googleAvailable &&
+        state.hasCalendarFor(contact.label, email: contact.calendarEmail);
 
     return Opacity(
       opacity: present ? 1 : 0.5,
@@ -529,7 +530,8 @@ class _ContactTile extends StatelessWidget {
               const SizedBox(width: 12),
               if (showCalendar && present) ...[
                 _PlansButton(
-                  onTap: () => showPersonCalendar(context, state, contact.label),
+                  onTap: () => showPersonCalendar(context, state, contact.label,
+                      email: contact.calendarEmail),
                   label: contact.label,
                 ),
                 const SizedBox(width: 8),

@@ -96,4 +96,29 @@ void main() {
       expect(s.hasCalendarFor('jaime'), isFalse);
     });
   });
+
+  group('hasCalendarFor email key', () {
+    test('a wire email resolves even with an empty index', () {
+      // The email is the strong key — no shared calendar needs to be in the index.
+      final s = seeded(const {});
+      expect(s.hasCalendarFor('Guru', email: 'kulkarni@safenow.de'), isTrue);
+    });
+
+    test('email wins when the name would have missed', () {
+      // "Guru" never name-matches "kulkarni", but the email carries it.
+      final s = seeded({'holidays in germany': 'cal-hol'});
+      expect(s.hasCalendarFor('Guru', email: 'kulkarni@safenow.de'), isTrue);
+    });
+
+    test('a blank email falls back to the name match', () {
+      final s = seeded({'jaime garcía': 'cal-jaime'});
+      expect(s.hasCalendarFor('jaime', email: ''), isTrue); // name still matches
+      expect(s.hasCalendarFor('nobody', email: '   '), isFalse);
+    });
+
+    test('an email on a disconnected account still matches nothing', () {
+      final s = AppState();
+      expect(s.hasCalendarFor('Guru', email: 'kulkarni@safenow.de'), isFalse);
+    });
+  });
 }

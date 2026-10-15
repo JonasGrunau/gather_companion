@@ -28,6 +28,7 @@ class Contact {
     this.x,
     this.y,
     this.status,
+    this.calendarEmail,
   });
 
   /// Built straight off a roster row. The label falls back to a short id the same
@@ -45,6 +46,7 @@ class Contact {
         x: row.x,
         y: row.y,
         status: row.status,
+        calendarEmail: row.calendarEmail,
       );
 
   /// Their `SpaceUser` id — the game plane's name for them, and what picks their
@@ -76,6 +78,11 @@ class Contact {
 
   /// The line under their name, if Gather holds one that has not expired.
   final PersonStatus? status;
+
+  /// Their primary calendar address, when they have connected one to Gather — the key
+  /// the Dial uses to ask Google about their availability. Null for the majority who
+  /// have not, which the calendar affordances read as "nothing to show".
+  final String? calendarEmail;
 
   /// Whether there is somewhere to warp to: present, and with a finite position.
   bool get isReachable => isPresent && x != null && y != null && x!.isFinite && y!.isFinite;
@@ -130,7 +137,8 @@ class PersonPresence {
   final bool inMeeting;
   final Duration? freeIn;
 
-  /// Whether there is anything worth drawing — a free person with no meeting needs no
-  /// badge at all.
-  bool get hasBadge => inMeeting;
+  /// Whether there is anything worth drawing. A Gather bubble is one reason; a calendar
+  /// that says they are busy right now ([freeIn] set) is the other — the latter shows
+  /// availability for someone heads-down at their desk, not only someone in a call.
+  bool get hasBadge => inMeeting || freeIn != null;
 }
