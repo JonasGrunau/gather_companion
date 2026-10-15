@@ -23,6 +23,7 @@ class MapPerson {
     this.direction,
     this.gait = Gait.walking,
     this.availability,
+    this.calendarEmail,
     this.isMe = false,
   });
 
@@ -73,6 +74,11 @@ class MapPerson {
   /// says "available" about somebody who has marked themselves busy. `Offline` never
   /// reaches here; those rows are not drawn at all.
   final String? availability;
+
+  /// The colleague's resolved calendar email (`calculatedPrimaryCalendarEmail` off
+  /// the wire), or null. The one identity that lets the person card look up their
+  /// shared calendar without guessing from a display name. See [AppState.hasCalendarFor].
+  final String? calendarEmail;
 
   /// Me. Drawn last and marked, because "where am I" is half of what this screen
   /// is for.

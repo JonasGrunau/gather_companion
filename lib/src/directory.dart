@@ -137,8 +137,9 @@ class PersonPresence {
   final bool inMeeting;
   final Duration? freeIn;
 
-  /// Whether there is anything worth drawing. A Gather bubble is one reason; a calendar
-  /// that says they are busy right now ([freeIn] set) is the other — the latter shows
-  /// availability for someone heads-down at their desk, not only someone in a call.
-  bool get hasBadge => inMeeting || freeIn != null;
+  /// Whether there is anything worth drawing. The Gather bubble is the gate: a badge is
+  /// only shown for someone the roster says is mid-conversation. [freeIn] refines that
+  /// badge from "In a meeting" to "Free in X" when their calendar carries the end time,
+  /// but never promotes a badge on its own — see [AppState.presenceFor].
+  bool get hasBadge => inMeeting;
 }

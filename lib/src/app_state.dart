@@ -675,6 +675,7 @@ class AppState extends ChangeNotifier {
           direction: row.direction,
           gait: gaitOf(row.speed),
           availability: row.availability,
+          calendarEmail: row.calendarEmail,
         ),
       );
     }
@@ -2732,7 +2733,12 @@ class AppState extends ChangeNotifier {
   /// next rebuild, so the badge fills in rather than blocking the list.
   PersonPresence presenceFor(Contact c) {
     final inMeeting = c.clusterId != null;
-    final freeIn = _freeInFor(c);
+    // "Free in X" qualifies a meeting we can already see — it is never promoted on
+    // its own for someone merely heads-down at their desk with a calendar block.
+    // Gather's own cluster is the gate: no bubble, no countdown. This keeps the
+    // availability claim honest (they are demonstrably busy right now) and matches
+    // where the colleague is actually sitting in a call with the event's other invitees.
+    final freeIn = inMeeting ? _freeInFor(c) : null;
     return PersonPresence(inMeeting: inMeeting, freeIn: freeIn);
   }
 

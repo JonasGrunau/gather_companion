@@ -1238,7 +1238,8 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                   person: _selectedPerson!,
                   onGoHere: () => _goToPerson(_selectedPerson!),
                   onWave: () => _waveAtPerson(_selectedPerson!),
-                  onPlans: () => showPersonCalendar(context, state, _selectedPerson!.label),
+                  onPlans: () => showPersonCalendar(context, state, _selectedPerson!.label,
+                      email: _selectedPerson!.calendarEmail),
                   onClear: () => setState(() => _selectedPerson = null),
                 ),
               ),
@@ -1350,11 +1351,18 @@ class _PersonCard extends StatelessWidget {
                 // can go as well as someone you can hail. [_goToPerson] lands beside them.
                 _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
                 _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
-                // Only where there is a calendar to show: a person who has shared one
-                // with this account. The same brand pill as Wave, so it reads as a peer
-                // action and restyles under the Gameboy palette for free.
-                if (state.googleAvailable && state.hasCalendarFor(person.label))
-                  _CardAction(icon: Icons.event_note_rounded, label: 'Plans', onTap: onPlans),
+                // Only where there is a calendar to show: a person whose shared calendar
+                // this account can read, keyed off their wire email (a display-name guess
+                // misses most of the roster). Icon-only — the two verbs next to it carry
+                // words, so a third would crowd the card; the calendar glyph is its own
+                // label. Same brand pill, so it restyles under the Gameboy palette for free.
+                if (state.googleAvailable &&
+                    state.hasCalendarFor(person.label, email: person.calendarEmail))
+                  _CardAction(
+                    icon: Icons.event_note_rounded,
+                    tooltip: 'Plans',
+                    onTap: onPlans,
+                  ),
                 IconButton(
                   icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
                   // Names the otherwise icon-only control for a screen reader, as the
@@ -1373,36 +1381,55 @@ class _PersonCard extends StatelessWidget {
 }
 
 /// One brand-tinted pill on the person card — an icon and a word. Wave and Go here are
-/// the same control twice, so they share a shape rather than each spelling it out.
+/// the same control twice, so they share a shape rather than each spelling it out. With
+/// no [label] it collapses to a square icon-only chip (the Plans glyph), named for a
+/// screen reader by [tooltip] instead; the round-pill radius is kept so all three sit on
+/// the same shape.
 class _CardAction extends StatelessWidget {
-  const _CardAction({required this.icon, required this.label, required this.onTap});
+  const _CardAction({
+    required this.icon,
+    this.label,
+    this.tooltip,
+    required this.onTap,
+  });
 
   final IconData icon;
-  final String label;
+  final String? label;
+  final String? tooltip;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    return Material(
+    final iconOnly = label == null;
+    final child = Material(
       color: t.brand.withValues(alpha: 0.18),
       borderRadius: BorderRadius.circular(17),
       child: InkWell(
         borderRadius: BorderRadius.circular(17),
         onTap: onTap,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          // Square for the icon-only chip so the glyph sits centred, wider when a word
+          // follows it.
+          padding: iconOnly
+              ? const EdgeInsets.all(8)
+              : const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(icon, size: 16, color: t.brand),
-              const SizedBox(width: 6),
-              Text(label, style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+              if (label != null) ...[
+                const SizedBox(width: 6),
+                Text(label!,
+                    style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+              ],
             ],
           ),
         ),
       ),
     );
+    final tip = tooltip;
+    return tip == null ? child : Tooltip(message: tip, child: child);
   }
 }
 
