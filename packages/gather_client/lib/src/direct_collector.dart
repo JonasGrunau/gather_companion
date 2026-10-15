@@ -199,6 +199,12 @@ class DirectCollector implements Collector {
   int _frames = 0;
   int _connects = 0;
 
+  /// Whether the one-shot calendar-signal scan has run and logged. A diagnostic to
+  /// learn whether Gather broadcasts colleague calendar entities
+  /// (`BaseCombinedCalendarEvent`, `SpaceUser.hasConnectedCalendars`) over this
+  /// socket, the way the desktop reads them — settled once per connection.
+  bool _calendarScanned = false;
+
   /// Whether `enterSpace` has gone out on the current socket. Reset per connect.
   bool _entered = false;
   DateTime? _handshakeAt;
@@ -1108,6 +1114,9 @@ class DirectCollector implements Collector {
     _backoff = const Duration(seconds: 1);
     if (reader.ingest(frame)) _dirty = true;
 
+    // One-shot: does Gather push colleague calendar entities over this socket?
+    if (!_calendarScanned) _scanCalendarSignals(frame);
+
     // The state dump is what names us, so this is the first moment the late path
     // can enter. Cheap to ask: it returns immediately once done.
     _maybeEnter();
@@ -1124,6 +1133,81 @@ class DirectCollector implements Collector {
       _interactions.add(event);
     }
   }
+
+  /// Walks a decoded frame once looking for the calendar entities the desktop reads —
+  /// `BaseCombinedCalendarEvent` collections and the `SpaceUser.hasConnectedCalendars`
+  /// /`activeCalendarInferredId`/`calculatedPrimaryCalendarEmail` fields — and logs
+  /// what it finds, so a pulled log answers whether this space broadcasts colleague
+  /// calendars at all before we build a parser against them.
+  ///
+  /// Settles once: the moment it finds a signal it logs and stops; failing that it
+  /// gives the dump [_calendarScanProbeFrames] frames to arrive and then logs the
+  /// negative. Bounded by a node budget so a 100-person state dump cannot stall the
+  /// message handler.
+  void _scanCalendarSignals(Object? frame) {
+    final calKeys = <String>{};
+    var combinedEvents = 0;
+    var hasConnectedField = false;
+    final sampleFields = <String>{};
+    var budget = 200000;
+
+    void walk(Object? node) {
+      if (budget-- <= 0) return;
+      if (node is Map) {
+        node.forEach((k, v) {
+          final key = k is String ? k : k.toString();
+          final lower = key.toLowerCase();
+          if (lower.contains('calendar')) {
+            calKeys.add(key);
+            if (lower == 'hasconnectedcalendars') hasConnectedField = true;
+            // A collection of calendar events — count rows and sample one row's fields.
+            if (lower.contains('calendarevent') || lower.contains('combinedcalendar')) {
+              if (v is Map) {
+                combinedEvents += v.length;
+                final first = v.values.firstWhere((e) => e is Map, orElse: () => null);
+                if (first is Map) {
+                  for (final fk in first.keys) {
+                    sampleFields.add(fk is String ? fk : fk.toString());
+                  }
+                }
+              } else if (v is List) {
+                combinedEvents += v.length;
+              }
+            }
+          }
+          walk(v);
+        });
+      } else if (node is List) {
+        for (final e in node) {
+          if (budget <= 0) break;
+          walk(e);
+        }
+      }
+    }
+
+    walk(frame);
+
+    final found = calKeys.isNotEmpty;
+    if (found) {
+      _calendarScanned = true;
+      _log('gcal-wire: calendar signals present — keys={${calKeys.join(', ')}}; '
+          'hasConnectedCalendars=$hasConnectedField; '
+          'combinedEvents=$combinedEvents; '
+          'sampleFields=[${sampleFields.join(', ')}]');
+      return;
+    }
+    // No signal yet. Give the dump a few frames before concluding it is simply absent.
+    if (hasState && _frames >= _calendarScanProbeFrames) {
+      _calendarScanned = true;
+      _log('gcal-wire: no calendar signals after $_frames frames '
+          '(userCount=${reader.userCount}) — this space does not broadcast '
+          'colleague calendars on the game socket');
+    }
+  }
+
+  /// How many frames to let arrive before concluding the socket carries no calendar
+  /// data — enough for the full state dump to land after the handshake.
+  static const int _calendarScanProbeFrames = 20;
 
   void _flush() {
     // First, because the block below is what was lying. `_frames` is cumulative and
