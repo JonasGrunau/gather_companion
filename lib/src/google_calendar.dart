@@ -209,6 +209,12 @@ class GoogleCalendar {
   static const _tokenEndpoint = 'https://oauth2.googleapis.com/token';
   static const _eventsEndpoint =
       'https://www.googleapis.com/calendar/v3/calendars/primary/events';
+  static const _calendarListEndpoint =
+      'https://www.googleapis.com/calendar/v3/users/me/calendarList';
+  static const _calendarsBase =
+      'https://www.googleapis.com/calendar/v3/calendars';
+  static const _freeBusyEndpoint =
+      'https://www.googleapis.com/calendar/v3/freeBusy';
   static const _refreshKey = 'google_calendar_refresh_token';
 
   /// A cached access token and when it stops being valid, held only in memory —
@@ -326,6 +332,130 @@ class GoogleCalendar {
     }
   }
 
+  /// A lowercased **display name → calendar id** map of every calendar this account
+  /// can see besides its own primary — the colleagues who have shared a calendar with
+  /// this Google account, the same set the desktop reads. Empty when disconnected or
+  /// the read fails. The caller matches a person's name into it to find their
+  /// calendar id; there is no email on the Gather wire to key on instead.
+  ///
+  /// Keyed on `summaryOverride ?? summary`: the override is the name this account gave
+  /// the shared calendar, which is the one most likely to match how the person shows
+  /// up in the office, and it falls back to the calendar's own summary (often their
+  /// email) when none was set.
+  Future<Map<String, String>> fetchCalendarIndex() async {
+    final token = await _accessTokenOrNull();
+    if (token == null) return const {};
+
+    final url = Uri.parse(_calendarListEndpoint).replace(queryParameters: {
+      'minAccessRole': 'freeBusyReader',
+      'showHidden': 'true',
+    });
+
+    try {
+      final body = await _get(url, token);
+      final items = body['items'];
+      if (items is! List) return const {};
+      final out = <String, String>{};
+      for (final item in items) {
+        if (item is! Map) continue;
+        if (item['primary'] == true) continue;
+        final id = (item['id'] as String?)?.trim();
+        final name =
+            ((item['summaryOverride'] as String?) ?? (item['summary'] as String?))
+                ?.trim();
+        if (id == null || id.isEmpty || name == null || name.isEmpty) continue;
+        out.putIfAbsent(name.toLowerCase(), () => id);
+      }
+      return out;
+    } on Object {
+      return const {};
+    }
+  }
+
+  /// The next [window] of events on [calendarId], soonest first — one colleague's
+  /// calendar, read through the same access this account already holds. Empty on any
+  /// failure, the best-effort contract [fetchUpcoming] keeps.
+  ///
+  /// Falls back to free/busy when the events themselves are not readable: a calendar
+  /// shared as free/busy only answers `events.list` with 403, so a refusal is retried
+  /// as a [_freeBusy] query, which every sharing level permits. Those come back as
+  /// title-less "Busy" blocks — enough to show when the person is occupied and when
+  /// they free up, without leaking a detail they did not share.
+  Future<List<GoogleEvent>> fetchEventsFor(
+    String calendarId, {
+    Duration window = const Duration(days: 7),
+  }) async {
+    final token = await _accessTokenOrNull();
+    if (token == null) return const [];
+
+    final now = _now();
+    final timeMin = now.toUtc().toIso8601String();
+    final timeMax = now.add(window).toUtc().toIso8601String();
+    final url = Uri.parse('$_calendarsBase/${Uri.encodeComponent(calendarId)}/events')
+        .replace(queryParameters: {
+      'timeMin': timeMin,
+      'timeMax': timeMax,
+      'singleEvents': 'true',
+      'orderBy': 'startTime',
+      'maxResults': '50',
+    });
+
+    try {
+      final body = await _get(url, token);
+      final items = body['items'];
+      if (items is! List) return const [];
+      return [
+        for (final item in items)
+          if (item is Map<String, Object?>) ?GoogleEvent.fromJson(item),
+      ];
+    } on Object {
+      // Most often a 403 from a free/busy-only share. Fall back rather than show a
+      // person as having an empty calendar when they are in fact just private.
+      return _freeBusy(calendarId, token, timeMin: timeMin, timeMax: timeMax);
+    }
+  }
+
+  /// The busy blocks on [calendarId] as title-less events, for a calendar shared
+  /// free/busy only. Empty on failure.
+  Future<List<GoogleEvent>> _freeBusy(
+    String calendarId,
+    String token, {
+    required String timeMin,
+    required String timeMax,
+  }) async {
+    try {
+      final body = await _postJson(_freeBusyEndpoint, token, {
+        'timeMin': timeMin,
+        'timeMax': timeMax,
+        'items': [
+          {'id': calendarId},
+        ],
+      });
+      final calendars = body['calendars'];
+      if (calendars is! Map) return const [];
+      final entry = calendars[calendarId];
+      final busy = entry is Map ? entry['busy'] : null;
+      if (busy is! List) return const [];
+      final out = <GoogleEvent>[];
+      for (var i = 0; i < busy.length; i++) {
+        final block = busy[i];
+        if (block is! Map) continue;
+        final start = DateTime.tryParse(block['start'] as String? ?? '');
+        final end = DateTime.tryParse(block['end'] as String? ?? '');
+        if (start == null || end == null) continue;
+        out.add(GoogleEvent(
+          id: 'busy-$i',
+          title: 'Busy',
+          startsAt: start.toLocal(),
+          endsAt: end.toLocal(),
+        ));
+      }
+      return out;
+    } on Object {
+      return const [];
+    }
+  }
+
   /// A valid access token, refreshing it if the cached one has expired or there is
   /// none, or null when no account is connected (or the refresh itself fails — a
   /// revoked grant reads as disconnected rather than throwing).
@@ -375,6 +505,30 @@ class GoogleCalendar {
       final text = await response.transform(utf8.decoder).join();
       if (response.statusCode >= 400) {
         throw HttpException('token endpoint ${response.statusCode}: $text');
+      }
+      return jsonDecode(text) as Map<String, Object?>;
+    } finally {
+      client.close();
+    }
+  }
+
+  /// A bearer-authorized JSON POST — the free/busy query's shape, distinct from the
+  /// form-encoded [_post] the token endpoint wants.
+  Future<Map<String, Object?>> _postJson(
+    String url,
+    String bearer,
+    Map<String, Object?> body,
+  ) async {
+    final client = _newClient();
+    try {
+      final request = await client.postUrl(Uri.parse(url));
+      request.headers.add(HttpHeaders.authorizationHeader, 'Bearer $bearer');
+      request.headers.contentType = ContentType('application', 'json', charset: 'utf-8');
+      request.write(jsonEncode(body));
+      final response = await request.close();
+      final text = await response.transform(utf8.decoder).join();
+      if (response.statusCode >= 400) {
+        throw HttpException('freebusy endpoint ${response.statusCode}: $text');
       }
       return jsonDecode(text) as Map<String, Object?>;
     } finally {

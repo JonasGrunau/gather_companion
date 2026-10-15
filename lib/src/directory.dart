@@ -116,3 +116,21 @@ class Meeting {
   /// offer to join something I am in.
   final bool includesMe;
 }
+
+/// What a person's status line in the Warp Dial shows: whether they are mid-meeting
+/// and, when their shared calendar is visible, how long until they free up.
+///
+/// [inMeeting] is Gather's own `clusterId` and always knowable; [freeIn] needs the
+/// end of the event they are in, which only their calendar carries, so it is null
+/// when no calendar is matched or none is cached yet. "In a meeting" with no
+/// countdown is the honest fallback, not a bug.
+class PersonPresence {
+  const PersonPresence({required this.inMeeting, this.freeIn});
+
+  final bool inMeeting;
+  final Duration? freeIn;
+
+  /// Whether there is anything worth drawing — a free person with no meeting needs no
+  /// badge at all.
+  bool get hasBadge => inMeeting;
+}

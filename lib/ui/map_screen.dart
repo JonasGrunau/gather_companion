@@ -19,6 +19,7 @@ import 'call_screen.dart';
 import 'control_bar.dart';
 import 'dpad.dart';
 import 'person_avatar.dart';
+import 'person_calendar_sheet.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -1237,6 +1238,7 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                   person: _selectedPerson!,
                   onGoHere: () => _goToPerson(_selectedPerson!),
                   onWave: () => _waveAtPerson(_selectedPerson!),
+                  onPlans: () => showPersonCalendar(context, state, _selectedPerson!.label),
                   onClear: () => setState(() => _selectedPerson = null),
                 ),
               ),
@@ -1284,6 +1286,7 @@ class _PersonCard extends StatelessWidget {
     required this.person,
     required this.onGoHere,
     required this.onWave,
+    required this.onPlans,
     required this.onClear,
   });
 
@@ -1291,6 +1294,7 @@ class _PersonCard extends StatelessWidget {
   final MapPerson person;
   final VoidCallback onGoHere;
   final VoidCallback onWave;
+  final VoidCallback onPlans;
   final VoidCallback onClear;
 
   @override
@@ -1346,6 +1350,11 @@ class _PersonCard extends StatelessWidget {
                 // can go as well as someone you can hail. [_goToPerson] lands beside them.
                 _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
                 _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
+                // Only where there is a calendar to show: a person who has shared one
+                // with this account. The same brand pill as Wave, so it reads as a peer
+                // action and restyles under the Gameboy palette for free.
+                if (state.googleAvailable && state.hasCalendarFor(person.label))
+                  _CardAction(icon: Icons.event_note_rounded, label: 'Plans', onTap: onPlans),
                 IconButton(
                   icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
                   // Names the otherwise icon-only control for a screen reader, as the

@@ -66,7 +66,7 @@ class CalendarScreen extends StatelessWidget {
           // Google and an 11am plan made here sit in one day in the right order.
           final entries = <_Entry>[
             for (final m in state.plannedMeetings) _Entry.plan(state, m),
-            for (final e in state.googleEvents) _Entry.google(e),
+            for (final e in state.googleEvents) _Entry.google(state, e),
           ];
           final upcoming = [for (final e in entries) if (!e.endsAt.isBefore(now)) e]
             ..sort((a, b) => a.startsAt.compareTo(b.startsAt));
@@ -132,8 +132,8 @@ class _Entry {
   factory _Entry.plan(AppState state, PlannedMeeting m) =>
       _Entry._(m.startsAt, m.endsAt, (context, {required past}) => _MeetingCard(state: state, meeting: m, past: past));
 
-  factory _Entry.google(GoogleEvent e) =>
-      _Entry._(e.startsAt, e.endsAt, (context, {required past}) => _GoogleEventCard(event: e, past: past));
+  factory _Entry.google(AppState state, GoogleEvent e) =>
+      _Entry._(e.startsAt, e.endsAt, (context, {required past}) => _GoogleEventCard(state: state, event: e, past: past));
 
   final DateTime startsAt;
   final DateTime endsAt;
@@ -209,8 +209,9 @@ class _GoogleButtonState extends State<_GoogleButton> {
 /// marker so it is clear where it came from. All-day events show their day, not a
 /// 00:00 time.
 class _GoogleEventCard extends StatelessWidget {
-  const _GoogleEventCard({required this.event, required this.past});
+  const _GoogleEventCard({required this.state, required this.event, required this.past});
 
+  final AppState state;
   final GoogleEvent event;
   final bool past;
 
@@ -218,6 +219,14 @@ class _GoogleEventCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final hasPlace = event.location != null && event.location!.isNotEmpty;
+    // Offered only while the meeting is actually on and its location is a Gather link
+    // naming a room in this space — the approved "else do nothing". A past or future
+    // event, or a link to somewhere a single walk cannot reach, carries no button.
+    final now = DateTime.now();
+    final isLive = !past &&
+        !event.startsAt.isAfter(now) &&
+        event.endsAt.isAfter(now);
+    final canWarp = isLive && state.gatherRoomFor(event) != null;
 
     return Opacity(
       opacity: past ? 0.55 : 1,
@@ -277,8 +286,73 @@ class _GoogleEventCard extends StatelessWidget {
                     Text('Google Calendar', style: TextStyle(color: t.faint, fontSize: 12)),
                   ],
                 ),
+                if (canWarp) ...[
+                  const SizedBox(height: 10),
+                  _GoToMeetingButton(state: state, event: event),
+                ],
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The "Go to meeting" action on a live Google event whose Gather link resolves to a
+/// room here — walks the user straight in with [AppState.walkToGoogleEvent], the same
+/// routing "Walk here" uses. A spinner while the hop runs; a snack when the room has
+/// slipped off the floor plan since the card was built.
+class _GoToMeetingButton extends StatefulWidget {
+  const _GoToMeetingButton({required this.state, required this.event});
+
+  final AppState state;
+  final GoogleEvent event;
+
+  @override
+  State<_GoToMeetingButton> createState() => _GoToMeetingButtonState();
+}
+
+class _GoToMeetingButtonState extends State<_GoToMeetingButton> {
+  bool _busy = false;
+
+  Future<void> _go() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    final error = await widget.state.walkToGoogleEvent(widget.event);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Material(
+      color: t.brand,
+      borderRadius: BorderRadius.circular(t.radius),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(t.radius),
+        onTap: _busy ? null : _go,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (_busy)
+                SizedBox(
+                  width: 15,
+                  height: 15,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: t.primaryForeground),
+                )
+              else
+                Icon(Icons.meeting_room_rounded, size: 16, color: t.primaryForeground),
+              const SizedBox(width: 6),
+              Text(
+                'Go to meeting',
+                style: TextStyle(color: t.primaryForeground, fontSize: 14, fontWeight: FontWeight.w600),
+              ),
+            ],
           ),
         ),
       ),

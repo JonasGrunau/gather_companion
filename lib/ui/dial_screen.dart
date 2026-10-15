@@ -36,6 +36,7 @@ import '../src/directory.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
 import 'person_avatar.dart';
+import 'person_calendar_sheet.dart';
 
 class DialScreen extends StatefulWidget {
   const DialScreen({super.key, required this.state, this.visible = true});
@@ -477,6 +478,11 @@ class _ContactTile extends StatelessWidget {
     final t = context.tokens;
     final present = contact.isPresent;
     final status = contact.status?.text;
+    // In-meeting (from Gather's cluster) and, when their calendar is visible, when
+    // they free up. Only drawn for a present row — a badge on an offline person would
+    // claim a liveness we do not have.
+    final presence = present ? state.presenceFor(contact) : const PersonPresence(inMeeting: false);
+    final showCalendar = state.googleAvailable && state.hasCalendarFor(contact.label);
 
     return Opacity(
       opacity: present ? 1 : 0.5,
@@ -505,7 +511,10 @@ class _ContactTile extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(color: t.foreground, fontSize: 16, fontWeight: FontWeight.w500),
                     ),
-                    if (status != null && status.isNotEmpty) ...[
+                    if (presence.hasBadge) ...[
+                      const SizedBox(height: 3),
+                      _PresenceBadge(presence: presence),
+                    ] else if (status != null && status.isNotEmpty) ...[
                       const SizedBox(height: 2),
                       Text(
                         status,
@@ -518,12 +527,99 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
+              if (showCalendar && present) ...[
+                _PlansButton(
+                  onTap: () => showPersonCalendar(context, state, contact.label),
+                  label: contact.label,
+                ),
+                const SizedBox(width: 8),
+              ],
               if (onWave != null && present) ...[
                 _WaveButton(onTap: busy ? null : onWave, label: contact.label),
                 const SizedBox(width: 8),
               ],
               if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The status line a mid-meeting person gets instead of their set status: "In a
+/// meeting", or "Free in 25 min" when their calendar tells us when it ends. A small
+/// amber dot marks it as a live state rather than a typed one.
+class _PresenceBadge extends StatelessWidget {
+  const _PresenceBadge({required this.presence});
+
+  final PersonPresence presence;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final freeIn = presence.freeIn;
+    final text = freeIn == null ? 'In a meeting' : 'Free in ${_freeInLabel(freeIn)}';
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: const BoxDecoration(color: Color(0xFFF59E0B), shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: t.mutedForeground, fontSize: 13),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// How long until someone frees up, rounded to whole minutes. Under a minute reads as
+/// "<1 min" rather than "0 min"; an hour or more picks up an `h`.
+String _freeInLabel(Duration d) {
+  final mins = d.inMinutes;
+  if (mins < 1) return '<1 min';
+  if (mins < 60) return '$mins min';
+  final h = mins ~/ 60;
+  final m = mins % 60;
+  return m == 0 ? '${h}h' : '${h}h ${m}m';
+}
+
+/// A quiet round button that opens a person's shared calendar, matched to the Wave
+/// button so the two sit together without either shouting.
+class _PlansButton extends StatelessWidget {
+  const _PlansButton({required this.onTap, required this.label});
+
+  final VoidCallback onTap;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final plansOf = "${_firstName(label)}'s plans";
+    return Semantics(
+      button: true,
+      label: plansOf,
+      child: Tooltip(
+        message: plansOf,
+        child: Material(
+          color: t.card,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Icon(Icons.event_note_rounded, size: 18, color: t.mutedForeground),
+            ),
           ),
         ),
       ),
