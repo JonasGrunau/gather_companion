@@ -283,6 +283,15 @@ class _ControlBarState extends State<ControlBar> {
     final state = widget.state;
     final navigator = Navigator.of(context);
 
+    // Walking away still broadcasting is the thing nobody wants. Silence first,
+    // then leave. Guarded so a door press with nothing live is a no-op, and not
+    // run through `_run`: a mute that hiccups must not pop a snackbar over the
+    // walk or hold it up — the departure is the point, the mute is a courtesy.
+    if (state.call.micOn) await state.setMicOn(false);
+    if (!mounted) return;
+    if (state.call.cameraOn) await state.setCameraOn(false);
+    if (!mounted) return;
+
     if (state.inHuddle) {
       await _run(state.leaveHuddle);
       if (!mounted) return;

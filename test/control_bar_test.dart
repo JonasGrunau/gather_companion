@@ -24,6 +24,25 @@ import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/control_bar.dart';
 
+/// An [AppState] that records the mute calls the door makes without a socket to
+/// carry them, so the door's silence-on-the-way-out can be seen in a widget test.
+class _SpyMute extends AppState {
+  final List<bool> mic = [];
+  final List<bool> camera = [];
+
+  @override
+  Future<String?> setMicOn(bool on) async {
+    mic.add(on);
+    return null;
+  }
+
+  @override
+  Future<String?> setCameraOn(bool on) async {
+    camera.add(on);
+    return null;
+  }
+}
+
 RosterRow _row(
   String id, {
   String? name,
@@ -777,6 +796,62 @@ void main() {
 
     expect(find.byTooltip('Leave the conversation'), findsOneWidget);
     expect(find.text('Not connected to Gather.'), findsOneWidget);
+  });
+
+  group('the door silences you on the way out', () {
+    // Walking away from a conversation still broadcasting is the thing nobody
+    // wants, so the door mutes the microphone and the camera before it leaves.
+    // There is no socket here to actually pause, so the proof is that the door
+    // *asks* AppState to — recorded through a spy — and that it only asks when
+    // there is something live to silence.
+    testWidgets('a live mic and camera are both turned off first',
+        (tester) async {
+      final state = _SpyMute()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugApplyRoster(Roster(
+          selfId: 'me',
+          rows: [_row('me', name: 'Jonas')],
+        ))
+        ..debugHuddle = ['Ada']
+        ..debugCall = const CallState(
+          media: LocalMediaState(
+            capturing: true,
+            audioEnabled: true,
+            audioTrackId: 'a1',
+            videoEnabled: true,
+            videoTrackId: 'v1',
+          ),
+        );
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      // Both silenced, each exactly once and each to off.
+      expect(state.mic, [false]);
+      expect(state.camera, [false]);
+    });
+
+    testWidgets('a door press with nothing live is a no-op', (tester) async {
+      // The plain desk walk, or leaving with your hardware already down: the
+      // guards make the mute a true no-op rather than a needless refusal.
+      final state = _SpyMute()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugApplyRoster(Roster(
+          selfId: 'me',
+          rows: [_row('me', name: 'Jonas')],
+        ))
+        ..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      expect(state.mic, isEmpty);
+      expect(state.camera, isEmpty);
+    });
   });
 
   group('the camera riding along', () {
