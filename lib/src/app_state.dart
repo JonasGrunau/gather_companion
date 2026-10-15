@@ -2578,15 +2578,85 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Seeds the shared-calendar index and marks Google connected, so the name-matching
+  /// the Dial depends on can be driven without a live OAuth account.
+  @visibleForTesting
+  void debugSeedCalendarIndex(Map<String, String> index) {
+    _calendarIndex = Map.of(index);
+    _googleConnected = true;
+    _gcalMatchLogged.clear();
+  }
+
+  /// The calendar id for a person shown in Gather as [label], or null when none in the
+  /// index is a confident match. The single resolver every calendar lookup goes
+  /// through, so the Dial gate, the "free in" countdown and the plans sheet all agree
+  /// on who a label points at.
+  ///
+  /// Matching is deliberately loose because the two names rarely line up: Gather shows
+  /// a short handle ("jaime", "dr. simon") while a shared calendar is named for the
+  /// whole person or their address ("Jaime García", `jaime@safenow.de`). An exact hit
+  /// wins outright; failing that, a label name-token that is a full word of a
+  /// calendar's name — or the local part of its email, or a prefix of one of its words
+  /// — counts as a match. Tokens shorter than three characters and role words
+  /// ("extern", "dr") are dropped so they cannot carry a match on their own.
+  ///
+  /// Ambiguity is resolved to *nothing*, never a guess: if the label matches two
+  /// different calendars, it resolves to null rather than risk showing one colleague's
+  /// schedule under another's name. That keeps the loosened matching safe — the cost of
+  /// a near-collision is a hidden button, not a wrong one.
+  String? _calendarIdForLabel(String label) {
+    final key = label.trim().toLowerCase();
+    if (key.isEmpty) return null;
+    final exact = _calendarIndex[key];
+    if (exact != null) return exact;
+
+    final labelTokens = _nameTokens(key);
+    if (labelTokens.isEmpty) return null;
+    final ids = <String>{};
+    for (final entry in _calendarIndex.entries) {
+      if (_calendarMatchesTokens(entry.key, labelTokens)) ids.add(entry.value);
+    }
+    // One confident calendar, or nothing — two means we cannot tell them apart.
+    return ids.length == 1 ? ids.first : null;
+  }
+
+  /// Whether a calendar named [calKey] (a display name or an email) carries any of a
+  /// label's [labelTokens] as one of its own name words. Emails are reduced to their
+  /// local part first, so the shared domain (`…@safenow.de`) cannot match everyone.
+  bool _calendarMatchesTokens(String calKey, Set<String> labelTokens) {
+    final at = calKey.indexOf('@');
+    final calTokens = _nameTokens(at >= 0 ? calKey.substring(0, at) : calKey);
+    for (final want in labelTokens) {
+      for (final have in calTokens) {
+        if (have == want) return true;
+        // A handle is often a prefix of the full name ("jaime" in "jaimeg"); require
+        // four characters so short fragments ("jan" in "janet") do not over-reach.
+        if (want.length >= 4 && have.startsWith(want)) return true;
+      }
+    }
+    return false;
+  }
+
+  /// The significant lowercase name words in [s]: alphanumeric runs of three or more
+  /// characters that are not role words. Splits on anything else, so "dr. simon",
+  /// "garcía-lópez" and "jaime (extern)" all reduce to the names that identify a person.
+  static Set<String> _nameTokens(String s) {
+    const stop = {'extern', 'intern', 'team', 'the', 'und', 'and', 'von', 'der', 'die'};
+    return {
+      for (final t in s.toLowerCase().split(RegExp(r'[^a-z0-9äöüß]+')))
+        if (t.length >= 3 && !stop.contains(t)) t,
+    };
+  }
+
   /// The upcoming events on the calendar matched to [label] — a person's shared Google
-  /// calendar, found by display name — soonest first. Returns null when no calendar
-  /// matches (nobody shared one under that name), distinct from an empty list, which
-  /// is a matched-but-clear calendar. Powers the "their plans" sheet, reached from
-  /// both the map's person card (which has only a label) and the Dial.
+  /// calendar, found by name — soonest first. Returns null when no calendar matches,
+  /// distinct from an empty list, which is a matched-but-clear calendar. Powers the
+  /// "their plans" sheet, reached from both the map's person card (which has only a
+  /// label) and the Dial.
   Future<List<GoogleEvent>?> calendarForLabel(String label) async {
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return null;
-    final calendarId = _calendarIndex[label.trim().toLowerCase()];
+    final calendarId = _calendarIdForLabel(label);
     if (calendarId == null) return null;
     final events = await _fetchPeopleEvents(calendarId);
     return events ?? const [];
@@ -2597,14 +2667,16 @@ class AppState extends ChangeNotifier {
   /// something. Cheap and synchronous: a lookup in the already-built index.
   bool hasCalendarFor(String label) {
     final key = label.trim().toLowerCase();
-    final hit = _googleConnected && _calendarIndex.containsKey(key);
-    // Log each distinct colleague once: shows the exact Gather name we looked up
-    // against the shared-calendar names — the place a nickname/name mismatch hides.
+    final calendarId = _googleConnected ? _calendarIdForLabel(label) : null;
+    // Log each distinct colleague once: shows the Gather name we looked up and the
+    // calendar it resolved to, so a mismatch — or a loosened match landing wrong — is
+    // visible in a pulled log rather than guessed at.
     if (_googleConnected && _gcalMatchLogged.add(key)) {
-      _log('gcal: dial match — "$key" -> ${hit ? 'HIT' : 'MISS'} '
+      _log('gcal: dial match — "$key" -> '
+          '${calendarId == null ? 'MISS' : 'HIT ($calendarId)'} '
           '(index has ${_calendarIndex.length})');
     }
-    return hit;
+    return calendarId != null;
   }
 
   /// One colleague's events, cached for [_peopleEventsTtl]. Returns null when the
@@ -2641,7 +2713,7 @@ class AppState extends ChangeNotifier {
 
   Duration? _freeInFor(Contact c) {
     if (!_googleConnected) return null;
-    final calendarId = _calendarIndex[c.label.trim().toLowerCase()];
+    final calendarId = _calendarIdForLabel(c.label);
     if (calendarId == null) return null;
 
     final at = _peopleEventsAt[calendarId];
