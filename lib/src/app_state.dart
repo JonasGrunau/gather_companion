@@ -2509,14 +2509,22 @@ class AppState extends ChangeNotifier {
 
   /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
   /// batch of events. Called from [boot]; best-effort, never fails the launch.
+  /// A diagnostic log line for the calendar feature, emitted only in a build made with
+  /// `--dart-define=GCAL_DEBUG=true`. These lines name colleague calendar emails, so
+  /// they stay out of a normal build's `media.log` and are turned on only to trace why
+  /// an availability badge is or is not showing.
+  void _gcalLog(String line) {
+    if (const bool.fromEnvironment('GCAL_DEBUG')) _log(line);
+  }
+
   Future<void> _restoreGoogle() async {
     final google = _googleCalendar;
     if (google == null) {
-      _log('gcal: restore — no calendar service (build carries no client id)');
+      _gcalLog('gcal: restore — no calendar service (build carries no client id)');
       return;
     }
     _googleConnected = await google.isConnected;
-    _log('gcal: restore — connected=$_googleConnected (refresh token in keychain)');
+    _gcalLog('gcal: restore — connected=$_googleConnected (refresh token in keychain)');
     if (_googleConnected) {
       await refreshGoogleEvents();
       unawaited(_buildCalendarIndex());
@@ -2530,11 +2538,11 @@ class AppState extends ChangeNotifier {
     if (google == null) return 'Google Calendar is not set up in this build.';
     final error = await google.connect();
     if (error != null) {
-      _log('gcal: connect — failed: $error');
+      _gcalLog('gcal: connect — failed: $error');
       return error;
     }
     _googleConnected = await google.isConnected;
-    _log('gcal: connect — connected=$_googleConnected');
+    _gcalLog('gcal: connect — connected=$_googleConnected');
     notifyListeners();
     await refreshGoogleEvents();
     unawaited(_buildCalendarIndex());
@@ -2573,7 +2581,7 @@ class AppState extends ChangeNotifier {
     // The decisive diagnostic: these are the names a colleague's Gather label must
     // match (lowercased) for the Dial's calendar button to appear. Empty here means
     // nobody has shared a calendar with this account — or the share has no name.
-    _log('gcal: calendar index — ${_calendarIndex.length} shared: '
+    _gcalLog('gcal: calendar index — ${_calendarIndex.length} shared: '
         '${_calendarIndex.keys.join(', ')}');
     notifyListeners();
   }
@@ -2691,7 +2699,7 @@ class AppState extends ChangeNotifier {
       final how = calendarId == null
           ? 'MISS'
           : (email != null && email.trim().isNotEmpty ? 'HIT email' : 'HIT name');
-      _log('gcal: dial match — "$logKey" -> $how (index has ${_calendarIndex.length})');
+      _gcalLog('gcal: dial match — "$logKey" -> $how (index has ${_calendarIndex.length})');
     }
     return calendarId != null;
   }

@@ -1114,8 +1114,12 @@ class DirectCollector implements Collector {
     _backoff = const Duration(seconds: 1);
     if (reader.ingest(frame)) _dirty = true;
 
-    // One-shot: does Gather push colleague calendar entities over this socket?
-    if (!_calendarScanned) _scanCalendarSignals(frame);
+    // One-shot: does Gather push colleague calendar entities over this socket? A
+    // diagnostic that names colleague emails, so it runs only in a build made with
+    // `--dart-define=GCAL_DEBUG=true` and is absent — not just quiet — otherwise.
+    if (const bool.fromEnvironment('GCAL_DEBUG') && !_calendarScanned) {
+      _scanCalendarSignals(frame);
+    }
 
     // The state dump is what names us, so this is the first moment the late path
     // can enter. Cheap to ask: it returns immediately once done.

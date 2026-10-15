@@ -71,14 +71,18 @@ const _googleClientId = String.fromEnvironment('GOOGLE_CLIENT_ID');
 /// defined. The reversed-domain form Google wants for the redirect/callback scheme
 /// is derived from the id, so only the one value need be supplied.
 GoogleCalendar? _buildGoogleCalendar() {
+  // Diagnostic, only in a `--dart-define=GCAL_DEBUG=true` build — the gate to rule in
+  // or out when the Plans tab and the Dial's calendar affordance are absent on device.
+  const gcalDebug = bool.fromEnvironment('GCAL_DEBUG');
   if (_googleClientId.isEmpty) {
-    // The whole Google feature compiles out when no GOOGLE_CLIENT_ID dart-define
-    // was passed to the build — the first gate to rule in or out when the Plans
-    // tab and the Dial's calendar affordance are simply absent on a device.
-    mediaLogToFile('gcal: no GOOGLE_CLIENT_ID compiled in — feature disabled');
+    if (gcalDebug) {
+      mediaLogToFile('gcal: no GOOGLE_CLIENT_ID compiled in — feature disabled');
+    }
     return null;
   }
-  mediaLogToFile('gcal: client id compiled in (len=${_googleClientId.length})');
+  if (gcalDebug) {
+    mediaLogToFile('gcal: client id compiled in (len=${_googleClientId.length})');
+  }
   const suffix = '.apps.googleusercontent.com';
   final base = _googleClientId.endsWith(suffix)
       ? _googleClientId.substring(0, _googleClientId.length - suffix.length)
