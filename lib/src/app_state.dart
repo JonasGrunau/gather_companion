@@ -2476,6 +2476,11 @@ class AppState extends ChangeNotifier {
   /// turn a tapped person into a calendar to read. Empty when disconnected.
   Map<String, String> _calendarIndex = const {};
 
+  /// Labels already logged by [hasCalendarFor], so the per-frame Dial gate records
+  /// each colleague's match-or-miss once instead of on every rebuild. Diagnostic
+  /// only — the match itself is a pure index lookup.
+  final Set<String> _gcalMatchLogged = {};
+
   /// A short-lived cache of one colleague's events, keyed by calendar id, so tapping
   /// the same person twice — or the Dial polling presence — does not re-hit Google
   /// each time. Entries expire via [_peopleEventsAt].
@@ -2506,8 +2511,12 @@ class AppState extends ChangeNotifier {
   /// batch of events. Called from [boot]; best-effort, never fails the launch.
   Future<void> _restoreGoogle() async {
     final google = _googleCalendar;
-    if (google == null) return;
+    if (google == null) {
+      _log('gcal: restore — no calendar service (build carries no client id)');
+      return;
+    }
     _googleConnected = await google.isConnected;
+    _log('gcal: restore — connected=$_googleConnected (refresh token in keychain)');
     if (_googleConnected) {
       await refreshGoogleEvents();
       unawaited(_buildCalendarIndex());
@@ -2520,8 +2529,12 @@ class AppState extends ChangeNotifier {
     final google = _googleCalendar;
     if (google == null) return 'Google Calendar is not set up in this build.';
     final error = await google.connect();
-    if (error != null) return error;
+    if (error != null) {
+      _log('gcal: connect — failed: $error');
+      return error;
+    }
     _googleConnected = await google.isConnected;
+    _log('gcal: connect — connected=$_googleConnected');
     notifyListeners();
     await refreshGoogleEvents();
     unawaited(_buildCalendarIndex());
@@ -2557,6 +2570,11 @@ class AppState extends ChangeNotifier {
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return;
     _calendarIndex = await google.fetchCalendarIndex();
+    // The decisive diagnostic: these are the names a colleague's Gather label must
+    // match (lowercased) for the Dial's calendar button to appear. Empty here means
+    // nobody has shared a calendar with this account — or the share has no name.
+    _log('gcal: calendar index — ${_calendarIndex.length} shared: '
+        '${_calendarIndex.keys.join(', ')}');
     notifyListeners();
   }
 
@@ -2577,8 +2595,17 @@ class AppState extends ChangeNotifier {
   /// Whether a person named [label] has a shared calendar this account can read —
   /// the gate the UI uses to offer a "Plans" affordance only where it will land on
   /// something. Cheap and synchronous: a lookup in the already-built index.
-  bool hasCalendarFor(String label) =>
-      _googleConnected && _calendarIndex.containsKey(label.trim().toLowerCase());
+  bool hasCalendarFor(String label) {
+    final key = label.trim().toLowerCase();
+    final hit = _googleConnected && _calendarIndex.containsKey(key);
+    // Log each distinct colleague once: shows the exact Gather name we looked up
+    // against the shared-calendar names — the place a nickname/name mismatch hides.
+    if (_googleConnected && _gcalMatchLogged.add(key)) {
+      _log('gcal: dial match — "$key" -> ${hit ? 'HIT' : 'MISS'} '
+          '(index has ${_calendarIndex.length})');
+    }
+    return hit;
+  }
 
   /// One colleague's events, cached for [_peopleEventsTtl]. Returns null when the
   /// fetch is already in flight for a cold cache (so a sync caller shows nothing yet
