@@ -1481,6 +1481,11 @@ class AppState extends ChangeNotifier {
   @visibleForTesting
   void debugAttachCollector(Collector collector) => _collector = collector;
 
+  /// Test seam: stand in the authenticated REST client a `/m/<code>` walk reaches
+  /// for, so the resolve→floor→knock path can be driven without a live login.
+  @visibleForTesting
+  void debugAttachAuth(GatherAuth auth) => _auth = auth;
+
   /// Test seam: drive [_onConnectivityChanged] without a plugin behind it.
   @visibleForTesting
   void debugNoteConnectivity(List<ConnectivityResult> now) => _onConnectivityChanged(now);
