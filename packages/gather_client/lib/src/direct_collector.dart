@@ -1147,29 +1147,48 @@ class DirectCollector implements Collector {
   void _scanCalendarSignals(Object? frame) {
     final calKeys = <String>{};
     var combinedEvents = 0;
-    var hasConnectedField = false;
-    final sampleFields = <String>{};
     var budget = 200000;
+
+    // Per-user tally: the question is not just "are the keys present" but "are they
+    // populated for real colleagues" — how many carry an email we could query, and
+    // how many are mid-meeting right now by Gather's own inference.
+    var userRows = 0;
+    var withEmail = 0;
+    var connectedTrue = 0;
+    var withInferred = 0;
+    final samples = <String>[];
 
     void walk(Object? node) {
       if (budget-- <= 0) return;
       if (node is Map) {
+        // A SpaceUser row carries the calendar fields directly. Detect it by the
+        // presence of the connection flag, then read its calendar shape once.
+        if (node.containsKey('hasConnectedCalendars') ||
+            node.containsKey('calculatedPrimaryCalendarEmail')) {
+          userRows++;
+          final email = node['calculatedPrimaryCalendarEmail'];
+          final connected = node['hasConnectedCalendars'];
+          final inferred = node['activeCalendarInferredId'];
+          final hasEmail = email is String && email.isNotEmpty;
+          if (hasEmail) withEmail++;
+          if (connected == true) connectedTrue++;
+          if (inferred != null && '$inferred'.isNotEmpty) withInferred++;
+          if (samples.length < 8 && (hasEmail || connected == true)) {
+            final name = node['name'] ?? node['displayName'] ?? '?';
+            samples.add('$name: email=${hasEmail ? email : '-'} '
+                'connected=${connected == true} '
+                'inMeeting=${inferred != null && '$inferred'.isNotEmpty}');
+          }
+        }
         node.forEach((k, v) {
           final key = k is String ? k : k.toString();
           final lower = key.toLowerCase();
           if (lower.contains('calendar')) {
             calKeys.add(key);
-            if (lower == 'hasconnectedcalendars') hasConnectedField = true;
-            // A collection of calendar events — count rows and sample one row's fields.
+            // A collection of calendar events — count rows if one is broadcast.
             if (lower.contains('calendarevent') || lower.contains('combinedcalendar')) {
               if (v is Map) {
                 combinedEvents += v.length;
-                final first = v.values.firstWhere((e) => e is Map, orElse: () => null);
-                if (first is Map) {
-                  for (final fk in first.keys) {
-                    sampleFields.add(fk is String ? fk : fk.toString());
-                  }
-                }
               } else if (v is List) {
                 combinedEvents += v.length;
               }
@@ -1187,13 +1206,18 @@ class DirectCollector implements Collector {
 
     walk(frame);
 
-    final found = calKeys.isNotEmpty;
+    // Wait for the full state dump before tallying, so the per-user counts reflect the
+    // whole roster rather than whichever delta happened to carry the first signal.
+    final found = calKeys.isNotEmpty && hasState;
     if (found) {
       _calendarScanned = true;
-      _log('gcal-wire: calendar signals present — keys={${calKeys.join(', ')}}; '
-          'hasConnectedCalendars=$hasConnectedField; '
-          'combinedEvents=$combinedEvents; '
-          'sampleFields=[${sampleFields.join(', ')}]');
+      _log('gcal-wire: signals present — keys={${calKeys.join(', ')}}; '
+          'combinedEvents=$combinedEvents');
+      _log('gcal-wire: users=$userRows withEmail=$withEmail '
+          'connected=$connectedTrue inMeetingNow=$withInferred');
+      for (final s in samples) {
+        _log('gcal-wire: sample — $s');
+      }
       return;
     }
     // No signal yet. Give the dump a few frames before concluding it is simply absent.
