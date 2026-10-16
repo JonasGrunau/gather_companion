@@ -284,12 +284,23 @@ class _ControlBarState extends State<ControlBar> {
     final navigator = Navigator.of(context);
 
     // Walking away still broadcasting is the thing nobody wants. Silence first,
-    // then leave. Guarded so a door press with nothing live is a no-op, and not
-    // run through `_run`: a mute that hiccups must not pop a snackbar over the
-    // walk or hold it up — the departure is the point, the mute is a courtesy.
-    if (state.call.micOn) await state.setMicOn(false);
-    if (!mounted) return;
-    if (state.call.cameraOn) await state.setCameraOn(false);
+    // then leave. Both off intents go in whenever a call *object* exists, rather
+    // than on `call.micOn` / `call.cameraOn`: those read the capture once it has
+    // finished opening, so an enable still in flight — tap Unmute, then the door
+    // before `_ensureCapture` returns — reads as off and skips the mute, and the
+    // pending enable then finishes and publishes after you have gone. Issued flat
+    // to off, they serialise behind that enable on the call's own queue, where
+    // `want = false` is the last word. Gated on [AppState.callHandle] so an idle
+    // door press with no call ever built stays a true no-op and does not conjure
+    // one just to mute it. Both before any `mounted` check: they are state-level
+    // and outlive this widget, so a call screen that pops mid-await must not
+    // strand the camera still live. Not run through `_run`: a mute that hiccups
+    // must not pop a snackbar over the walk or hold it up — the departure is the
+    // point, the mute is a courtesy.
+    if (state.callHandle != null) {
+      await state.setMicOn(false);
+      await state.setCameraOn(false);
+    }
     if (!mounted) return;
 
     if (state.inHuddle) {
