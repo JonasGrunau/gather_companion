@@ -47,13 +47,23 @@ class FakeMediaEngine implements MediaEngine {
       videoEnabled: withVideo,
       videoTrackId: withVideo ? 'fake-video' : null,
       audioTrackId: audio ? 'fake-audio' : null,
+      // A share in progress rides through the capture (re)start, as the real
+      // engine carries it over.
+      screenCapturing: _state.screenCapturing,
+      screenTrackId: _state.screenTrackId,
     ));
   }
 
   @override
   Future<void> stopCapture() async {
     calls.add('stopCapture');
-    _emit(const LocalMediaState());
+    // Screen is a separate capture and survives a camera/mic stop — including the
+    // restart that adds the camera mid-call — exactly as the real engine carries
+    // it over.
+    _emit(LocalMediaState(
+      screenCapturing: _state.screenCapturing,
+      screenTrackId: _state.screenTrackId,
+    ));
   }
 
   @override
@@ -75,6 +85,38 @@ class FakeMediaEngine implements MediaEngine {
     calls.add('switchCamera');
     if (_state.videoTrackId == null) return;
     _emit(_state.copyWith(frontCamera: !_state.frontCamera));
+  }
+
+  /// When set, [startScreenCapture] throws this instead of succeeding — the
+  /// declined-picker path, exercised without a picker.
+  MediaFailure? failScreenWith;
+
+  @override
+  Future<void> startScreenCapture() async {
+    calls.add('startScreenCapture');
+    final failure = failScreenWith;
+    if (failure != null) {
+      _emit(_state.copyWith(clearScreen: true, failure: failure));
+      throw failure;
+    }
+    _emit(_state.copyWith(
+      screenCapturing: true,
+      screenTrackId: 'fake-screen',
+      clearFailure: true,
+    ));
+  }
+
+  @override
+  Future<void> stopScreenCapture() async {
+    calls.add('stopScreenCapture');
+    _emit(_state.copyWith(clearScreen: true));
+  }
+
+  /// Mimics the OS "Stop" control ending the broadcast from outside the app: the
+  /// capture vanishes with no `stopScreenCapture` call, which is the signal
+  /// [LiveCall] watches for.
+  void endScreenFromOs() {
+    _emit(_state.copyWith(clearScreen: true));
   }
 
   /// What headset, if any, is plugged in — null for none. Lets a test drive the

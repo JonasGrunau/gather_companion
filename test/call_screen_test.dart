@@ -43,6 +43,44 @@ void main() {
     return state;
   }
 
+  group('sharing your own screen (issue #43)', () {
+    testWidgets('the header offers to share, and the picker lives there not in '
+        'the dock', (tester) async {
+      await show(tester, stateWith(const CallState()));
+
+      // In the header, not the island: the dock is at its plate budget (see the
+      // note atop control_bar.dart), so the share toggle sits in the call-screen
+      // chrome instead.
+      final share = find.byTooltip('Share your screen');
+      expect(share, findsOneWidget);
+      expect(
+        find.descendant(of: find.byType(ControlBar), matching: share),
+        findsNothing,
+      );
+    });
+
+    testWidgets('a live share flips the control to stop, wearing the brand',
+        (tester) async {
+      await show(
+        tester,
+        stateWith(const CallState(
+          media: LocalMediaState(screenCapturing: true, screenTrackId: 's1'),
+          publishingScreen: true,
+        )),
+      );
+
+      expect(find.byTooltip('Share your screen'), findsNothing);
+      final stop = find.byTooltip('Stop sharing');
+      expect(stop, findsOneWidget);
+      final t = tester.element(stop).tokens;
+      final button = tester.widget<IconButton>(
+        find.widgetWithIcon(IconButton, Icons.stop_screen_share_rounded),
+      );
+      expect(button.color, t.brand,
+          reason: 'live wears the brand, like the dock glyphs');
+    });
+  });
+
   group('the banner says who you are with', () {
     test('in every size of call, named or not', () {
       String both(List<String?> people) {

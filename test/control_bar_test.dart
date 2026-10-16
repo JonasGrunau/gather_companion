@@ -19,6 +19,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
+import 'package:gather_companion/harness/scripted_call.dart';
 import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
@@ -777,6 +778,95 @@ void main() {
 
     expect(find.byTooltip('Leave the conversation'), findsOneWidget);
     expect(find.text('Not connected to Gather.'), findsOneWidget);
+  });
+
+  group('the door silences you on the way out', () {
+    // Walking away from a conversation still broadcasting is the thing nobody
+    // wants, so the door mutes the microphone and the camera before it leaves.
+    // There is no socket here to actually pause, so the proof is that the door
+    // *asks* the call to — recorded by a [ScriptedCall] attached as the real
+    // call object — and that it asks whenever a call exists, including while an
+    // enable is still in flight, but conjures no call for a plain desk walk.
+
+    /// A state with a conversation to leave and [call] standing in as the live
+    /// call object, so [AppState.callHandle] is non-null and the mute requests
+    /// land somewhere that records them.
+    AppState withCall(ScriptedCall call) => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugApplyRoster(Roster(
+        selfId: 'me',
+        rows: [_row('me', name: 'Jonas')],
+      ))
+      ..debugHuddle = ['Ada']
+      ..debugAttachCall(call);
+
+    testWidgets('a live mic and camera are both turned off first',
+        (tester) async {
+      final call = ScriptedCall()
+        ..emit(const CallState(
+          media: LocalMediaState(
+            capturing: true,
+            audioEnabled: true,
+            audioTrackId: 'a1',
+            videoEnabled: true,
+            videoTrackId: 'v1',
+          ),
+        ));
+      final state = withCall(call);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      // Both silenced, each exactly once and each to off.
+      expect(call.micCalls, [false]);
+      expect(call.cameraCalls, [false]);
+    });
+
+    testWidgets('an enable still in flight is silenced too', (tester) async {
+      // The regression the review caught: a capture that has not finished opening
+      // reads as off through `call.micOn` / `call.cameraOn`. A guard on those
+      // would skip the mute, and the pending enable would publish after the
+      // walk. The door now issues the off intents on any live call, so this
+      // still-opening capture is caught and queued off behind the enable.
+      final call = ScriptedCall()
+        ..emit(const CallState(
+          media: LocalMediaState(capturing: false),
+        ));
+      final state = withCall(call);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      expect(call.micCalls, [false]);
+      expect(call.cameraCalls, [false]);
+    });
+
+    testWidgets('a door press with no call built is a no-op', (tester) async {
+      // The plain desk walk with nothing ever opened: no call object exists, so
+      // the door silences nothing and — the point of the guard — does not build
+      // a call just to mute it.
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugApplyRoster(Roster(
+          selfId: 'me',
+          rows: [_row('me', name: 'Jonas')],
+        ))
+        ..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      expect(state.callHandle, isNull);
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      // No call was conjured by the door press.
+      expect(state.callHandle, isNull);
+    });
   });
 
   group('the camera riding along', () {

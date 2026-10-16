@@ -378,8 +378,13 @@ class _MeetingCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final title = meeting.roomName ?? _conversationLabel(meeting.members);
-    final subtitle = '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
-        '${meeting.includesMe ? ' · you' : ''}';
+    // While a tap is resolving, the subtitle narrates the wait: warpToMeeting may
+    // spend a few seconds letting a freshly-reconnected roster place the room before
+    // it can walk in. See AppState.warpToMeeting.
+    final subtitle = busy
+        ? 'Finding directions…'
+        : '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
+            '${meeting.includesMe ? ' · you' : ''}';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(kTextGutter, 4, kTextGutter, 8),

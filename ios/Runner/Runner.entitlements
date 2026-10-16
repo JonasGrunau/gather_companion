@@ -18,5 +18,18 @@
 <dict>
 	<key>aps-environment</key>
 	<string>development</string>
+	<!--
+		Shared with the screen-share Broadcast Upload Extension. The extension runs
+		in its own process (ReplayKit hosts it), so the only way it can hand captured
+		frames to the app's peer connection is a file in a container both sides can
+		reach — this App Group. `flutter_webrtc` reads the group id from the
+		`RTCAppGroupIdentifier` Info.plist key and opens a socket on a file inside it.
+		The identifier here, in the extension's entitlements, and in that Info.plist
+		key must match exactly.
+	-->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.jonasgrunau.gatherCompanion.screenshare</string>
+	</array>
 </dict>
 </plist>

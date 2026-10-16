@@ -66,7 +66,24 @@ class LiveCall implements Call {
                 )) {
     _engineSub = _engine.states.listen((media) {
       _emit(_state.copyWith(media: media));
+      _noticeScreenEnded(media);
     });
+  }
+
+  /// The OS owns the "Stop" control for a system broadcast, so a share can end
+  /// without a tap in this app: the engine reports the screen capture gone while
+  /// [_wantScreen] still believes it is on. Catch that, drop the producer, and
+  /// clear the intent so the button falls back rather than offering to "stop" a
+  /// share that is already over.
+  void _noticeScreenEnded(LocalMediaState media) {
+    if (!_wantScreen || media.hasScreen) return;
+    _log('call: the screen share ended outside the app; dropping the producer');
+    unawaited(_serialise(() async {
+      _wantScreen = false;
+      await _sfu?.unpublish(SfuTag.screen);
+      _emit(_state.copyWith(publishingScreen: false));
+      return null;
+    }));
   }
 
   static void _noop(String _) {}
@@ -128,6 +145,14 @@ class LiveCall implements Call {
   /// reach, and these are what the retry on the next tap is judged against.
   bool _wantMic = false;
   bool _wantCamera = false;
+  bool _wantScreen = false;
+
+  /// Reentrancy guard for the bad-auth token heal in [_publish]. A stale SFU
+  /// token (after a transport change the socket slept through) is refused with
+  /// `TokenVerificationFailed`; the heal rebuilds the session to mint a fresh
+  /// one and retries the publish exactly once. Without this flag a token that is
+  /// still bad after the rebuild would rebuild-and-retry forever (#57).
+  bool _authHealing = false;
 
   /// Serialises the whole thing. Two taps in quick succession would otherwise
   /// interleave a capture restart with a publish and produce on a dead track.
@@ -195,6 +220,64 @@ class LiveCall implements Call {
         return detail;
       });
 
+  @override
+  Future<String?> setScreenShareOn(bool on) => _serialise(() async {
+        _wantScreen = on;
+        if (!on) {
+          // Unpublish before stopping the capture: the producer should go off the
+          // wire while its track is still alive, rather than the SFU holding a
+          // sender onto a track that is being torn down underneath it.
+          await _sfu?.unpublish(SfuTag.screen);
+          await _engine.stopScreenCapture();
+          _emit(_state.copyWith(publishingScreen: false, clearDetail: true));
+          return null;
+        }
+
+        // A second, independent capture — the system picker — that does not touch
+        // the camera/mic session. On denial the engine throws and the button
+        // falls back, the same shape as a refused camera.
+        try {
+          await _engine.startScreenCapture();
+        } on MediaFailure catch (failure) {
+          _wantScreen = false;
+          return _fail(SfuTag.screen, failure.message);
+        }
+        return _publishScreen();
+      });
+
+  /// Puts the screen-share track on the wire, from its own capture stream.
+  ///
+  /// The twin of [_publish], but it pulls the track from [CaptureEngine.screenStream]
+  /// rather than the camera/mic `localStream` — the whole point of a separate
+  /// capture is a separate track, published as its own [SfuTag.screen] producer.
+  Future<String?> _publishScreen() async {
+    final stream = _engine.screenStream;
+    final track = stream?.getVideoTracks().firstOrNull;
+    if (stream == null || track == null) {
+      _wantScreen = false;
+      return _fail(SfuTag.screen, 'The screen share did not open.');
+    }
+
+    try {
+      final sfu = await _sfuOrStart();
+      if (sfu.publishing(SfuTag.screen)) {
+        sfu.resume(SfuTag.screen);
+      } else {
+        await sfu.publish(track, stream, tag: SfuTag.screen);
+      }
+    } on Object catch (error) {
+      _log('call: publishing the screen failed: $error');
+      // The broadcast is live and only the wire failed, so the button stays on
+      // and the sentence says the room cannot see it yet — same stance as a
+      // camera that captured but did not reach the SFU.
+      return _fail(SfuTag.screen,
+          'You are sharing, but Gather has not picked up the screen yet.');
+    }
+
+    _emit(_state.copyWith(publishingScreen: true, clearDetail: true));
+    return null;
+  }
+
   /// Put back whatever a capture restart took with it.
   ///
   /// [_ensureCapture] closes both producers before it reopens the hardware,
@@ -211,6 +294,14 @@ class LiveCall implements Call {
     }
     if (_wantCamera && just != SfuTag.video && !sfu.publishing(SfuTag.video)) {
       await _publish(SfuTag.video);
+    }
+    // The screen rides its own capture, untouched by a camera restart, so this is
+    // only reached when the heal is for something else — but it belongs here for
+    // the same reason the others do: a republish that forgets a tag drops it.
+    if (_wantScreen &&
+        just != SfuTag.screen &&
+        !sfu.publishing(SfuTag.screen)) {
+      await _publishScreen();
     }
   }
 
@@ -268,7 +359,10 @@ class LiveCall implements Call {
     final stream = _engine.localStream;
     final track = switch (tag) {
       SfuTag.audio => stream?.getAudioTracks().firstOrNull,
-      SfuTag.video || SfuTag.screen => stream?.getVideoTracks().firstOrNull,
+      SfuTag.video => stream?.getVideoTracks().firstOrNull,
+      // Screen capture is a separate stream with its own publish path
+      // ([_publishScreen]); it never comes through here.
+      SfuTag.screen => null,
     };
     if (stream == null || track == null) {
       return _fail(tag, 'The ${tag == SfuTag.audio ? 'microphone' : 'camera'} '
@@ -291,6 +385,26 @@ class LiveCall implements Call {
           'your microphone on again here.',
         );
       }
+      // A stale SFU token — the socket slept through a transport change and the
+      // server now refuses every produce `bad auth / TokenVerificationFailed`,
+      // which no restart-free path recovers on its own (#57). Rebuild the
+      // session to mint a fresh token and retry the publish once. The guard
+      // stops a token that is still bad after the rebuild from looping; it falls
+      // through to the ordinary failure message instead.
+      if (_isStaleAuth(error) && !_authHealing) {
+        _authHealing = true;
+        _log('call: SFU refused bad-auth — rebuilding to mint a fresh token (#57)');
+        try {
+          // `_rebuild`, not the public `rebuild`: we are already inside the
+          // serialise job, so taking the lock again would deadlock. It republishes
+          // this tag onto the fresh session itself, so we return *that* result —
+          // a second `_publish(tag)` here would be a duplicate produce the fresh
+          // session also refuses on a still-bad token.
+          return await _rebuild(report: tag);
+        } finally {
+          _authHealing = false;
+        }
+      }
       // The hardware is live and only the wire failed, so the button stays on:
       // the person is unmuted, and the sentence says the room cannot hear them
       // yet. Silently flipping it back would read as the tap not registering.
@@ -305,6 +419,16 @@ class LiveCall implements Call {
     ));
     return null;
   }
+
+  /// A produce refusal that means the SFU token is stale, not that the track or
+  /// the transport is wrong. The server sends `bad auth` with
+  /// `{reason: TokenVerificationFailed}`, which `SfuSignalling` surfaces as the
+  /// message of an [SfuException]. Keyed on both strings because only the reason
+  /// is stable across Gather's error shapes.
+  bool _isStaleAuth(Object error) =>
+      error is SfuException &&
+      (error.message.contains('TokenVerificationFailed') ||
+          error.message.contains('bad auth'));
 
   /// The connected session, connecting it if this is the first thing to need one.
   ///
@@ -362,12 +486,13 @@ class LiveCall implements Call {
   /// `_ensureCapture` is restarting the session would produce on a track that is
   /// about to be stopped.
   void _onNeedsRepublish(void _) {
-    if (!_wantMic && !_wantCamera) return;
+    if (!_wantMic && !_wantCamera && !_wantScreen) return;
     _log('call: the SFU lost our producers; putting them back');
     unawaited(_serialise(() async {
       if (_sfu == null) return null;
       if (_wantMic) await _publish(SfuTag.audio);
       if (_wantCamera) await _publish(SfuTag.video);
+      if (_wantScreen) await _publishScreen();
       return null;
     }));
   }
@@ -400,6 +525,14 @@ class LiveCall implements Call {
       // Nobody left to hear. The session stays up if it exists — we may still be
       // publishing, and tearing it down over an empty cluster would cost a full
       // reconnection the moment somebody walks back.
+      //
+      // A screen share is the exception. Unlike the mic/camera it is a
+      // heavyweight, user-visible system broadcast — the iOS red indicator, the
+      // whole device captured — and it makes no sense to keep it running with
+      // nobody watching. Walking out of the conversation should end it, exactly
+      // as tapping Stop would; otherwise the broadcast keeps going back at your
+      // desk. Mic/camera stay as they are, so walking back is still cheap.
+      if (_wantScreen) await setScreenShareOn(false);
       final sfu = _sfu;
       if (sfu != null && sfu.ready) await sfu.setSubscriptions(const {});
       return;
@@ -506,11 +639,13 @@ class LiveCall implements Call {
   Future<void> hangUp() async {
     _wantMic = false;
     _wantCamera = false;
+    _wantScreen = false;
     await _detach();
     await _sfu?.dispose();
     _sfu = null;
     _remoteStreams.clear();
     await _engine.releaseAudioSession();
+    await _engine.stopScreenCapture();
     await _engine.stopCapture();
     // The desired set survives a hang-up: the cluster has not changed just
     // because we stopped listening to it, and the next tap should pick up the
@@ -523,20 +658,48 @@ class LiveCall implements Call {
     // Serialised like every other session-touching path, so a rebuild landing in
     // the middle of a tap cannot interleave a capture restart with a produce.
     await _serialise(() async {
-      // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
-      // cluster or tap builds one from scratch, which is the right amount of work.
-      if (_sfu == null && _listeningTo.isEmpty && !_wantMic && !_wantCamera) {
-        return null;
-      }
-      _log('call: rebuilding the media session after an external teardown');
-      // `_start` disposes the stale session, opens fresh transports, and replays
-      // the allow list, the conversation and the subscriptions — but not our
-      // producers, since only this class holds the tracks to put back.
-      await _start();
-      if (_wantMic) await _publish(SfuTag.audio);
-      if (_wantCamera) await _publish(SfuTag.video);
+      await _rebuild();
       return null;
     });
+  }
+
+  /// The rebuild itself, already holding the queue.
+  ///
+  /// Split out from [rebuild] because the bad-auth heal in [_publish] runs
+  /// *inside* a `_serialise` job already: calling the public [rebuild] from there
+  /// would queue behind the job it is part of and deadlock. This takes no lock,
+  /// so it may only be called from a path that already holds one.
+  ///
+  /// [report] names the track whose republish result the caller wants back — the
+  /// bad-auth heal passes the tag it was trying to publish, because the republish
+  /// below *is* its single retry: a second `_publish(tag)` on the fresh session
+  /// would send a duplicate produce (refused twice on a still-bad token). Returns
+  /// that tag's detail (`null` on success), or `null` when nobody is asking.
+  Future<String?> _rebuild({SfuTag? report}) async {
+    // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
+    // cluster or tap builds one from scratch, which is the right amount of work.
+    if (_sfu == null &&
+        _listeningTo.isEmpty &&
+        !_wantMic &&
+        !_wantCamera &&
+        !_wantScreen) {
+      return null;
+    }
+    _log('call: rebuilding the media session after an external teardown');
+    // `_start` disposes the stale session, opens fresh transports, and replays
+    // the allow list, the conversation and the subscriptions — but not our
+    // producers, since only this class holds the tracks to put back.
+    await _start();
+    String? audioDetail;
+    String? videoDetail;
+    if (_wantMic) audioDetail = await _publish(SfuTag.audio);
+    if (_wantCamera) videoDetail = await _publish(SfuTag.video);
+    if (_wantScreen) await _publishScreen();
+    return switch (report) {
+      SfuTag.audio => audioDetail,
+      SfuTag.video || SfuTag.screen => videoDetail,
+      null => null,
+    };
   }
 
   @override

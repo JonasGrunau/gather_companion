@@ -175,6 +175,124 @@ void main() {
     });
   });
 
+  group('sharing the screen (issue #43)', () {
+    test('opens its own capture and publishes it as a screen producer',
+        () async {
+      expect(await call.setScreenShareOn(true), isNull);
+
+      expect(engine.calls, contains('startScreenCapture'));
+      expect(rig.node().argsFor('produce')?['tag'], 'screen');
+      expect(call.state.publishingScreen, isTrue);
+      expect(call.state.screenOn, isTrue);
+    });
+
+    test('is a second capture that leaves the camera/mic session untouched',
+        () async {
+      await call.setMicOn(true);
+      await call.setCameraOn(true);
+      rig.node().drain();
+
+      // Sharing must not restart the camera capture — that would cut audio and
+      // flip the picture — so no `stopCapture`/`startCapture` follows the share.
+      final before = engine.calls.length;
+      expect(await call.setScreenShareOn(true), isNull);
+      final after = engine.calls.sublist(before);
+      expect(after, contains('startScreenCapture'));
+      expect(after, isNot(contains('stopCapture')));
+      expect(after, isNot(contains('startCapture(audio: true, video: true)')));
+
+      expect(rig.node().argsFor('produce')?['tag'], 'screen');
+      // The camera producer is still up: a screen share does not replace the face.
+      expect(call.state.publishingVideo, isTrue);
+      expect(call.state.publishingScreen, isTrue);
+    });
+
+    test('stopping it closes the producer and releases only the screen capture',
+        () async {
+      await call.setScreenShareOn(true);
+      rig.node().drain();
+
+      await call.setScreenShareOn(false);
+
+      expect(rig.node().argsFor('produce-close'), {'tag': 'screen'});
+      expect(engine.calls, contains('stopScreenCapture'));
+      expect(rig.session.publishing(SfuTag.screen), isFalse);
+      expect(call.state.publishingScreen, isFalse);
+      expect(call.state.screenOn, isFalse);
+    });
+
+    test('the OS ending the broadcast drops the producer on its own', () async {
+      await call.setScreenShareOn(true);
+      rig.node().drain();
+
+      // No tap in the app — the system "Stop" control ended it, which the engine
+      // reports as the screen capture simply vanishing.
+      engine.endScreenFromOs();
+      await settle();
+
+      expect(rig.node().argsFor('produce-close'), {'tag': 'screen'});
+      expect(call.state.publishingScreen, isFalse);
+      expect(call.state.screenOn, isFalse);
+    });
+
+    test('a declined picker leaves the button off and says why', () async {
+      engine.failScreenWith = const MediaFailure(
+        MediaFailureKind.unknown,
+        'Screen sharing did not start. Tap it again and allow the broadcast.',
+      );
+
+      final detail = await call.setScreenShareOn(true);
+
+      expect(detail, isNotNull);
+      expect(call.state.publishingScreen, isFalse);
+      expect(call.state.screenOn, isFalse);
+      expect(rig.sockets, isEmpty,
+          reason: 'a capture that never opened connects nothing to publish onto');
+    });
+
+    test('survives the camera restart that adding video forces', () async {
+      // Turning the camera on with only the mic open restarts the capture
+      // session. That tears the camera/mic stream down and back up — but the
+      // screen is a separate capture and must ride through untouched, or the
+      // engine would look like the broadcast ended and the producer would be
+      // dropped the moment somebody turned their camera on.
+      await call.setMicOn(true);
+      await call.setScreenShareOn(true);
+      rig.node().drain();
+
+      await call.setCameraOn(true);
+      await settle();
+
+      expect(call.state.publishingScreen, isTrue,
+          reason: 'the share was not caught in the camera restart');
+      expect(call.state.screenOn, isTrue);
+      expect(rig.session.publishing(SfuTag.screen), isTrue);
+      // And it was not needlessly republished — the capture never stopped.
+      expect(
+        rig.node().sent.where(
+            (f) => f.method == 'produce' && f.args['tag'] == 'screen'),
+        isEmpty,
+        reason: 'the screen producer was left alone, not torn down and rebuilt',
+      );
+    });
+
+    test('a lost socket puts the screen share back with everything else',
+        () async {
+      await call.setScreenShareOn(true);
+      rig.node().drain();
+
+      rig.node().drop();
+      rig.node().comeBack();
+      await settle();
+      await settle();
+      await settle();
+
+      expect(rig.node().argsFor('produce')?['tag'], 'screen',
+          reason: 'the screen producer died with the socket and was put back');
+      expect(call.state.publishingScreen, isTrue);
+    });
+  });
+
   group('being in a conversation', () {
     test('connects the media plane without anybody tapping anything', () async {
       // The fix this pins, and the reason it matters: the SFU socket is what
@@ -387,6 +505,95 @@ void main() {
           reason: 'mic and camera republished onto the fresh session');
       expect(localCall.state.publishingAudio, isTrue);
       expect(localCall.state.publishingVideo, isTrue);
+    });
+  });
+
+  group('a stale SFU token after a transport change (#57)', () {
+    /// A call whose sessions come from a fresh [Rig] each build, with the first
+    /// [refuseCount] of them refusing `produce` the way the server does when the
+    /// token went stale across a network gap. Mirrors the #41 harness above.
+    ({LiveCall call, List<Rig> rigs}) staleTokenCall({required int refuseCount}) {
+      final rigs = <Rig>[];
+      final localEngine = FakeCaptureEngine();
+      final localCall = LiveCall(
+        auth: GatherAuth(
+          credentials: const GatherCredentials(refreshToken: 'unused'),
+        ),
+        spaceId: spaceId,
+        srcId: me,
+        engine: localEngine,
+        buildSfu: () {
+          final rig = Rig();
+          rigs.add(rig);
+          if (rigs.length <= refuseCount) {
+            rig.nodeRefusals['produce'] =
+                'produce refused: {message: bad auth, '
+                'data: {reason: TokenVerificationFailed}}';
+          }
+          return rig.session;
+        },
+        voice: VoiceActivity(hold: Duration.zero),
+      );
+      addTearDown(() async {
+        await localCall.dispose();
+        for (final rig in rigs) {
+          await rig.close();
+        }
+      });
+      return (call: localCall, rigs: rigs);
+    }
+
+    test('rebuilds to mint a fresh token and republishes the track', () async {
+      // The first session carries the stale token and refuses every produce; the
+      // rebuilt one does not. Turning the mic on must survive that without a tap
+      // being needed to retry.
+      final (:call, :rigs) = staleTokenCall(refuseCount: 1);
+
+      final detail = await call.setMicOn(true);
+      await settle();
+
+      // The stale session was thrown away and a second stood up in its place —
+      // exactly the restart the person used to have to do by hand.
+      expect(rigs, hasLength(2), reason: 'one rebuild, no more');
+      expect(rigs[0].node().disposed, isTrue,
+          reason: 'the session with the dead token was disposed');
+      final produced = rigs[1]
+          .node()
+          .sent
+          .where((f) => f.method == 'produce')
+          .map((f) => f.args['tag'])
+          .toList();
+      expect(produced, contains('audio'),
+          reason: 'the track was republished onto the fresh session');
+      expect(detail, isNull, reason: 'the unmute succeeded, so it says nothing');
+      expect(call.state.publishingAudio, isTrue);
+    });
+
+    test('a token still bad after the rebuild fails once, it does not loop',
+        () async {
+      // Every session refuses, so the heal cannot win. It must give up after a
+      // single rebuild and surface the ordinary failure, not rebuild forever.
+      final (:call, :rigs) = staleTokenCall(refuseCount: 99);
+
+      final detail = await call.setMicOn(true);
+      await settle();
+
+      expect(rigs, hasLength(2),
+          reason: 'exactly one rebuild attempt, then it stands down');
+      // One produce on the fresh session, not two: the rebuild's own republish is
+      // the single retry, so the heal must not issue a second produce the fresh
+      // session would also refuse.
+      final retried = rigs[1]
+          .node()
+          .sent
+          .where((f) => f.method == 'produce' && f.args['tag'] == 'audio');
+      expect(retried, hasLength(1),
+          reason: 'the heal retries the produce exactly once, no duplicate');
+      expect(detail, isNotNull);
+      expect(call.state.detail, contains('has not picked up'));
+      expect(call.state.publishingAudio, isFalse);
+      // The hardware is live and only the wire failed, so the button stays on.
+      expect(call.state.micOn, isTrue);
     });
   });
 

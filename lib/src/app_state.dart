@@ -1475,6 +1475,14 @@ class AppState extends ChangeNotifier {
     return failed;
   }
 
+  Future<String?> setScreenShareOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setScreenShareOn(on);
+    notifyListeners();
+    return failed;
+  }
+
   Future<void> switchCamera() async {
     await _call?.switchCamera();
     notifyListeners();
@@ -2055,34 +2063,78 @@ class AppState extends ChangeNotifier {
 
     // On another floor there is no room on this map to walk into and no tile a hop
     // could reach — the same ceiling [warpToPerson] hits. Refuse rather than walk
-    // into a room that merely shares a name or coordinates on the wrong floor.
+    // into a room that merely shares a name or coordinates on the wrong floor. The
+    // test is applied to the *live* meeting again after the wait below: a sparse
+    // snapshot names no floor, so the conversation can place onto another one while
+    // we wait, and [_meetingRoom] matches purely by name and would otherwise walk us
+    // into a same-named room on this floor.
     final myFloor = _myRow()?.floorId;
-    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+    bool onAnotherFloor(Meeting m) =>
+        myFloor != null && m.floorId != null && m.floorId != myFloor;
+    if (onAnotherFloor(meeting)) {
       return 'That conversation is on another floor.';
     }
 
-    final map = this.map;
-    final roomName = meeting.roomName;
-    if (map != null && roomName != null) {
-      for (final room in map.rooms) {
-        if (room.name != roomName) continue;
-        final failed = await goToRoom(
-          room,
-          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
-        );
-        if (failed != null) return failed;
-        final micFailed = await setMicOn(true);
-        if (micFailed != null) _notices.add(micFailed);
-        return null;
+    // The roster mutates under us as placement streams in after a reconnect, so
+    // re-read the meeting by its cluster each time rather than trusting the snapshot
+    // the card was built from.
+    Meeting? live() {
+      for (final m in meetings) {
+        if (m.clusterId == meeting.clusterId) return m;
+      }
+      return null;
+    }
+
+    // Right after a reconnect the cluster is known (its card shows) but its members
+    // are not placed yet, so neither a room name nor a member tile resolves. Rather
+    // than refuse on that first sparse snapshot — the old "Could not work out where
+    // that conversation is." the moment you tapped — wait briefly for the roster to
+    // place them, then go. If it never resolves, send the user to the map, where the
+    // room is walkable off static geometry with no roster dependency.
+    if (_meetingRoom(meeting) == null && _meetingMemberTile(meeting) == null) {
+      if (_link.isDisrupted) return 'No connection — waiting for network.';
+      // The wait ends the moment the question is settled, which includes the two
+      // terminal ways it can settle against us: the link dropping (a walk started
+      // now would only move this phone's avatar) and the cluster ending (nothing
+      // left to travel to). Folding those into the predicate makes them early-outs
+      // rather than a full five-second stall before the same verdict.
+      await _pollUntil(() {
+        if (_link.isDisrupted) return true;
+        final m = live();
+        if (m == null) return true;
+        return m.includesMe || _meetingRoom(m) != null || _meetingMemberTile(m) != null;
+      }, timeout: const Duration(seconds: 5));
+      if (_link.isDisrupted) return 'No connection — waiting for network.';
+      final settled = live();
+      if (settled == null) return 'That conversation just ended.';
+      if (!settled.includesMe &&
+          _meetingRoom(settled) == null &&
+          _meetingMemberTile(settled) == null) {
+        return 'Still finding a way in — open the map and walk into the room.';
       }
     }
 
-    for (final member in meeting.members) {
-      final x = member.x, y = member.y;
-      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      // Only hop beside a member this hop can actually reach: one on our own floor.
-      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
-      final failed = await warpToTile(x.round(), y.round());
+    final m = live() ?? meeting;
+    // Pulled into it while we waited — nothing left to travel to.
+    if (m.includesMe) return null;
+    // Placement may have landed the conversation on another floor while we waited.
+    if (onAnotherFloor(m)) return 'That conversation is on another floor.';
+
+    final room = _meetingRoom(m);
+    if (room != null) {
+      final failed = await goToRoom(
+        room,
+        toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+      );
+      if (failed != null) return failed;
+      final micFailed = await setMicOn(true);
+      if (micFailed != null) _notices.add(micFailed);
+      return null;
+    }
+
+    final tile = _meetingMemberTile(m);
+    if (tile != null) {
+      final failed = await warpToTile(tile.x, tile.y);
       if (failed != null) return failed;
       final micFailed = await setMicOn(true);
       if (micFailed != null) _notices.add(micFailed);
@@ -2090,6 +2142,51 @@ class AppState extends ChangeNotifier {
     }
 
     return 'Could not work out where that conversation is.';
+  }
+
+  /// The named room a meeting sits in, resolved against this floor's map, or null
+  /// when the roster has not named it yet (see [Meeting.roomName]). Shared by
+  /// [warpToMeeting]'s wait predicate and its executor so both read one truth.
+  SpaceRoom? _meetingRoom(Meeting meeting) {
+    final map = this.map;
+    final roomName = meeting.roomName;
+    if (map == null || roomName == null) return null;
+    for (final room in map.rooms) {
+      if (room.name == roomName) return room;
+    }
+    return null;
+  }
+
+  /// A tile beside the first meeting member this hop can reach — one placed, with
+  /// finite coordinates, on our own floor — or null when none is placed yet.
+  ({int x, int y})? _meetingMemberTile(Meeting meeting) {
+    final myFloor = _myRow()?.floorId;
+    for (final member in meeting.members) {
+      final x = member.x, y = member.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      // Only hop beside a member this hop can actually reach: one on our own floor.
+      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
+      return (x: x.round(), y: y.round());
+    }
+    return null;
+  }
+
+  /// Polls [test] every [interval] for up to [timeout], returning true the moment it
+  /// passes and false on timeout. Counts ticks rather than reading a wall clock so it
+  /// advances deterministically under `fakeAsync` in tests. Used to let a sparse
+  /// post-reconnect roster finish placing a meeting before [warpToMeeting] gives up.
+  Future<bool> _pollUntil(
+    bool Function() test, {
+    required Duration timeout,
+    Duration interval = const Duration(milliseconds: 200),
+  }) async {
+    if (test()) return true;
+    final ticks = (timeout.inMilliseconds / interval.inMilliseconds).ceil();
+    for (var i = 0; i < ticks; i++) {
+      await Future<void>.delayed(interval);
+      if (test()) return true;
+    }
+    return false;
   }
 
   /// Walk into a room, landing on a seat if it has a free one.
@@ -2829,6 +2926,13 @@ class AppState extends ChangeNotifier {
     _link = const LinkStatus(LinkState.retrying, 'Network changed — reconnecting.');
     notifyListeners();
     unawaited(collector.resync());
+    // resync() reconnects only the game socket. The SFU socket sleeps through the
+    // transport change on a connection it still believes is alive, so its token
+    // goes stale and every republish is refused `bad auth` until a full restart
+    // (#57). Rebuild the media session too — `_start()` mints a fresh token.
+    // rebuild() no-ops when there is no session, and this shares the 5s resync
+    // cooldown above, so a flapping radio cannot spam it.
+    unawaited(_call?.rebuild() ?? Future<void>.value());
   }
 
   Future<void> _detach() async {

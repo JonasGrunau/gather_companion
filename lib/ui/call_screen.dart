@@ -348,6 +348,18 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
+  /// Starts or stops sharing the phone's screen, surfacing a refusal — a declined
+  /// picker, a wire that did not pick it up — the same way the control bar does:
+  /// success is silent, only a sentence interrupts.
+  Future<void> _toggleShare() async {
+    final on = widget.state.call.screenOn;
+    final failed = await widget.state.setScreenShareOn(!on);
+    if (!mounted || failed == null) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(failed)));
+  }
+
   /// Flips the toggle, carrying the current big view across so it does not jump.
   void _setMode(SpotlightMode mode) {
     if (mode == _mode) return;
@@ -448,6 +460,8 @@ class _CallScreenState extends State<CallScreen> {
                         count: tiles.where((tile) => !tile.isSelf).length,
                         mode: _mode,
                         onMode: _setMode,
+                        sharing: widget.state.call.screenOn,
+                        onToggleShare: _toggleShare,
                       ),
                       Expanded(
                         child: tiles.isEmpty
@@ -657,11 +671,19 @@ class _Header extends StatelessWidget {
     required this.count,
     required this.mode,
     required this.onMode,
+    required this.sharing,
+    required this.onToggleShare,
   });
 
   final int count;
   final SpotlightMode mode;
   final ValueChanged<SpotlightMode> onMode;
+
+  /// Whether our own screen is going out right now, and the way to start or stop
+  /// it. Here rather than in the dock island because the island is full — see the
+  /// plate-budget note at the top of `control_bar.dart`.
+  final bool sharing;
+  final VoidCallback onToggleShare;
 
   @override
   Widget build(BuildContext context) {
@@ -689,6 +711,17 @@ class _Header extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
+          ),
+          // Sharing the phone's screen into the room. Brand while it is going out,
+          // the ordinary grey at rest, like the live glyphs in the dock. It raises
+          // the platform's own broadcast picker on the first tap.
+          IconButton(
+            onPressed: onToggleShare,
+            icon: Icon(sharing
+                ? Icons.stop_screen_share_rounded
+                : Icons.screen_share_rounded),
+            color: sharing ? t.brand : t.mutedForeground,
+            tooltip: sharing ? 'Stop sharing' : 'Share your screen',
           ),
           // How the big view is chosen. Persistent across both layouts, so the
           // way out of auto is the same control that got you in.

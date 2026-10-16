@@ -10,8 +10,15 @@
 ///
 /// ## What is here, and what is deliberately not
 ///
-/// Gather's bar also carries a screen-share button. It does not survive the trip
-/// to a phone: there is nothing on a phone worth sharing a window of.
+/// Gather's bar carries a screen-share button; this one does **not**, and the
+/// reason is the worst-case row below rather than the feature. A phone can share
+/// its whole screen now (issue #43), but this island is already at its plate
+/// budget — self, mic, camera, camera-switch, speaker, React and the door fill a
+/// 360-point phone, and an eighth fixed-width plate is exactly the overflow the
+/// `worst-case row` test in `control_bar_test.dart` was written to catch. So the
+/// share toggle lives in the call screen's header (`_Header` in `call_screen.dart`),
+/// which is call-only chrome with room to spare — the one place a broadcast picker
+/// belongs anyway, since there is nothing to share from over the map.
 ///
 /// Gather's door does survive, and it is **one** door, as it is on the desktop.
 /// This bar briefly had three ways out — a desk button, a *leave* button beside it
@@ -275,6 +282,26 @@ class _ControlBarState extends State<ControlBar> {
   Future<void> _leave() async {
     final state = widget.state;
     final navigator = Navigator.of(context);
+
+    // Walking away still broadcasting is the thing nobody wants. Silence first,
+    // then leave. Both off intents go in whenever a call *object* exists, rather
+    // than on `call.micOn` / `call.cameraOn`: those read the capture once it has
+    // finished opening, so an enable still in flight — tap Unmute, then the door
+    // before `_ensureCapture` returns — reads as off and skips the mute, and the
+    // pending enable then finishes and publishes after you have gone. Issued flat
+    // to off, they serialise behind that enable on the call's own queue, where
+    // `want = false` is the last word. Gated on [AppState.callHandle] so an idle
+    // door press with no call ever built stays a true no-op and does not conjure
+    // one just to mute it. Both before any `mounted` check: they are state-level
+    // and outlive this widget, so a call screen that pops mid-await must not
+    // strand the camera still live. Not run through `_run`: a mute that hiccups
+    // must not pop a snackbar over the walk or hold it up — the departure is the
+    // point, the mute is a courtesy.
+    if (state.callHandle != null) {
+      await state.setMicOn(false);
+      await state.setCameraOn(false);
+    }
+    if (!mounted) return;
 
     if (state.inHuddle) {
       await _run(state.leaveHuddle);

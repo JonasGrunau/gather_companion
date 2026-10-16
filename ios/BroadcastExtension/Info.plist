@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	The Broadcast Upload Extension that captures the whole device screen for the
+	companion's screen-share (issue #43). RPBroadcastProcessMode = Sample is what
+	makes ReplayKit hand us raw sample buffers rather than a finished recording.
+	The NSExtensionPrincipalClass must resolve to SampleHandler (module-qualified
+	once the target is created, e.g. $(PRODUCT_MODULE_NAME).SampleHandler).
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Gather Screen</string>
+	<key>CFBundleName</key>
+	<string>BroadcastExtension</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.broadcast-services-upload</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).SampleHandler</string>
+		<key>RPBroadcastProcessMode</key>
+		<string>RPBroadcastProcessModeSampleBuffer</string>
+	</dict>
+</dict>
+</plist>

@@ -20,4 +20,11 @@ import 'media_engine.dart';
 abstract class CaptureEngine implements MediaEngine {
   /// The live capture, or null when nothing is open.
   MediaStream? get localStream;
+
+  /// The live screen-share capture, or null when nothing is sharing. A separate
+  /// handle from [localStream] because it is a separate capture session — the
+  /// camera/mic stream from `getUserMedia` and the screen stream from
+  /// `getDisplayMedia` are independent, and [SfuSession] publishes each as its
+  /// own producer.
+  MediaStream? get screenStream;
 }
