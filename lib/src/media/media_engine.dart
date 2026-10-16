@@ -69,6 +69,8 @@ class LocalMediaState {
     this.audioOutput = AudioOutput.speaker,
     this.videoTrackId,
     this.audioTrackId,
+    this.screenCapturing = false,
+    this.screenTrackId,
     this.failure,
   });
 
@@ -76,6 +78,20 @@ class LocalMediaState {
   final bool audioEnabled;
   final bool videoEnabled;
   final bool frontCamera;
+
+  /// The screen share is a *second* capture, independent of the camera/mic one
+  /// above: it comes from `getDisplayMedia` (ReplayKit on iOS, MediaProjection on
+  /// Android), not `getUserMedia`, and lives or dies on its own. Kept beside the
+  /// camera fields rather than folded into [capturing] because a person can share
+  /// their screen with their camera still on, and the two capture sessions start
+  /// and stop for unrelated reasons.
+  ///
+  /// [screenTrackId] going null while [screenCapturing] was true is how the engine
+  /// reports the OS tore the broadcast down from under us — the system "Stop"
+  /// control, an incoming phone call, a permission revoked — so the caller can
+  /// drop the producer rather than keep publishing a dead track.
+  final bool screenCapturing;
+  final String? screenTrackId;
 
   /// Where the sound is coming out. The speaker until routing is applied: that
   /// is the default [WebrtcMediaEngine] itself settles on (no headset ⇒ speaker,
@@ -94,6 +110,9 @@ class LocalMediaState {
   /// Whether there is a live video track worth drawing.
   bool get hasVideo => capturing && videoEnabled && videoTrackId != null;
 
+  /// Whether there is a live screen-share track worth publishing.
+  bool get hasScreen => screenCapturing && screenTrackId != null;
+
   LocalMediaState copyWith({
     bool? capturing,
     bool? audioEnabled,
@@ -102,9 +121,12 @@ class LocalMediaState {
     AudioOutput? audioOutput,
     String? videoTrackId,
     String? audioTrackId,
+    bool? screenCapturing,
+    String? screenTrackId,
     MediaFailure? failure,
     bool clearFailure = false,
     bool clearTracks = false,
+    bool clearScreen = false,
   }) =>
       LocalMediaState(
         capturing: capturing ?? this.capturing,
@@ -114,12 +136,19 @@ class LocalMediaState {
         audioOutput: audioOutput ?? this.audioOutput,
         videoTrackId: clearTracks ? null : (videoTrackId ?? this.videoTrackId),
         audioTrackId: clearTracks ? null : (audioTrackId ?? this.audioTrackId),
+        // Screen is its own capture, so [clearTracks] — which follows a camera/mic
+        // stop — must not touch it; only [clearScreen] drops the screen fields.
+        screenCapturing:
+            clearScreen ? false : (screenCapturing ?? this.screenCapturing),
+        screenTrackId:
+            clearScreen ? null : (screenTrackId ?? this.screenTrackId),
         failure: clearFailure ? null : (failure ?? this.failure),
       );
 
   @override
   String toString() => 'LocalMediaState(capturing: $capturing, '
       'audio: $audioEnabled, video: $videoEnabled, out: ${audioOutput.name}'
+      '${screenCapturing ? ', screen' : ''}'
       '${failure == null ? '' : ', $failure'})';
 }
 
@@ -162,6 +191,19 @@ abstract class MediaEngine {
 
   /// Stops sending video without releasing the camera.
   Future<void> setVideoEnabled(bool enabled);
+
+  /// Opens the screen-share capture — the system picker on iOS (ReplayKit), the
+  /// consent dialog on Android (MediaProjection) — as a *second*, independent
+  /// capture that leaves the camera/mic session untouched.
+  ///
+  /// Throws [MediaFailure] when the person declines the picker or the platform
+  /// refuses, the same contract as [startCapture]. Idempotent: a second call
+  /// while already sharing does nothing.
+  Future<void> startScreenCapture();
+
+  /// Stops the screen-share capture and releases its track, leaving the
+  /// camera/mic capture alone. Safe to call when nothing is sharing.
+  Future<void> stopScreenCapture();
 
   /// Front to back and back again.
   Future<void> switchCamera();

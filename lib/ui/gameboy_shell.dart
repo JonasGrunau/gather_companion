@@ -51,6 +51,7 @@ import '../src/app_state.dart';
 import '../src/media/gameboy_sfx.dart';
 import '../theme/gather_theme.dart' show availabilityColor, availabilityLabel, GatherThemeContext;
 import 'call_screen.dart' show callBannerTextFor, openCallScreen;
+import 'gameboy_theme.dart';
 
 // The shell's own palette, kept deliberately apart from [GatherTokens]: the
 // office inside the screen must stay the app's normal colours, so the retro
@@ -58,19 +59,13 @@ import 'call_screen.dart' show callBannerTextFor, openCallScreen;
 // the console design system — hardware plastic in one ramp, screen chrome in
 // another, and a short semantic set for the lights.
 
-// Hardware plastic: one purple ramp from deep shadow to bright highlight. The
-// range is deliberately wide — the housing sits mid-ramp and the moulded
-// controls (cross, pills, grille) sink to the near-black end, so a part always
-// has a darker value to stand against. A control the same value as the body
-// behind it reads as a hollow outline, which is the one thing to avoid.
-const _hw990 = Color(0xFF160A2E); // the deepest: the drop under the cross, its sunk hub
-const _hw950 = Color(0xFF241243); // near-black: the cross face and the hard drop under a part
-const _hw900 = Color(0xFF35205F); // a dark moulded face — the pill slots
-const _hw800 = Color(0xFF48287A); // the bezel and the recessed frame
-const _hw700 = Color(0xFF63379A); // the main housing
-const _hw600 = Color(0xFF7544B4); // a raised face, and the top-edge highlight
-const _hw500 = Color(0xFF8B55C8); // the brightest catch of light on a dome
-const _hw150 = Color(0xFFE6DAF7); // bright lavender-white: legible chrome text
+// Hardware plastic: one ramp from deep shadow to bright highlight, now owned by
+// the active theme ([GbHardware], provided through [GameboyThemeScope] and read
+// as `context.gbHardware`). The range is deliberately wide — the housing sits
+// mid-ramp and the moulded controls (cross, pills, grille) sink to the near-black
+// end, so a part always has a darker value to stand against. A control the same
+// value as the body behind it reads as a hollow outline, which is the one thing
+// to avoid. The purple ramp lives on as `kPurpleHardware` in `gameboy_theme.dart`.
 
 // Neutral hardware greys. The D-pad and the SELECT/START keys are moulded in
 // charcoal, not the body's purple — the console's one grey part, as the design
@@ -104,8 +99,10 @@ const _pixelFont = 'PixelifySans';
 
 /// A pixel shadow: a solid block offset down, no blur. The signature of the
 /// whole look — every moulded part casts one so it reads as sitting proud of the
-/// body rather than painted onto it.
-const _hardShadow = BoxShadow(color: _hw900, blurRadius: 0, offset: Offset(0, 4));
+/// body rather than painted onto it. Built per-theme from `hw900` at the one site
+/// that uses it ([_Screen]), since its colour now rides the active palette.
+BoxShadow _hardShadow(GbHardware hw) =>
+    BoxShadow(color: hw.hw900, blurRadius: 0, offset: const Offset(0, 4));
 
 /// How wide the cross is. Each arm is then a target a thumb can hit without
 /// looking, which is the point of a control used while watching the screen above it.
@@ -118,16 +115,18 @@ const _emotes = ['👋', '❤️', '🎉', '👍️', '🤣', '👏', '💯', '�
 
 /// The Select menu's rows, in D-pad order top to bottom. Two of them — the
 /// status choices and the emote strip — are rows the D-pad walks left/right
-/// inside; the other four are single targets, one per tab the menu can leave to
-/// (Dial, Activity, Settings) plus the camera toggle. Kept as a count so the cursor can
-/// clamp without the menu and the router disagreeing about how many rows there are.
+/// inside; the other five are single targets, one per tab the menu can leave to
+/// (Dial, Activity, Plans, Settings) plus the camera toggle. Kept as a count so the
+/// cursor can clamp without the menu and the router disagreeing about how many rows
+/// there are.
 const int _menuRowStatus = 0;
 const int _menuRowCamera = 1;
 const int _menuRowEmotes = 2;
 const int _menuRowDial = 3;
 const int _menuRowActivity = 4;
-const int _menuRowSettings = 5;
-const int _menuRowCount = 6;
+const int _menuRowPlans = 5;
+const int _menuRowSettings = 6;
+const int _menuRowCount = 7;
 
 /// Wraps [child] (the office) in the handheld. [onOpenDial]/[onOpenActivity]/
 /// [onOpenSettings] are how the Select menu leaves for another tab — the shell
@@ -147,6 +146,7 @@ class GameboyShell extends StatefulWidget {
     required this.child,
     required this.onOpenSettings,
     required this.onOpenActivity,
+    required this.onOpenPlans,
     required this.onOpenDial,
   });
 
@@ -154,6 +154,7 @@ class GameboyShell extends StatefulWidget {
   final Widget child;
   final VoidCallback onOpenSettings;
   final VoidCallback onOpenActivity;
+  final VoidCallback onOpenPlans;
   final VoidCallback onOpenDial;
 
   @override
@@ -342,6 +343,11 @@ class _GameboyShellState extends State<GameboyShell> {
     widget.onOpenActivity();
   }
 
+  void _doPlans() {
+    _closeMenu();
+    widget.onOpenPlans();
+  }
+
   void _doSettings() {
     _closeMenu();
     widget.onOpenSettings();
@@ -365,6 +371,8 @@ class _GameboyShellState extends State<GameboyShell> {
         _doDial();
       case _menuRowActivity:
         _doActivity();
+      case _menuRowPlans:
+        _doPlans();
       case _menuRowSettings:
         _doSettings();
     }
@@ -372,61 +380,80 @@ class _GameboyShellState extends State<GameboyShell> {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
-      // A top-lit mid-purple body: a short highlight along the top edge, then the
-      // housing holds one mid value all the way down. It must *not* darken into
-      // the controls' own value — a cross or a pill the same purple as the body
-      // behind it reads as a hollow outline, which is exactly the washed-out look
-      // this replaces.
-      decoration: const BoxDecoration(
+    // The active theme picks the plastic palette; [GameboyThemeScope] hands it to
+    // every widget below through `context.gbHardware`, so the body here and the
+    // controls deeper down all paint from one source that a theme swap rebuilds.
+    final theme = themeById(widget.state.gameboyTheme);
+    final hw = theme.hardware;
+    return GameboyThemeScope(
+      hardware: hw,
+      child: DecoratedBox(
+      // A top-lit body: a short highlight along the top edge, then the housing
+      // holds one mid value all the way down. It must *not* darken into the
+      // controls' own value — a cross or a pill the same colour as the body behind
+      // it reads as a hollow outline, which is exactly the washed-out look this
+      // replaces.
+      decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [_hw600, _hw700, _hw700],
-          stops: [0, 0.22, 1],
+          colors: [hw.hw600, hw.hw700, hw.hw700],
+          stops: const [0, 0.22, 1],
         ),
       ),
       child: SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-          child: Column(
-            children: [
-              Expanded(
-                child: _Screen(
-                  state: widget.state,
-                  // The handheld's own snackbar, shown inside the LCD.
-                  toast: _toast,
-                  // Only live while somebody is in call distance; the prompt itself
-                  // decides when to show, this just gives it the action.
-                  onWave: _doWave,
-                  // The Select menu is the screen's overlay, not the device's: it
-                  // is handed in here so it clips to the LCD well and leaves the
-                  // plastic body showing around it.
-                  menu: _menuOpen
-                      ? _GameboyMenu(
-                          state: widget.state,
-                          rowKeys: _rowKeys,
-                          focusedRow: _row,
-                          focusedStatus: _status,
-                          focusedEmote: _emote,
-                          onStatus: _doStatus,
-                          onCamera: _doCamera,
-                          onReact: _doReact,
-                          onDial: _doDial,
-                          onActivity: _doActivity,
-                          onSettings: _doSettings,
-                          onDismiss: _closeMenu,
-                        )
-                      : null,
-                  child: widget.child,
-                ),
-              ),
-              // The purple band between the screen and the controls. Measured off
-              // the mock: the gap there is ~10% of the screen width, which lands at
-              // ~40 logical pixels on a phone — a deliberate breath between the LCD
-              // and the D-pad, not the tight 8px of before.
-              const SizedBox(height: 40),
-              _ControlsDeck(
+          child: Builder(
+            builder: (context) {
+              // The LCD, built once and placed either above the controls (upright)
+              // or between the two thumbs (on its side). Same screen, same menu and
+              // toast, whichever way it is held.
+              final screen = _Screen(
+                state: widget.state,
+                // The handheld's own snackbar, shown inside the LCD.
+                toast: _toast,
+                // Only live while somebody is in call distance; the prompt itself
+                // decides when to show, this just gives it the action.
+                onWave: _doWave,
+                // The Select menu is the screen's overlay, not the device's: it
+                // is handed in here so it clips to the LCD well and leaves the
+                // plastic body showing around it.
+                menu: _menuOpen
+                    ? _GameboyMenu(
+                        state: widget.state,
+                        rowKeys: _rowKeys,
+                        focusedRow: _row,
+                        focusedStatus: _status,
+                        focusedEmote: _emote,
+                        onStatus: _doStatus,
+                        onCamera: _doCamera,
+                        onReact: _doReact,
+                        onDial: _doDial,
+                        onActivity: _doActivity,
+                        onPlans: _doPlans,
+                        onSettings: _doSettings,
+                        onDismiss: _closeMenu,
+                      )
+                    : null,
+                child: widget.child,
+              );
+
+              // Held sideways there is no vertical room to stack LCD over controls,
+              // so the handheld turns into its landscape cousin: the D-pad to the
+              // left of the screen, A/B to the right, Select/Start below. The deck
+              // owns that arrangement — it is handed the [screen] to place between the
+              // thumbs — so its one B double-tap timer stays a single instance.
+              final landscape =
+                  MediaQuery.orientationOf(context) == Orientation.landscape;
+
+              // The deck is always the builder's root — upright it stacks the LCD,
+              // the brand band and the controls; on its side it wraps the LCD between
+              // the thumbs. Keeping it the root means a rotation only relays the same
+              // `_ControlsDeck` element to a new layout instead of swapping the root
+              // type (Column ⇄ deck), which would dispose and rebuild its State and
+              // drop a pending B double-tap timer mid-gesture.
+              return _ControlsDeck(
                 state: widget.state,
                 menuOpen: _menuOpen,
                 onMenuMove: _move,
@@ -438,11 +465,41 @@ class _GameboyShellState extends State<GameboyShell> {
                 onWave: _doWave,
                 // Refusals (mute, the door) land in the LCD, not on the plastic.
                 onMessage: _say,
-              ),
-            ],
+                landscape: landscape,
+                screen: screen,
+                // The band between the screen and the controls upright — a theme may
+                // print its brand here (the DMG wordmark spot); dropped on its side.
+                brand: _BrandBand(theme: theme),
+              );
+            },
           ),
         ),
       ),
+      ),
+    );
+  }
+}
+
+/// The band below the LCD, where a theme may print its brand — the spot a real
+/// handheld stamps its wordmark. [GameboyTheme.brandmark] draws it centred; a
+/// theme with none keeps the plain ~40px breath the layout had before, so the
+/// purple shell stays pixel-identical to how it always looked.
+class _BrandBand extends StatelessWidget {
+  const _BrandBand({required this.theme});
+
+  final GameboyTheme theme;
+
+  @override
+  Widget build(BuildContext context) {
+    final mark = theme.brandmark;
+    // A bare theme keeps the plain ~40px breath, pixel-identical to before.
+    if (mark == null) return const SizedBox(height: 40);
+    // A printed brand wants room to sit off the LCD rather than hug its lip, so
+    // the branded band is taller with most of the extra breath above the mark —
+    // a clear gap to the screen, a smaller one to the controls below.
+    return Padding(
+      padding: const EdgeInsets.only(top: 20, bottom: 6),
+      child: Center(child: mark(context)),
     );
   }
 }
@@ -466,6 +523,7 @@ class _Header extends StatelessWidget {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) {
+        final hw = context.gbHardware;
         return Padding(
           padding: const EdgeInsets.fromLTRB(4, 0, 4, 2),
           child: Row(
@@ -477,10 +535,10 @@ class _Header extends StatelessWidget {
                   state.spaceName ?? 'The office',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontFamily: _pixelFont,
                     fontWeight: FontWeight.w700,
-                    color: _hw150,
+                    color: hw.hw150,
                     fontSize: 19,
                     letterSpacing: 0.5,
                   ),
@@ -499,12 +557,12 @@ class _Header extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 7),
-              const Text(
+              Text(
                 'POWER',
                 style: TextStyle(
                   fontFamily: _pixelFont,
                   fontWeight: FontWeight.w700,
-                  color: _hw150,
+                  color: hw.hw150,
                   fontSize: 13,
                   letterSpacing: 0.5,
                 ),
@@ -986,24 +1044,24 @@ class _Screen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final hw = context.gbHardware;
     return Container(
-      // The moulded lip around the well: a dark bezel, darker than the mid-purple
-      // body so the screen reads as sunk into the console rather than laid on top
-      // of it. Wider at the top (the header sits there) than on the other three
-      // sides. It still catches a little light along the top and falls to shadow
-      // at the bottom, and casts the same hard drop the buttons do. The gradient,
-      // not per-side borders, because a rounded corner needs one border colour
-      // all the way round.
+      // The moulded lip around the well: a dark bezel, darker than the body so the
+      // screen reads as sunk into the console rather than laid on top of it. Wider
+      // at the top (the header sits there) than on the other three sides. It still
+      // catches a little light along the top and falls to shadow at the bottom, and
+      // casts the same hard drop the buttons do. The gradient, not per-side borders,
+      // because a rounded corner needs one border colour all the way round.
       padding: const EdgeInsets.fromLTRB(6, 7, 6, 6),
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [_hw800, _hw900],
+          colors: [hw.hw800, hw.hw900],
         ),
-        borderRadius: BorderRadius.all(Radius.circular(14)),
-        border: Border.fromBorderSide(BorderSide(color: _hw950, width: 1.5)),
-        boxShadow: [_hardShadow],
+        borderRadius: const BorderRadius.all(Radius.circular(14)),
+        border: Border.fromBorderSide(BorderSide(color: hw.hw950, width: 1.5)),
+        boxShadow: [_hardShadow(hw)],
       ),
       child: Column(
         children: [
@@ -1116,10 +1174,26 @@ class _ControlsDeck extends StatefulWidget {
     required this.onMenuToggle,
     required this.onWave,
     required this.onMessage,
+    required this.landscape,
+    required this.screen,
+    required this.brand,
   });
 
   final AppState state;
   final bool menuOpen;
+
+  /// Whether the handheld is held on its side. The deck owns both arrangements so it
+  /// stays one element across a rotation, keeping its B double-tap timer alive.
+  final bool landscape;
+
+  /// The LCD. Upright the deck stacks it over the brand band and the controls; on
+  /// its side it wraps it between the thumbs — D-pad left, A/B right, Select/Start
+  /// below.
+  final Widget screen;
+
+  /// The band printed below the LCD upright (the DMG wordmark spot); dropped on its
+  /// side, where there is no room for it.
+  final Widget brand;
   final void Function(String direction) onMenuMove;
   final VoidCallback onMenuConfirm;
   final VoidCallback onMenuClose;
@@ -1264,93 +1338,122 @@ class _ControlsDeckState extends State<_ControlsDeck> {
     }
   }
 
+  /// The D-pad, walking the office or driving the menu cursor. Its own listener on
+  /// [AppState.positions] so it dims exactly when there is nowhere to walk.
+  Widget _dpad() => ListenableBuilder(
+        listenable: state.positions,
+        builder: (context, _) => _GbDpad(
+          key: const Key('gb-dpad'),
+          enabled: menuOpen || state.canWalk,
+          // The menu drives the cursor, the office walks — name the gesture for
+          // whichever the pad is doing right now.
+          moveVerb: menuOpen ? 'Move' : 'Walk',
+          onPress: menuOpen ? onMenuMove : state.walk,
+          // Always stop walking on release. It is idempotent, and the case that
+          // matters is opening the menu with the pad still held: a no-op release
+          // there would let the walk timer outlive the lift and step the avatar
+          // forever. See [Walk.release].
+          onRelease: state.stopWalking,
+        ),
+      );
+
+  /// A: the cart, or — in the menu — the choose key, or — during a call — the way
+  /// back to the faces, the partner to the LCD banner's "Press A or tap". Lit while
+  /// the cart is latched on or a call is live; plain in the menu.
+  Widget _aButton(BuildContext context) => _GbRoundButton(
+        label: 'A',
+        size: 64,
+        lit: !menuOpen && (state.inCall || state.boost),
+        // A switch only when it means boost. In the menu it chooses, during a call
+        // it opens the call — both actions, so the glow there is not an "on" state
+        // the reader should announce.
+        toggled: (menuOpen || state.inCall) ? null : state.boost,
+        onTap: menuOpen
+            ? onMenuConfirm
+            : state.inCall
+                ? () => openCallScreen(context, state)
+                : () {
+                    HapticFeedback.selectionClick();
+                    state.boost = !state.boost;
+                    // Up for latched on, down for released.
+                    _sfx(state.boost ? GbSound.toggleOn : GbSound.toggleOff);
+                  },
+      );
+
+  /// B: mute, and — double-tapped while somebody is in call distance — a wave. Lit
+  /// means the mic is live. Inert in the menu, where a stray mute would surprise.
+  Widget _bButton() => _GbRoundButton(
+        label: 'B',
+        size: 64,
+        lit: !menuOpen && state.call.micOn,
+        toggled: menuOpen ? null : state.call.micOn,
+        onTap: menuOpen ? null : _tapB,
+      );
+
+  /// Select opens/closes the menu; Start goes home in the office and backs out of
+  /// the menu while it is up. Upright, the pair are the DMG's flat pills side by
+  /// side on the chin; in landscape they become the GBA's round knobs, each with
+  /// its name printed to the left, stacked START-over-SELECT down the left thumb.
+  Widget _selectStart({bool vertical = false}) {
+    if (vertical) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          _GbRoundKey(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+          const SizedBox(height: 16),
+          _GbRoundKey(label: 'SELECT', onTap: onMenuToggle),
+        ],
+      );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _GbPill(label: 'SELECT', onTap: onMenuToggle),
+        const SizedBox(width: 22),
+        _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) {
-        final call = state.call;
-        // Two packed zones rather than one tall box with the keys pinned to its
-        // edges: the cross and the A/B pair share an upper band, the SELECT/START
-        // pair and the grille a lower one, with no dead plastic in between. The
-        // buttons sit low against the cross's centre so the right of the body fills
-        // the way the left does.
+        if (widget.landscape) return _landscape(context);
+
+        // Upright: the LCD on top, the brand band, then the controls below.
         return Column(
+          children: [
+            Expanded(child: widget.screen),
+            widget.brand,
+            _portraitControls(),
+          ],
+        );
+      },
+    );
+  }
+
+  /// The upright thumb deck below the LCD. Two packed zones rather than one tall box
+  /// with the keys pinned to its edges: the cross and the A/B pair share an upper
+  /// band, the SELECT/START pair and the grille a lower one, with no dead plastic in
+  /// between. The buttons sit low against the cross's centre so the right of the body
+  /// fills the way the left does.
+  Widget _portraitControls() {
+    return Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             SizedBox(
               height: _dpadSize,
               child: Stack(
                 children: [
-                  // D-pad, bottom-left. In the office it walks and dims when there
-                  // is nowhere to go; while the menu is up it drives the cursor
-                  // instead and is always live, because there is always a row to
-                  // move to.
-                  Positioned(
-                    left: 2,
-                    top: 0,
-                    child: ListenableBuilder(
-                      listenable: state.positions,
-                      builder: (context, _) => _GbDpad(
-                        key: const Key('gb-dpad'),
-                        enabled: menuOpen || state.canWalk,
-                        // The menu drives the cursor, the office walks — name the
-                        // gesture for whichever the pad is doing right now.
-                        moveVerb: menuOpen ? 'Move' : 'Walk',
-                        onPress: menuOpen ? onMenuMove : state.walk,
-                        // Always stop walking on release. It is idempotent, and the
-                        // case that matters is opening the menu with the pad still
-                        // held: a no-op release there would let the walk timer
-                        // outlive the lift and step the avatar forever. See
-                        // [Walk.release].
-                        onRelease: state.stopWalking,
-                      ),
-                    ),
-                  ),
-                  // A, raised and to the right: the cart, or — in the menu — the
-                  // choose key, or — during a call — the way back to the faces, the
-                  // partner to the LCD banner's "Press A or tap". Lit while the cart
-                  // is latched on or a call is live; plain in the menu.
-                  Positioned(
-                    right: 18,
-                    top: 30,
-                    child: _GbRoundButton(
-                      label: 'A',
-                      size: 64,
-                      lit: !menuOpen && (state.inCall || state.boost),
-                      // A switch only when it means boost. In the menu it chooses,
-                      // during a call it opens the call — both actions, so the glow
-                      // there is not an "on" state the reader should announce.
-                      toggled: (menuOpen || state.inCall) ? null : state.boost,
-                      onTap: menuOpen
-                          ? onMenuConfirm
-                          : state.inCall
-                              ? () => openCallScreen(context, state)
-                              : () {
-                                  HapticFeedback.selectionClick();
-                                  state.boost = !state.boost;
-                                  // Up for latched on, down for released.
-                                  _sfx(state.boost ? GbSound.toggleOn : GbSound.toggleOff);
-                                },
-                    ),
-                  ),
-                  // B, below and left of A: mute, and — double-tapped while somebody
-                  // is in call distance — a wave. Lit means the mic is live, so the
-                  // button glows when you are the one being heard. Inert in the
-                  // menu — it has no job there, and a stray mute mid-menu surprises.
-                  Positioned(
-                    right: 98,
-                    top: 66,
-                    child: _GbRoundButton(
-                      label: 'B',
-                      size: 64,
-                      lit: !menuOpen && call.micOn,
-                      // Mute is a real switch; inert in the menu, so no toggle state
-                      // there.
-                      toggled: menuOpen ? null : call.micOn,
-                      onTap: menuOpen ? null : _tapB,
-                    ),
-                  ),
+                  // D-pad, bottom-left.
+                  Positioned(left: 2, top: 0, child: _dpad()),
+                  // A, raised and to the right.
+                  Positioned(right: 18, top: 30, child: _aButton(context)),
+                  // B, below and left of A.
+                  Positioned(right: 98, top: 66, child: _bButton()),
                 ],
               ),
             ),
@@ -1366,28 +1469,82 @@ class _ControlsDeckState extends State<_ControlsDeck> {
                     bottom: 2,
                     child: _SpeakerGrille(),
                   ),
-                  Positioned.fill(
-                    child: Center(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Select opens the menu, and closes it again — a thumb
-                          // that opened it reaches for the same key to put it away.
-                          _GbPill(label: 'SELECT', onTap: onMenuToggle),
-                          const SizedBox(width: 22),
-                          // Start goes home in the office, and backs out of the menu
-                          // while it is up.
-                          _GbPill(label: 'START', onTap: menuOpen ? onMenuClose : _goHome),
-                        ],
-                      ),
-                    ),
-                  ),
+                  Positioned.fill(child: Center(child: _selectStart())),
                 ],
               ),
             ),
           ],
         );
-      },
+  }
+
+  /// The handheld on its side, laid out like the GBA it is modelled on: the LCD
+  /// full-height in the middle, the D-pad high on the left with START/SELECT stacked
+  /// in the corner below it, and A/B tucked tight together on the right with the
+  /// speaker grille in the lower corner under them. The same controls and the same B
+  /// double-tap timer as upright — only their arrangement turns ninety degrees. Each
+  /// thumb column is wrapped in a [FittedBox] so a short landscape phone scales the
+  /// fixed 135px cross and 64px keys down beside a full-height LCD rather than
+  /// overflowing.
+  Widget _landscape(BuildContext context) {
+    Widget fit(Widget child) => FittedBox(fit: BoxFit.scaleDown, child: child);
+
+    // Left thumb: the cross riding high, START over SELECT in the corner below —
+    // `spaceBetween` pushes them to the top and bottom the way the mock sets them.
+    final left = fit(
+      SizedBox(
+        width: _dpadSize,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            SizedBox(width: _dpadSize, height: _dpadSize, child: _dpad()),
+            const SizedBox(height: 28),
+            _selectStart(vertical: true),
+          ],
+        ),
+      ),
+    );
+
+    // A high-right, B low-left — the same diagonal the upright deck has, but tucked
+    // tight so the pair sits nearly on one line, as the mock draws them.
+    final ab = fit(
+      SizedBox(
+        width: 150,
+        height: 96,
+        child: Stack(
+          children: [
+            Positioned(top: 0, right: 0, child: _aButton(context)),
+            Positioned(top: 32, left: 0, child: _bButton()),
+          ],
+        ),
+      ),
+    );
+
+    // The right thumb runs the full LCD height: A/B float in the upper middle, and
+    // the speaker moulding drops to the lower corner — sitting just shy of the LCD's
+    // bottom edge, the way the GBA flanks the screen — rather than hugging A/B.
+    final right = Column(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(child: Center(child: ab)),
+        fit(const _SpeakerGrille(key: Key('gb-grille-landscape'), horizontal: true)),
+        const SizedBox(height: 10),
+      ],
+    );
+
+    // Wide gaps between each thumb and the LCD, so the D-pad and B sit well off the
+    // screen the way they do on the hardware. `stretch` lets the side columns run the
+    // LCD's full height so the grille can ride down near its bottom.
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(right: 20),
+          child: Center(child: left),
+        ),
+        Expanded(child: widget.screen),
+        Padding(padding: const EdgeInsets.only(left: 20), child: right),
+      ],
     );
   }
 }
@@ -1626,6 +1783,7 @@ class _GbRoundButtonState extends State<_GbRoundButton> {
   @override
   Widget build(BuildContext context) {
     final lit = widget.lit;
+    final hw = context.gbHardware;
     return Semantics(
       button: true,
       toggled: widget.toggled,
@@ -1648,16 +1806,16 @@ class _GbRoundButtonState extends State<_GbRoundButton> {
             // plastic with the letter engraved into them, so the dome is gentle
             // (one step of light near the top) and the depth comes from the hard
             // drop below, not from gloss.
-            gradient: const RadialGradient(
-              center: Alignment(-0.25, -0.35),
+            gradient: RadialGradient(
+              center: const Alignment(-0.25, -0.35),
               radius: 1.05,
-              colors: [_hw500, _hw600],
+              colors: [hw.hw500, hw.hw600],
             ),
-            border: Border.all(color: lit ? _online : _hw950, width: 3),
+            border: Border.all(color: lit ? _online : hw.hw950, width: 3),
             boxShadow: [
               // The hard drop — a deeper, more offset block than a soft shadow, so
               // the key reads as sitting proud of the body; it closes up on press.
-              BoxShadow(color: _hw950, blurRadius: 0, offset: Offset(0, _down ? 2 : 7)),
+              BoxShadow(color: hw.hw950, blurRadius: 0, offset: Offset(0, _down ? 2 : 7)),
               if (lit) const BoxShadow(color: _online, blurRadius: 10, spreadRadius: 0),
             ],
           ),
@@ -1681,7 +1839,7 @@ class _GbRoundButtonState extends State<_GbRoundButton> {
                   fontWeight: FontWeight.w700,
                   // Dark and engraved into the lit dome when idle, the way the
                   // mock prints its A/B; white only when the control is live.
-                  color: lit ? _scWhite : _hw900,
+                  color: lit ? _scWhite : hw.hw900,
                   fontSize: widget.size * 0.42,
                 ),
               ),
@@ -1771,50 +1929,161 @@ class _GbPillState extends State<_GbPill> {
   }
 }
 
-/// The moulded grille in the corner. Identical upright slots — every one the same
-/// length and width, each perfectly vertical — stepped up to the right so the
-/// block reads as an angled speaker moulding while no single slot is itself
-/// slanted, the way the mock draws it. Hidden from the reader: it is decoration,
-/// not a control.
-class _SpeakerGrille extends StatelessWidget {
-  const _SpeakerGrille();
+/// A round Select/Start knob with its name printed to its *left*, the way the GBA
+/// sets the pair in the lower corner — the upright DMG uses the flat [_GbPill]
+/// instead. A small moulded charcoal knob that sinks into its own hard shadow on
+/// press; the label is engraved grey, right-aligned in a fixed box so START and
+/// SELECT line their knobs up in a column.
+class _GbRoundKey extends StatefulWidget {
+  const _GbRoundKey({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  State<_GbRoundKey> createState() => _GbRoundKeyState();
+}
+
+class _GbRoundKeyState extends State<_GbRoundKey> {
+  bool _down = false;
+
+  void _set(bool down) {
+    if (_down == down) return;
+    setState(() => _down = down);
+  }
 
   @override
   Widget build(BuildContext context) {
-    return const ExcludeSemantics(
+    return Semantics(
+      button: true,
+      label: widget.label,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        onTapDown: (_) => _set(true),
+        onTapUp: (_) => _set(false),
+        onTapCancel: () => _set(false),
+        behavior: HitTestBehavior.opaque,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 72,
+              child: Text(
+                widget.label,
+                textAlign: TextAlign.right,
+                style: const TextStyle(
+                  fontFamily: _pixelFont,
+                  fontWeight: FontWeight.w700,
+                  color: _n700,
+                  fontSize: 14,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 90),
+              curve: Curves.easeOut,
+              transform: Matrix4.translationValues(0, _down ? 2 : 0, 0),
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                // The same charcoal moulding as the pill and the D-pad, domed with a
+                // touch of top light; the depth is the hard drop below, not gloss.
+                gradient: const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [_n700, _n800],
+                ),
+                border: Border.all(color: _n950, width: 1),
+                boxShadow: [
+                  BoxShadow(color: _n900, blurRadius: 0, offset: Offset(0, _down ? 1 : 4)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The moulded grille in the corner. Identical slots — every one the same length
+/// and width — stepped so the block reads as an angled speaker moulding while no
+/// single slot is itself slanted, the way the mock draws it. Upright (the portrait
+/// shell) the slots stand vertical and march up to the right; [horizontal] (the
+/// landscape GBA) turns the same moulding on its side — the slots lie flat and
+/// march inward as the body does. Hidden from the reader: it is decoration, not a
+/// control.
+class _SpeakerGrille extends StatelessWidget {
+  const _SpeakerGrille({super.key, this.horizontal = false});
+
+  /// The sideways cut, for the landscape body — flat slots instead of upright ones.
+  final bool horizontal;
+
+  @override
+  Widget build(BuildContext context) {
+    return ExcludeSemantics(
       child: SizedBox(
-        width: 74,
-        height: 60,
-        child: CustomPaint(painter: _GrillePainter()),
+        // The box turns with the slots: tall-and-narrow upright, wide-and-short flat.
+        // The landscape vents run wider than the upright grille, the way the GBA
+        // stretches them along its lower-right flank.
+        width: horizontal ? 104 : 74,
+        height: horizontal ? 74 : 60,
+        child: CustomPaint(
+          painter: _GrillePainter(
+            barColor: context.gbHardware.hw990,
+            horizontal: horizontal,
+          ),
+        ),
       ),
     );
   }
 }
 
 class _GrillePainter extends CustomPainter {
-  const _GrillePainter();
+  const _GrillePainter({required this.barColor, this.horizontal = false});
+
+  /// The deepest hardware value (`hw990`) of the active theme, so the moulded
+  /// grille sinks into whichever body it sits on.
+  final Color barColor;
+
+  /// Flat slots marching down, for the landscape body; upright slots otherwise.
+  final bool horizontal;
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = _hw990
+      ..color = barColor
       ..strokeWidth = 5
       ..strokeCap = StrokeCap.round;
     const count = 6;
-    const barLen = 32.0; // every slot the same height
-    const stepX = 11.0; // march to the right
-    const stepY = 3.0; // and climb, so the cluster reads as an angled moulding
+    // The flat landscape vents run long across the flank; the upright slots are the
+    // short original.
+    final barLen = horizontal ? 84.0 : 32.0;
+    const step = 11.0; // the march along the stack
+    const skew = 3.0; // and the small climb, so the cluster reads as angled
     for (var i = 0; i < count; i++) {
-      final x = 8 + i * stepX;
-      final bottom = size.height - 4 - i * stepY;
-      // A straight up-and-down slot: same endpoints' x, so it is never angled —
-      // only its position moves, in both axes.
-      canvas.drawLine(Offset(x, bottom), Offset(x, bottom - barLen), paint);
+      if (horizontal) {
+        // A straight left-to-right slot: same endpoints' y, so it is never angled —
+        // the stack marches down the right edge and eases inward as it goes.
+        final y = 8 + i * step;
+        final right = size.width - 4 - i * skew;
+        canvas.drawLine(Offset(right, y), Offset(right - barLen, y), paint);
+      } else {
+        // A straight up-and-down slot: same endpoints' x, so it is never angled —
+        // only its position moves, in both axes.
+        final x = 8 + i * step;
+        final bottom = size.height - 4 - i * skew;
+        canvas.drawLine(Offset(x, bottom), Offset(x, bottom - barLen), paint);
+      }
     }
   }
 
   @override
-  bool shouldRepaint(_GrillePainter old) => false;
+  bool shouldRepaint(_GrillePainter old) =>
+      old.barColor != barColor || old.horizontal != horizontal;
 }
 
 /// The Select menu, drawn inside the LCD: the controls that are not one of the
@@ -1835,6 +2104,7 @@ class _GameboyMenu extends StatelessWidget {
     required this.onReact,
     required this.onDial,
     required this.onActivity,
+    required this.onPlans,
     required this.onSettings,
     required this.onDismiss,
   });
@@ -1852,6 +2122,7 @@ class _GameboyMenu extends StatelessWidget {
   final ValueChanged<String> onReact;
   final VoidCallback onDial;
   final VoidCallback onActivity;
+  final VoidCallback onPlans;
   final VoidCallback onSettings;
   final VoidCallback onDismiss;
 
@@ -1928,6 +2199,16 @@ class _GameboyMenu extends StatelessWidget {
                     title: 'Activity',
                     focused: focusedRow == _menuRowActivity,
                     onTap: onActivity,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                KeyedSubtree(
+                  key: rowKeys[_menuRowPlans],
+                  child: _MenuRow(
+                    icon: Icons.event_rounded,
+                    title: 'Plans',
+                    focused: focusedRow == _menuRowPlans,
+                    onTap: onPlans,
                   ),
                 ),
                 const SizedBox(height: 8),

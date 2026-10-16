@@ -1,4 +1,5 @@
-/// The faces. Everybody the SFU is sending us, plus your own camera.
+/// The faces. Everybody the SFU is sending us, plus your own tile — always
+/// present, your camera when it is on and an avatar when it is not.
 ///
 /// ## Why this is a route and not a panel
 ///
@@ -45,7 +46,7 @@ import 'person_avatar.dart';
 ///
 /// In [manual] the person looking picks: tap a face to enlarge it, the return
 /// button to go back. In [auto] the view follows whoever is talking, and a tap
-/// only pins a face until the next speaker takes the floor. The toggle in the
+/// on a face leaves auto for manual to watch that person. The toggle in the
 /// header flips between the two, over and over.
 enum SpotlightMode { manual, auto }
 
@@ -53,8 +54,16 @@ enum SpotlightMode { manual, auto }
 /// while nobody else is in the call, the control bar's own camera button.
 Future<void> openCallScreen(BuildContext context, AppState state) =>
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => CallScreen(state: state)),
+      MaterialPageRoute<void>(
+        builder: (_) => CallScreen(state: state, buildTile: debugCallTileBuilder),
+      ),
     );
+
+/// Harness-only override every [openCallScreen] picks up. The simulator has no
+/// camera, so the whole-app harness sets this to paint stand-in footage into the
+/// tiles; null in production, where the real `_VideoTile` renders real streams.
+@visibleForTesting
+CallTileBuilder? debugCallTileBuilder;
 
 /// One face to draw, resolved from call state and the roster.
 class CallTile {
@@ -70,6 +79,7 @@ class CallTile {
     this.availability,
     this.speaking = false,
     this.reactions = const [],
+    this.handRaised = false,
   });
 
   /// `SpaceUser.id` when we could place them, otherwise the media `srcId`. Only
@@ -91,6 +101,22 @@ class CallTile {
   /// A list rather than one emoji because a reaction is an act and not a status:
   /// three taps are three of them, overlapping. See `../src/reactions.dart`.
   final List<ReactionFlight> reactions;
+
+  /// Whether this person's hand is up. A sticky status, unlike [reactions]: it
+  /// stays until lowered. Ours comes from `AppState.myHandRaised` (local-first);
+  /// everybody else's from their `RosterRow.handRaised`.
+  final bool handRaised;
+
+  /// Whether this tile has a frame to show, as opposed to a face to draw.
+  ///
+  /// Not `stream != null`: a paused camera keeps its stream, so that would leave
+  /// a dead texture — and a fit button — floating over the avatar. Not
+  /// `videoLive` either: that is derived from the camera track alone, so a
+  /// screen share with the camera off reads as `false` while [stream] holds the
+  /// very screen frames this screen most wants to show. A screen share stays
+  /// renderable whatever the camera is doing; everyone else shows video only
+  /// while their camera is live.
+  bool get showsVideo => stream != null && (videoLive || sharingScreen);
 }
 
 typedef CallTileBuilder = Widget Function(BuildContext context, CallTile tile);
@@ -143,12 +169,21 @@ class _CallScreenState extends State<CallScreen> {
 
   /// How the spotlight is chosen, and the state each side of the toggle keeps.
   ///
-  /// [_manualId] is the face the person tapped in manual mode. [_autoPinned] is a
-  /// tap in auto mode — a temporary pin that the next promoted speaker overrides
-  /// without the mode changing. Only one is live at a time, decided by [_mode].
+  /// [_manualId] is the face the person tapped in manual mode. [_autoPinned] is
+  /// the big view carried across when the toggle flips to auto — a temporary pin
+  /// that the next promoted speaker overrides without the mode changing. (A tap
+  /// in auto no longer pins; it switches to manual.) Only one is live at a time,
+  /// decided by [_mode].
   SpotlightMode _mode = SpotlightMode.manual;
   String? _manualId;
   String? _autoPinned;
+
+  /// The big view's crop override and the tile it applies to. Null id means no
+  /// override is live, so every big face falls back to its type's default (see
+  /// [_cropBig]). Pinned to an id so the choice stays with the face it was made
+  /// on and does not leak onto the next person promoted.
+  String? _cropForId;
+  bool _cropOverride = false;
 
   late final SpotlightDirector _director = widget.director ?? SpotlightDirector();
 
@@ -282,9 +317,12 @@ class _CallScreenState extends State<CallScreen> {
       return;
     }
 
-    // Ourselves included, because the self tile takes a share of the screen
-    // without anybody having to send it to us.
-    final count = ids.length + (call.media.capturing ? 1 : 0);
+    // Off the rendered tile list, not the SFU participant count: the self tile
+    // and any roster-only face (mic and camera both off, or not negotiated yet)
+    // each take a cell the SFU is not sending, and all of them squeeze the faces
+    // that are. Counting only `ids + 1` would over-request a layer for a grid
+    // that is really one cell busier.
+    final count = _tiles(widget.state).length;
     _applyWatching(
       ids,
       switch (count) {
@@ -308,6 +346,18 @@ class _CallScreenState extends State<CallScreen> {
       widget.state.callHandle?.setWatching(ids, quality: quality) ??
           Future<void>.value(),
     );
+  }
+
+  /// Starts or stops sharing the phone's screen, surfacing a refusal — a declined
+  /// picker, a wire that did not pick it up — the same way the control bar does:
+  /// success is silent, only a sentence interrupts.
+  Future<void> _toggleShare() async {
+    final on = widget.state.call.screenOn;
+    final failed = await widget.state.setScreenShareOn(!on);
+    if (!mounted || failed == null) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(failed)));
   }
 
   /// Flips the toggle, carrying the current big view across so it does not jump.
@@ -337,15 +387,21 @@ class _CallScreenState extends State<CallScreen> {
     _syncWatching();
   }
 
-  /// A tap on a face: enlarge it in manual, pin it in auto. Never yourself in
-  /// auto — the room does not need to watch you watch it.
+  /// A tap on a face: enlarge it, and leave auto for manual if that is where the
+  /// tap came from. Never yourself in auto — the room does not need to watch you
+  /// watch it, and tapping yourself there is a no-op rather than a mode switch.
   void _onTapTile(CallTile tile) {
     if (_mode == SpotlightMode.auto && tile.isSelf) return;
     setState(() {
-      if (_mode == SpotlightMode.manual) {
-        _manualId = tile.id;
-      } else {
-        _autoPinned = tile.id;
+      _manualId = tile.id;
+      if (_mode == SpotlightMode.auto) {
+        // Tapping a face is a request to watch that person: leave the automatic
+        // follow and pin them, so the toggle reflects the manual view the tap
+        // produced. The next speaker no longer overrides it.
+        _mode = SpotlightMode.manual;
+        _autoPinned = null;
+        _dwellTimer?.cancel();
+        _dwellTimer = null;
       }
     });
     _syncWatching();
@@ -382,20 +438,30 @@ class _CallScreenState extends State<CallScreen> {
           final tiles = _tiles(widget.state);
           final spotlight = _effectiveSpotlight(tiles);
           final build = widget.buildTile ?? _defaultTile;
+          // Held sideways, the faces want the width and the controls move off the
+          // bottom onto a right-edge rail — otherwise the dock eats the little
+          // height there is and the tiles squish. Portrait is left exactly as it was.
+          final landscape =
+              MediaQuery.orientationOf(context) == Orientation.landscape;
           return Stack(
             children: [
               SafeArea(
                 child: Padding(
-                  // Clear of the island below, the way the shell's tabs clear the
-                  // rail. The reaction tray is not counted — it is up for a second
-                  // and may sit over the bottom of a face while it is.
-                  padding: const EdgeInsets.only(bottom: kControlDockInset),
+                  // Clear of the island, the way the shell's tabs clear the rail —
+                  // below it in portrait, beside it on the right in landscape. The
+                  // reaction tray is not counted: it is up for a second and may sit
+                  // over the edge of a face while it is.
+                  padding: landscape
+                      ? const EdgeInsets.only(right: kControlDockRailInset)
+                      : const EdgeInsets.only(bottom: kControlDockInset),
                   child: Column(
                     children: [
                       _Header(
                         count: tiles.where((tile) => !tile.isSelf).length,
                         mode: _mode,
                         onMode: _setMode,
+                        sharing: widget.state.call.screenOn,
+                        onToggleShare: _toggleShare,
                       ),
                       Expanded(
                         child: tiles.isEmpty
@@ -405,13 +471,23 @@ class _CallScreenState extends State<CallScreen> {
                                     tiles: tiles,
                                     buildTile: build,
                                     onTapTile: _onTapTile,
+                                    landscape: landscape,
                                   )
                                 : _Spotlight(
                                     tiles: tiles,
                                     spotlightId: spotlight,
                                     buildTile: build,
+                                    // The big face gets a fit toggle and pinch-zoom;
+                                    // the strip stays on the plain builder. A test
+                                    // that injects [buildTile] overrides the big tile
+                                    // too, keeping the platform view out of the tree.
+                                    buildBig: widget.buildTile ?? _bigTile,
                                     onTapTile: _onTapTile,
                                     onReturn: _returnToOverview,
+                                    cropOn: _cropBig(_tileFor(tiles, spotlight)),
+                                    onToggleCrop: () =>
+                                        _toggleCrop(_tileFor(tiles, spotlight)),
+                                    landscape: landscape,
                                   ),
                       ),
                     ],
@@ -420,13 +496,22 @@ class _CallScreenState extends State<CallScreen> {
               ),
               // The controls follow you onto the faces — muting is the thing a
               // person looking at a call most wants — and the navigation does not:
-              // this is a place you go back from, not a fourth tab.
+              // this is a place you go back from, not a fourth tab. Along the bottom
+              // in portrait; stood on its side against the right edge in landscape.
               Positioned(
-                left: 0,
+                left: landscape ? null : 0,
                 right: 0,
+                top: landscape ? 0 : null,
                 bottom: 0,
                 child: DockIsland(
-                  children: [ControlBar(state: widget.state, onCallScreen: true)],
+                  vertical: landscape,
+                  children: [
+                    ControlBar(
+                      state: widget.state,
+                      onCallScreen: true,
+                      vertical: landscape,
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -443,6 +528,40 @@ class _CallScreenState extends State<CallScreen> {
   /// gets a fresh renderer rather than a reused one.
   static Widget _defaultTile(BuildContext context, CallTile tile) =>
       tile.stream == null ? _TileFrame(tile: tile) : _VideoTile(tile: tile);
+
+  /// The big-view builder: the one tile that gets a fit toggle and pinch-zoom.
+  /// The grid and strip stay on [_defaultTile], which always covers.
+  Widget _bigTile(BuildContext context, CallTile tile) => tile.stream == null
+      ? _TileFrame(tile: tile)
+      : _VideoTile(
+          tile: tile,
+          zoomable: true,
+          fit: _cropBig(tile)
+              ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
+              : RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+        );
+
+  /// The tile behind a spotlight id. Falls back to the first tile the way
+  /// [_Spotlight] itself does, so the fit lookup never dereferences nothing.
+  CallTile _tileFor(List<CallTile> tiles, String id) {
+    for (final tile in tiles) {
+      if (tile.id == id) return tile;
+    }
+    return tiles.first;
+  }
+
+  /// Whether the big view crops (cover) rather than letterboxes (contain). A
+  /// screen share defaults to no-crop — cropping a shared screen hides its edges
+  /// — and a camera face to crop, where cover is what a face wants. [_toggleCrop]
+  /// pins an override to the tile it was pressed on, so promoting a new face
+  /// returns to that face's default rather than carrying the last choice across.
+  bool _cropBig(CallTile big) =>
+      _cropForId == big.id ? _cropOverride : bigCropsByDefault(big);
+
+  void _toggleCrop(CallTile big) => setState(() {
+        _cropOverride = !_cropBig(big);
+        _cropForId = big.id;
+      });
 }
 
 /// Call state plus roster, folded into what a tile needs.
@@ -453,29 +572,43 @@ class _CallScreenState extends State<CallScreen> {
 @visibleForTesting
 List<CallTile> tilesFor(AppState state) => _tiles(state);
 
+/// How the big view fills by default, before any tap on the fit button: a camera
+/// face crops (cover), a shared screen letterboxes (contain) so its edges show.
+@visibleForTesting
+bool bigCropsByDefault(CallTile tile) => !tile.sharingScreen;
+
 List<CallTile> _tiles(AppState state) {
   final call = state.call;
   final handle = state.callHandle;
   final live = handle is LiveCall ? handle : null;
 
   final tiles = <CallTile>[
-    // Ourselves first, and only while the camera is actually open — a self tile
-    // showing an avatar when nothing is captured is just a second name badge.
-    if (call.media.capturing)
-      CallTile(
-        id: state.mePerson?.id ?? 'self',
-        label: 'You',
-        isSelf: true,
-        videoLive: call.cameraOn,
-        muted: !call.micOn,
-        sharingScreen: false,
-        stream: live?.localStream,
-        // Measured here rather than read back off the roster: Gather agrees a
-        // beat later, and a beat is visible on your own face. See
-        // `AppState.amSpeaking`.
-        speaking: state.amSpeaking,
-        reactions: state.reactions.forPerson(state.mePerson?.id),
-      ),
+    // Ourselves first, and always — before the camera is ever opened too. The
+    // tile is how you check how you look to the others, or confirm your camera
+    // is off; a face and a name are exactly what the others see of you then, so
+    // an avatar-only self tile is the honest answer, not noise. Camera off falls
+    // through to the `PersonAvatar` placeholder via `_defaultTile`.
+    CallTile(
+      // Off `meId`, not `mePerson`: the roster names me a beat before it places
+      // me, and until then `mePerson` is null — keyed off it, my own avatar
+      // would be missing for the first moment of every call.
+      id: state.meId ?? 'self',
+      label: 'You',
+      isSelf: true,
+      videoLive: call.cameraOn,
+      muted: !call.micOn,
+      sharingScreen: false,
+      stream: live?.localStream,
+      photoUrl: state.meId == null ? null : state.photoUrlFor(state.meId!),
+      // Measured here rather than read back off the roster: Gather agrees a
+      // beat later, and a beat is visible on your own face. See
+      // `AppState.amSpeaking`.
+      speaking: state.amSpeaking,
+      reactions: state.reactions.forPerson(state.meId),
+      // Ours, local-first, for the same reason as [speaking] above: the button is
+      // under your thumb and should not wait for the roster to echo your own hand.
+      handRaised: state.myHandRaised,
+    ),
   ];
 
   for (final person in call.participants) {
@@ -499,6 +632,7 @@ List<CallTile> _tiles(AppState state) {
       availability: row?.availability,
       speaking: row?.speaking ?? false,
       reactions: state.reactions.forPerson(row?.id),
+      handRaised: row?.handRaised ?? false,
     ));
   }
 
@@ -523,6 +657,7 @@ List<CallTile> _tiles(AppState state) {
       availability: row.availability,
       speaking: row.speaking ?? false,
       reactions: state.reactions.forPerson(row.id),
+      handRaised: row.handRaised,
     ));
   }
   return tiles;
@@ -536,11 +671,19 @@ class _Header extends StatelessWidget {
     required this.count,
     required this.mode,
     required this.onMode,
+    required this.sharing,
+    required this.onToggleShare,
   });
 
   final int count;
   final SpotlightMode mode;
   final ValueChanged<SpotlightMode> onMode;
+
+  /// Whether our own screen is going out right now, and the way to start or stop
+  /// it. Here rather than in the dock island because the island is full — see the
+  /// plate-budget note at the top of `control_bar.dart`.
+  final bool sharing;
+  final VoidCallback onToggleShare;
 
   @override
   Widget build(BuildContext context) {
@@ -568,6 +711,17 @@ class _Header extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
+          ),
+          // Sharing the phone's screen into the room. Brand while it is going out,
+          // the ordinary grey at rest, like the live glyphs in the dock. It raises
+          // the platform's own broadcast picker on the first tap.
+          IconButton(
+            onPressed: onToggleShare,
+            icon: Icon(sharing
+                ? Icons.stop_screen_share_rounded
+                : Icons.screen_share_rounded),
+            color: sharing ? t.brand : t.mutedForeground,
+            tooltip: sharing ? 'Stop sharing' : 'Share your screen',
           ),
           // How the big view is chosen. Persistent across both layouts, so the
           // way out of auto is the same control that got you in.
@@ -667,6 +821,7 @@ class _Grid extends StatelessWidget {
     required this.tiles,
     required this.buildTile,
     required this.onTapTile,
+    this.landscape = false,
   });
 
   /// Nothing on top: the first face starts directly under the header, which
@@ -679,6 +834,12 @@ class _Grid extends StatelessWidget {
 
   /// Tapping a face enlarges it. See [_CallScreenState._onTapTile].
   final void Function(CallTile) onTapTile;
+
+  /// Whether the phone is held sideways. Two faces go side by side rather than
+  /// stacked, and a crowd scrolls off the right edge in wide tiles rather than
+  /// down the page in narrow ones — a landscape screen is short and wide, so the
+  /// portrait splits (stack two, two columns at 3:4) squish every face.
+  final bool landscape;
 
   @override
   Widget build(BuildContext context) {
@@ -699,19 +860,32 @@ class _Grid extends StatelessWidget {
       );
     }
     if (tiles.length == 2) {
+      // Two faces split the long axis: stacked up a tall portrait, side by side
+      // across a wide landscape — either way two halves rather than two slivers.
+      final children = [
+        Expanded(child: wrap(tiles.first)),
+        const SizedBox(width: 8, height: 8),
+        Expanded(child: wrap(tiles.last)),
+      ];
       return Padding(
         padding: _edges,
-        child: Column(
-          children: [
-            Expanded(child: wrap(tiles.first)),
-            const SizedBox(height: 8),
-            Expanded(child: wrap(tiles.last)),
-          ],
-        ),
+        child: landscape
+            ? Row(children: children)
+            : Column(children: children),
       );
     }
+    // A crowd: two columns scrolling down a portrait, two rows scrolling off the
+    // right across a landscape. The tile wants the orientation's own shape — a
+    // 3:4 upright plate, a 4:3 one on its side — so a face keeps its proportions
+    // instead of being squeezed into the shape the other orientation wants.
+    //
+    // `childAspectRatio` is cross-axis÷main-axis, and the scroll axis flips with
+    // the orientation, so the same 3/4 yields opposite tile shapes: upright the
+    // main axis is vertical, so 3/4 = width÷height → a 3:4 tall plate; on its
+    // side the main axis is horizontal, so 3/4 = height÷width → a 4:3 wide one.
     return GridView.count(
       padding: _edges,
+      scrollDirection: landscape ? Axis.horizontal : Axis.vertical,
       crossAxisCount: 2,
       mainAxisSpacing: 8,
       crossAxisSpacing: 8,
@@ -734,15 +908,33 @@ class _Spotlight extends StatelessWidget {
     required this.tiles,
     required this.spotlightId,
     required this.buildTile,
+    required this.buildBig,
     required this.onTapTile,
     required this.onReturn,
+    required this.cropOn,
+    required this.onToggleCrop,
+    this.landscape = false,
   });
 
   final List<CallTile> tiles;
   final String spotlightId;
   final CallTileBuilder buildTile;
+
+  /// Whether the phone is held sideways. The strip of other faces runs down the
+  /// right of the big face rather than across its foot — on a short wide screen a
+  /// horizontal strip under the big tile would halve what little height it has.
+  final bool landscape;
+
+  /// The builder for the big face. Separate from [buildTile] so the big view can
+  /// carry the fit toggle and pinch-zoom the strip does not.
+  final CallTileBuilder buildBig;
   final void Function(CallTile) onTapTile;
   final VoidCallback onReturn;
+
+  /// Whether the big view is cropping (cover) right now, and the tap that flips
+  /// it. Drives the fit button's icon and label.
+  final bool cropOn;
+  final VoidCallback onToggleCrop;
 
   /// The strip's height, enough for a face plate under a 3:4 thumbnail.
   static const _stripHeight = 96.0;
@@ -758,63 +950,85 @@ class _Spotlight extends StatelessWidget {
       }
     }
 
+    // A 3:4 thumbnail either way; the strip's cross-thickness is [_stripHeight] and
+    // the thumbnail's other side follows from it.
+    const thumb = _stripHeight * 3 / 4;
+
+    final bigStack = Stack(
+      children: [
+        Positioned.fill(
+          child: KeyedSubtree(
+            key: ValueKey('big-${big.id}'),
+            child: buildBig(context, big),
+          ),
+        ),
+        // Back to the grid. Over the top-left of the big face, where it
+        // sits clear of the name plate along the bottom.
+        Positioned(
+          top: 8,
+          left: 8,
+          child: _OverviewButton(onTap: onReturn),
+        ),
+        // Crop/letterbox, top-right, opposite the way-out button. Only on
+        // a face with a frame on screen — there is nothing to fit over an
+        // avatar, whether the camera is off, paused, or never opened.
+        if (big.showsVideo)
+          Positioned(
+            top: 8,
+            right: 8,
+            child: _CropButton(cropOn: cropOn, onTap: onToggleCrop),
+          ),
+      ],
+    );
+
+    final strip = ListView.separated(
+      // Down the right in landscape, across the foot in portrait.
+      scrollDirection: landscape ? Axis.vertical : Axis.horizontal,
+      // Yourself first — the order [_tiles] already builds — so your own
+      // face is always where you reach for it, at the front of the strip.
+      itemCount: tiles.length,
+      separatorBuilder: (_, _) =>
+          SizedBox(width: landscape ? 0 : 8, height: landscape ? 8 : 0),
+      itemBuilder: (context, i) {
+        final tile = tiles[i];
+        final selected = tile.id == spotlightId;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => onTapTile(tile),
+          child: Container(
+            // Set the thumbnail's free side; the other is pinned by the strip's
+            // cross-axis. Upright the width is fixed and the height fills; on its
+            // side the height is fixed and the width fills.
+            width: landscape ? null : thumb,
+            height: landscape ? _stripHeight : null,
+            foregroundDecoration: selected
+                ? BoxDecoration(
+                    borderRadius: BorderRadius.circular(t.radius),
+                    border: Border.all(color: t.brand, width: 2),
+                  )
+                : null,
+            child: KeyedSubtree(
+              key: ValueKey('strip-${tile.id}'),
+              child: buildTile(context, tile),
+            ),
+          ),
+        );
+      },
+    );
+
+    final stripBox = landscape
+        ? SizedBox(width: thumb, child: strip)
+        : SizedBox(height: _stripHeight, child: strip);
+
+    final children = [
+      Expanded(child: bigStack),
+      SizedBox(width: landscape ? 8 : 0, height: landscape ? 0 : 8),
+      stripBox,
+    ];
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-      child: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: KeyedSubtree(
-                    key: ValueKey('big-${big.id}'),
-                    child: buildTile(context, big),
-                  ),
-                ),
-                // Back to the grid. Over the top-left of the big face, where it
-                // sits clear of the name plate along the bottom.
-                Positioned(
-                  top: 8,
-                  left: 8,
-                  child: _OverviewButton(onTap: onReturn),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: _stripHeight,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              // Yourself first — the order [_tiles] already builds — so your own
-              // face is always where you reach for it, at the front of the strip.
-              itemCount: tiles.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 8),
-              itemBuilder: (context, i) {
-                final tile = tiles[i];
-                final selected = tile.id == spotlightId;
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => onTapTile(tile),
-                  child: Container(
-                    width: _stripHeight * 3 / 4,
-                    foregroundDecoration: selected
-                        ? BoxDecoration(
-                            borderRadius: BorderRadius.circular(t.radius),
-                            border: Border.all(color: t.brand, width: 2),
-                          )
-                        : null,
-                    child: KeyedSubtree(
-                      key: ValueKey('strip-${tile.id}'),
-                      child: buildTile(context, tile),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
+      child: landscape ? Row(children: children) : Column(children: children),
     );
   }
 }
@@ -868,6 +1082,72 @@ class _OverviewButton extends StatelessWidget {
   }
 }
 
+/// Crop vs letterbox for the big face, over its top-right.
+///
+/// Same black scrim as [_OverviewButton] for the same reason — it sits on video
+/// of unpredictable brightness. The label names the result of the tap, not the
+/// current state: "Fit" while cropped offers the whole frame; "Fill" while
+/// letterboxed offers the crop.
+/// The fit button, exposed so a widget test can assert its label and tap without
+/// a spotlighted video stream — which `flutter test` has no platform to make.
+@visibleForTesting
+class CropButton extends StatelessWidget {
+  const CropButton({super.key, required this.cropOn, required this.onTap});
+
+  final bool cropOn;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) =>
+      _CropButton(cropOn: cropOn, onTap: onTap);
+}
+
+class _CropButton extends StatelessWidget {
+  const _CropButton({required this.cropOn, required this.onTap});
+
+  final bool cropOn;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = cropOn ? Icons.fit_screen_outlined : Icons.crop_outlined;
+    final label = cropOn ? 'Fit' : 'Fill';
+    return Semantics(
+      button: true,
+      label: cropOn ? 'Fit whole screen' : 'Fill the view',
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(8),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 48),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 15, color: Colors.white),
+                  const SizedBox(width: 6),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _Nobody extends StatelessWidget {
   const _Nobody();
 
@@ -902,9 +1182,21 @@ class _Nobody extends StatelessWidget {
 
 /// One face, with its own renderer.
 class _VideoTile extends StatefulWidget {
-  const _VideoTile({required this.tile});
+  const _VideoTile({
+    required this.tile,
+    this.fit = RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+    this.zoomable = false,
+  });
 
   final CallTile tile;
+
+  /// How the frame fills the tile. Cover (crop) for faces; contain (letterbox)
+  /// is offered on the big view so a shared screen shows its edges.
+  final RTCVideoViewObjectFit fit;
+
+  /// Wraps the video in an [InteractiveViewer] for pinch-zoom and pan. Only the
+  /// big spotlight tile sets this; the grid and strip are tap-to-enlarge.
+  final bool zoomable;
 
   @override
   State<_VideoTile> createState() => _VideoTileState();
@@ -935,18 +1227,19 @@ class _VideoTileState extends State<_VideoTile> {
   @override
   void didUpdateWidget(_VideoTile old) {
     super.didUpdateWidget(old);
-    // `videoLive` as well as the stream. Somebody turning their camera back on
-    // keeps the same stream id, so comparing streams alone would leave the
-    // renderer detached and show a frozen avatar over a live track.
+    // `showsVideo` as well as the stream. Somebody turning their camera back on,
+    // or starting a screen share, keeps the same stream id, so comparing streams
+    // alone would leave the renderer detached and show a frozen avatar over a
+    // live track.
     if (old.tile.stream?.id != widget.tile.stream?.id ||
-        old.tile.videoLive != widget.tile.videoLive) {
+        old.tile.showsVideo != widget.tile.showsVideo) {
       _attach();
     }
   }
 
   void _attach() {
     if (!_ready) return;
-    _renderer.srcObject = widget.tile.videoLive ? widget.tile.stream : null;
+    _renderer.srcObject = widget.tile.showsVideo ? widget.tile.stream : null;
   }
 
   @override
@@ -955,9 +1248,18 @@ class _VideoTileState extends State<_VideoTile> {
     // stopped underneath it is the crash this ordering avoids. Only once it is
     // initialised: setting `srcObject` before that throws, which a tile closed in
     // the moment after it opened would otherwise do — `_init` disposes those.
+    //
+    // But detaching is not enough. The native `FlutterRTCVideoRenderer`
+    // dispatches each `renderFrame:` onto the main queue; when a tile is swapped
+    // out — which auto-spotlight does on every active-speaker change, and a
+    // manual tap does on every switch — frames can already be sitting in that
+    // backlog. Freeing the renderer synchronously pulls the texture out from
+    // under those queued blocks and the next one dereferences freed memory:
+    // EXC_BAD_ACCESS at `-[FlutterRTCVideoRenderer renderFrame:]`. So hand the
+    // renderer off to drain and be freed once the backlog has run, rather than
+    // disposing it here under the live frame path.
     if (_ready) {
-      _renderer.srcObject = null;
-      _renderer.dispose();
+      unawaited(retireRenderer(_renderer));
     }
     super.dispose();
   }
@@ -970,17 +1272,41 @@ class _VideoTileState extends State<_VideoTile> {
     // with this tile — a theme change, a parent rebuild — so doing it here would
     // reattach the texture at arbitrary moments. `initState` and
     // `didUpdateWidget` are the two places the stream can actually have changed.
-    return _TileFrame(
-      tile: tile,
-      video: _ready && tile.videoLive && tile.stream != null
-          ? RTCVideoView(
-              _renderer,
-              mirror: tile.isSelf,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            )
-          : null,
-    );
+    Widget? video;
+    if (_ready && tile.showsVideo) {
+      video = RTCVideoView(
+        _renderer,
+        mirror: tile.isSelf,
+        objectFit: widget.fit,
+      );
+      // Only the video layer is wrapped, so the name and mute plates that
+      // [_TileFrame] stacks on top stay put while the frame zooms and pans.
+      if (widget.zoomable) {
+        video = InteractiveViewer(minScale: 1, maxScale: 5, child: video);
+      }
+    }
+    return _TileFrame(tile: tile, video: video);
   }
+}
+
+/// Free a renderer that a tile has finished with, but only after the native
+/// main-queue frame backlog has had a chance to drain.
+///
+/// Nulling `srcObject` stops further frames being enqueued; the delay lets any
+/// `renderFrame:` blocks already dispatched run against a renderer that is still
+/// alive before the texture is torn down. Without it, disposing synchronously in
+/// `State.dispose()` frees the texture under an in-flight frame and crashes with
+/// EXC_BAD_ACCESS in `-[FlutterRTCVideoRenderer renderFrame:]`. Half a second is
+/// far longer than a frame interval and costs one lingering texture per swap.
+///
+/// Public, not `_private`, so a test can drive it against a mocked platform
+/// channel: the full `_VideoTile` cannot be built under `flutter test` (its
+/// renderer needs a `MethodChannel`), so this helper is where the detach/delay/
+/// dispose ordering is guarded against a regression to synchronous disposal.
+Future<void> retireRenderer(RTCVideoRenderer renderer) async {
+  renderer.srcObject = null;
+  await Future<void>.delayed(const Duration(milliseconds: 500));
+  await renderer.dispose();
 }
 
 /// The chrome around a tile: the fallback face, the name, the mute pip.
@@ -1061,6 +1387,21 @@ class _TileFrame extends StatelessWidget {
               Positioned.fill(
                 child: IgnorePointer(
                   child: ClipRect(child: _Reactions(flights: tile.reactions)),
+                ),
+              ),
+            // Top-left, away from the name and status plates along the bottom, so a
+            // raised hand reads at a glance even on a thumbnail-sized tile in the
+            // overview — and the same badge rides the spotlight, since both views
+            // draw this one frame.
+            if (tile.handRaised)
+              Positioned(
+                top: 8,
+                left: 8,
+                // Named, not a bare glyph: the badge is a meeting status, and a
+                // screen reader that only heard the name would miss whose hand is up.
+                child: Semantics(
+                  label: '${tile.label} raised their hand',
+                  child: const _HandBadge(),
                 ),
               ),
             Positioned(
@@ -1216,6 +1557,31 @@ class _FlightState extends State<_Flight> with SingleTickerProviderStateMixin {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// A raised hand, in the corner of a tile.
+///
+/// Amber rather than a theme token on purpose, and the one raw hue on this screen
+/// beside [_Plate]'s black scrim: a raised hand is amber across every meeting tool
+/// a colleague has used, and `t.brand` — the app's blue — would read as one more
+/// piece of chrome rather than as "this person wants in". The white glyph on a
+/// solid fill carries at the size an overview thumbnail gives it, where a tinted
+/// outline would disappear.
+class _HandBadge extends StatelessWidget {
+  const _HandBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(5),
+      decoration: const BoxDecoration(
+        color: kHandRaised,
+        shape: BoxShape.circle,
+        boxShadow: [BoxShadow(color: Color(0x66000000), blurRadius: 4)],
+      ),
+      child: const Icon(Icons.front_hand, size: 15, color: Colors.white),
     );
   }
 }

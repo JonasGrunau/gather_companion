@@ -5,7 +5,12 @@ import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
+import 'calendar.dart';
+import 'calendar_mirror.dart';
+import 'calendar_store.dart';
 import 'credentials.dart';
+import 'gather_link.dart';
+import 'google_calendar.dart';
 import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
@@ -17,6 +22,7 @@ import 'push.dart';
 import 'reactions.dart';
 import 'settings.dart';
 import 'ui_preferences.dart';
+import '../ui/gameboy_theme.dart' show GameboyThemeId;
 
 /// Everything the UI reads. One object, so the whole app is a single
 /// `ListenableBuilder` away from being correct.
@@ -40,6 +46,57 @@ import 'ui_preferences.dart';
 ///    what happened while the app was open is empty exactly when it would be worth
 ///    reading. Events exist to be notified about. `_onFold` hands each one to
 ///    [Notifier] and lets it go.
+/// How a colleague's calendar lookup resolved, for the "their plans" sheet. Keeps the
+/// three outcomes distinct so the sheet never reads an unreadable calendar as an empty
+/// one: no calendar matched, a calendar that could not be read now, or a clean read.
+enum CalendarLookup { noCalendar, unavailable, ok }
+
+/// The result of [AppState.calendarForLabel]: a [CalendarLookup] status and, when the
+/// status is [CalendarLookup.ok], the events read (possibly none).
+class PersonCalendar {
+  const PersonCalendar(this.status, this.events);
+
+  final CalendarLookup status;
+  final List<GoogleEvent> events;
+
+  static const noCalendar = PersonCalendar(CalendarLookup.noCalendar, []);
+  static const unavailable = PersonCalendar(CalendarLookup.unavailable, []);
+  factory PersonCalendar.ok(List<GoogleEvent> events) =>
+      PersonCalendar(CalendarLookup.ok, events);
+}
+
+/// When a colleague next frees up, given their cached calendar [events] and [now], or
+/// null when nothing timed is on them right now.
+///
+/// Merges overlapping and back-to-back timed events into one continuous busy span and
+/// returns the gap to the end of the span covering [now]. Taking the soonest single
+/// end instead under-reports: at 09:45 a 10:00 and an 11:00 meeting would read "free in
+/// 15 min" while the next one is already running — they are busy until 11:00.
+@visibleForTesting
+Duration? freeInFromEvents(List<GoogleEvent> events, DateTime now) {
+  final timed = [
+    for (final e in events)
+      if (!e.allDay && e.endsAt.isAfter(e.startsAt)) e,
+  ]..sort((a, b) => a.startsAt.compareTo(b.startsAt));
+
+  DateTime? busyUntil;
+  for (final e in timed) {
+    if (busyUntil == null) {
+      // Open a span only on an event that is active right now.
+      if (!e.startsAt.isAfter(now) && e.endsAt.isAfter(now)) busyUntil = e.endsAt;
+      continue;
+    }
+    // Extend while the next event starts at or before the running end (overlap or
+    // back-to-back); the first real gap ends the continuous busy period.
+    if (!e.startsAt.isAfter(busyUntil)) {
+      if (e.endsAt.isAfter(busyUntil)) busyUntil = e.endsAt;
+    } else {
+      break;
+    }
+  }
+  return busyUntil?.difference(now);
+}
+
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -70,6 +127,15 @@ class AppState extends ChangeNotifier {
     // Test seam for the resync cooldown clock. Production reads the wall clock.
     DateTime Function()? now,
     UiPreferences? uiPreferences,
+    CalendarStore? calendarStore,
+    // The device-calendar bridge. Defaulted to a no-op so a widget test — or any
+    // build without the native plugin — never touches a real calendar; `main.dart`
+    // supplies the plugin-backed one.
+    CalendarMirror? calendarMirror,
+    // The read-only Google Calendar connection, or null when this build has no OAuth
+    // client configured (every test, and a placeholder build). Null reads as "not
+    // offered": the Plans tab shows local plans only and never tries to connect.
+    GoogleCalendar? googleCalendar,
   }) : _notifier = notifier ?? Notifier(),
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
@@ -81,6 +147,10 @@ class AppState extends ChangeNotifier {
        _bridgeStore = bridge ?? BridgeSettingsStore(),
        _log = log ?? _noop,
        _uiPrefs = uiPreferences ?? UiPreferences(),
+       _calendarStore = calendarStore ?? CalendarStore(),
+       _calendarMirror = calendarMirror ?? const NoopCalendarMirror(),
+       // ignore: prefer_initializing_formals
+       _googleCalendar = googleCalendar,
        _buildCollector = buildCollector ??
            ((auth, spaceId) =>
                DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
@@ -98,6 +168,9 @@ class AppState extends ChangeNotifier {
   final GatherCredentialStore _credentialStore;
   final BridgeSettingsStore _bridgeStore;
   final UiPreferences _uiPrefs;
+  final CalendarStore _calendarStore;
+  final CalendarMirror _calendarMirror;
+  final GoogleCalendar? _googleCalendar;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -411,15 +484,129 @@ class AppState extends ChangeNotifier {
   /// From the single `Space` row in the state dump, carried through the snapshot.
   String? get spaceName => _snapshot.self.spaceName;
 
+  /// The last floor plan we drew, held across a reconnect.
+  ///
+  /// `DirectCollector` swaps in a fresh empty reader on every reconnect — the dump
+  /// it is about to receive is complete, so carrying rows over would keep ghosts.
+  /// But the *map* is the one thing in that reader that has not changed: the office
+  /// is the office whether the socket blipped or not. Without this the map getter
+  /// went null the instant the reader was replaced and the screen blanked to black
+  /// for the second or two until the next dump repopulated it. These keep the last
+  /// office so the getters below can fall back to it — but only while we are still
+  /// in the same space, which [_heldMapSpaceId] pins. See [_refreshHeldMap].
+  SpaceMap? _heldMap;
+  SpaceArt? _heldArt;
+  String? _heldMapSpaceId;
+
+  /// The floor the held office belongs to, so a move to another floor does not keep
+  /// drawing the old plan. A reconnect empties the roster, so the live floor reads
+  /// null mid-blip — that is not a floor change and must keep the hold, so the
+  /// getters only drop it when a *known* floor differs from this one.
+  String? _heldMapFloorId;
+
+  /// True while the getters are serving the held copy, so the diagnostic below
+  /// fires once per disruption rather than on every rebuild. Reset when a live map
+  /// returns.
+  bool _holdingMap = false;
+
   /// The floor plan, or null until enough of it has arrived.
-  SpaceMap? get map => debugMap ?? _collector?.mapFor(_myRow()?.floorId);
+  ///
+  /// Falls back to the last office held across a reconnect (see [_heldMap]) while
+  /// the live reader is momentarily empty and we are still in the same space.
+  SpaceMap? get map {
+    if (debugMap != null) return debugMap;
+    final floorId = _myRow()?.floorId;
+    final live = _collector?.mapFor(floorId);
+    if (live != null) {
+      _holdingMap = false;
+      // A live map is the freshest office there is: stash it now so the next
+      // reconnect's empty reader has it to fall back on, even if the plan finished
+      // arriving after the last roster (a map-only patch publishes no roster, so
+      // `_noteMine` never fired for it).
+      _stashHeld(live, floorId);
+      return live;
+    }
+    if (_canHold(floorId) && _heldMap != null) {
+      if (!_holdingMap) {
+        _holdingMap = true;
+        _log('map: live lookup null — holding last office');
+      }
+      return _heldMap;
+    }
+    return null;
+  }
 
   /// The same floor's artwork — what to draw, and the images to fetch for it.
   ///
   /// Dark, because the app is: the client keeps a second set of files for its dark
   /// appearance and picking the light ones would put a white office inside a black
   /// phone.
-  SpaceArt? get art => debugArt ?? _collector?.artFor(_myRow()?.floorId, dark: true);
+  ///
+  /// Mirrors [map]'s hold across a reconnect: the art rides the same empty reader
+  /// and must not blank out from under a map that stayed.
+  SpaceArt? get art {
+    if (debugArt != null) return debugArt;
+    final floorId = _myRow()?.floorId;
+    final live = _collector?.artFor(floorId, dark: true);
+    if (live != null) return live;
+    if (_canHold(floorId) && _heldArt != null) {
+      return _heldArt;
+    }
+    return null;
+  }
+
+  /// Whether the held office may stand in for a null live lookup right now.
+  ///
+  /// Two things disqualify it. The space must still be the one the hold was taken
+  /// in — and we must *know* that space: a null identity (no dump yet, or a reader
+  /// that drifted to another space) is not proof of a match, so `null == null` must
+  /// not pass. The floor must also still be the held one, except that a reconnect
+  /// empties the roster and the live floor reads null — not a floor change, so a
+  /// null floor keeps the hold.
+  bool _canHold(String? liveFloorId) =>
+      _heldMapSpaceId != null &&
+      _heldMapSpaceId == _currentMapSpaceId &&
+      (liveFloorId == null || liveFloorId == _heldMapFloorId);
+
+  /// The space the live reader is populated for, as the ground truth of which office
+  /// the hold belongs to.
+  ///
+  /// The collector's own resolved id leads, because it is the one thing that cannot
+  /// drift out from under the hold: `PresenceTracker.applyRoster` rebuilds the
+  /// snapshot without a space id, so `_snapshot.self.spaceId` reads null the moment a
+  /// roster lands, and `_resolveSpace` can pick a *different* most-recent space on a
+  /// reconnect when no id was configured. Keying on the resolved id means a genuine
+  /// space change invalidates the held office and an unknown id (null, before the
+  /// reader has resolved one) refuses the fallback outright — `null == null` must not
+  /// pass for two offices that only share not-knowing. The snapshot and stored id
+  /// stay as fallbacks for the window before the collector has one.
+  String? get _currentMapSpaceId =>
+      _collector?.spaceId ?? _snapshot.self.spaceId ?? _spaceId;
+
+  /// Stashes the live map, art and current space, so the getters can fall back to
+  /// them while a reconnect's fresh reader is briefly empty.
+  ///
+  /// Called from [_noteMine] — which runs on every roster apply, by which point a
+  /// fresh dump has repopulated the reader. No roster arrives mid-reconnect, so the
+  /// held copy stays untouched for the whole blip.
+  void _refreshHeldMap() {
+    final floorId = _myRow()?.floorId;
+    final live = _collector?.mapFor(floorId);
+    if (live == null) return;
+    _stashHeld(live, floorId);
+  }
+
+  /// Pins [live] and its floor as the office to fall back on, with the art and space
+  /// that go with it. The builder hands back the same map instance until a patch
+  /// rebuilds it, so an unchanged map skips the art lookup rather than re-fetching it
+  /// on every rebuild.
+  void _stashHeld(SpaceMap live, String? floorId) {
+    if (identical(live, _heldMap) && floorId == _heldMapFloorId) return;
+    _heldMap = live;
+    _heldArt = _collector?.artFor(floorId, dark: true);
+    _heldMapSpaceId = _currentMapSpaceId;
+    _heldMapFloorId = floorId;
+  }
 
   /// Test seam, as [debugMap].
   @visibleForTesting
@@ -439,9 +626,22 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
+  /// My roster id, the moment the roster names me — before any position lands.
+  ///
+  /// [mePerson] is for the map and so withholds me until I have finite
+  /// coordinates; call membership can arrive a beat ahead of them. The call
+  /// screen keys my own avatar off this so the picture is there for the whole
+  /// call, not only once Gather has placed me.
+  String? get meId => _roster?.selfId;
+
   /// Where I am, in tiles, or null before the first roster. Rounded, because its
   /// callers ask questions about tiles — which room am I in — rather than drawing.
   ({int x, int y})? get myTile {
+    // The optimistic tile while a walk is in flight, so room-and-ping questions
+    // agree with the avatar the map is actually drawing. Null at rest, when it
+    // falls through to the roster. See [Walk.leadTile] and [mePerson].
+    final lead = _walk?.leadTile;
+    if (lead != null) return lead;
     final me = _myRow();
     final x = me?.x, y = me?.y;
     if (x == null || y == null || !x.isFinite || !y.isFinite) return null;
@@ -456,18 +656,24 @@ class AppState extends ChangeNotifier {
     final me = _myRow();
     final x = me?.x, y = me?.y;
     if (me == null || x == null || y == null || !x.isFinite || !y.isFinite) return null;
+    // Drawn from the optimistic walk while steps are unconfirmed, so a press moves
+    // the body at once rather than after the round-trip that the roster takes to
+    // echo it back. Null at rest, where this falls through to the roster tile; the
+    // same deference [Walk.noteRoster] already pays, and the reason [gait] below is
+    // read off [Walk] too. See [Walk.leadTile].
+    final lead = _walk?.leadTile;
     return MapPerson(
       id: me.id,
       label: me.name ?? 'You',
-      x: x.toDouble(),
-      y: y.toDouble(),
+      x: (lead?.x ?? x).toDouble(),
+      y: (lead?.y ?? y).toDouble(),
       isFollowingMe: false,
       // Ours, not the roster's. See [amSpeaking] — the roster agrees a beat
       // later, and a beat is visible on your own avatar.
       speaking: _amSpeaking,
       dancing: me.dancing == true,
       avatarUrl: _collector?.avatarUrlFor(me.id),
-      direction: me.direction,
+      direction: _walk?.facing ?? me.direction,
       // Mine off [Walk] and not off the row. The gait changes twice inside a single
       // route and the roster is coalesced to a quarter of a second, so reading my own
       // back off the wire would show me climbing into the kart two tiles after the
@@ -520,6 +726,7 @@ class AppState extends ChangeNotifier {
           direction: row.direction,
           gait: gaitOf(row.speed),
           availability: row.availability,
+          calendarEmail: row.calendarEmail,
         ),
       );
     }
@@ -561,6 +768,21 @@ class AppState extends ChangeNotifier {
     await _uiPrefs.saveGameboyMode(on);
   }
 
+  /// Which hardware skin Gameboy mode wears. A pure look preference — it swaps
+  /// only the handheld's plastic palette and the brand printed on it, never the
+  /// office inside the screen nor any behaviour — so it sits beside [gameboyMode]
+  /// as one more switch the app owns, read back at [boot] and persisted the moment
+  /// it changes. Silent: a theme earns no boot chime.
+  GameboyThemeId _gameboyTheme = GameboyThemeId.purple;
+  GameboyThemeId get gameboyTheme => _gameboyTheme;
+
+  Future<void> setGameboyTheme(GameboyThemeId id) async {
+    if (_gameboyTheme == id) return;
+    _gameboyTheme = id;
+    notifyListeners();
+    await _uiPrefs.saveGameboyThemeId(id.id);
+  }
+
   /// Whether the app's sound effects play — the handheld's blips, the boot
   /// jingle, and the speaker-test chime. On by default. This never touches
   /// in-call voice; it is a UI-sound switch only, read back at [boot] and
@@ -594,7 +816,14 @@ class AppState extends ChangeNotifier {
     _credentials = await _credentialStore.load();
     _spaceId = await _credentialStore.loadSpaceId();
     _gameboyMode = await _uiPrefs.loadGameboyMode();
+    _gameboyTheme = GameboyThemeId.fromId(await _uiPrefs.loadGameboyThemeId());
     _soundEffects = await _uiPrefs.loadSoundEffects();
+    _plannedMeetings = await _calendarStore.load();
+    _mirrorCalendarId = await _uiPrefs.loadMirrorCalendarId();
+    // Fire-and-forget: a connected Google account fills the Plans tab a beat after
+    // launch, and a failed read just leaves it empty. Not awaited — it must not hold
+    // boot behind a network round trip.
+    unawaited(_restoreGoogle());
 
     // Launched straight into Gameboy mode with sounds on: no setter ran to warm
     // the SFX player, so do it here while there is no call yet. The restore itself
@@ -616,6 +845,11 @@ class AppState extends ChangeNotifier {
     _loaded = true;
     await _notifier.init();
     notifyListeners();
+
+    // After the notifier is up: scheduled reminders do not survive a reinstall or a
+    // reboot, so the stored plans re-arm theirs here. Unawaited — it is a background
+    // catch-up, not something the first frame waits on.
+    unawaited(_rescheduleAllReminders());
 
     if (_credentials.isComplete) _attach();
   }
@@ -650,6 +884,9 @@ class AppState extends ChangeNotifier {
 
         await _notifier.requestPermission();
         _snapshot = PresenceSnapshot.empty;
+        // The held office belongs to the space we were in. Pairing into another one
+        // must not flash the old floor plan under the new roster.
+        _clearHeldMap();
         notifyListeners();
         _attach();
         return null;
@@ -659,15 +896,35 @@ class AppState extends ChangeNotifier {
   Future<void> unpair() async {
     await _bridgeStore.clear();
     await _credentialStore.clear();
+    // The plans go with the pairing. They are pinned to rooms in a specific space,
+    // so a phone re-paired into another one would carry a calendar of places that
+    // are not there. Their reminders go too; the mirrored calendar events are the
+    // user's own account's now and are left alone.
+    for (final meeting in _plannedMeetings) {
+      await _notifier.cancelReminder(_reminderId(meeting));
+    }
+    _plannedMeetings = const [];
+    await _calendarStore.clear();
     _settings = BridgeSettings.empty;
     _credentials = GatherCredentials.empty;
     _spaceId = null;
     _bridgeName = null;
     _pushReach = PushRegistration.unknown;
     _snapshot = PresenceSnapshot.empty;
+    _clearHeldMap();
     await _detach();
     _link = const LinkStatus(LinkState.idle);
     notifyListeners();
+  }
+
+  /// Drops the office held across reconnects, on the paths where it would be stale:
+  /// a space change or a logout. A plain reconnect leaves it be — that is the point.
+  void _clearHeldMap() {
+    _heldMap = null;
+    _heldArt = null;
+    _heldMapSpaceId = null;
+    _heldMapFloorId = null;
+    _holdingMap = false;
   }
 
   /// Starts or stops teleporting my avatar around the map.
@@ -707,16 +964,43 @@ class AppState extends ChangeNotifier {
   /// What makes "leave the conversation" a control that is only offered when
   /// there is one to leave, the same rule the D-pad follows: a button that cannot
   /// do anything is indistinguishable from a broken one.
-  List<String> get huddle => debugHuddle ?? [for (final row in _roster?.myCluster ?? const []) row.name ?? 'Someone'];
+  List<String> get huddle => debugHuddle ?? [for (final row in _stableHuddleRows) row.name ?? 'Someone'];
 
   bool get inHuddle => huddle.isNotEmpty;
 
   /// The rows behind [huddle], for a screen that needs to put a face to a name and
   /// match it against the media plane rather than only print it.
-  List<RosterRow> get huddleRows => _roster?.myCluster ?? const [];
+  ///
+  /// The *held* cluster, not the live roster: our own `clusterId` flickers to null
+  /// for a few seconds while walking (issue #22), and reading the live roster made
+  /// the banner and the faces blink out with it. [_noteCluster] holds the last
+  /// membership across such a flap.
+  List<RosterRow> get huddleRows => _stableHuddleRows;
 
   /// My availability and status line as the tree last heard about them.
   ({String? availability, String? text, String? emoji})? _mine;
+
+  /// The last availability we saw that was not `Offline`, so the issue #41 self-heal
+  /// can restore Busy or Away rather than stomping everyone back to Active.
+  String? _lastOnlineAvailability;
+
+  /// Whether the phone is foregrounded, as the lifecycle last reported via
+  /// [setActive]. The self-heal only defends a call the person is actually sitting
+  /// in: a backgrounded phone going Offline is correct, not something to fight.
+  bool _active = false;
+
+  /// Issue #41 self-heal ladder state: the cooldown between re-asserts (a Timer so
+  /// it rides the same fake clock the cluster hold is tested on), how many times
+  /// this episode, and whether the media rebuild has already fired. See
+  /// [_noteSelfHealth].
+  Timer? _selfHealCooldown;
+  bool _selfHealCooling = false;
+  int _selfHealStrikes = 0;
+  bool _selfHealRebuilt = false;
+
+  /// How many times we re-assert against an external Offline before standing down,
+  /// so a Mac that stays asleep cannot keep us in a reconnect loop forever.
+  static const _selfHealMaxStrikes = 4;
 
   /// Wakes the tree when my own availability or status line changes.
   ///
@@ -727,12 +1011,95 @@ class AppState extends ChangeNotifier {
   /// some unrelated socket frame. Compared by value rather than by row, because the
   /// row is a new object on every roster.
   void _noteMine() {
+    // A roster means a dump has landed and the reader is whole again, so this is the
+    // moment to refresh the office we hold against the next reconnect's empty reader.
+    _refreshHeldMap();
     final row = _myRow();
     final status = row?.status;
-    final mine = (availability: row?.availability, text: status?.text, emoji: status?.emoji);
+    final availability = row?.availability;
+    // Remember the last real availability, so a later Offline forced on us by another
+    // device (issue #41) is undone back to what the person actually chose. Only a
+    // *sendable* one: the self-heal restore goes back out through `setAvailability`,
+    // which rejects anything but Active/Busy/Away wholesale, so a Focused or
+    // FocusedCoworking the desktop set on the shared user would be discarded and leave
+    // us stuck Offline. Keep the last user-selectable state instead.
+    if (availability != null && settableAvailabilities.contains(availability)) {
+      _lastOnlineAvailability = availability;
+    }
+    final mine = (availability: availability, text: status?.text, emoji: status?.emoji);
     if (mine == _mine) return;
     _mine = mine;
     notifyListeners();
+  }
+
+  /// Fight an external device hanging up our call (issue #41).
+  ///
+  /// The phone and the desktop client log in as one shared `SpaceUser`. When the
+  /// desktop locks or sleeps, its `AutoOfflineService` flips that shared user to
+  /// `availability: Offline` and suspends its WebRTC transports, and the server
+  /// tears the phone's call down with it — a hang-up nobody on the phone asked for.
+  ///
+  /// The phone has no control that sets itself Offline, so an Offline reading while
+  /// we are foreground and in a call is always some other device's doing. Re-assert
+  /// our presence and availability to undo it, and rebuild the media session the
+  /// suspend killed server-side. Bounded: a Mac that stays asleep cannot keep us in
+  /// a reconnect loop — after [_selfHealMaxStrikes] tries we stand down and let the
+  /// next genuine wake or tap bring the call back.
+  void _noteSelfHealth() {
+    final availability = myAvailability;
+    // Unknown, not recovered: a reconnect installs a fresh reader and the collector
+    // emits partial state-dump chunks the moment any user exists, so an early roster
+    // can carry no self row at all and leave this null before our own row lands.
+    // Resetting the ladder on that would clear the strike cap and the once-per-episode
+    // rebuild guard mid-episode — and if the self row then arrives still Offline, the
+    // same episode would start over and reconnect/rebuild without bound. Only a *known*
+    // availability tells us anything; wait for one.
+    if (availability == null) return;
+    if (availability != 'Offline') {
+      // Healthy again: reset the ladder so the next episode starts its count from
+      // scratch.
+      _selfHealCooldown?.cancel();
+      _selfHealCooldown = null;
+      _selfHealCooling = false;
+      _selfHealStrikes = 0;
+      _selfHealRebuilt = false;
+      return;
+    }
+    // Only our own, in-call, foreground presence is ours to defend.
+    if (!_active || !inCall) return;
+
+    // One re-assert per cooldown, so a roster four times a second does not become a
+    // re-assert four times a second.
+    if (_selfHealCooling) return;
+    if (_selfHealStrikes >= _selfHealMaxStrikes) return;
+
+    _selfHealStrikes++;
+    _selfHealCooling = true;
+    _selfHealCooldown?.cancel();
+    _selfHealCooldown = Timer(const Duration(seconds: 3), () {
+      _selfHealCooling = false;
+    });
+    if (_selfHealStrikes >= _selfHealMaxStrikes) {
+      _log('self-heal: an external device set us Offline mid-call — re-asserting '
+          '(final try $_selfHealStrikes), standing down after this');
+    } else {
+      _log('self-heal: an external device set us Offline mid-call — re-asserting '
+          '(try $_selfHealStrikes)');
+    }
+
+    unawaited(setActive(true));
+    unawaited(setAvailability(_lastOnlineAvailability ?? 'Active'));
+    unawaited(reconnect());
+
+    // Once per episode: the media session the desktop's suspendWebRTCTransports
+    // killed server-side can still believe it is connected, so the resync above
+    // would re-subscribe onto a dead session and wait out the deaf-timer. Force a
+    // fresh one. Guarded so the re-assert tries do not tear the media plane down
+    // again and again.
+    if (!_selfHealRebuilt) {
+      _selfHealRebuilt = true;
+      unawaited(_call?.rebuild() ?? Future<void>.value());
+    }
   }
 
   /// Wakes [directoryChanges] when the roster's directory-relevant projection moves
@@ -944,6 +1311,39 @@ class AppState extends ChangeNotifier {
     return sendEmote(emote);
   }
 
+  /// Whether our own hand is up, as this phone has it.
+  ///
+  /// Local-first like [amSpeaking]: the button reflects the press at once and the
+  /// roster echo — `handRaisedAt` arriving on our own row — only confirms it. The
+  /// call tiles read this for our own face; everybody else's hand comes off the
+  /// roster, which is the only source there is for them.
+  bool get myHandRaised => _myHandRaised;
+  bool _myHandRaised = false;
+
+  /// Raises or lowers our hand in the meeting, showing it here before the wire
+  /// agrees. A no-op if it is already where asked, so the roster echo and the
+  /// speak-lowering below cannot stutter the button.
+  Future<void> setHandRaised(bool raised) async {
+    if (raised == _myHandRaised) return;
+    _myHandRaised = raised;
+    notifyListeners();
+    _collector?.setHandRaised(raised);
+  }
+
+  /// Flips the hand — the raise/lower toggle that lives in the React tray.
+  Future<void> toggleHandRaised() => setHandRaised(!_myHandRaised);
+
+  /// Drops our own hand once we are no longer in a meeting.
+  ///
+  /// The hand is a meetings-only gesture and the button that raises it is gone
+  /// the moment the call is, so a hand left up would have no way down from the UI
+  /// — and worse, it would ride into the next meeting. Walking out of a huddle is
+  /// the common case no explicit Lower press ever covers, which is why this hangs
+  /// off the roster fold rather than off [leaveHuddle].
+  void _lowerHandIfOutOfMeeting() {
+    if (_myHandRaised && !inCall) setHandRaised(false);
+  }
+
   /// When we last waved at each person, to hold the button back.
   ///
   /// The server does *not* rate-limit this — `presence_tracker` measured 41
@@ -1012,6 +1412,50 @@ class AppState extends ChangeNotifier {
 
   Set<String> _speakers = const {};
 
+  /// Wakes the call screen when a hand goes up or down in our conversation, and
+  /// reconciles our own hand against the roster the desktop also writes.
+  ///
+  /// The same narrow question as [_noteSpeakers], for the same reason: the
+  /// presence fold does not count a raised hand as a state change, so without this
+  /// a colleague's badge would hang at whatever it was when some unrelated frame
+  /// last woke the screen. Bounded to the huddle we are in, not the whole space.
+  ///
+  /// Our own hand is local-first in [setHandRaised], but the roster is the
+  /// authority the *desktop* writes to as well: raising or lowering the hand on the
+  /// computer moves our own row under us, and this phone must follow it or its
+  /// button and self tile go stale. We follow an actual transition on our own row
+  /// and ignore a roster that merely repeats the value we already hold, so the
+  /// optimistic press is confirmed by its own echo rather than stuttered by it.
+  void _noteHands(Roster roster) {
+    final mine = _myRow()?.clusterId;
+    final hands = <String>{
+      if (mine != null)
+        for (final row in roster.rows)
+          if (row.id != roster.selfId && row.clusterId == mine && row.handRaised)
+            row.id,
+    };
+
+    final ownHand = _myRow()?.handRaised ?? false;
+    var ownChanged = false;
+    if (ownHand != _rosterHandRaised) {
+      _rosterHandRaised = ownHand;
+      if (ownHand != _myHandRaised) {
+        _myHandRaised = ownHand;
+        ownChanged = true;
+      }
+    }
+
+    if (setEquals(hands, _handsUp) && !ownChanged) return;
+    _handsUp = hands;
+    notifyListeners();
+  }
+
+  Set<String> _handsUp = const {};
+
+  /// Our own hand as the last roster had it, to tell a desktop raise or lower from
+  /// a roster that only echoes the value this phone already holds. See [_noteHands].
+  bool _rosterHandRaised = false;
+
   /// Whether *we* are talking, measured from our own microphone.
   ///
   /// Read here rather than off the roster, even though the roster carries it
@@ -1035,12 +1479,23 @@ class AppState extends ChangeNotifier {
     // Locally first. The ring on this phone should not wait for Gather to agree.
     notifyListeners();
     _collector?.setSpeaking(speaking);
+    // Starting to talk lowers your hand: the raised hand was a request to speak,
+    // and now you are. Gather's own client does the same, and it saves the one
+    // person in the meeting who most needs their hand down from having to find
+    // the button for it.
+    if (speaking && _myHandRaised) setHandRaised(false);
   }
 
   /// Steps out of the conversation without walking away from it.
   Future<String?> leaveHuddle() async {
     final collector = _collector;
     if (collector == null) return 'Not connected to Gather.';
+    // Mark the leave so the next empty roster is released at once instead of
+    // held as a flap. Tapping Leave puts us out of the cluster while we are
+    // still standing with the same peers, which is exactly what a #22 flicker
+    // looks like to the proximity test — so the intent is tracked rather than
+    // guessed at. See [_leaving].
+    _leaving = true;
     return _sent(collector.leaveCluster(), 'Could not leave the conversation.');
   }
 
@@ -1078,6 +1533,11 @@ class AppState extends ChangeNotifier {
   @visibleForTesting
   void debugAttachCollector(Collector collector) => _collector = collector;
 
+  /// Test seam: stand in the authenticated REST client a `/m/<code>` walk reaches
+  /// for, so the resolve→floor→knock path can be driven without a live login.
+  @visibleForTesting
+  void debugAttachAuth(GatherAuth auth) => _auth = auth;
+
   /// Test seam: drive [_onConnectivityChanged] without a plugin behind it.
   @visibleForTesting
   void debugNoteConnectivity(List<ConnectivityResult> now) => _onConnectivityChanged(now);
@@ -1109,6 +1569,14 @@ class AppState extends ChangeNotifier {
     final call = _callOrNull();
     if (call == null) return 'Not connected to Gather.';
     final failed = await call.setCameraOn(on);
+    notifyListeners();
+    return failed;
+  }
+
+  Future<String?> setScreenShareOn(bool on) async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.setScreenShareOn(on);
     notifyListeners();
     return failed;
   }
@@ -1191,13 +1659,74 @@ class AppState extends ChangeNotifier {
   /// sentence, while leaving late means still hearing a conversation you have
   /// walked away from, which is the worse of the two.
   void _noteCluster(Roster roster) {
+    _logSelfCluster(roster);
+
+    final liveRows = roster.myCluster;
+
+    if (liveRows.isNotEmpty) {
+      // A conversation we are in: take it at once and drop any pending hold.
+      // Forming and growing stay prompt — only an *empty* reading is ever held.
+      _clusterHoldTimer?.cancel();
+      _clusterHoldTimer = null;
+      // Back in a cluster: a Leave we tapped before this did not take (or we
+      // have re-formed since), so drop the intent rather than let it suppress a
+      // later genuine flap.
+      _leaving = false;
+      _commitStableCluster(liveRows, roster.myClusterId);
+    } else {
+      // The live cluster is empty. Our own `clusterId` flickers to null for a few
+      // seconds while walking (issue #22), and that is not the same event as
+      // walking away — the tell is proximity. If somebody from the cluster we last
+      // held is still *in range* (Gather's own `nearby` relation), we are standing
+      // with them and the empty is a transient server flap: hold the call across
+      // it rather than blink the banner and clear the SFU metadata to `""`. If
+      // nobody we were talking to is near any more, we have left, and the release
+      // is immediate.
+      final near = <String>{for (final row in roster.nearby) row.id};
+      final peerStillNear = _stableHuddleRows.any((p) => near.contains(p.id));
+      // Two more things disqualify an empty from being held, each so the hold
+      // only ever protects a call that genuinely existed:
+      //
+      //  * An explicit Leave is a decision, not a flap, and looks identical to a
+      //    flicker to the proximity test above — so [leaveHuddle] flags it and
+      //    we release at once. Consumed here: it governs this one transition.
+      //  * A walk-through that never lasted past the join debounce never became
+      //    a subscription ([_lastAppliedCluster] is still empty), so there is no
+      //    call to protect, and holding it would be the very "open a call by
+      //    walking past a group" the debounce exists to prevent.
+      final established = _lastAppliedCluster.isNotEmpty;
+      final transient = peerStillNear && established && !_leaving;
+      _leaving = false;
+      if (transient) {
+        // Bounded, so a peer row that lingers cannot keep a dead call alive.
+        _clusterHoldTimer ??= Timer(const Duration(seconds: 12), () {
+          _clusterHoldTimer = null;
+          _commitStableCluster(const [], null);
+        });
+      } else {
+        _clusterHoldTimer?.cancel();
+        _clusterHoldTimer = null;
+        _commitStableCluster(const [], null);
+      }
+    }
+
+    // Consume-allow widens from the *held* cluster plus whoever is live-nearby, so
+    // the people we are talking to keep permission to hear us through a flap. Run
+    // every roster — `nearby` moves even when the cluster does not.
     _noteNeighbours(roster);
-    _noteConversation(roster);
+  }
+
+  /// Point the media subscription at the held cluster, behind the asymmetric
+  /// debounce. Called from [_commitStableCluster] rather than off the raw roster,
+  /// so the subscription follows exactly what the banner does — audio rides
+  /// through a transient flap and is dropped on a genuine release, including the
+  /// one the safety cap fires.
+  void _applyClusterMedia() {
     // Their `UserAccount.id`, which is what the media plane is keyed on — see
     // `RosterRow.userAccountId`. Somebody whose row has not carried it yet is
     // skipped rather than guessed at, and picked up on a later roster.
     final wanted = <String>{
-      for (final row in roster.myCluster) ?row.userAccountId,
+      for (final row in _stableHuddleRows) ?row.userAccountId,
     };
 
     if (wanted.length == _clusterWanted.length &&
@@ -1208,7 +1737,7 @@ class AppState extends ChangeNotifier {
     // The one line that says whether Gather ever formed a conversation for us. An
     // empty set after walking up to somebody is the fingerprint of the desk-desync
     // bug: the server never counted us as adjacent, so there is nobody to listen to
-    // and no call to start. See [_noteConversation] for the id that pairs with it.
+    // and no call to start. See [_commitStableCluster] for the id that pairs with it.
     _log('cluster: members -> ${wanted.length}'
         '${wanted.isEmpty ? '' : ' (${wanted.join(',')})'}');
 
@@ -1235,19 +1764,80 @@ class AppState extends ChangeNotifier {
   Set<String> _lastAppliedCluster = const {};
   Timer? _clusterDebounce;
 
-  /// Tell the media plane which conversation we are in, by Gather's own id.
+  /// The cluster as the banner, the SFU conversation name and the media
+  /// subscription all read it: the last non-empty membership, held across a
+  /// transient empty for as long as we are standing with the people in it. See
+  /// [_noteCluster] for the proximity test that tells a flap from a walk-away.
+  List<RosterRow> _stableHuddleRows = const [];
+
+  /// The safety cap on a hold, so a peer row that lingers on the roster cannot
+  /// keep a dead call alive forever.
+  Timer? _clusterHoldTimer;
+
+  /// Set by [leaveHuddle], consumed by the next empty [_noteCluster]: an explicit
+  /// Leave puts us out of the cluster while we are still beside the peers we just
+  /// left, which the proximity test cannot tell from a #22 flap. The intent is
+  /// tracked instead so the call is released at once rather than held for 12s.
+  bool _leaving = false;
+
+  /// De-dupes [_logSelfCluster]; our own row's cluster signature, last logged.
+  String? _lastSelfClusterSig;
+
+  /// Move the banner, the conversation name and (via [_noteCluster]) the media
+  /// subscription to [rows]/[id] together, so they can never disagree about
+  /// whether we are in a call.
   ///
   /// `set-player-conversation-metadata` is in the measured method table and the
-  /// desktop client sends it on every change, so this does too. Undebounced and
-  /// separate from the membership on purpose: it is a name, not a subscription,
-  /// and naming the room you are in late is the one part of this that costs
-  /// nothing to get right immediately.
-  void _noteConversation(Roster roster) {
-    final id = roster.myClusterId;
-    if (id == _conversation) return;
-    _conversation = id;
-    _log('cluster: conversation id -> ${id ?? '(none)'}');
-    unawaited(_call?.setConversation(id) ?? Future<void>.value());
+  /// desktop client sends it on every change — including `clusterId: ""` on
+  /// leaving, so the SFU stops counting us a member of a bubble we have walked out
+  /// of. It is folded in here, rather than sent undebounced off the raw roster,
+  /// precisely so a transient empty (issue #22) does not clear it mid-call.
+  void _commitStableCluster(List<RosterRow> rows, String? id) {
+    final rowsChanged = !_sameCluster(_stableHuddleRows, rows);
+    _stableHuddleRows = rows;
+    if (id != _conversation) {
+      _conversation = id;
+      _log('cluster: conversation id -> ${id ?? '(none)'}');
+      unawaited(_call?.setConversation(id) ?? Future<void>.value());
+    }
+    _applyClusterMedia();
+    if (rowsChanged) notifyListeners();
+  }
+
+  /// The same people, by `SpaceUser.id`, order aside.
+  bool _sameCluster(List<RosterRow> a, List<RosterRow> b) {
+    if (a.length != b.length) return false;
+    final ids = <String>{for (final r in a) r.id};
+    return b.every((r) => ids.contains(r.id));
+  }
+
+  /// Record our own row's `clusterId` as the server actually sends it — absent,
+  /// explicit null, or an id — next to `connected`, so a pulled `media.log` can
+  /// say whether a flap to (none) was the server dropping us or a client-side
+  /// roster merge losing the key. That is the one fact the `cluster:` lines cannot
+  /// show, and the one that decides where the #22 flap comes from. Logged only on
+  /// a change, so a roster four times a second does not fill the file.
+  void _logSelfCluster(Roster roster) {
+    RosterRow? me;
+    final id = roster.selfId;
+    if (id != null) {
+      for (final row in roster.rows) {
+        if (row.id == id) {
+          me = row;
+          break;
+        }
+      }
+    }
+    final key = me == null
+        ? 'no-self'
+        : !me.clusterIdKnown
+            ? 'absent'
+            : me.clusterId ?? 'null';
+    final sig = '$key/${me?.connected}';
+    if (sig == _lastSelfClusterSig) return;
+    _lastSelfClusterSig = sig;
+    _log('cluster: self clusterId=$key connected=${me?.connected} '
+        'members=${roster.myCluster.length}');
   }
 
   String? _conversation;
@@ -1284,7 +1874,11 @@ class AppState extends ChangeNotifier {
       // Being in somebody's conversation is a strictly stronger claim than
       // standing near them, so this can only ever widen the set, and widening it
       // is cheap — allowing somebody negotiates nothing.
-      for (final row in roster.myCluster) ?row.userAccountId,
+      //
+      // The *held* cluster, not the live roster, so a transient flap (issue #22)
+      // does not drop consume-allow for the person we are talking to and leave
+      // them unable to hear us for the length of the flap.
+      for (final row in _stableHuddleRows) ?row.userAccountId,
     };
     if (wanted.length == _visibleTo.length && _visibleTo.containsAll(wanted)) {
       return;
@@ -1567,34 +2161,78 @@ class AppState extends ChangeNotifier {
 
     // On another floor there is no room on this map to walk into and no tile a hop
     // could reach — the same ceiling [warpToPerson] hits. Refuse rather than walk
-    // into a room that merely shares a name or coordinates on the wrong floor.
+    // into a room that merely shares a name or coordinates on the wrong floor. The
+    // test is applied to the *live* meeting again after the wait below: a sparse
+    // snapshot names no floor, so the conversation can place onto another one while
+    // we wait, and [_meetingRoom] matches purely by name and would otherwise walk us
+    // into a same-named room on this floor.
     final myFloor = _myRow()?.floorId;
-    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+    bool onAnotherFloor(Meeting m) =>
+        myFloor != null && m.floorId != null && m.floorId != myFloor;
+    if (onAnotherFloor(meeting)) {
       return 'That conversation is on another floor.';
     }
 
-    final map = this.map;
-    final roomName = meeting.roomName;
-    if (map != null && roomName != null) {
-      for (final room in map.rooms) {
-        if (room.name != roomName) continue;
-        final failed = await goToRoom(
-          room,
-          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
-        );
-        if (failed != null) return failed;
-        final micFailed = await setMicOn(true);
-        if (micFailed != null) _notices.add(micFailed);
-        return null;
+    // The roster mutates under us as placement streams in after a reconnect, so
+    // re-read the meeting by its cluster each time rather than trusting the snapshot
+    // the card was built from.
+    Meeting? live() {
+      for (final m in meetings) {
+        if (m.clusterId == meeting.clusterId) return m;
+      }
+      return null;
+    }
+
+    // Right after a reconnect the cluster is known (its card shows) but its members
+    // are not placed yet, so neither a room name nor a member tile resolves. Rather
+    // than refuse on that first sparse snapshot — the old "Could not work out where
+    // that conversation is." the moment you tapped — wait briefly for the roster to
+    // place them, then go. If it never resolves, send the user to the map, where the
+    // room is walkable off static geometry with no roster dependency.
+    if (_meetingRoom(meeting) == null && _meetingMemberTile(meeting) == null) {
+      if (_link.isDisrupted) return 'No connection — waiting for network.';
+      // The wait ends the moment the question is settled, which includes the two
+      // terminal ways it can settle against us: the link dropping (a walk started
+      // now would only move this phone's avatar) and the cluster ending (nothing
+      // left to travel to). Folding those into the predicate makes them early-outs
+      // rather than a full five-second stall before the same verdict.
+      await _pollUntil(() {
+        if (_link.isDisrupted) return true;
+        final m = live();
+        if (m == null) return true;
+        return m.includesMe || _meetingRoom(m) != null || _meetingMemberTile(m) != null;
+      }, timeout: const Duration(seconds: 5));
+      if (_link.isDisrupted) return 'No connection — waiting for network.';
+      final settled = live();
+      if (settled == null) return 'That conversation just ended.';
+      if (!settled.includesMe &&
+          _meetingRoom(settled) == null &&
+          _meetingMemberTile(settled) == null) {
+        return 'Still finding a way in — open the map and walk into the room.';
       }
     }
 
-    for (final member in meeting.members) {
-      final x = member.x, y = member.y;
-      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
-      // Only hop beside a member this hop can actually reach: one on our own floor.
-      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
-      final failed = await warpToTile(x.round(), y.round());
+    final m = live() ?? meeting;
+    // Pulled into it while we waited — nothing left to travel to.
+    if (m.includesMe) return null;
+    // Placement may have landed the conversation on another floor while we waited.
+    if (onAnotherFloor(m)) return 'That conversation is on another floor.';
+
+    final room = _meetingRoom(m);
+    if (room != null) {
+      final failed = await goToRoom(
+        room,
+        toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+      );
+      if (failed != null) return failed;
+      final micFailed = await setMicOn(true);
+      if (micFailed != null) _notices.add(micFailed);
+      return null;
+    }
+
+    final tile = _meetingMemberTile(m);
+    if (tile != null) {
+      final failed = await warpToTile(tile.x, tile.y);
       if (failed != null) return failed;
       final micFailed = await setMicOn(true);
       if (micFailed != null) _notices.add(micFailed);
@@ -1602,6 +2240,51 @@ class AppState extends ChangeNotifier {
     }
 
     return 'Could not work out where that conversation is.';
+  }
+
+  /// The named room a meeting sits in, resolved against this floor's map, or null
+  /// when the roster has not named it yet (see [Meeting.roomName]). Shared by
+  /// [warpToMeeting]'s wait predicate and its executor so both read one truth.
+  SpaceRoom? _meetingRoom(Meeting meeting) {
+    final map = this.map;
+    final roomName = meeting.roomName;
+    if (map == null || roomName == null) return null;
+    for (final room in map.rooms) {
+      if (room.name == roomName) return room;
+    }
+    return null;
+  }
+
+  /// A tile beside the first meeting member this hop can reach — one placed, with
+  /// finite coordinates, on our own floor — or null when none is placed yet.
+  ({int x, int y})? _meetingMemberTile(Meeting meeting) {
+    final myFloor = _myRow()?.floorId;
+    for (final member in meeting.members) {
+      final x = member.x, y = member.y;
+      if (x == null || y == null || !x.isFinite || !y.isFinite) continue;
+      // Only hop beside a member this hop can actually reach: one on our own floor.
+      if (myFloor != null && member.floorId != null && member.floorId != myFloor) continue;
+      return (x: x.round(), y: y.round());
+    }
+    return null;
+  }
+
+  /// Polls [test] every [interval] for up to [timeout], returning true the moment it
+  /// passes and false on timeout. Counts ticks rather than reading a wall clock so it
+  /// advances deterministically under `fakeAsync` in tests. Used to let a sparse
+  /// post-reconnect roster finish placing a meeting before [warpToMeeting] gives up.
+  Future<bool> _pollUntil(
+    bool Function() test, {
+    required Duration timeout,
+    Duration interval = const Duration(milliseconds: 200),
+  }) async {
+    if (test()) return true;
+    final ticks = (timeout.inMilliseconds / interval.inMilliseconds).ceil();
+    for (var i = 0; i < ticks; i++) {
+      await Future<void>.delayed(interval);
+      if (test()) return true;
+    }
+    return false;
   }
 
   /// Walk into a room, landing on a seat if it has a free one.
@@ -1645,6 +2328,732 @@ class AppState extends ChangeNotifier {
     // through somebody else's desk. Arrive at the best of them anyway, the way
     // `shouldTeleport` does.
     return _travelTo(map, walk, at, wanted.first, occupied);
+  }
+
+  // ---- planned meetings ------------------------------------------------------
+  //
+  // A calendar that is entirely this phone's own. Gather has none to read or write
+  // — its Calendar Panel mirrors a Google/Outlook account, and the game socket
+  // carries no scheduled event — so a plan made here is saved in [_calendarStore]
+  // (the keychain) and reaches Gather only if the user opts to mirror it into the
+  // phone's own calendar (see [_calendarMirror] and [setMirrorCalendar]).
+
+  List<PlannedMeeting> _plannedMeetings = const [];
+
+  /// The planned meetings, soonest first. The Plans tab renders straight off this.
+  List<PlannedMeeting> get plannedMeetings {
+    final out = [..._plannedMeetings];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Test seam: lets a widget test stand up the Plans tab without a keychain.
+  @visibleForTesting
+  set debugPlannedMeetings(List<PlannedMeeting> meetings) {
+    _plannedMeetings = meetings;
+    notifyListeners();
+  }
+
+  /// The device calendar plans are mirrored into, or null when mirroring is off.
+  String? _mirrorCalendarId;
+  String? get mirrorCalendarId => _mirrorCalendarId;
+
+  /// A notification id for a meeting's reminder, derived from its stable id. A
+  /// positive 31-bit int because that is what the platforms accept, and kept a pure
+  /// function of the id so cancelling finds the same slot scheduling used.
+  ///
+  /// Hashed by hand rather than with [String.hashCode]: the Dart VM seeds string
+  /// hashes randomly per process, so `id.hashCode` returns a different number on the
+  /// next launch. That id has to survive a restart — boot reschedules from it, and
+  /// an edit or delete cancels by it — so a hash that moved would orphan the old
+  /// notification and schedule a duplicate. This FNV-1a over the id's code units is
+  /// deterministic across launches and platforms.
+  int _reminderId(PlannedMeeting m) {
+    var hash = 0x811c9dc5;
+    for (final unit in m.id.codeUnits) {
+      hash = ((hash ^ unit) * 0x01000193) & 0xffffffff;
+    }
+    return hash & 0x7fffffff;
+  }
+
+  /// Adds a plan: saves it, schedules its reminder, and best-effort mirrors it to
+  /// the phone's calendar. Returns null on success or a sentence for the user.
+  ///
+  /// The local save is the commit — a plan is kept the moment the keychain takes
+  /// it. The reminder and the mirror are consequences of a saved plan, not
+  /// conditions of saving one: a reminder that will not schedule or a calendar that
+  /// refuses the write are not reasons to tell the user their meeting was lost.
+  Future<String?> addMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    var saved = meeting;
+
+    // Mirror first, so the device-event id it hands back is part of the record the
+    // store persists — otherwise a crash between save and mirror would orphan the
+    // calendar event with nothing pointing at it.
+    saved = await _mirror(saved);
+
+    _plannedMeetings = [..._plannedMeetings, saved];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that meeting.';
+    }
+
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Replaces a plan with an edited copy, keeping its id. Re-mirrors and
+  /// re-schedules so a moved time carries its reminder and calendar entry with it.
+  Future<String?> updateMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    final at = _plannedMeetings.indexWhere((m) => m.id == meeting.id);
+    if (at < 0) return addMeeting(meeting);
+
+    // Carry the existing device-event id across so the mirror updates in place
+    // rather than leaving the old event behind and creating a second. A failed
+    // re-mirror clears that id (see [_mirror]) so the local reminder arms as the
+    // fallback instead of staying suppressed behind an event that never moved.
+    var saved = meeting.withDeviceEventId(_plannedMeetings[at].deviceEventId);
+    saved = await _mirror(saved);
+
+    final next = [..._plannedMeetings];
+    next[at] = saved;
+    _plannedMeetings = next;
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that change.';
+    }
+
+    await _notifier.cancelReminder(_reminderId(saved));
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Removes a plan, its reminder and its mirrored calendar event. Optimistic: the
+  /// row leaves the list at once and is put back only if the store write fails.
+  Future<String?> deleteMeeting(String id) async {
+    final before = _plannedMeetings;
+    final gone = _plannedMeetings.where((m) => m.id == id).toList();
+    if (gone.isEmpty) return null;
+
+    _plannedMeetings = [for (final m in _plannedMeetings) if (m.id != id) m];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not delete that meeting.';
+    }
+
+    for (final m in gone) {
+      await _notifier.cancelReminder(_reminderId(m));
+      if (m.deviceEventId != null && _mirrorCalendarId != null) {
+        await _calendarMirror.delete(m.deviceEventId, calendarId: _mirrorCalendarId!);
+      }
+    }
+    return null;
+  }
+
+  /// Walks (or warps) to where a planned meeting is set to happen.
+  ///
+  /// Resolves [PlannedMeeting.roomStableId] against the live map and walks in with
+  /// [goToRoom], the same machinery the "Go here" card and [warpToMeeting] use.
+  /// Falls back to a tile hop when the plan carries only coordinates, and refuses
+  /// cleanly when the room is on another floor or the map has not arrived — a plan
+  /// can be made offline, but it can only be walked to once there is a floor to
+  /// walk on.
+  Future<String?> walkToMeeting(PlannedMeeting meeting) async {
+    final map = this.map;
+    if (map == null) return 'Still reading the floor plan.';
+
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+      return '${meeting.roomName ?? 'That room'} is on another floor.';
+    }
+
+    final stableId = meeting.roomStableId;
+    if (stableId != null) {
+      for (final room in map.rooms) {
+        if (room.stableId != stableId) continue;
+        return goToRoom(
+          room,
+          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+        );
+      }
+    }
+
+    final x = meeting.x, y = meeting.y;
+    if (x != null && y != null && x.isFinite && y.isFinite) {
+      return warpToTile(x.round(), y.round());
+    }
+
+    return meeting.roomName == null
+        ? 'This meeting has no place set.'
+        : "Can't find ${meeting.roomName} on the floor plan.";
+  }
+
+  /// The rooms a plan can be pinned to, for the create sheet's place picker — every
+  /// named room on the floor I am on, soonest resolved. Empty until the map has
+  /// arrived, which is the same gate [walkToMeeting] enforces.
+  List<SpaceRoom> get plannableRooms {
+    final rooms = map?.rooms ?? const <SpaceRoom>[];
+    return [
+      for (final room in rooms)
+        if (room.name != null && room.name!.isNotEmpty) room,
+    ];
+  }
+
+  // ---- Google Calendar (read-only) -------------------------------------------
+  //
+  // The events the desktop Calendar Panel shows, read from the source Gather itself
+  // reads — a connected Google account — rather than from Gather, which carries no
+  // scheduled event on the wire. Separate from [_plannedMeetings] because it is the
+  // opposite kind of thing: not a plan this phone owns and can edit, but one it only
+  // mirrors. The Plans tab renders both, the Google ones read-only.
+
+  List<GoogleEvent> _googleEvents = const [];
+
+  /// Lowercased **display name → calendar id** of the calendars this Google account
+  /// can see besides its own — the colleagues who shared one. Built once per connect
+  /// (names rarely change within a session) and consulted by [calendarForPerson] to
+  /// turn a tapped person into a calendar to read. Empty when disconnected.
+  Map<String, String> _calendarIndex = const {};
+
+  /// Labels already logged by [hasCalendarFor], so the per-frame Dial gate records
+  /// each colleague's match-or-miss once instead of on every rebuild. Diagnostic
+  /// only — the match itself is a pure index lookup.
+  final Set<String> _gcalMatchLogged = {};
+
+  /// A short-lived cache of one colleague's events, keyed by calendar id, so tapping
+  /// the same person twice — or the Dial polling presence — does not re-hit Google
+  /// each time. Entries expire via [_peopleEventsAt].
+  final Map<String, List<GoogleEvent>> _peopleEvents = {};
+  final Map<String, DateTime> _peopleEventsAt = {};
+  static const _peopleEventsTtl = Duration(minutes: 5);
+
+  /// One shared read per calendar id while it is in flight. A cold-cache Dial rebuild,
+  /// the completion of another calendar's load, and opening a person's sheet can each
+  /// ask for the same calendar at once; they await this one future instead of
+  /// multiplying requests on a slow connection.
+  final Map<String, Future<List<GoogleEvent>?>> _peopleEventsInFlight = {};
+
+  /// Bumped on every connect and disconnect so a Google read that was already in flight
+  /// when the account changed can tell it is stale and drop its result rather than
+  /// repopulating state the disconnect just cleared (or seeding the new account's cache
+  /// with the old one's events).
+  int _googleSession = 0;
+
+  /// The upcoming Google Calendar events, soonest first. Empty when no account is
+  /// connected or the build has no OAuth client. The Plans tab renders these beside
+  /// the local plans, without the walk/delete a plan carries.
+  List<GoogleEvent> get googleEvents {
+    final out = [..._googleEvents];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Whether a Google account is connected. Drives the Plans tab's connect/disconnect
+  /// action. Updated by [connectGoogle]/[disconnectGoogle] and seeded at boot.
+  bool _googleConnected = false;
+  bool get googleConnected => _googleConnected;
+
+  /// Whether this build can offer a Google connection at all — false when no OAuth
+  /// client was compiled in (every test, a placeholder build), so the UI can hide
+  /// the action rather than offer one that cannot work.
+  bool get googleAvailable => _googleCalendar != null;
+
+  /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
+  /// batch of events. Called from [boot]; best-effort, never fails the launch.
+  /// A diagnostic log line for the calendar feature, emitted only in a build made with
+  /// `--dart-define=GCAL_DEBUG=true`. These lines name colleague calendar emails, so
+  /// they stay out of a normal build's `media.log` and are turned on only to trace why
+  /// an availability badge is or is not showing.
+  void _gcalLog(String line) {
+    if (const bool.fromEnvironment('GCAL_DEBUG')) _log(line);
+  }
+
+  Future<void> _restoreGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) {
+      _gcalLog('gcal: restore — no calendar service (build carries no client id)');
+      return;
+    }
+    _googleConnected = await google.isConnected;
+    _gcalLog('gcal: restore — connected=$_googleConnected (refresh token in keychain)');
+    if (_googleConnected) {
+      await refreshGoogleEvents();
+      unawaited(_buildCalendarIndex());
+    }
+  }
+
+  /// Runs the Google consent flow and, on success, pulls the events in. Returns null
+  /// on success or a cancel, or a sentence for the user on a real failure.
+  Future<String?> connectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return 'Google Calendar is not set up in this build.';
+    final error = await google.connect();
+    if (error != null) {
+      _gcalLog('gcal: connect — failed: $error');
+      return error;
+    }
+    _googleConnected = await google.isConnected;
+    // New session: reject any read still in flight from before this connect, and tag
+    // the reads below as belonging to it.
+    _googleSession++;
+    _peopleEventsInFlight.clear();
+    _gcalLog('gcal: connect — connected=$_googleConnected');
+    notifyListeners();
+    await refreshGoogleEvents();
+    unawaited(_buildCalendarIndex());
+    return null;
+  }
+
+  /// Forgets the Google account and clears its events from the tab.
+  Future<void> disconnectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return;
+    // Invalidate before the await: any read in flight now carries the old session and
+    // must not repopulate the state cleared below when it lands.
+    _googleSession++;
+    await google.disconnect();
+    _googleConnected = false;
+    _googleEvents = const [];
+    _calendarIndex = const {};
+    _peopleEvents.clear();
+    _peopleEventsAt.clear();
+    _peopleEventsInFlight.clear();
+    notifyListeners();
+  }
+
+  /// Re-reads the upcoming Google events. A no-op when disconnected; swallows a
+  /// failed read (the service returns an empty list) rather than surfacing it.
+  Future<void> refreshGoogleEvents() async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return;
+    final gen = _googleSession;
+    final events = await google.fetchUpcoming();
+    // A disconnect or account switch landed while this was fetching — drop the result
+    // rather than repopulating the tab with the gone account's events.
+    if (gen != _googleSession) return;
+    _googleEvents = events;
+    notifyListeners();
+  }
+
+  /// Reads the index of shared calendars and rebuilds [_calendarIndex]. Best-effort;
+  /// a failure leaves the tab working with only the user's own events and no
+  /// per-person calendars, which is what an account with nothing shared to it sees.
+  Future<void> _buildCalendarIndex() async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return;
+    final gen = _googleSession;
+    final index = await google.fetchCalendarIndex();
+    if (gen != _googleSession) return;
+    _calendarIndex = index;
+    // The decisive diagnostic: these are the names a colleague's Gather label must
+    // match (lowercased) for the Dial's calendar button to appear. Empty here means
+    // nobody has shared a calendar with this account — or the share has no name.
+    _gcalLog('gcal: calendar index — ${_calendarIndex.length} shared: '
+        '${_calendarIndex.keys.join(', ')}');
+    notifyListeners();
+  }
+
+  /// Seeds the shared-calendar index and marks Google connected, so the name-matching
+  /// the Dial depends on can be driven without a live OAuth account.
+  @visibleForTesting
+  void debugSeedCalendarIndex(Map<String, String> index) {
+    _calendarIndex = Map.of(index);
+    _googleConnected = true;
+    _gcalMatchLogged.clear();
+  }
+
+  /// The calendar id for a person shown in Gather as [label], or null when none in the
+  /// index is a confident match. The single resolver every calendar lookup goes
+  /// through, so the Dial gate, the "free in" countdown and the plans sheet all agree
+  /// on who a label points at.
+  ///
+  /// Matching is deliberately loose because the two names rarely line up: Gather shows
+  /// a short handle ("jaime", "dr. simon") while a shared calendar is named for the
+  /// whole person or their address ("Jaime García", `jaime@safenow.de`). An exact hit
+  /// wins outright; failing that, a label name-token that is a full word of a
+  /// calendar's name — or the local part of its email, or a prefix of one of its words
+  /// — counts as a match. Tokens shorter than three characters and role words
+  /// ("extern", "dr") are dropped so they cannot carry a match on their own.
+  ///
+  /// Ambiguity is resolved to *nothing*, never a guess: if the label matches two
+  /// different calendars, it resolves to null rather than risk showing one colleague's
+  /// schedule under another's name. That keeps the loosened matching safe — the cost of
+  /// a near-collision is a hidden button, not a wrong one.
+  String? _calendarIdForLabel(String label) {
+    final key = label.trim().toLowerCase();
+    if (key.isEmpty) return null;
+    final exact = _calendarIndex[key];
+    if (exact != null) return exact;
+
+    final labelTokens = _nameTokens(key);
+    if (labelTokens.isEmpty) return null;
+    final ids = <String>{};
+    for (final entry in _calendarIndex.entries) {
+      if (_calendarMatchesTokens(entry.key, labelTokens)) ids.add(entry.value);
+    }
+    // One confident calendar, or nothing — two means we cannot tell them apart.
+    return ids.length == 1 ? ids.first : null;
+  }
+
+  /// Whether a calendar named [calKey] (a display name or an email) carries any of a
+  /// label's [labelTokens] as one of its own name words. Emails are reduced to their
+  /// local part first, so the shared domain (`…@safenow.de`) cannot match everyone.
+  bool _calendarMatchesTokens(String calKey, Set<String> labelTokens) {
+    final at = calKey.indexOf('@');
+    final calTokens = _nameTokens(at >= 0 ? calKey.substring(0, at) : calKey);
+    for (final want in labelTokens) {
+      for (final have in calTokens) {
+        if (have == want) return true;
+        // A handle is often a prefix of the full name ("jaime" in "jaimeg"); require
+        // four characters so short fragments ("jan" in "janet") do not over-reach.
+        if (want.length >= 4 && have.startsWith(want)) return true;
+      }
+    }
+    return false;
+  }
+
+  /// The significant lowercase name words in [s]: alphanumeric runs of three or more
+  /// characters that are not role words. Splits on anything else, so "dr. simon",
+  /// "garcía-lópez" and "jaime (extern)" all reduce to the names that identify a person.
+  static Set<String> _nameTokens(String s) {
+    const stop = {'extern', 'intern', 'team', 'the', 'und', 'and', 'von', 'der', 'die'};
+    return {
+      for (final t in s.toLowerCase().split(RegExp(r'[^a-z0-9äöüß]+')))
+        if (t.length >= 3 && !stop.contains(t)) t,
+    };
+  }
+
+  /// The Google calendar id to read for a colleague, preferring the exact calendar
+  /// [email] Gather hands us on the wire over a guessed name match.
+  ///
+  /// The email is the strong key: `fetchEventsFor` passes it straight to Google, which
+  /// answers free/busy for any address inside the same Workspace domain without the
+  /// colleague sharing anything by name — the mechanism the desktop uses. Only when no
+  /// email arrived (a colleague who never connected a calendar to Gather) does it fall
+  /// back to matching their Gather label against a calendar shared directly with this
+  /// account. Null when disconnected or neither key resolves.
+  String? _calendarKeyFor(String label, String? email) {
+    if (!_googleConnected) return null;
+    final trimmed = email?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+    return _calendarIdForLabel(label);
+  }
+
+  /// The upcoming events on a colleague's calendar — keyed by their wire [email] when
+  /// Gather gave us one, else matched to [label]. Carries one of three outcomes the
+  /// "their plans" sheet must tell apart: no calendar resolved ([CalendarLookup.noCalendar]),
+  /// a calendar that could not be read right now ([CalendarLookup.unavailable], so the
+  /// sheet says "could not load" rather than claiming an empty schedule), or a clean
+  /// read ([CalendarLookup.ok]) whose list may itself be empty. Reached from the map's
+  /// person card (label only) and the Dial (which also has the email).
+  Future<PersonCalendar> calendarForLabel(String label, {String? email}) async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return PersonCalendar.noCalendar;
+    final calendarId = _calendarKeyFor(label, email);
+    if (calendarId == null) return PersonCalendar.noCalendar;
+    final events = await _fetchPeopleEvents(calendarId);
+    if (events == null) return PersonCalendar.unavailable;
+    return PersonCalendar.ok(events);
+  }
+
+  /// Whether a colleague has a calendar this account can ask about — the gate the UI
+  /// uses to offer a "Plans" affordance only where it will land on something. True as
+  /// soon as Gather gave us their [email]; otherwise a name match against a directly
+  /// shared calendar. Cheap and synchronous.
+  bool hasCalendarFor(String label, {String? email}) {
+    final logKey = label.trim().toLowerCase();
+    final calendarId = _calendarKeyFor(label, email);
+    // Log each distinct colleague once: whether we resolved by email or name (or
+    // missed), visible in a pulled log rather than guessed at.
+    if (_googleConnected && _gcalMatchLogged.add(logKey)) {
+      final how = calendarId == null
+          ? 'MISS'
+          : (email != null && email.trim().isNotEmpty ? 'HIT email' : 'HIT name');
+      _gcalLog('gcal: dial match — "$logKey" -> $how (index has ${_calendarIndex.length})');
+    }
+    return calendarId != null;
+  }
+
+  /// One colleague's events, cached for [_peopleEventsTtl]. Returns the cached or freshly
+  /// read list, or null when the calendar could not be read at all (offline or refused) —
+  /// distinct from an empty list, which is a calendar that read cleanly with nothing on it.
+  ///
+  /// Concurrent asks for the same calendar share one in-flight read ([_peopleEventsInFlight]),
+  /// and a read whose session has since changed (a disconnect or account switch mid-flight)
+  /// drops its result rather than seeding the new account's cache.
+  Future<List<GoogleEvent>?> _fetchPeopleEvents(String calendarId) async {
+    final at = _peopleEventsAt[calendarId];
+    final cached = _peopleEvents[calendarId];
+    if (cached != null && at != null && _now().difference(at) < _peopleEventsTtl) {
+      return cached;
+    }
+    final inFlight = _peopleEventsInFlight[calendarId];
+    if (inFlight != null) return inFlight;
+
+    final google = _googleCalendar;
+    if (google == null) return cached;
+
+    final gen = _googleSession;
+    final future = () async {
+      try {
+        final events = await google.fetchEventsFor(calendarId);
+        if (gen != _googleSession) return null;
+        _peopleEvents[calendarId] = events;
+        _peopleEventsAt[calendarId] = _now();
+        return events;
+      } on CalendarUnavailable {
+        // Leave any existing cache untouched; tell the caller it could not be read now.
+        return null;
+      } finally {
+        _peopleEventsInFlight.remove(calendarId);
+      }
+    }();
+    _peopleEventsInFlight[calendarId] = future;
+    return future;
+  }
+
+  /// What to show under a person's name in the Dial: whether they are mid-conversation
+  /// and, when their calendar is visible, when they free up.
+  ///
+  /// "In a meeting" is Gather's own `clusterId` — a shared non-null value is a bubble,
+  /// the same signal the call screen keys on, and needs no calendar. The "free in X"
+  /// refinement needs an end time, which only their calendar carries: when that is
+  /// cached (a tap, or a prior look, warmed it) and an event spans now, the gap to its
+  /// end is the countdown. A cold cache is warmed in the background and surfaces on the
+  /// next rebuild, so the badge fills in rather than blocking the list.
+  PersonPresence presenceFor(Contact c) {
+    final inMeeting = c.clusterId != null;
+    // "Free in X" qualifies a meeting we can already see — it is never promoted on
+    // its own for someone merely heads-down at their desk with a calendar block.
+    // Gather's own cluster is the gate: no bubble, no countdown. This keeps the
+    // availability claim honest (they are demonstrably busy right now) and matches
+    // where the colleague is actually sitting in a call with the event's other invitees.
+    final freeIn = inMeeting ? _freeInFor(c) : null;
+    return PersonPresence(inMeeting: inMeeting, freeIn: freeIn);
+  }
+
+  Duration? _freeInFor(Contact c) {
+    if (!_googleConnected) return null;
+    final calendarId = _calendarKeyFor(c.label, c.calendarEmail);
+    if (calendarId == null) return null;
+
+    final at = _peopleEventsAt[calendarId];
+    final cached = _peopleEvents[calendarId];
+    if (cached == null || at == null || _now().difference(at) >= _peopleEventsTtl) {
+      // Warm the cache for next time; ignore the result here.
+      unawaited(_fetchPeopleEvents(calendarId).then((_) => notifyListeners()));
+      return null;
+    }
+
+    return freeInFromEvents(cached, _now());
+  }
+
+  /// The live-map room a read-only Google event points at, when its location is a
+  /// Gather link naming a room in *this* space — else null, which hides the Plans
+  /// tab's "Go to meeting" rather than risk a wrong jump. A link to another space, or
+  /// one that names only the space with no resolvable room, resolves to null by
+  /// design (the approved behaviour: walk in only when a room is carried).
+  SpaceRoom? gatherRoomFor(GoogleEvent event) {
+    final link = GatherLink.tryParse(event.location);
+    if (link == null) return null;
+    final here = _currentMapSpaceId;
+    if (here == null || link.spaceId != here) return null;
+    final hint = link.roomHint?.trim().toLowerCase();
+    if (hint == null || hint.isEmpty) return null;
+    final map = this.map;
+    if (map == null) return null;
+    for (final room in map.rooms) {
+      final name = room.name?.trim().toLowerCase();
+      if (name != null && name.isNotEmpty && name == hint) return room;
+    }
+    return null;
+  }
+
+  /// Whether the Plans tab should offer a "Go to meeting" button for [event].
+  ///
+  /// True when the location is a Gather link this phone can act on: either an
+  /// `/app/<spaceId>/…` link naming a room in this space, resolvable against the live
+  /// map right now ([gatherRoomFor]), or a `/m/<code>` short link, whose space and
+  /// room are not in the URL and are resolved on tap by [walkToGoogleEvent]. A short
+  /// link to another space answers true here and explains itself on tap, because the
+  /// only way to know where it points is to ask.
+  bool canGoToMeeting(GoogleEvent event) {
+    if (gatherRoomFor(event) != null) return true;
+    return GatherLink.tryParse(event.location)?.meetingLinkId != null;
+  }
+
+  /// Walks into the Gather room a Google event names, the same routing "Walk here"
+  /// and [walkToMeeting] use. A `/m/<code>` short link is resolved over REST first.
+  /// Returns null on success, or a sentence to show the user: a failure, or — when
+  /// the room is locked and we are not admitted — word that we have asked to be let
+  /// in rather than set off on a walk the server would silently refuse.
+  Future<String?> walkToGoogleEvent(GoogleEvent event) async {
+    final room = gatherRoomFor(event);
+    if (room != null) return _enterOrAsk(room);
+
+    final linkId = GatherLink.tryParse(event.location)?.meetingLinkId;
+    if (linkId != null) return _walkToMeetingLink(linkId);
+
+    return "Can't find that room on the floor plan.";
+  }
+
+  /// Resolves a `/m/<code>` short link to its room on *this* floor, then walks in or
+  /// asks to be let in. The code carries no ids, so this is the one step that must
+  /// reach the network; a link to another space is as far as a single walk goes.
+  Future<String?> _walkToMeetingLink(String linkId) async {
+    final auth = _auth;
+    if (auth == null) return 'Not connected to Gather.';
+
+    final MeetingLinkInfo info;
+    try {
+      info = await resolveMeetingLink(auth, linkId);
+    } on Object {
+      return "Couldn't open that meeting link.";
+    }
+
+    final here = _currentMapSpaceId;
+    if (here == null || info.spaceId != here) {
+      return 'That meeting is in another Gather space.';
+    }
+
+    final room = map?.rooms.where((r) => r.id == info.areaId).firstOrNull;
+    if (room == null) return "Can't find that room on the floor plan.";
+
+    return _enterOrAsk(room);
+  }
+
+  /// Walks into [room], or — when it is locked and we are not admitted — asks to be
+  /// let in instead. The second case is the one the floor plan cannot act on alone:
+  /// a locked door is opened by the host accepting an `AreaAccessRequest`, and once
+  /// they do the map lets us walk in on the next try.
+  Future<String?> _enterOrAsk(SpaceRoom room) {
+    if (room.locked && !canEnter(room)) return Future.value(_askToEnter(room));
+    return goToRoom(
+      room,
+      toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+    );
+  }
+
+  /// Asks the host to be let into a locked [room]. Fire-and-forget: the acceptance,
+  /// when it comes, arrives as a patch the map already reads.
+  String _askToEnter(SpaceRoom room) {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    final sent = collector.requestToAccess(room.id);
+    if (!sent.ok) return sent.detail ?? "Couldn't ask to join.";
+    return 'Asked to join ${room.name ?? 'the meeting'} — walk in once you are let in.';
+  }
+
+  /// The device calendars the user could mirror plans into. Empty when permission
+  /// has not been granted or the build has no calendar plugin (the no-op mirror).
+  Future<List<MirrorCalendar>> writableCalendars() => _calendarMirror.writableCalendars();
+
+  /// Chooses the device calendar to mirror plans into, or null to stop mirroring,
+  /// and brings every existing plan into line with the choice: turning mirroring on
+  /// pushes the plans that are not yet there, turning it off leaves the calendar
+  /// events in place (they are the user's now) but forgets their ids and re-arms the
+  /// app's own reminders; switching between calendars does both — forgets the ids
+  /// into the calendar being left, then pushes every future plan into the new one.
+  Future<void> setMirrorCalendar(String? calendarId) async {
+    if (_mirrorCalendarId == calendarId) return;
+    final leavingACalendar = _mirrorCalendarId != null;
+    _mirrorCalendarId = calendarId;
+    await _uiPrefs.saveMirrorCalendarId(calendarId);
+    notifyListeners();
+
+    // Leaving a calendar (turning off, or switching away): the stored device-event
+    // ids name events in the calendar we just left, so they mean nothing here now.
+    // Forget them — the events themselves stay put, they are the user's — and re-arm
+    // the local reminder for every future plan, which those ids had been suppressing.
+    // Without this the plans go silent: no app reminder, and no alert in the new
+    // calendar either, because the backfill below skips anything that still looks
+    // mirrored.
+    if (leavingACalendar) {
+      _plannedMeetings = [
+        for (final m in _plannedMeetings)
+          m.deviceEventId == null ? m : m.withDeviceEventId(null),
+      ];
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+      for (final m in _plannedMeetings) {
+        await _scheduleReminder(m);
+      }
+    }
+
+    if (calendarId == null) return;
+
+    // Mirroring is on now (freshly, or onto a different calendar): push every future
+    // plan not already in this calendar. When a write lands, cancel the app's own
+    // reminder for it — the calendar event carries the OS's alert, and keeping ours
+    // would buzz the phone twice for one meeting.
+    var changed = false;
+    final next = [..._plannedMeetings];
+    for (var i = 0; i < next.length; i++) {
+      if (next[i].isPast || next[i].deviceEventId != null) continue;
+      final mirrored = await _mirror(next[i]);
+      if (mirrored.deviceEventId != null) {
+        next[i] = mirrored;
+        changed = true;
+        await _notifier.cancelReminder(_reminderId(mirrored));
+      }
+    }
+    if (changed) {
+      _plannedMeetings = next;
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+    }
+  }
+
+  /// Writes a plan into the chosen device calendar and returns the copy to store.
+  ///
+  /// Mirroring off: the meeting is returned unchanged. Mirroring on: the returned
+  /// copy carries the new device-event id on success, or has any stale id *cleared*
+  /// on failure — so an update whose write did not land falls back to the app's own
+  /// reminder rather than being suppressed by an id pointing at an event that was
+  /// never (re)written. Never throws — the mirror's own contract.
+  Future<PlannedMeeting> _mirror(PlannedMeeting meeting) async {
+    final calendarId = _mirrorCalendarId;
+    if (calendarId == null) return meeting;
+    final eventId = await _calendarMirror.createOrUpdate(meeting, calendarId: calendarId);
+    return meeting.withDeviceEventId(eventId);
+  }
+
+  /// Schedules a meeting's reminder, unless it is mirrored into the device calendar
+  /// — that event carries the OS's own alert, and scheduling ours too would buzz
+  /// the phone twice for one meeting. A past meeting schedules nothing; the notifier
+  /// guards that too, but checking here keeps a reminder id from being spent on it.
+  Future<void> _scheduleReminder(PlannedMeeting meeting) async {
+    if (meeting.isPast) return;
+    if (meeting.deviceEventId != null) return;
+    if (meeting.remindAt.isBefore(_now())) return;
+    await _notifier.scheduleReminder(
+      id: _reminderId(meeting),
+      when: meeting.remindAt,
+      title: 'Upcoming: ${meeting.title}',
+      body: meeting.roomName == null ? 'Starting soon' : 'In ${meeting.roomName}',
+    );
+  }
+
+  /// Re-arms every future meeting's reminder. Scheduled notifications do not
+  /// survive a reinstall or a reboot, so [boot] replays them off the stored list —
+  /// the same reason the list is reloaded there rather than kept only in memory.
+  Future<void> _rescheduleAllReminders() async {
+    for (final meeting in _plannedMeetings) {
+      await _scheduleReminder(meeting);
+    }
   }
 
   /// The desk Gather has given me, or null if it has given me none.
@@ -2095,6 +3504,7 @@ class AppState extends ChangeNotifier {
   /// reports on every idle and focus change; the phone's equivalent is the
   /// lifecycle, which is where this is called from.
   Future<void> setActive(bool active) async {
+    _active = active;
     _collector?.setActive(active);
   }
 
@@ -2174,6 +3584,18 @@ class AppState extends ChangeNotifier {
       // Same reasoning: the kart appearing and disappearing is a thing the screen
       // shows, and it happens mid-walk rather than on a roster boundary.
       onGaitChanged: notifyListeners,
+      // A buffer of moves the server never confirmed means we are walking ahead of
+      // an avatar nobody else can see. Hand it straight to the collector's
+      // presence recovery; it debounces, so firing per overflow is safe.
+      onMovesUnconfirmed: () => _collector?.notePresenceDoubt(),
+      // A confirmed step after that doubt means the server is applying our moves
+      // again — the one proof a walk-triggered recovery took, since we stayed
+      // reported-connected throughout. Clears the recovery before its grace reconnects.
+      onMovesConfirmed: () => _collector?.noteMovesConfirmed(),
+      // The movement wake, fired on each optimistic step so the avatar leaves on
+      // the press rather than on the roster that confirms it a round-trip later —
+      // the same `_positions.tick()` a roster and a party hop already pump.
+      onStepped: _positions.tick,
       log: _log,
     )..boost = _boost;
 
@@ -2193,9 +3615,16 @@ class AppState extends ChangeNotifier {
           _noteDirectory(roster);
           _noteCluster(roster);
           _noteSpeakers(roster);
+          _noteHands(roster);
           final out = _tracker.applyRoster(roster);
           _onFold(out);
           _noteMine();
+          // After `_noteMine`, so it reads this roster's availability and the held
+          // cluster `_noteCluster` just settled.
+          _noteSelfHealth();
+          // After the fold, when `inCall` reflects this roster: a hand raised in a
+          // meeting we have since walked out of comes down here.
+          _lowerHandIfOutOfMeeting();
         }),
       )
       ..add(
@@ -2235,6 +3664,9 @@ class AppState extends ChangeNotifier {
       // by the now-stale baseline. Only adopt the probe if nothing arrived first.
       final seen = await _connectivityNow();
       _lastConnectivity ??= seen;
+      // Suspend the collector up front if we launched with no transport, so a phone
+      // opened in flight mode never starts the deaf-timer spin (issue #8).
+      _collector?.setReachable(!_isOffline());
     } on Object {
       // The watcher degrades to the deaf-timer, which is where we started.
     }
@@ -2284,6 +3716,9 @@ class AppState extends ChangeNotifier {
       // cooldown and fall back to the 45s deaf-timer — the very wait this watcher exists to avoid.
       _lastNetResync = null;
       final collector = _collector;
+      // Suspend reconnects outright: offline is a dead end and the deaf-timer would
+      // otherwise spin connect attempts that cannot succeed (issue #8). Idempotent.
+      collector?.setReachable(false);
       if (collector != null && !_link.isOffline) {
         _link = const LinkStatus(LinkState.offline, 'No connection — waiting for network.');
         _suspendOnlineActivity('no network');
@@ -2291,6 +3726,10 @@ class AppState extends ChangeNotifier {
       }
       return;
     }
+    // A transport is present again: lift the offline suspend before anything else, so
+    // the resync below — or the deaf-timer, if this event is filtered out as a repeat —
+    // is allowed to reconnect (issue #8). Idempotent while already reachable.
+    _collector?.setReachable(true);
     if (before != null &&
         before.length == now.length &&
         before.toSet().containsAll(now)) {
@@ -2311,6 +3750,13 @@ class AppState extends ChangeNotifier {
     _link = const LinkStatus(LinkState.retrying, 'Network changed — reconnecting.');
     notifyListeners();
     unawaited(collector.resync());
+    // resync() reconnects only the game socket. The SFU socket sleeps through the
+    // transport change on a connection it still believes is alive, so its token
+    // goes stale and every republish is refused `bad auth` until a full restart
+    // (#57). Rebuild the media session too — `_start()` mints a fresh token.
+    // rebuild() no-ops when there is no session, and this shares the 5s resync
+    // cooldown above, so a flapping radio cannot spam it.
+    unawaited(_call?.rebuild() ?? Future<void>.value());
   }
 
   Future<void> _detach() async {
@@ -2352,6 +3798,7 @@ class AppState extends ChangeNotifier {
     // inherited by whoever pairs this phone next.
     reactions.clear();
     _amSpeaking = false;
+    _myHandRaised = false;
 
     for (final sub in subs) {
       await sub.cancel();
@@ -2498,8 +3945,11 @@ class AppState extends ChangeNotifier {
     _noteDirectory(roster);
     _noteCluster(roster);
     _noteSpeakers(roster);
+    _noteHands(roster);
     _onFold(_tracker.applyRoster(roster));
     _noteMine();
+    _noteSelfHealth();
+    _lowerHandIfOutOfMeeting();
   }
 
   /// Feeds a feed in as though Gather had answered, so the activity screen can be
@@ -2572,6 +4022,10 @@ class AppState extends ChangeNotifier {
     // otherwise fire into a call that has already been torn down.
     _clusterDebounce?.cancel();
     _clusterDebounce = null;
+    _clusterHoldTimer?.cancel();
+    _clusterHoldTimer = null;
+    _selfHealCooldown?.cancel();
+    _selfHealCooldown = null;
     unawaited(_detach());
     // After `_detach`, which clears it: a `ChangeNotifier` notified after it has
     // been disposed throws, and `_detach` reaches that line before its first

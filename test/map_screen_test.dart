@@ -85,6 +85,19 @@ SpaceRoom _everywhere({required String type, String? name}) => SpaceRoom(
       walled: false,
     );
 
+/// Records where a walk is aimed and reports it as sent, standing in for the collector
+/// the real [AppState.goTo] needs — so a test can read back the destination the card
+/// handed it instead of only seeing the offline refusal.
+class _RecordingGoTo extends AppState {
+  final destinations = <(int, int)>[];
+
+  @override
+  Future<String?> goTo(int x, int y) async {
+    destinations.add((x, y));
+    return null;
+  }
+}
+
 void main() {
   // The same pair of listenables the app opens this screen with. `state` alone is
   // not enough: walking is not a presence event, so a roster where everybody moved
@@ -636,6 +649,92 @@ void main() {
 
       expect(_officePainter(tester).shouldRepaint(before), isTrue,
           reason: 'the reticle has to be drawn');
+    });
+  });
+
+  group('walking to a person', () {
+    // A body and me on the same tile, so the centre tap that lands on my own tile
+    // falls on them instead — peopleOnMap leaves me out, so the only person under the
+    // tap is the other one. It saves pinning a pixel to a body (see [_everywhere]) and
+    // is the one deterministic way to raise the person card in a test.
+    AppState withPersonUnderCentre() => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugCanWalk = true
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [
+        _row('me', 5, 5),
+        _row('ada', 5, 5, name: 'Ada'),
+      ]));
+
+    testWidgets('the card offers a walk as well as a wave', (tester) async {
+      // The whole of this change: you can go to somebody, not only hail them.
+      await tester.pumpWidget(wrap(withPersonUnderCentre()));
+      await tester.pumpAndSettle();
+
+      await tapFloor(tester);
+
+      expect(find.text('Ada'), findsOneWidget, reason: 'the body under the tap is picked');
+      expect(find.text('Go here'), findsOneWidget);
+      expect(find.text('Wave'), findsOneWidget);
+    });
+
+    testWidgets("Go here sends that person's tile and takes the card down", (tester) async {
+      // A recording state so the walk succeeds and its destination can be read back:
+      // the refusal path alone would pass even if this forwarded the wrong person's
+      // position, because goTo bails before it ever looks at a coordinate.
+      final state = _RecordingGoTo()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugCanWalk = true
+        ..debugMap = _map()
+        ..debugApplyRoster(Roster(selfId: 'me', rows: [
+          _row('me', 5, 5),
+          _row('ada', 5, 5, name: 'Ada'),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+      await tapFloor(tester);
+
+      await tester.tap(find.text('Go here'));
+      await tester.pump();
+
+      expect(state.destinations, [(5, 5)], reason: "Ada's tile is where the walk is sent");
+      expect(find.text('Ada'), findsNothing, reason: 'the card is dropped the moment it is acted on');
+    });
+
+    testWidgets('a refused Go here still takes the card down and says why', (tester) async {
+      // No collector behind this state, so the walk is refused — the card comes down
+      // either way, and the refusal is shown rather than swallowed.
+      await tester.pumpWidget(wrap(withPersonUnderCentre()));
+      await tester.pumpAndSettle();
+      await tapFloor(tester);
+
+      await tester.tap(find.text('Go here'));
+      await tester.pump();
+
+      expect(find.text('Ada'), findsNothing, reason: 'the card is dropped the moment it is acted on');
+      expect(find.text('Not connected to Gather.'), findsOneWidget);
+    });
+
+    testWidgets('both actions fit a narrow phone at a large text scale', (tester) async {
+      // 375 points wide at 2x text: the avatar, both pills and the close button are all
+      // fixed-width, so one Row would run past the edge and clip. The Wrap drops the
+      // actions onto a second line rather than overflowing — proven by the absence of a
+      // RenderFlex exception with both pills still on screen.
+      tester.view.physicalSize = const Size(375, 780);
+      tester.view.devicePixelRatio = 1.0;
+      tester.platformDispatcher.textScaleFactorTestValue = 2.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+
+      await tester.pumpWidget(wrap(withPersonUnderCentre()));
+      await tester.pumpAndSettle();
+      await tester.tapAt(const Offset(187, 390));
+      await tester.pump();
+
+      expect(tester.takeException(), isNull, reason: 'no RenderFlex overflow at 2x text');
+      expect(find.text('Go here'), findsOneWidget);
+      expect(find.text('Wave'), findsOneWidget);
     });
   });
 
@@ -1205,6 +1304,95 @@ void main() {
       expect(cam.getTranslation().x, closeTo(want.getTranslation().x, 0.5),
           reason: 'back to centre after the re-grab');
       expect(cam.getTranslation().y, closeTo(want.getTranslation().y, 0.5));
+    });
+  });
+
+  // A pan can carry your own avatar clean off the floor. The "Back to me" pill is the
+  // way back: present only while the avatar is off screen and nothing else holds the
+  // bottom slot, and it recentres the camera when tapped. Works the same in the office
+  // and inside the Gameboy LCD, since both render the one map.
+  group('back to me', () {
+    const viewport = Size(390, 780);
+
+    /// The office with me in the top-left corner, so a drag to the far corner can push
+    /// me fully off the glass. Not Gameboy mode: the plain office camera.
+    AppState office() => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugCanWalk = true
+      ..debugMap = _map()
+      ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+
+    Future<void> mount(WidgetTester tester, AppState state) async {
+      tester.view.physicalSize = viewport;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump(); // layout
+      await tester.pump(); // the post-frame opening shot centres me
+    }
+
+    /// Drag the floor far enough that the edge clamp strands my corner off screen.
+    Future<void> panAway(WidgetTester tester) async {
+      await tester.drag(find.byType(InteractiveViewer), const Offset(-4000, -4000));
+      await tester.pump();
+    }
+
+    testWidgets('is absent while my avatar is on screen', (tester) async {
+      await mount(tester, office());
+      expect(find.text('Back to me'), findsNothing);
+    });
+
+    testWidgets('appears once a pan carries my avatar off screen', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget);
+    });
+
+    testWidgets('yields the slot the moment something is selected', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget, reason: 'off screen, so offered');
+
+      // A tap in the middle of the glass picks a tile — me is off in the corner, so it
+      // is not the clear-the-selection tile. The selection owns the slot now.
+      await tester.tapAt(const Offset(195, 390));
+      await tester.pump();
+      expect(find.text('Back to me'), findsNothing);
+    });
+
+    testWidgets('tapping it brings the camera back and takes itself down', (tester) async {
+      await mount(tester, office());
+      await panAway(tester);
+      expect(find.text('Back to me'), findsOneWidget);
+
+      await tester.tap(find.text('Back to me'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400)); // the eased camera arrives
+      expect(find.text('Back to me'), findsNothing,
+          reason: 'the avatar is back on screen, so there is nothing to go back to');
+    });
+
+    testWidgets('works inside the Gameboy LCD: a broken lock, then a tap re-grabs it',
+        (tester) async {
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugCanWalk = true
+        ..debugMap = _map()
+        ..setGameboyMode(true)
+        ..debugApplyRoster(Roster(selfId: 'me', rows: [_row('me', 1, 1, name: 'Me')]));
+      await mount(tester, state);
+      await tester.pump(const Duration(seconds: 1)); // the lock eases home first
+
+      // The pan drops the Gameboy lock and strands the avatar off the LCD.
+      await panAway(tester);
+      await tester.pump(const Duration(seconds: 1)); // a still-locked ticker would yank it back
+      expect(find.text('Back to me'), findsOneWidget);
+
+      await tester.tap(find.text('Back to me'));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1)); // the re-grabbed lock re-settles
+      expect(find.text('Back to me'), findsNothing,
+          reason: 'the lock re-centred the avatar');
     });
   });
 }

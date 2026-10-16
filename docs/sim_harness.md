@@ -1,15 +1,31 @@
-# Simulator mock harness — whole app, call & spotlight
+# Simulator mock harness — the whole app, on a bare simulator
 
-A second `flutter run` target that boots straight into a **scripted scene** on the
-iOS simulator — no login, no WebRTC, no Gather backend. Two targets, chosen with
-`--dart-define=TARGET`:
+**This is the harness to use for driving Gather Companion on the iOS simulator** —
+for a human eyeballing a change or an autonomous agent (`idb` + screenshots). It is
+a `flutter run` target that boots straight into a **scripted scene** with **no
+login, no WebRTC, no camera, no Gather backend** behind it. Nothing reaches the
+network and nothing touches real simulator state.
 
-- **`call`** (default) — straight into the call screen on a scripted multi-party
-  call, for the `feature/call-spotlight` big-view auto mode.
-- **`app`** — the *whole app*: it boots the real pair→home flow into `HomeShell`
-  with a `FakeCollector` standing in for the Gather socket, so the **Office is
-  walkable**, **party mode runs**, and the **Activity feed fills** — all with no
+By default it is the **whole app**, so there is one place to test everything rather
+than a call-only stub wired halfway. Two targets, chosen with `--dart-define=TARGET`:
+
+- **`app`** (default) — the *whole app*: it boots the real pair→home flow into
+  `HomeShell` with a `FakeCollector` standing in for the Gather socket, so the
+  **Office is walkable**, people **mill about and talk**, the **Activity feed
+  fills**, **Dial warps into a real call**, **Gameboy mode** opens, and the call's
+  **door walks your character back to its desk** and into the office — all with no
   network. Tap a tile to walk; `idb`-drive it like any other screen.
+- **`call`** — a quick shortcut that boots **straight into the call screen** on a
+  scripted multi-party call, for a fast spotlight-only look without walking there.
+
+**The simulator has no camera**, so a real WebRTC stream cannot exist. Both targets
+paint **stand-in footage** into the call tiles instead (`lib/harness/demo_footage.dart`):
+a moving test card per person — a mix of camera aspects (16:9, 9:16, 4:3, 1:1) so
+the layout is seen cropping real shapes, with a **double-tap** (or the **Fit/Fill**
+button on the big tile) to toggle cover↔letterbox and pinch-to-zoom. It is wired in
+through the `debugCallTileBuilder` seam (`call_screen.dart`), which every
+`openCallScreen` reads; it is null in production, where the real `_VideoTile`
+renders real streams.
 
 It is the gather equivalent of `beacon_manager`'s `example/lib/main.dart` harness.
 
@@ -17,7 +33,8 @@ It is the gather equivalent of `beacon_manager`'s `example/lib/main.dart` harnes
 
 | File | Role |
 |------|------|
-| `lib/main_harness.dart` | Entrypoint. `TARGET=call` mounts `CallScreen`; `TARGET=app` injects the fakes, `boot()`s, and mounts the real phase switch (booting→pairing→home). |
+| `lib/main_harness.dart` | Entrypoint. `TARGET=app` (default) injects the fakes, `boot()`s, and mounts the real phase switch (booting→pairing→home); `TARGET=call` mounts `CallScreen` directly. Sets `debugCallTileBuilder` so both targets get stand-in footage. |
+| `lib/harness/demo_footage.dart` | `demoFootageTile` + `DemoFootage` — the stand-in "video": a moving test card fit to cover a tile, with a Fit/Fill toggle and pinch-zoom, since the simulator has no camera. |
 | `lib/harness/scripted_call.dart` | `ScriptedCall implements Call` — a drivable fake: `emit(CallState)` and `speak(bool)`, every hardware/SFU method a recorded no-op. |
 | `lib/harness/fake_collector.dart` | `FakeCollector implements Collector` — the presence-plane fake. Holds a mutable roster; `move`/`teleport` advance my tile and **re-emit `rosters`** (the server's half of a step), so the real `Walk`/`PartyMode` drive my avatar against it. `placePerson`/`stepPerson`/`publish`/`wave` are the scenario's levers. |
 | `lib/harness/harness_data.dart` | The fake cast, the call roster builders (`CallParticipant.srcId == RosterRow.userAccountId`, one `clusterId`), **and** the schematic office — `schematicOffice()` (plain grid, a few rooms, no sprite art) with start tiles and map-plane row builders. |
@@ -39,16 +56,20 @@ texture, no sprite art is fetched.
 # list booted simulators
 xcrun simctl list devices booted
 
-# the call screen (spotlight)
+# the whole app (default) — boots into the Office, walkable, feed alive, Dial
+# warps into a real call, Gameboy mode opens, the call door walks you to your desk
+flutter run -t lib/main_harness.dart -d <sim-udid>
+
+# …or pick a scenario / cast size explicitly
+flutter run -t lib/main_harness.dart -d <sim-udid> \
+  --dart-define=SCENARIO=office --dart-define=PARTICIPANTS=4
+
+# the call screen only (quick spotlight look, no walking there)
 flutter run -t lib/main_harness.dart -d <sim-udid> \
   --dart-define=TARGET=call --dart-define=SCENARIO=roundrobin --dart-define=PARTICIPANTS=4
-
-# the whole app — boots into the Office, walkable, feed alive
-flutter run -t lib/main_harness.dart -d <sim-udid> \
-  --dart-define=TARGET=app --dart-define=SCENARIO=office --dart-define=PARTICIPANTS=4
 ```
 
-- `TARGET` — `call` (default) or `app`.
+- `TARGET` — `app` (default) or `call`.
 - `SCENARIO` — a call scenario or an app scenario name (see below).
 - `PARTICIPANTS` — how many of the cast to seat, 1–8 (default `4`).
 
@@ -157,7 +178,8 @@ finds them:
   big view to the scenario.
 - **A face** — grid tiles key `ValueKey(<tile.id>)`; in the big view the strip
   tiles key `ValueKey('strip-<tile.id>')` and the enlarged face
-  `ValueKey('big-<tile.id>')`. Tapping a face enlarges (manual) or pins it (auto).
+  `ValueKey('big-<tile.id>')`. Tapping a face enlarges it (manual); tapping in
+  auto switches to manual and watches that face.
 - **`Everyone`** — the return button (`_OverviewButton`, label `"Everyone"`) back
   to the grid.
 

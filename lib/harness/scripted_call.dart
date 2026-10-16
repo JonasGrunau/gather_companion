@@ -22,6 +22,7 @@ class ScriptedCall implements Call {
   /// What the call screen's buttons asked for, kept so a harness can show it.
   final List<bool> micCalls = [];
   final List<bool> cameraCalls = [];
+  final List<bool> screenCalls = [];
   final List<bool> speakerCalls = [];
   final List<({List<String> srcIds, VideoQuality quality})> watching = [];
 
@@ -62,6 +63,12 @@ class ScriptedCall implements Call {
   }
 
   @override
+  Future<String?> setScreenShareOn(bool on) async {
+    screenCalls.add(on);
+    return null;
+  }
+
+  @override
   Future<String?> setSpeakerOn(bool on) async {
     speakerCalls.add(on);
     return null;
@@ -88,6 +95,9 @@ class ScriptedCall implements Call {
 
   @override
   Future<void> hangUp() async {}
+
+  @override
+  Future<void> rebuild() async {}
 
   @override
   Future<void> dispose() async {

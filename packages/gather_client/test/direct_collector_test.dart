@@ -43,7 +43,10 @@ void main() {
 
   DirectCollector build({
     String? spaceId = 'space-1',
+    String? socketUrl,
     Duration? silenceLimit,
+    Duration? selfAbsentLimit,
+    Duration? reenterGrace,
     void Function(String)? log,
   }) {
     final auth = GatherAuth(
@@ -53,11 +56,30 @@ void main() {
     return collector = DirectCollector(
       auth: auth,
       spaceId: spaceId,
-      socketUrl: gather.url,
+      socketUrl: socketUrl ?? gather.url,
       log: log,
       silenceLimit: silenceLimit ?? const Duration(seconds: 45),
+      // Short by default so the presence ladder's two stages are observable inside
+      // a test's patience; raised per-test where a stage must *not* fire.
+      selfAbsentLimit: selfAbsentLimit ?? const Duration(milliseconds: 150),
+      reenterGrace: reenterGrace ?? const Duration(milliseconds: 150),
     );
   }
+
+  /// How many `enterSpace` frames this connection has received — one per entry,
+  /// so more than one means a re-enter went out.
+  int entersOn(FakeConnection conn) =>
+      conn.received.where((f) => f['action'] == 'enterSpace').length;
+
+  /// Merge a change into our own `SpaceUser` row via a delta, the way the server
+  /// does. [fields] is spread over `{id: 'me-1'}`.
+  void patchSelf(FakeConnection conn, Map<String, Object?> fields) => conn.delta([
+        {
+          'op': 'addmodel',
+          'model': 'SpaceUser',
+          'data': {'id': 'me-1', ...fields},
+        },
+      ]);
 
   test('the handshake is sent in order, then enters once the dump names us', () async {
     final c = build()..start();
@@ -234,6 +256,27 @@ void main() {
       // Three separate actions rather than one with a number in it, and each takes
       // nothing — so the tuple is two long, not three padded with null.
       expect(sent['args'], ['SpaceUser', 'me-1']);
+    });
+
+    test('requestToAccess addresses a MapArea by id, with no arguments', () async {
+      final c = build()..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      expect(c.requestToAccess('area-9').ok, isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      final sent = await conn.waitFor('requestToAccess');
+      // Unlike every other action, addressed to the area and not our own avatar —
+      // and no third element, like the no-arg actions.
+      expect(sent['args'], ['MapArea', 'area-9']);
+    });
+
+    test('requestToAccess refuses an empty area id before sending', () {
+      final c = build()..start();
+      final sent = c.requestToAccess('');
+      expect(sent.ok, isFalse);
+      expect(sent.detail, contains('no area'));
     });
 
     test('each gait names its own action', () async {
@@ -576,6 +619,264 @@ void main() {
 
       expect(gather.connections, hasLength(1), reason: 'a live socket must not be reconnected');
       expect(c.healthy, isTrue);
+    });
+
+    test('while unreachable the deaf socket stands down and makes no attempt', () async {
+      // Issue #8: offline is a dead end. Before this, the deaf watchdog kept tearing
+      // the socket down and reconnecting into no network — ~14 attempts a second —
+      // burning battery exactly when there is least to spare. Told it is unreachable,
+      // the collector must sit still: no reconnect, no "went deaf", until a transport
+      // returns.
+      final lines = <String>[];
+      final c = build(silenceLimit: const Duration(milliseconds: 300), log: lines.add)..start();
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the first dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      // The radio drops — what AppState signals the instant connectivity reports offline.
+      c.setReachable(false);
+      final connectsAtOffline = gather.connections.length;
+
+      // Well past the deaf limit: a reachable collector would have reconnected by now.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(gather.connections.length, connectsAtOffline,
+          reason: 'no reconnect may be attempted while offline');
+      expect(lines.any((l) => l.contains('went deaf')), isFalse,
+          reason: 'the deaf watchdog stands down while offline, got $lines');
+
+      // A transport returns: reconnect from the backoff floor, at once.
+      c.setReachable(true);
+      await firstWhere(gather.onDumped, (_) => true, reason: 'a reconnect once back online')
+          .timeout(const Duration(seconds: 5));
+      expect(gather.connections.length, greaterThan(connectsAtOffline),
+          reason: 'a returning transport reconnects');
+    });
+
+    test('a resync while unreachable makes no connect attempt', () async {
+      // Issue #8, finding 1: every connect funnels through `_connectNow`, so the
+      // offline gate has to live there — not only in the deaf watchdog. `AppState`
+      // calls `resync()` on app resume (verifyLink). Resumed while offline, that must
+      // not open a socket into no network and defeat the stand-down.
+      final c = build(silenceLimit: const Duration(milliseconds: 300))..start();
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the first dump');
+
+      c.setReachable(false);
+      final connectsAtOffline = gather.connections.length;
+
+      final result = await c.resync();
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(gather.connections.length, connectsAtOffline,
+          reason: 'resync must not connect while offline, got ${result.detail}');
+    });
+
+    test('frameless reconnects grow the backoff, and a frame resets it', () async {
+      // The primary regression issue #8 fixed: the backoff reset used to live on
+      // socket-open, so in a dead zone every connect-then-deaf cycle pinned it at the
+      // 1s floor and the retry never backed off. The reset now lives on a received
+      // frame, so repeated frameless connects must climb — and a frame must still drop
+      // it back to the floor. A silent server is the dead zone: it accepts the socket
+      // and says nothing.
+      final silent = await FakeGatherServer.start(silent: true);
+      addTearDown(silent.close);
+      final c = build(
+        socketUrl: silent.url,
+        silenceLimit: const Duration(milliseconds: 60),
+      )..start();
+
+      Future<void> waitUntil(bool Function() cond, {String reason = 'a condition'}) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!cond()) {
+          if (DateTime.now().isAfter(deadline)) throw StateError('timed out: $reason');
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      }
+
+      // First connect fell deaf and the retry fired a second. With the reset off
+      // socket-open, that second connect must have let the backoff double past the
+      // floor rather than resetting it.
+      await waitUntil(() => silent.connections.length >= 2, reason: 'a second connect');
+      expect(c.stats()['backoffMs'] as int, greaterThan(1000),
+          reason: 'a frameless reconnect must let the backoff grow');
+
+      // A frame lands on the live socket — proof the pipe carries data — so the next
+      // retry drops back to the floor.
+      silent.latest!.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      await waitUntil(() => c.stats()['backoffMs'] == 1000,
+          reason: 'a received frame resets the backoff to the floor');
+    });
+  });
+
+  group('staying visible to other people', () {
+    // The case `healthy` cannot see. Frames keep arriving and the roster is current,
+    // so the inbound light stays green — but the roster no longer holds a present,
+    // placed us, which is exactly how we go missing from everyone else's office while
+    // our own screen looks fine. The ladder is two rungs: a quiet re-enter, then a
+    // reconnect that finally shows the banner.
+
+    Future<void> waitUntil(bool Function() cond, {String reason = 'a condition'}) async {
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (!cond()) {
+        if (DateTime.now().isAfter(deadline)) throw StateError('timed out waiting for $reason');
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+    }
+
+    Future<({DirectCollector c, FakeConnection conn})> entered({
+      Duration? selfAbsentLimit,
+      Duration? reenterGrace,
+      void Function(String)? log,
+    }) async {
+      final c = build(selfAbsentLimit: selfAbsentLimit, reenterGrace: reenterGrace, log: log)
+        ..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      // Polled, not awaited off `statuses`: health flips true in the same flush as
+      // the first roster, which has already passed on this broadcast stream by now.
+      await waitUntil(() => c.healthy, reason: 'a healthy collector');
+      await pumpEventQueue();
+      return (c: c, conn: conn);
+    }
+
+    test('losing our own row re-enters quietly, and getting it back needs no reconnect',
+        () async {
+      // reenterGrace long, so the quiet rung has every chance and the loud one does
+      // not get to fire: the whole point is that a blip self-heals with no banner.
+      final (:c, :conn) = await entered(reenterGrace: const Duration(seconds: 5));
+      expect(entersOn(conn), 1, reason: 'entered once on connect');
+
+      patchSelf(conn, {'connected': false}); // we drop off the roster others see
+      await waitUntil(() => entersOn(conn) >= 2, reason: 'a silent re-enter');
+
+      expect(gather.connections, hasLength(1), reason: 'the quiet rung does not reconnect');
+      expect(c.healthy, isTrue, reason: 'and says nothing to the user');
+
+      patchSelf(conn, {'connected': true}); // the re-enter takes
+      await pumpEventQueue();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(gather.connections, hasLength(1), reason: 'seeing ourselves again ends it');
+      expect(c.healthy, isTrue);
+    });
+
+    test('a re-enter that does not bring us back reconnects and raises the banner',
+        () async {
+      final (:c, :conn) = await entered(reenterGrace: const Duration(milliseconds: 150));
+      patchSelf(conn, {'connected': false}); // and never restored
+
+      final loud = await firstWhere(
+        c.statuses,
+        (s) => !s.healthy && (s.detail?.contains('restoring your presence') ?? false),
+        reason: 'the banner',
+      );
+      expect(loud.healthy, isFalse);
+      // The reconnect's fresh dump carries a present us again, so the second
+      // connection is the recovery landing.
+      await firstWhere(gather.onDumped, (_) => true, reason: 'a reconnect')
+          .timeout(const Duration(seconds: 5));
+      expect(gather.connections.length, greaterThanOrEqualTo(2));
+    });
+
+    test('a blink of absence under the limit never re-enters or reconnects', () async {
+      // Smoothness: a working app stays a working app through a short gap. The limit
+      // is generous and the gap is well inside it, so nothing should stir.
+      final (:c, :conn) = await entered(selfAbsentLimit: const Duration(seconds: 3));
+      patchSelf(conn, {'connected': false});
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      patchSelf(conn, {'connected': true});
+
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(entersOn(conn), 1, reason: 'no re-enter for a blink');
+      expect(gather.connections, hasLength(1));
+      expect(c.healthy, isTrue);
+    });
+
+    test('a chosen Offline, still connected and placed, is left alone', () async {
+      // The deliberate-away case, and the reason presence is a connection test rather
+      // than an isPresent one: a person can set Offline and keep it for hours. Our row
+      // is still connected and on a tile, so recovery must not fire and drag them back
+      // online against their choice.
+      final (:c, :conn) = await entered(selfAbsentLimit: const Duration(milliseconds: 150));
+      patchSelf(conn, {'userSetAvailability__value': 'Offline'});
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(entersOn(conn), 1, reason: 'Offline-but-connected is not a disappearance');
+      expect(gather.connections, hasLength(1));
+      expect(c.healthy, isTrue);
+    });
+
+    test('the walk engine reporting unapplied moves re-enters at once', () async {
+      // notePresenceDoubt is the walking accelerator: stronger evidence than an
+      // absent row, so it does not wait out selfAbsentLimit. Self stays visible the
+      // whole time — the stall is moves being ignored, not our row vanishing — so the
+      // grace is long here to isolate the one quiet re-enter.
+      final (:c, :conn) = await entered(
+        selfAbsentLimit: const Duration(seconds: 10),
+        reenterGrace: const Duration(seconds: 10),
+      );
+      expect(entersOn(conn), 1);
+      c.notePresenceDoubt();
+      await waitUntil(() => entersOn(conn) >= 2, reason: 'a re-enter from the walk signal');
+      expect(gather.connections, hasLength(1));
+      expect(c.healthy, isTrue);
+    });
+
+    test('a walk re-enter is not cleared by the visibility it never lost', () async {
+      // The bug this guards: with self still visible throughout, the next flush used
+      // to call _notePresenceOk and drop the re-enter. Each later overflow then sent a
+      // fresh enterSpace, racking up numTimesEnteredSpace. The re-enter must stay
+      // latched, so repeated doubt is a no-op until it resolves.
+      final (:c, :conn) = await entered(
+        selfAbsentLimit: const Duration(seconds: 10),
+        reenterGrace: const Duration(seconds: 10),
+      );
+      c.notePresenceDoubt();
+      await waitUntil(() => entersOn(conn) >= 2, reason: 'the one re-enter');
+
+      // Several more overflows arrive while the first re-enter is still outstanding.
+      for (var i = 0; i < 5; i++) {
+        c.notePresenceDoubt();
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(entersOn(conn), 2, reason: 'doubt while re-entering sends no further enterSpace');
+      expect(gather.connections, hasLength(1));
+    });
+
+    test('a confirmed move settles a walk re-enter with no reconnect', () async {
+      // The repair signal visibility cannot give: a roster finally lands us on a tile
+      // we stepped onto, so the server is applying our moves again. That — not
+      // selfVisible — is what ends the walk re-enter, and it ends it quietly.
+      final (:c, :conn) = await entered(
+        selfAbsentLimit: const Duration(seconds: 10),
+        reenterGrace: const Duration(seconds: 10),
+      );
+      c.notePresenceDoubt();
+      await waitUntil(() => entersOn(conn) >= 2, reason: 'the re-enter');
+
+      c.noteMovesConfirmed(); // the walk engine saw a step land
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(gather.connections, hasLength(1), reason: 'a confirmed move needs no reconnect');
+      expect(c.healthy, isTrue);
+
+      // And with the latch released, a fresh doubt can re-enter again.
+      c.notePresenceDoubt();
+      await waitUntil(() => entersOn(conn) >= 3, reason: 'doubt works again once settled');
+    });
+
+    test('a walk re-enter that never gets a move confirmed reconnects on the grace',
+        () async {
+      // The loud rung for the walking case. No confirmed move arrives within the
+      // grace, so the socket is no longer believed and the banner finally shows —
+      // which the old stale-visibility clear made unreachable.
+      final (:c, :conn) = await entered(reenterGrace: const Duration(milliseconds: 150));
+      expect(entersOn(conn), 1);
+      c.notePresenceDoubt();
+
+      final loud = await firstWhere(
+        c.statuses,
+        (s) => !s.healthy && (s.detail?.contains('restoring your presence') ?? false),
+        reason: 'the banner',
+      );
+      expect(loud.healthy, isFalse);
+      await firstWhere(gather.onDumped, (_) => true, reason: 'a reconnect')
+          .timeout(const Duration(seconds: 5));
+      expect(gather.connections.length, greaterThanOrEqualTo(2));
     });
   });
 

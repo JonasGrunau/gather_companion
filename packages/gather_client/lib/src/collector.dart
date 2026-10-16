@@ -78,6 +78,13 @@ abstract interface class Collector {
 
   // ---- what the app reads ----------------------------------------------------
 
+  /// The space this collector resolved and connected to, once it has one.
+  ///
+  /// The ground truth of which office the live reader is populated for — unlike the
+  /// roster-derived snapshot, it does not go blank between dumps, so a held map can
+  /// pin itself to it and know when a reconnect lands in a different space.
+  String? get spaceId;
+
   /// Our own `SpaceUser` id, once the dump has told us which row is us.
   String? get selfId;
 
@@ -134,13 +141,46 @@ abstract interface class Collector {
   /// Says whether we are talking. This is the speaking ring.
   ({bool ok, String? detail}) setSpeaking(bool speaking);
 
+  /// Puts our hand up in a meeting, or takes it down. The raised state is sticky:
+  /// it stays until this is called again, and every other client sees it as
+  /// `handRaisedAt` on our roster row.
+  ({bool ok, String? detail}) setHandRaised(bool raised);
+
+  /// Asks to be let into a locked area — a `MapArea` by its id. Fire-and-forget:
+  /// the server records an `AreaAccessRequest`, and when the host accepts it the
+  /// acceptance arrives as a patch the map already reads (it flips
+  /// `canEnterRoom`). The id is the area's [SpaceRoom.id], the same one a resolved
+  /// `/m/<link>` carries as `areaId`.
+  ({bool ok, String? detail}) requestToAccess(String areaId);
+
   /// Steps out of the huddle without walking away from it.
   ({bool ok, String? detail}) leaveCluster();
 
   /// Says whether the person is actually at the phone.
   ({bool ok, String? detail}) setActive(bool active);
 
+  /// A caller outside the socket suspects we have gone missing to other people —
+  /// the clearest case being the walk engine finding move after move that the
+  /// server never applied. The collector owns the one recovery path (re-enter,
+  /// then reconnect if that does not take); this lets the walk engine feed into
+  /// it without duplicating any of it. Idempotent and cheap: a no-op while a
+  /// recovery is already under way.
+  void notePresenceDoubt();
+
+  /// A move the walk engine was waiting on has finally been confirmed by a roster —
+  /// the server is applying our moves again. This is the only proof that a
+  /// walk-triggered recovery actually worked: with the socket still reporting us
+  /// connected and placed, [notePresenceDoubt]'s own `selfVisible` check stays true
+  /// throughout and can never clear the doubt it raised. Idempotent and cheap: a
+  /// no-op when no walk-triggered recovery is outstanding.
+  void noteMovesConfirmed();
+
   /// Reconnects, which is all a resync is here: the server replays the full state
   /// dump on every new connection.
   Future<({bool ok, String detail})> resync();
+
+  /// Suspends all reconnect attempts while the device reports no transport, and
+  /// resumes — reconnecting from the backoff floor — when one returns. Offline is a
+  /// known dead end: retrying into it only burns CPU and battery (issue #8).
+  void setReachable(bool reachable);
 }

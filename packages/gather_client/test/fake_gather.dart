@@ -176,8 +176,13 @@ class FakeGatherServer {
 
   FakeConnection? get latest => connections.isEmpty ? null : connections.last;
 
+  /// When true, the server upgrades the socket and then says nothing at all — no
+  /// heartbeat, no dump. This is the dead-zone case the backoff exists for: a connect
+  /// that succeeds onto an immediately-deaf pipe (issue #8). A test can still push
+  /// frames by hand through [latest] to prove a frame resets the backoff.
   static Future<FakeGatherServer> start({
     bool requireAuth = true,
+    bool silent = false,
     List<Map<String, Object?>> Function()? patches,
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -189,8 +194,9 @@ class FakeGatherServer {
       fake.connections.add(conn);
 
       // The real server heartbeats before the first state chunk, which is what makes
-      // a premature "handshake rejected" verdict so tempting.
-      conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      // a premature "handshake rejected" verdict so tempting. A silent server skips
+      // it on purpose, so the socket is deaf from the first byte.
+      if (!silent) conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
 
       socket.listen((data) {
         if (data is! List<int>) return;
@@ -210,6 +216,8 @@ class FakeGatherServer {
               (credential['jwt'] as String?)?.isNotEmpty == true;
         }
         if (decoded['action'] == 'loadSpaceUser') {
+          // A silent server never dumps — the pipe stays deaf no matter what we send.
+          if (silent) return;
           // Stay silent when unauthenticated, as Gather does.
           if (requireAuth && !conn.authenticated) return;
           conn.send({'type': 'SpaceStatus', 'warmInGatewayServer': true});

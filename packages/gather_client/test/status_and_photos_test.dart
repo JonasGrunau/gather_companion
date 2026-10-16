@@ -237,4 +237,26 @@ void main() {
       expect(rowFor(reader, 'ada')?.deskId, isNull);
     });
   });
+
+  group('the calendar email', () {
+    test('is read from calculatedPrimaryCalendarEmail', () {
+      // The one identity on the wire that ties a space-user to their calendar, so a
+      // companion can ask about their availability without a name guess.
+      reader.ingest(chunk([
+        add('SpaceUser', {
+          'id': 'guru',
+          'name': 'Guru',
+          'calculatedPrimaryCalendarEmail': 'kulkarni@safenow.de',
+        }),
+      ]));
+      expect(rowFor(reader, 'guru')?.calendarEmail, 'kulkarni@safenow.de');
+    });
+
+    test('is null for someone who has not connected a calendar', () {
+      reader.ingest(chunk([
+        add('SpaceUser', {'id': 'ada', 'name': 'Ada'}),
+      ]));
+      expect(rowFor(reader, 'ada')?.calendarEmail, isNull);
+    });
+  });
 }

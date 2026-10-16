@@ -51,6 +51,7 @@ library;
 import 'dart:convert';
 
 import 'avatar.dart';
+import 'msgpack.dart';
 import 'space_map.dart';
 
 /// Only these models matter; a full state dump is mostly calendars and catalogs.
@@ -153,6 +154,11 @@ const _trackedFields = {
   // also changes under you when a desk manager reassigns one, and the whole point
   // of tracking a field rather than remembering it is that the answer follows.
   'deskId',
+  // Whether their hand is up in a meeting. The wire carries a *timestamp*,
+  // `handRaisedAt`, not a bool — set when the hand goes up and `undefined` when it
+  // comes down (see [RosterRow.handRaised]). Tracked so a lowering patch, which
+  // arrives as a `replace` to `undefined`, is not dropped and a hand left stuck up.
+  'handRaisedAt',
 };
 
 /// One interaction off `DeltaState.events[]`.
@@ -275,6 +281,8 @@ class RosterRow {
     this.profilePictureId,
     this.deskId,
     this.status,
+    this.calendarEmail,
+    this.handRaised = false,
   });
 
   final String id;
@@ -368,6 +376,22 @@ class RosterRow {
 
   /// The line under their name, if it has not expired.
   final PersonStatus? status;
+
+  /// Their primary calendar address (`calculatedPrimaryCalendarEmail`), or null when
+  /// they have not connected a calendar to Gather. The key a companion app uses to ask
+  /// Google about their availability, since the Gather wire carries no other email.
+  final String? calendarEmail;
+
+  /// Whether their hand is up in a meeting.
+  ///
+  /// The wire carries no bool: a raised hand is a `handRaisedAt` *timestamp*, and
+  /// a lowered one is that field as msgpack `undefined` — the ext-4 sentinel this
+  /// protocol maps to [msgpackUndefined], **not** null and **not** absent. So "up"
+  /// is "the field arrived and holds something other than undefined", which is what
+  /// [DeltaState] distils this bool down to; a client reading `handRaisedAt != null`
+  /// would see every lowered hand as still up. Defaults false — nobody starts with
+  /// a hand up, and a row that has never carried the field reads as down.
+  final bool handRaised;
 
   /// Connected, and not away. See [availability].
   bool get isPresent => connected == true && availability != 'Offline';
@@ -499,6 +523,8 @@ class _Row {
   String? availability;
   String? profilePictureId;
   String? deskId;
+  String? calendarEmail;
+  bool handRaised = false;
   bool gone = false;
 }
 
@@ -970,6 +996,15 @@ class GameProtocolReader {
           (v) => row.profilePictureId = v);
     }
 
+    // The calendar address Gather resolved for this person — the one identity on the
+    // wire that maps a space-user to their Google/Outlook calendar, so a companion app
+    // can ask about their availability without a name-match. Present only for people
+    // who have connected a calendar; a plain string, patched like any other column.
+    if (data.containsKey('calculatedPrimaryCalendarEmail')) {
+      set(row.calendarEmail, _nullableString(data['calculatedPrimaryCalendarEmail']),
+          (v) => row.calendarEmail = v);
+    }
+
     // Read the same way, and nullable for the same reason: plenty of people in a
     // space have never claimed a desk, and losing one is a `null` patch rather
     // than a missing key.
@@ -987,6 +1022,15 @@ class GameProtocolReader {
     }
     if (data.containsKey('dancing')) {
       set(row.dancing, _asBool(data['dancing']), (v) => row.dancing = v);
+    }
+    // A timestamp, not a bool: present and holding something means the hand is up,
+    // `undefined` (the ext-4 sentinel, not null) means it just came down. Reading
+    // it as `!= null` would leave every lowered hand stuck up. See
+    // [RosterRow.handRaised].
+    if (data.containsKey('handRaisedAt')) {
+      final value = data['handRaisedAt'];
+      final up = value != null && !identical(value, msgpackUndefined);
+      set(row.handRaised, up, (v) => row.handRaised = v);
     }
     if (data.containsKey('isBot')) {
       set(row.isBot, _asBool(data['isBot']), (v) => row.isBot = v);
@@ -1145,6 +1189,40 @@ class GameProtocolReader {
     }
   }
 
+  /// Whether the server is reflecting *us* back as present — the one thing the
+  /// inbound roster can say about whether other people can see us.
+  ///
+  /// `Connection.entered` and `Connection.isActive` are the fields that would
+  /// answer it directly, but both are write-only: we send them and never read
+  /// them back. What *is* reflected is our own `SpaceUser` row, and the same
+  /// placement a peer's client keys their rendering on. So when our own row is
+  /// absent, marked gone, `connected != true`, or has no tile, that is also how we
+  /// have gone missing from everyone else's office — the readable shadow of the
+  /// unreadable `entered`. A half-open socket ends exactly here: the server's own
+  /// heartbeat eventually times us out and flips `connected` to false (or drops
+  /// the row), which is what others see as us leaving.
+  ///
+  /// Deliberately *not* the full `isPresent` test: `availability == 'Offline'` is
+  /// left out because it is a state a person chooses or drifts into and keeps for
+  /// hours — measured, nine of twelve `connected` rows were Offline, some for a
+  /// day (see [RosterRow.isPresent]). Treating that as a fault would reconnect the
+  /// socket and re-enter under someone who meant to appear away, fighting their
+  /// own choice. The connection-level signals above carry no such ambiguity, and
+  /// the walk engine's unapplied-moves signal covers a server that fails to relay
+  /// us while still calling us connected.
+  ///
+  /// Null [selfId] reads as not-visible: until the `Connection` row has named us
+  /// we cannot claim to be present. Callers must gate this on having entered and
+  /// holding state, or a first connect still assembling its dump looks like a
+  /// disappearance.
+  bool get selfVisible {
+    final me = selfId;
+    if (me == null) return false;
+    final row = _users[me];
+    if (row == null || row.gone || row.connected != true) return false;
+    return row.x != null && row.y != null;
+  }
+
   /// The roster in the shape [PresenceTracker] consumes.
   Roster roster() {
     final rows = <RosterRow>[];
@@ -1174,6 +1252,8 @@ class GameProtocolReader {
         profilePictureId: row.profilePictureId,
         deskId: row.deskId,
         status: _statusFor(row.id, now),
+        calendarEmail: row.calendarEmail,
+        handRaised: row.handRaised,
       ));
     }
     return Roster(selfId: selfId, rows: rows, spaceName: spaceName);

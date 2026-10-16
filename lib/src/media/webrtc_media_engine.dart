@@ -98,6 +98,11 @@ class WebrtcMediaEngine implements CaptureEngine {
 
   MediaStream? _stream;
 
+  /// The screen-share capture, from `getDisplayMedia`. A separate handle from
+  /// [_stream] on purpose: it is a second, independent capture session that the
+  /// camera/mic lifecycle must never stop, and vice versa.
+  MediaStream? _screenStream;
+
   /// The person's standing choice, or null to follow the default — loudspeaker
   /// unless a headset is in. A tap pins it; a headset plugged or pulled clears it
   /// back to the default, so AirPods grab the audio and unplugging falls back to
@@ -147,6 +152,9 @@ class WebrtcMediaEngine implements CaptureEngine {
   /// interface for the two callers that genuinely need the native handle.
   @override
   MediaStream? get localStream => _stream;
+
+  @override
+  MediaStream? get screenStream => _screenStream;
 
   @override
   Future<void> startCapture({bool audio = true, bool video = true}) async {
@@ -217,6 +225,10 @@ class WebrtcMediaEngine implements CaptureEngine {
       frontCamera: true,
       videoTrackId: videoTrack?.id,
       audioTrackId: audioTrack?.id,
+      // A share already running survives the camera coming on — same reason
+      // [stopCapture] carries it over, since a camera restart stops then starts.
+      screenCapturing: _state.screenCapturing,
+      screenTrackId: _state.screenTrackId,
     ));
     _log('media: capturing '
         '${[if (audioTrack != null) 'audio', if (videoTrack != null) 'video'].join(' + ')}');
@@ -261,7 +273,14 @@ class WebrtcMediaEngine implements CaptureEngine {
     }
     // Deliberately *not* releasing the audio session here: this also runs on a
     // mid-call capture restart (adding the camera), and the route must outlive it.
-    _emit(const LocalMediaState());
+    //
+    // The screen share is its own capture and is left untouched — stopping the
+    // camera mid-call (or restarting it to add video) must not drop a share in
+    // progress, so its fields are carried over rather than reset to the default.
+    _emit(LocalMediaState(
+      screenCapturing: _state.screenCapturing,
+      screenTrackId: _state.screenTrackId,
+    ));
   }
 
   /// Hands the audio session back: drops the device-change listener, forgets any
@@ -515,6 +534,77 @@ class WebrtcMediaEngine implements CaptureEngine {
   }
 
   @override
+  Future<void> startScreenCapture() async {
+    if (_screenStream != null) return;
+
+    final MediaStream stream;
+    try {
+      // Video only: tab/system audio is a separate producer the room does not
+      // expect from a phone, and `call.dart` keeps it out of scope. Declining the
+      // picker/dialog lands here as a thrown error.
+      //
+      // The iOS `deviceId: 'broadcast'` is load-bearing, not cosmetic: without it
+      // `FlutterRTCDesktopCapturer` falls back to `RPScreenRecorder`, which
+      // captures only *this app's* view — useless for a companion whose own view
+      // is the map. The `broadcast` prefix is what selects the ReplayKit Broadcast
+      // Upload Extension and the whole-device capture it carries, and it raises the
+      // `RPSystemBroadcastPickerView` pointed at our extension (see the
+      // `RTCScreenSharingExtension` Info.plist key). Android's MediaProjection
+      // already shares the whole device, so a plain `true` is right there.
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        'video': Platform.isIOS ? {'deviceId': 'broadcast'} : true,
+        'audio': false,
+      });
+    } on Object catch (error) {
+      final failure = _classifyScreen(error);
+      _log('media: screen capture failed — ${failure.message}');
+      _emit(_state.copyWith(clearScreen: true, failure: failure));
+      throw failure;
+    }
+
+    _screenStream = stream;
+    final track = stream.getVideoTracks().firstOrNull;
+
+    // The OS owns the "Stop" control for a system broadcast, so the track can end
+    // without anyone tapping anything in this app. Notice it and let go, which
+    // surfaces as [LocalMediaState.screenTrackId] going null — the signal
+    // [LiveCall] drops the producer on.
+    track?.onEnded = () {
+      _log('media: the screen share ended (OS stop)');
+      unawaited(stopScreenCapture());
+    };
+
+    _emit(_state.copyWith(
+      screenCapturing: true,
+      screenTrackId: track?.id,
+      clearFailure: true,
+    ));
+    _log('media: sharing the screen');
+  }
+
+  @override
+  Future<void> stopScreenCapture() async {
+    final stream = _screenStream;
+    _screenStream = null;
+    if (stream != null) {
+      for (final track in [...stream.getTracks()]) {
+        track.onEnded = null;
+        try {
+          await track.stop();
+        } on Object {
+          /* already gone */
+        }
+      }
+      try {
+        await stream.dispose();
+      } on Object {
+        /* already gone */
+      }
+    }
+    _emit(_state.copyWith(clearScreen: true));
+  }
+
+  @override
   Future<void> switchCamera() async {
     final track = _stream?.getVideoTracks().firstOrNull;
     if (track == null) return;
@@ -529,6 +619,7 @@ class WebrtcMediaEngine implements CaptureEngine {
   @override
   Future<void> dispose() async {
     await releaseAudioSession();
+    await stopScreenCapture();
     await stopCapture();
     await _states.close();
   }
@@ -562,6 +653,26 @@ MediaFailure _classify(Object error) {
     return MediaFailure(
       MediaFailureKind.noDevice,
       'No microphone or camera is available right now.',
+    );
+  }
+  return MediaFailure(MediaFailureKind.unknown, '$error');
+}
+
+/// The screen-share twin of [_classify].
+///
+/// Declining the ReplayKit picker or the MediaProjection dialog is the common
+/// case and reads as a permission denial, but it is not the Settings-fixable
+/// kind `getUserMedia` means — the person just has to tap the picker again — so
+/// the sentence says that rather than sending them into Settings.
+MediaFailure _classifyScreen(Object error) {
+  final text = error.toString().toLowerCase();
+  if (text.contains('notallowed') ||
+      text.contains('permission') ||
+      text.contains('denied') ||
+      text.contains('cancel')) {
+    return const MediaFailure(
+      MediaFailureKind.unknown,
+      'Screen sharing did not start. Tap it again and allow the broadcast.',
     );
   }
   return MediaFailure(MediaFailureKind.unknown, '$error');

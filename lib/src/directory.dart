@@ -28,6 +28,7 @@ class Contact {
     this.x,
     this.y,
     this.status,
+    this.calendarEmail,
   });
 
   /// Built straight off a roster row. The label falls back to a short id the same
@@ -45,6 +46,7 @@ class Contact {
         x: row.x,
         y: row.y,
         status: row.status,
+        calendarEmail: row.calendarEmail,
       );
 
   /// Their `SpaceUser` id — the game plane's name for them, and what picks their
@@ -76,6 +78,11 @@ class Contact {
 
   /// The line under their name, if Gather holds one that has not expired.
   final PersonStatus? status;
+
+  /// Their primary calendar address, when they have connected one to Gather — the key
+  /// the Dial uses to ask Google about their availability. Null for the majority who
+  /// have not, which the calendar affordances read as "nothing to show".
+  final String? calendarEmail;
 
   /// Whether there is somewhere to warp to: present, and with a finite position.
   bool get isReachable => isPresent && x != null && y != null && x!.isFinite && y!.isFinite;
@@ -115,4 +122,24 @@ class Meeting {
   /// Whether I am already in this conversation. First in the list, and not an
   /// offer to join something I am in.
   final bool includesMe;
+}
+
+/// What a person's status line in the Warp Dial shows: whether they are mid-meeting
+/// and, when their shared calendar is visible, how long until they free up.
+///
+/// [inMeeting] is Gather's own `clusterId` and always knowable; [freeIn] needs the
+/// end of the event they are in, which only their calendar carries, so it is null
+/// when no calendar is matched or none is cached yet. "In a meeting" with no
+/// countdown is the honest fallback, not a bug.
+class PersonPresence {
+  const PersonPresence({required this.inMeeting, this.freeIn});
+
+  final bool inMeeting;
+  final Duration? freeIn;
+
+  /// Whether there is anything worth drawing. The Gather bubble is the gate: a badge is
+  /// only shown for someone the roster says is mid-conversation. [freeIn] refines that
+  /// badge from "In a meeting" to "Free in X" when their calendar carries the end time,
+  /// but never promotes a badge on its own — see [AppState.presenceFor].
+  bool get hasBadge => inMeeting;
 }

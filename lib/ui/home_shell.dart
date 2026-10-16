@@ -46,6 +46,7 @@ import 'package:flutter/services.dart';
 import '../src/app_state.dart';
 import '../theme/gather_theme.dart';
 import 'activity_screen.dart';
+import 'calendar_screen.dart';
 import 'dial_screen.dart';
 import 'control_bar.dart';
 import 'gameboy_shell.dart';
@@ -61,13 +62,14 @@ import 'settings_screen.dart';
 /// silently swapped two tabs' bodies — the rail said Activity and the office
 /// appeared. Adding a destination is a case in [_TabView.icon], [_TabView.label]
 /// and `_bodyFor`, which the compiler will demand.
-enum _Tab { dial, map, activity, settings }
+enum _Tab { dial, map, activity, plans, settings }
 
 extension _TabView on _Tab {
   IconData get icon => switch (this) {
         _Tab.activity => Icons.notifications_rounded,
         _Tab.map => Icons.map_outlined,
         _Tab.dial => Icons.bolt,
+        _Tab.plans => Icons.event_rounded,
         _Tab.settings => Icons.settings_rounded,
       };
 
@@ -75,6 +77,7 @@ extension _TabView on _Tab {
         _Tab.activity => 'Activity',
         _Tab.map => 'Office',
         _Tab.dial => 'Warp',
+        _Tab.plans => 'Plans',
         _Tab.settings => 'Settings',
       };
 }
@@ -180,6 +183,7 @@ class _HomeShellState extends State<HomeShell> {
                 state: widget.state,
                 onOpenSettings: () => _select(_Tab.settings),
                 onOpenActivity: () => _select(_Tab.activity),
+                onOpenPlans: () => _select(_Tab.plans),
                 onOpenDial: () => _select(_Tab.dial),
                 child: ListenableBuilder(
                   listenable: _tab == _Tab.map ? _mapTick : widget.state,
@@ -199,6 +203,9 @@ class _HomeShellState extends State<HomeShell> {
                 ),
               ),
         _Tab.activity => ActivityScreen(state: widget.state),
+        // Like Activity: a scrolling list with no control bar, so the shell's rail
+        // inset is the only padding it needs to clear the dock.
+        _Tab.plans => CalendarScreen(state: widget.state),
         // No control bar, so no `kControlBarInset` layer: the shell's own rail
         // inset is all a scrolling directory needs to clear the dock.
         _Tab.dial => DialScreen(state: widget.state, visible: _tab == _Tab.dial),

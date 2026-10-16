@@ -12,15 +12,20 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
+import 'package:gather_companion/src/credentials.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
+import 'package:gather_companion/src/notifications.dart';
+import 'package:gather_companion/src/settings.dart';
 import 'package:gather_companion/src/ui_preferences.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
+import 'package:gather_companion/ui/calendar_screen.dart';
 import 'package:gather_companion/ui/dial_screen.dart';
 import 'package:gather_companion/ui/gameboy_shell.dart';
+import 'package:gather_companion/ui/gameboy_theme.dart';
 import 'package:gather_companion/ui/home_shell.dart';
 import 'package:gather_companion/ui/map_screen.dart';
 import 'package:gather_companion/ui/settings_screen.dart';
@@ -39,6 +44,30 @@ class _SpyState extends AppState {
 
   @override
   void stopWalking() => released++;
+}
+
+/// A [Notifier] whose [init] is a no-op, so a full [AppState.boot] can run under
+/// test without blocking on the local-notifications platform channel.
+class _SilentNotifier extends Notifier {
+  @override
+  Future<void> init() async {}
+}
+
+/// Credential and bridge stores backed by nothing, so [AppState.boot] can run
+/// under test without touching the keychain (its platform channel never answers
+/// here). Both report "not paired", which is all the theme read-back needs.
+class _EmptyCredentialStore extends GatherCredentialStore {
+  @override
+  Future<GatherCredentials> load() async => GatherCredentials.empty;
+  @override
+  Future<String?> loadSpaceId() async => null;
+}
+
+class _EmptyBridgeStore extends BridgeSettingsStore {
+  @override
+  Future<BridgeSettings> load() async => BridgeSettings.empty;
+  @override
+  Future<String?> loadName() async => null;
 }
 
 void main() {
@@ -156,6 +185,120 @@ void main() {
     });
   });
 
+  // The hardware theme is a pure look choice, so it is pinned at the same seams as
+  // the mode and the sound switch: the persistence round-trip, the stored-value
+  // default, the boot read-back, and the UI that swaps the shell's skin — plus the
+  // one rule the picker adds, that it is offered only while the handheld is on.
+  group('the hardware theme', () {
+    Widget wrapSettings(AppState state) => MaterialApp(
+          theme: buildGatherTheme(),
+          home: ListenableBuilder(
+            listenable: state,
+            builder: (context, _) => SettingsScreen(state: state, onUnpair: () {}),
+          ),
+        );
+
+    testWidgets('survives a reload through the preference store', (tester) async {
+      await UiPreferences().saveGameboyThemeId('safenow');
+      expect(await UiPreferences().loadGameboyThemeId(), 'safenow');
+    });
+
+    testWidgets('defaults to purple when nothing is stored', (tester) async {
+      expect(await UiPreferences().loadGameboyThemeId(), 'purple');
+      expect(GameboyThemeId.fromId(null), GameboyThemeId.purple);
+    });
+
+    testWidgets('the picked theme is what a reboot reads back', (tester) async {
+      final state = configure(AppState());
+      expect(state.gameboyTheme, GameboyThemeId.purple, reason: 'purple by default');
+
+      await state.setGameboyTheme(GameboyThemeId.safeNow);
+      expect(state.gameboyTheme, GameboyThemeId.safeNow);
+
+      // The round-trip above only proves the store holds the pick. Actually boot a
+      // fresh AppState so the restore line in boot() is exercised: a dropped or
+      // mis-mapped assignment there would pass the store check yet come back purple.
+      // The notifier and stores are faked so boot() does not block on the
+      // notifications or keychain platform channels, which never answer in a test.
+      final rebooted = AppState(
+        notifier: _SilentNotifier(),
+        credentials: _EmptyCredentialStore(),
+        bridge: _EmptyBridgeStore(),
+      );
+      await rebooted.boot();
+      expect(rebooted.gameboyTheme, GameboyThemeId.safeNow,
+          reason: 'boot() restores the stored theme, not just the default');
+    });
+
+    testWidgets('the picker is offered only while the handheld is on', (tester) async {
+      final state = configure(AppState());
+      await tester.pumpWidget(wrapSettings(state));
+      await tester.pump();
+
+      // Off: no theme row at all — nothing to skin when the office wears its normal
+      // interface.
+      expect(find.text('Theme'), findsNothing);
+
+      await tester.ensureVisible(find.text('Gameboy mode'));
+      await tester.tap(find.text('Gameboy mode'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Theme'), findsOneWidget, reason: 'the picker appears with the mode');
+      expect(find.text('The handheld in Purple.'), findsOneWidget);
+    });
+
+    testWidgets('picking SafeNow prints its brand below the LCD; purple prints none', (tester) async {
+      // The brandmark rides the band below the LCD — a detail of the upright
+      // handheld, which the sideways (GBA) layout has no room for. Pin a portrait
+      // surface so the band is in the tree to assert on; the default test window is
+      // landscape.
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      // Purple ships a bare band — no brandmark printed on the plastic.
+      expect(find.byKey(kSafeNowBrandmarkKey), findsNothing);
+
+      await state.setGameboyTheme(GameboyThemeId.safeNow);
+      await tester.pumpAndSettle();
+
+      // The SafeNow mark (the pixel-art logo image) is now printed in the band.
+      expect(
+        find.descendant(
+          of: find.byType(GameboyShell),
+          matching: find.byKey(kSafeNowBrandmarkKey),
+        ),
+        findsOneWidget,
+        reason: 'the brand is baked into the SafeNow theme, below the screen',
+      );
+    });
+
+    testWidgets('the body repaints in the theme colour', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      // The root body gradient reads the active hardware ramp; swapping the theme
+      // must change the colour it paints. Probe the scope the shell provides.
+      GbHardware hardwareInShell() =>
+          tester.widget<GameboyThemeScope>(find.byType(GameboyThemeScope)).hardware;
+
+      expect(hardwareInShell().hw700, kPurpleHardware.hw700);
+
+      await state.setGameboyTheme(GameboyThemeId.safeNow);
+      await tester.pumpAndSettle();
+
+      expect(hardwareInShell().hw700, kSafeNowHardware.hw700,
+          reason: 'the SafeNow body is the brand blue, not purple');
+      expect(kSafeNowHardware.hw700, const Color(0xFF0022FF));
+    });
+  });
+
   group('the startup tab', () {
     testWidgets('Gameboy mode opens on the office', (tester) async {
       final state = configure(AppState())..setGameboyMode(true);
@@ -217,6 +360,45 @@ void main() {
 
       expect(find.byType(GameboyShell), findsNothing);
       expect(find.byType(ControlBar), findsOneWidget);
+    });
+
+    // The whole point of the hold: the LCD must keep drawing the office when the
+    // reconnect swaps in a fresh empty reader, instead of flashing the black "Not
+    // connected" placeholder the user actually saw. The handheld embeds `MapScreen`
+    // as its screen body, whose `map == null ? _Waiting : _Plan` branch reads the
+    // `map` getter — which now returns the held office — so this proves the fix
+    // reaches the pixels inside the shell, not just `state.map` in isolation.
+    testWidgets('the LCD keeps the office on a reconnect rather than going black', (tester) async {
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        // A roster lands with a whole reader behind it: the office is drawn, and
+        // held against the next reconnect.
+        ..debugApplyRoster(const Roster(selfId: 'me', rows: [
+          RosterRow(id: 'me', name: 'You', x: 5, y: 5, floorId: 'f1', connected: true),
+        ]));
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.byType(GameboyShell), findsOneWidget);
+      expect(find.byType(MapScreen), findsOneWidget);
+      expect(find.text('Not connected'), findsNothing,
+          reason: 'the office is up, so no black placeholder');
+      expect(state.map, isNotNull);
+
+      // The reconnect: `DirectCollector` swaps in a fresh empty reader, so the live
+      // lookup goes null. No roster flows mid-reconnect, so the held office stands.
+      collector.hasMap = false;
+      state.debugApplyLink(const LinkStatus(LinkState.retrying, 'Network changed — reconnecting.'));
+      await tester.pump();
+
+      expect(state.map, isNotNull, reason: 'the held office carries the gap');
+      expect(find.text('Not connected'), findsNothing,
+          reason: 'the LCD must not blank to the black placeholder on a reconnect');
+      expect(find.textContaining('The map comes from Gather'), findsNothing,
+          reason: 'nor show the waiting copy under it');
     });
 
     testWidgets('A latches the cart', (tester) async {
@@ -369,6 +551,44 @@ void main() {
           reason: 'the pending mute tap, not the live mic flag, decides the second tap');
     });
 
+    testWidgets('a B double-tap survives a rotation between the two taps',
+        (tester) async {
+      // Regression: the deck must stay one `State` across an orientation change, or
+      // rotating between the two B taps would dispose it — cancelling the pending
+      // mute and losing the first tap's timestamp, so the second tap no longer
+      // waves. Upright and sideways the deck is the same element; only its layout
+      // turns.
+      tester.view.physicalSize = const Size(400, 800); // upright
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final collector = FakeCollector();
+      final state = configure(AppState())
+        ..setGameboyMode(true)
+        ..debugAttachCollector(collector)
+        ..debugApplyRoster(withAdaInCallDistance());
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await tester.pump();
+
+      // First tap upright.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+
+      // Turn the handheld on its side between the taps.
+      tester.view.physicalSize = const Size(800, 400); // on its side
+      await tester.pump();
+
+      // Second tap sideways, still inside the wall-clock double-tap window.
+      await tester.tap(find.text('B'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(collector.waves, ['a'],
+          reason: 'the deck kept its double-tap state across the rotation');
+    });
+
     testWidgets('a single B tap does not wave', (tester) async {
       final collector = FakeCollector();
       final state = configure(AppState())
@@ -432,8 +652,30 @@ void main() {
 
       expect(find.text('Dial'), findsOneWidget);
       expect(find.text('Activity'), findsOneWidget);
+      // Every non-map tab the dock holds has to be reachable here — the menu is the
+      // only way to the other tabs while the handheld hides the dock — so Plans,
+      // added to the dock, has to have its row too.
+      expect(find.text('Plans'), findsOneWidget);
       expect(find.text('Settings'), findsOneWidget);
       expect(find.textContaining('camera'), findsOneWidget);
+    });
+
+    testWidgets('the Plans row leaves the office for the plans tab', (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      await tester.pumpWidget(wrap(state));
+      await tester.pump();
+      await toOffice(tester);
+
+      await tester.tap(find.text('SELECT'));
+      await tester.pumpAndSettle();
+      // The menu scrolls inside the LCD, so the Plans row can sit below the fold on a
+      // short screen — bring it up before choosing it.
+      await tester.ensureVisible(find.text('Plans'));
+      await tester.tap(find.text('Plans'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CalendarScreen), findsOneWidget);
+      expect(find.byType(GameboyShell), findsNothing, reason: 'left the office for plans');
     });
 
     testWidgets('the Select menu switches tab', (tester) async {
@@ -643,11 +885,11 @@ void main() {
       await tester.pumpAndSettle();
 
       // Walk the cursor down to the last row (Settings). Pressing the bottom of the
-      // cross is a Down; from the status row it is five of them past Camera, Emotes,
-      // Dial and Activity onto Settings.
+      // cross is a Down; from the status row it is six of them past Camera, Emotes,
+      // Dial, Activity and Plans onto Settings.
       final pad = tester.getRect(find.byKey(const Key('gb-dpad')));
       final down = Offset(pad.center.dx, pad.top + pad.height * 0.88);
-      for (var i = 0; i < 5; i++) {
+      for (var i = 0; i < 6; i++) {
         final g = await tester.startGesture(down);
         await tester.pump();
         await g.up();
@@ -800,6 +1042,46 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(seen, isEmpty, reason: 'the normal map owns its own camera');
       await sub.cancel();
+    });
+  });
+
+  group('held sideways, the handheld turns into a landscape console', () {
+    // Pinned explicitly even though the default window is already landscape, so the
+    // GBA layout the test asserts is the one it means and not an accident of the
+    // default surface.
+    void landscape(WidgetTester tester) {
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+    }
+
+    testWidgets('D-pad and Select/Start left, A/B and the grille right, as the GBA lays them',
+        (tester) async {
+      final state = configure(AppState())..setGameboyMode(true);
+      landscape(tester);
+      await tester.pumpWidget(wrap(state));
+      await toOffice(tester);
+
+      final mid = tester.getRect(find.byType(GameboyShell)).center.dx;
+      final dpad = tester.getRect(find.byKey(const Key('gb-dpad'))).center.dx;
+      final a = tester.getRect(find.text('A')).center;
+      final b = tester.getRect(find.text('B')).center;
+      final select = tester.getRect(find.text('SELECT')).center.dx;
+      final start = tester.getRect(find.text('START')).center.dx;
+
+      expect(dpad, lessThan(mid), reason: 'the cross is the left thumb');
+      expect(a.dx, greaterThan(mid), reason: 'A is the right thumb');
+      expect(b.dx, greaterThan(mid), reason: 'and so is B');
+      // START/SELECT have left the chin and joined the D-pad on the left thumb, the
+      // way the GBA stacks them in the lower-left corner.
+      expect(select, lessThan(mid), reason: 'SELECT moved to the left side');
+      expect(start, lessThan(mid), reason: 'START moved to the left side');
+      // A high-right, B low-left, but tucked close — not the tall diagonal they had.
+      expect((a.dy - b.dy).abs(), lessThan(80),
+          reason: 'A and B sit nearly on one line, tight together');
+      // The horizontal speaker moulding fills the lower-right corner under A/B.
+      expect(find.byKey(const Key('gb-grille-landscape')), findsOneWidget);
     });
   });
 }

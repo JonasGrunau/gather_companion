@@ -9,6 +9,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/media/call.dart';
@@ -17,6 +18,7 @@ import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
+import 'package:gather_companion/ui/control_bar.dart';
 import 'package:gather_companion/ui/person_avatar.dart';
 
 import 'fake_call.dart';
@@ -40,6 +42,44 @@ void main() {
     }
     return state;
   }
+
+  group('sharing your own screen (issue #43)', () {
+    testWidgets('the header offers to share, and the picker lives there not in '
+        'the dock', (tester) async {
+      await show(tester, stateWith(const CallState()));
+
+      // In the header, not the island: the dock is at its plate budget (see the
+      // note atop control_bar.dart), so the share toggle sits in the call-screen
+      // chrome instead.
+      final share = find.byTooltip('Share your screen');
+      expect(share, findsOneWidget);
+      expect(
+        find.descendant(of: find.byType(ControlBar), matching: share),
+        findsNothing,
+      );
+    });
+
+    testWidgets('a live share flips the control to stop, wearing the brand',
+        (tester) async {
+      await show(
+        tester,
+        stateWith(const CallState(
+          media: LocalMediaState(screenCapturing: true, screenTrackId: 's1'),
+          publishingScreen: true,
+        )),
+      );
+
+      expect(find.byTooltip('Share your screen'), findsNothing);
+      final stop = find.byTooltip('Stop sharing');
+      expect(stop, findsOneWidget);
+      final t = tester.element(stop).tokens;
+      final button = tester.widget<IconButton>(
+        find.widgetWithIcon(IconButton, Icons.stop_screen_share_rounded),
+      );
+      expect(button.color, t.brand,
+          reason: 'live wears the brand, like the dock glyphs');
+    });
+  });
 
   group('the banner says who you are with', () {
     test('in every size of call, named or not', () {
@@ -250,9 +290,13 @@ void main() {
     await show(
       tester,
       stateWith(
-        const CallState(participants: [
-          CallParticipant(srcId: 'account-1', hasAudio: true, audioPaused: true),
-        ]),
+        // Our own mic is open, so the only mute pip on screen is Mira's.
+        const CallState(
+          media: LocalMediaState(capturing: true, audioEnabled: true),
+          participants: [
+            CallParticipant(srcId: 'account-1', hasAudio: true, audioPaused: true),
+          ],
+        ),
         rows: const [RosterRow(id: 'space-1', name: 'Mira', userAccountId: 'account-1')],
       ),
     );
@@ -265,11 +309,13 @@ void main() {
     expect(muted.top, name.top);
   });
 
-  testWidgets('an empty call says so rather than showing a blank screen',
+  testWidgets('alone in a call you see your own tile, not a blank screen',
       (tester) async {
     await show(tester, stateWith(const CallState()));
 
-    expect(find.textContaining('Nobody is in this conversation yet'), findsOneWidget);
+    // Nobody else, but your own tile is still there — the point of it is that you
+    // can always check how you look, even before anyone arrives.
+    expect(find.text('You'), findsOneWidget);
     expect(find.text('Nobody else here'), findsOneWidget);
   });
 
@@ -311,9 +357,13 @@ void main() {
     await show(
       tester,
       stateWith(
-        const CallState(participants: [
-          CallParticipant(srcId: 'account-1', hasAudio: true, audioPaused: true),
-        ]),
+        // Our own mic is open, so the only mute pip is the muted remote's.
+        const CallState(
+          media: LocalMediaState(capturing: true, audioEnabled: true),
+          participants: [
+            CallParticipant(srcId: 'account-1', hasAudio: true, audioPaused: true),
+          ],
+        ),
         rows: const [
           RosterRow(id: 'space-1', name: 'Mira', userAccountId: 'account-1'),
         ],
@@ -324,17 +374,21 @@ void main() {
     expect(find.byIcon(Icons.mic_off), findsOneWidget);
   });
 
-  testWidgets('the self tile appears only once the hardware is open',
+  testWidgets('the self tile is always there, before any hardware is open',
       (tester) async {
+    // No camera, no microphone ever touched. You still get a tile — it is how
+    // you check how you look to the room, or confirm your camera is off.
     await show(tester, stateWith(const CallState()));
-    expect(find.text('You'), findsNothing);
+    expect(find.text('You'), findsOneWidget);
+    // Still nobody else — the header counts the room, not the tiles.
+    expect(find.text('Nobody else here'), findsOneWidget);
 
+    // Opening the camera does not add a second self tile.
     await show(
       tester,
       stateWith(const CallState(media: LocalMediaState(capturing: true))),
     );
     expect(find.text('You'), findsOneWidget);
-    // Still nobody else — the header counts the room, not the tiles.
     expect(find.text('Nobody else here'), findsOneWidget);
   });
 
@@ -352,7 +406,7 @@ void main() {
     expect(find.text('3 other people'), findsOneWidget);
   });
 
-  testWidgets('a face filling the screen is asked for at full size',
+  testWidgets('a single remote shares the screen with your own tile',
       (tester) async {
     final call = FakeCall();
     final state = stateWith(const CallState(participants: [
@@ -361,10 +415,11 @@ void main() {
       ..debugAttachCall(call);
     await show(tester, state);
 
-    // Nobody sends more than their smallest layer until a consumer asks, so
-    // without this the one face on a phone screen stays a thumbnail.
+    // Two tiles now — the one remote face plus your own, always present — so the
+    // remote gets half a phone, not the whole of it. Only the remote is on the
+    // wire to ask for; your own tile needs nobody to send it.
     expect(call.watching.last.srcIds, ['account-1']);
-    expect(call.watching.last.quality, VideoQuality.full);
+    expect(call.watching.last.quality, VideoQuality.half);
   });
 
   testWidgets('a grid of four asks for thumbnails', (tester) async {
@@ -395,7 +450,7 @@ void main() {
     ]))
       ..debugAttachCall(call);
     await show(tester, state);
-    expect(call.watching.last.quality, VideoQuality.full);
+    expect(call.watching.last.quality, VideoQuality.half);
 
     // The map draws no video, so once this route is gone nobody is looking at
     // anything — and until it is said, a colleague keeps encoding a big layer
@@ -417,7 +472,7 @@ void main() {
         ),
       ]);
 
-    final tile = tilesFor(state).single;
+    final tile = tilesFor(state).firstWhere((t) => !t.isSelf);
     expect(tile.sharingScreen, isTrue);
     // No live call behind this state, so there is no stream to pick — the point
     // is that the tile carries the flag the layout reads.
@@ -441,7 +496,7 @@ void main() {
         rows: [me, luca],
       );
 
-      final tile = tilesFor(state).single;
+      final tile = tilesFor(state).firstWhere((t) => !t.isSelf);
       expect(tile.label, 'Luca');
       expect(tile.speaking, isTrue, reason: "off the roster's own `speaking`");
     });
@@ -524,10 +579,11 @@ void main() {
 
       // Both, in press order. A second tap adds to what is in the air rather
       // than replacing it — three claps are three claps.
-      expect([for (final f in tilesFor(state).single.reactions) f.emote], ['🎉', '🔥']);
+      final lucaTile = tilesFor(state).firstWhere((t) => !t.isSelf);
+      expect([for (final f in lucaTile.reactions) f.emote], ['🎉', '🔥']);
 
       await tester.pump(reactionLinger);
-      expect(tilesFor(state).single.reactions, isEmpty,
+      expect(tilesFor(state).firstWhere((t) => !t.isSelf).reactions, isEmpty,
           reason: 'nothing on the wire ever says a reaction ended');
     });
 
@@ -559,6 +615,80 @@ void main() {
       await tester.pump(reactionLinger);
       await tester.pump();
       expect(find.text('🎉'), findsNothing);
+    });
+  });
+
+  group('a raised hand', () {
+    const me = RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', connected: true);
+    const lucaUp = RosterRow(
+      id: 'luca',
+      name: 'Luca',
+      clusterId: 'c1',
+      userAccountId: 'account-luca',
+      connected: true,
+      handRaised: true,
+    );
+
+    test("a colleague's hand rides onto their tile, off the roster", () {
+      final state = stateWith(
+        const CallState(participants: [CallParticipant(srcId: 'account-luca', hasAudio: true)]),
+        rows: [me, lucaUp],
+      );
+      addTearDown(state.dispose);
+
+      expect(tilesFor(state).firstWhere((t) => !t.isSelf).handRaised, isTrue);
+      expect(tilesFor(state).firstWhere((t) => t.isSelf).handRaised, isFalse,
+          reason: 'one hand up is not everybody');
+    });
+
+    test('our own hand shows on our own tile, read local-first', () {
+      final state = stateWith(const CallState(), rows: [me]);
+      addTearDown(state.dispose);
+
+      expect(tilesFor(state).single.handRaised, isFalse);
+
+      // From `AppState.myHandRaised`, not the roster — the same reason our own
+      // speaking ring is read locally: the button is under the thumb.
+      state.setHandRaised(true);
+      expect(tilesFor(state).single.handRaised, isTrue);
+    });
+
+    testWidgets('is a badge in the corner of the frame both views share',
+        (tester) async {
+      Future<void> frame(bool raised) async {
+        await tester.pumpWidget(MaterialApp(
+          theme: buildGatherTheme(),
+          home: Scaffold(
+            body: Center(
+              child: SizedBox(
+                width: 200,
+                height: 150,
+                // `TileFrame` is the one widget the overview grid and the
+                // spotlight both build their faces from, so a badge proven here is
+                // a badge in both — which is what the feature asks for.
+                child: TileFrame(
+                  tile: CallTile(
+                    id: 'luca',
+                    label: 'Luca',
+                    isSelf: false,
+                    videoLive: false,
+                    muted: false,
+                    sharingScreen: false,
+                    handRaised: raised,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ));
+        await tester.pump();
+      }
+
+      await frame(false);
+      expect(find.byIcon(Icons.front_hand), findsNothing);
+
+      await frame(true);
+      expect(find.byIcon(Icons.front_hand), findsOneWidget);
     });
   });
 
@@ -698,7 +828,8 @@ void main() {
       await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
     });
 
-    testWidgets('a tap in auto pins, and the next speaker overrides it without leaving auto', (tester) async {
+    testWidgets('a tap in auto switches to manual and pins the face, and a later speaker no longer overrides it', (tester) async {
+      final semantics = tester.ensureSemantics();
       final state = stateWith(
         threeFaces(),
         rows: [me, person('0', speaking: true), person('1'), person('2')],
@@ -709,17 +840,36 @@ void main() {
       await tester.pump();
       expect(find.text('Person 0'), findsNWidgets(2), reason: 'auto enlarged the talker');
 
-      // Pin Person 1 from the strip. The view moves to them at once.
+      // Tap Person 1 from the strip. A tap is a request to watch that person, so
+      // it leaves auto for manual and pins them — the view moves at once.
       await tester.tap(find.byKey(const ValueKey('strip-space-1')));
       await tester.pump();
       expect(find.text('Person 1'), findsNWidgets(2));
+      // And the toggle reflects the manual view the tap produced: the Manual
+      // segment is the selected one, the Auto segment no longer.
+      expect(
+        find.byWidgetPredicate(
+          (w) => w is Semantics && w.properties.label == 'Manual' && w.properties.selected == true,
+        ),
+        findsOneWidget,
+        reason: 'the toggle now shows Manual selected',
+      );
+      expect(
+        find.byWidgetPredicate(
+          (w) => w is Semantics && w.properties.label == 'Auto' && w.properties.selected == true,
+        ),
+        findsNothing,
+        reason: 'and Auto is no longer selected',
+      );
 
-      // Still auto: when the floor passes to Person 2, the pin gives way.
+      // The floor passes to Person 2 — but a manual pin does not give way to the
+      // room the way an auto pin would.
       state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2', speaking: true)]));
       await tester.pump();
-      expect(find.text('Person 2'), findsNWidgets(2), reason: 'auto overrode the pin');
-      expect(find.text('Auto'), findsOneWidget, reason: 'and never left auto mode');
+      expect(find.text('Person 1'), findsNWidgets(2), reason: 'the manual pin held the big view');
+      expect(find.text('Person 2'), findsOneWidget, reason: 'the speaker stayed in the strip, it did not take the big view');
       await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+      semantics.dispose();
     });
 
     testWidgets('auto never enlarges yourself for talking', (tester) async {
@@ -752,14 +902,16 @@ void main() {
       addTearDown(state.dispose);
       await showAuto(tester, state);
 
-      await tester.tap(find.byKey(const ValueKey('space-1')));
+      // Person 0, which sits in the first grid row beside the self tile — Person 1
+      // is now pushed into the second row, below the test viewport.
+      await tester.tap(find.byKey(const ValueKey('space-0')));
       await tester.pump();
-      expect(find.text('Person 1'), findsNWidgets(2), reason: 'manually enlarged');
+      expect(find.text('Person 0'), findsNWidgets(2), reason: 'manually enlarged');
 
       await tester.tap(find.text('Auto'));
       await tester.pump();
       expect(find.byType(GridView), findsNothing, reason: 'the big view held across the switch');
-      expect(find.text('Person 1'), findsNWidgets(2));
+      expect(find.text('Person 0'), findsNWidgets(2));
 
       // Still auto: the next speaker to hold the floor takes the pin's place.
       state.debugApplyRoster(Roster(selfId: 'me', rows: [me, person('0'), person('1'), person('2', speaking: true)]));
@@ -787,9 +939,9 @@ void main() {
       // Enlarge yourself. Your own face has nothing on the media plane to boost,
       // and the remote is now only a strip thumbnail — so the request drops to
       // the low layer rather than staying on the grid's count-based split.
-      // The self tile has no map position in this state, so it takes the 'self'
-      // fallback id rather than a roster id.
-      await tester.tap(find.byKey(const ValueKey('self')));
+      // The self tile keys off the coordinate-independent roster self id, so it
+      // is 'me' even with no map position — not the 'self' fallback.
+      await tester.tap(find.byKey(const ValueKey('me')));
       await tester.pump();
       expect(call.watching.last.quality, VideoQuality.thumbnail);
       expect(call.watching.last.srcIds, ['account-1']);
@@ -837,4 +989,199 @@ void main() {
       await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
     });
   });
+
+  group('the big view crops or letterboxes', () {
+    CallTile tile({required bool sharingScreen}) => CallTile(
+          id: 'x',
+          label: 'X',
+          isSelf: false,
+          videoLive: true,
+          muted: false,
+          sharingScreen: sharingScreen,
+        );
+
+    test('a camera face crops by default, a shared screen letterboxes', () {
+      expect(bigCropsByDefault(tile(sharingScreen: false)), isTrue,
+          reason: 'cover is what a face wants');
+      expect(bigCropsByDefault(tile(sharingScreen: true)), isFalse,
+          reason: 'a shared screen shows its edges, not a cropped middle');
+    });
+
+    testWidgets('the fit button names the result of the tap and reports it', (tester) async {
+      var taps = 0;
+      Future<void> pumpButton(bool cropOn) => tester.pumpWidget(MaterialApp(
+            theme: buildGatherTheme(),
+            home: Scaffold(
+              body: CropButton(cropOn: cropOn, onTap: () => taps++),
+            ),
+          ));
+
+      // Cropped now: the button offers the whole frame.
+      await pumpButton(true);
+      expect(find.text('Fit'), findsOneWidget);
+      expect(find.text('Fill'), findsNothing);
+      expect(find.byIcon(Icons.fit_screen_outlined), findsOneWidget);
+
+      await tester.tap(find.text('Fit'));
+      expect(taps, 1);
+
+      // Letterboxed now: the button offers the crop.
+      await pumpButton(false);
+      expect(find.text('Fill'), findsOneWidget);
+      expect(find.text('Fit'), findsNothing);
+      expect(find.byIcon(Icons.crop_outlined), findsOneWidget);
+
+      await tester.tap(find.text('Fill'));
+      expect(taps, 2);
+    });
+
+    testWidgets('no fit button over a big face with nothing on the wire', (tester) async {
+      // The spotlight tiles here are roster-only — `hasVideo` without a stream a
+      // platform-free test can make — so there is nothing to fit and the button
+      // stays away. The toggle only earns its place once a frame is arriving.
+      final state = stateWith(
+        const CallState(participants: [
+          CallParticipant(srcId: 'account-0', hasVideo: true),
+          CallParticipant(srcId: 'account-1', hasVideo: true),
+        ]),
+        rows: const [
+          RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', connected: true),
+          RosterRow(id: 'space-0', name: 'Person 0', clusterId: 'c1', userAccountId: 'account-0'),
+          RosterRow(id: 'space-1', name: 'Person 1', clusterId: 'c1', userAccountId: 'account-1'),
+        ],
+      );
+      addTearDown(state.dispose);
+      await show(tester, state);
+
+      await tester.tap(find.byKey(const ValueKey('space-0')));
+      await tester.pump();
+
+      expect(find.text('Everyone'), findsOneWidget, reason: 'the big view is up');
+      expect(find.text('Fit'), findsNothing);
+      expect(find.text('Fill'), findsNothing);
+      await tester.pump(const Duration(seconds: 2)); // flush the cluster debounce
+    });
+  });
+
+  group('a tile shows video rather than a face when', () {
+    // A platform-free stand-in: `showsVideo` only asks whether the stream is
+    // there, never touches a track, so a Fake standing in for the one stream
+    // `flutter test` cannot construct is enough to exercise the predicate.
+    final stream = _FakeStream();
+
+    CallTile tile({
+      required bool videoLive,
+      required bool sharingScreen,
+      MediaStream? stream,
+    }) =>
+        CallTile(
+          id: 'x',
+          label: 'X',
+          isSelf: false,
+          videoLive: videoLive,
+          muted: false,
+          sharingScreen: sharingScreen,
+          stream: stream,
+        );
+
+    test('a screen share is on, even with the camera off', () {
+      // The PR's whole point: a screen-only share — camera off, so `videoLive`
+      // is false — must still render its frames, not fall back to an avatar.
+      expect(
+        tile(videoLive: false, sharingScreen: true, stream: stream).showsVideo,
+        isTrue,
+      );
+    });
+
+    test('the camera is live', () {
+      expect(
+        tile(videoLive: true, sharingScreen: false, stream: stream).showsVideo,
+        isTrue,
+      );
+    });
+
+    test('but not when the camera is paused with the stream still attached', () {
+      // A paused camera keeps its stream; without the `videoLive` gate this would
+      // leave a dead texture — and a fit button — over the avatar.
+      expect(
+        tile(videoLive: false, sharingScreen: false, stream: stream).showsVideo,
+        isFalse,
+      );
+    });
+
+    test('and not when there is nothing on the wire at all', () {
+      expect(
+        tile(videoLive: true, sharingScreen: true, stream: null).showsVideo,
+        isFalse,
+      );
+    });
+  });
+
+  group('held sideways, the faces take the width and the controls the edge', () {
+    // The default test window is already landscape (800×600); pin it explicitly so
+    // the intent is on the page and a future default change does not quietly flip
+    // these to portrait.
+    void landscape(WidgetTester tester) {
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+    }
+
+    testWidgets('the controls stand on the right as a rail, not across the bottom',
+        (tester) async {
+      landscape(tester);
+      await show(tester, stateWith(const CallState()));
+
+      final rect = tester.getRect(find.byType(ControlBar));
+      expect(rect.height, greaterThan(rect.width),
+          reason: 'the bar is stacked into a column, taller than it is wide');
+      expect(rect.center.dx, greaterThan(400),
+          reason: 'and sits against the right edge, not the middle');
+    });
+
+    testWidgets('a crowd scrolls off the right in wide tiles, not down the page',
+        (tester) async {
+      landscape(tester);
+      await show(
+        tester,
+        stateWith(const CallState(participants: [
+          CallParticipant(srcId: 'a', hasAudio: true),
+          CallParticipant(srcId: 'b', hasAudio: true),
+          CallParticipant(srcId: 'c', hasAudio: true),
+        ])),
+      );
+
+      final grid = tester.widget<GridView>(find.byType(GridView));
+      expect(grid.scrollDirection, Axis.horizontal);
+
+      // And the tiles are wide 4:3 plates, not the narrow portrait slivers an
+      // un-flipped childAspectRatio would cut. Guards the cross-axis÷main-axis
+      // inversion that bites when the grid's scroll axis turns on its side.
+      final tile = tester.getRect(find.byType(TileFrame).first);
+      expect(tile.width, greaterThan(tile.height),
+          reason: 'a landscape tile is wider than it is tall');
+    });
+
+    testWidgets('two faces split side by side, not stacked', (tester) async {
+      landscape(tester);
+      await show(
+        tester,
+        stateWith(const CallState(
+            participants: [CallParticipant(srcId: 'a', hasAudio: true)])),
+      );
+
+      // Self plus one other: two tiles, and in landscape they divide the width.
+      final tiles = find.byType(TileFrame);
+      expect(tiles, findsNWidgets(2));
+      final a = tester.getRect(tiles.at(0));
+      final b = tester.getRect(tiles.at(1));
+      expect((a.center.dy - b.center.dy).abs(), lessThan(1),
+          reason: 'level with each other — a row, not a column');
+      expect((a.center.dx - b.center.dx).abs(), greaterThan(100),
+          reason: 'and set apart across the width');
+    });
+  });
 }
+
+class _FakeStream extends Fake implements MediaStream {}

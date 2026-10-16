@@ -19,6 +19,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/app_state.dart';
 import 'package:gather_companion/src/link_status.dart';
+import 'package:gather_companion/harness/scripted_call.dart';
 import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
@@ -459,6 +460,144 @@ void main() {
     });
   });
 
+  group('the raise-hand toggle', () {
+    testWidgets('is absent from the React tray until there is a meeting',
+        (tester) async {
+      // Standing alone over the map — a hand is a meeting gesture, and like the
+      // door and the camera flip, the control for it is absent, not dimmed, when
+      // there is nothing to do with it. Open the tray and it is eight reactions
+      // and nothing else.
+      await tester.pumpWidget(wrap(connected()));
+      await tester.tap(find.byTooltip('React'));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Raise hand'), findsNothing);
+      expect(find.byTooltip('Lower hand'), findsNothing);
+    });
+
+    testWidgets('lives in the React tray in a meeting and toggles the hand',
+        (tester) async {
+      final state = connected()..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+
+      // Folded into React now, not a button of its own in the main row — the bar
+      // ran out of width for a tenth control on a phone.
+      expect(find.byTooltip('Raise hand'), findsNothing);
+      await tester.tap(find.byTooltip('React'));
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('Raise hand'), findsOneWidget);
+      expect(state.myHandRaised, isFalse);
+      // Closed-state: no amber badge on React yet.
+      expect(find.byKey(const Key('react-hand-badge')), findsNothing);
+
+      await tester.tap(find.byTooltip('Raise hand'));
+      await tester.pumpAndSettle();
+
+      // The state flipped and the label with it — the one control is both raise and
+      // lower, and the tray stays open so lowering is one tap, not a reopen.
+      expect(state.myHandRaised, isTrue);
+      expect(find.byTooltip('Lower hand'), findsOneWidget);
+      expect(find.byTooltip('Raise hand'), findsNothing);
+      // The raised state rides up onto React as an amber dot, so it survives the
+      // tray closing.
+      expect(find.byKey(const Key('react-hand-badge')), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Lower hand'));
+      await tester.pumpAndSettle();
+      expect(state.myHandRaised, isFalse);
+      expect(find.byTooltip('Raise hand'), findsOneWidget);
+      expect(find.byKey(const Key('react-hand-badge')), findsNothing);
+    });
+
+    testWidgets('amber badge on React persists after the tray is closed',
+        (tester) async {
+      final state = connected()..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+
+      await tester.tap(find.byTooltip('React'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Raise hand'));
+      await tester.pumpAndSettle();
+
+      // Close the tray again from the React button.
+      await tester.tap(find.byTooltip('React, hand raised'));
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('Raise hand'), findsNothing);
+      expect(find.byTooltip('Lower hand'), findsNothing);
+      expect(find.byKey(const Key('react-hand-badge')), findsOneWidget);
+    });
+  });
+
+  group('the worst-case row still fits a phone', () {
+    // The reason raise-hand moved into React in the first place. On the call
+    // screen, with the camera on and somebody else in the room, the control row
+    // carries its most — self, mic, camera, camera-switch, speaker, React and the
+    // door. These are fixed-width plates that cannot shrink, so a tenth one pushed
+    // the row's own intrinsic width past the phone it had to sit on: the island
+    // then overflowed rather than the nav row setting its width, the `spaceEvenly`
+    // gaps collapsed to zero and the red door was crushed flush against the edge —
+    // the "squashed" report. This pins the fullest row against a phone narrower
+    // than the iPhone 12 it was first seen on, so a tenth button cannot come back
+    // unnoticed.
+    AppState worstCase() => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugApplyRoster(Roster(
+        selfId: 'me',
+        rows: [
+          _row('me', name: 'Jonas', deskId: 'desk-1', x: 11, y: 10),
+          _row('ada', name: 'Ada', x: 11, y: 11),
+        ],
+      ))
+      ..debugHuddle = ['Ada']
+      ..debugCall = const CallState(
+        media: LocalMediaState(
+            capturing: true, videoEnabled: true, videoTrackId: 'v1'),
+      );
+
+    testWidgets('the fullest control set does not overflow a 360-point phone',
+        (tester) async {
+      final state = worstCase();
+      // Capped the way the shell caps the dock — an `IntrinsicWidth` over the
+      // [kRailMinWidth] floor — but bounded here by a small phone, so a row that
+      // outgrows it overflows the test rather than silently crushing on a device.
+      const phoneWidth = 360.0;
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: phoneWidth),
+              child: IntrinsicWidth(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: kRailMinWidth),
+                  child: ControlBar(state: state, onCallScreen: true),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      // The fullest row it has: every control that can be present, is — the
+      // camera-switch only the call screen shows and the door only a conversation
+      // gives are both here, so this is the worst case and not a lesser one.
+      expect(find.byTooltip('Switch camera'), findsOneWidget);
+      expect(find.byTooltip('Leave the conversation'), findsOneWidget);
+
+      // No `RenderFlex` overflow: the plates fit side by side on the phone without
+      // being asked to shrink into one another. A tenth button trips this.
+      expect(tester.takeException(), isNull);
+
+      // And the whole row is inside the phone with room to spare — the margin the
+      // tenth button ate.
+      expect(tester.getSize(find.byType(ControlBar)).width,
+          lessThanOrEqualTo(phoneWidth));
+    });
+  });
+
   group('the status sheet', () {
     testWidgets('opens off the avatar and offers the three you can set',
         (tester) async {
@@ -639,6 +778,95 @@ void main() {
 
     expect(find.byTooltip('Leave the conversation'), findsOneWidget);
     expect(find.text('Not connected to Gather.'), findsOneWidget);
+  });
+
+  group('the door silences you on the way out', () {
+    // Walking away from a conversation still broadcasting is the thing nobody
+    // wants, so the door mutes the microphone and the camera before it leaves.
+    // There is no socket here to actually pause, so the proof is that the door
+    // *asks* the call to — recorded by a [ScriptedCall] attached as the real
+    // call object — and that it asks whenever a call exists, including while an
+    // enable is still in flight, but conjures no call for a plain desk walk.
+
+    /// A state with a conversation to leave and [call] standing in as the live
+    /// call object, so [AppState.callHandle] is non-null and the mute requests
+    /// land somewhere that records them.
+    AppState withCall(ScriptedCall call) => AppState()
+      ..debugApplyLink(const LinkStatus(LinkState.live))
+      ..debugApplyRoster(Roster(
+        selfId: 'me',
+        rows: [_row('me', name: 'Jonas')],
+      ))
+      ..debugHuddle = ['Ada']
+      ..debugAttachCall(call);
+
+    testWidgets('a live mic and camera are both turned off first',
+        (tester) async {
+      final call = ScriptedCall()
+        ..emit(const CallState(
+          media: LocalMediaState(
+            capturing: true,
+            audioEnabled: true,
+            audioTrackId: 'a1',
+            videoEnabled: true,
+            videoTrackId: 'v1',
+          ),
+        ));
+      final state = withCall(call);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      // Both silenced, each exactly once and each to off.
+      expect(call.micCalls, [false]);
+      expect(call.cameraCalls, [false]);
+    });
+
+    testWidgets('an enable still in flight is silenced too', (tester) async {
+      // The regression the review caught: a capture that has not finished opening
+      // reads as off through `call.micOn` / `call.cameraOn`. A guard on those
+      // would skip the mute, and the pending enable would publish after the
+      // walk. The door now issues the off intents on any live call, so this
+      // still-opening capture is caught and queued off behind the enable.
+      final call = ScriptedCall()
+        ..emit(const CallState(
+          media: LocalMediaState(capturing: false),
+        ));
+      final state = withCall(call);
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      expect(call.micCalls, [false]);
+      expect(call.cameraCalls, [false]);
+    });
+
+    testWidgets('a door press with no call built is a no-op', (tester) async {
+      // The plain desk walk with nothing ever opened: no call object exists, so
+      // the door silences nothing and — the point of the guard — does not build
+      // a call just to mute it.
+      final state = AppState()
+        ..debugApplyLink(const LinkStatus(LinkState.live))
+        ..debugApplyRoster(Roster(
+          selfId: 'me',
+          rows: [_row('me', name: 'Jonas')],
+        ))
+        ..debugHuddle = ['Ada'];
+      await tester.pumpWidget(wrap(state));
+      await tester.pumpAndSettle();
+
+      expect(state.callHandle, isNull);
+
+      await tester.tap(find.byTooltip('Leave the conversation'));
+      await tester.pumpAndSettle();
+
+      // No call was conjured by the door press.
+      expect(state.callHandle, isNull);
+    });
   });
 
   group('the camera riding along', () {

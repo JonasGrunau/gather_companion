@@ -147,6 +147,11 @@ class FakeTransport implements ms.Transport {
   int iceRestarts = 0;
   List<RTCIceServer> lastIceServers = const [];
 
+  /// How many times a producer on this transport hit the `createOffer` path
+  /// while the transport's peer connection was still live — the dead-pc queue of
+  /// issue #7. A clean teardown (transport closed before producers) leaves this 0.
+  int offerAttempts = 0;
+
   /// The handler, and specifically whether it admits to being ready.
   ///
   /// The real `Transport` starts `handler.run()` without waiting for it, so for
@@ -221,7 +226,8 @@ class FakeTransport implements ms.Transport {
         }
         if (chosen is String) id = chosen;
       }
-      final producer = FakeProducer(id: id, tag: tag, encodings: encodings);
+      final producer =
+          FakeProducer(id: id, tag: tag, encodings: encodings, transport: this);
       producers.add(producer);
       producerCallback?.call(producer);
     });
@@ -254,14 +260,36 @@ class FakeTransport implements ms.Transport {
   void restartIce(ms.IceParameters iceParameters) => iceRestarts++;
 
   @override
-  Future<void> close() async => closed = true;
+  Future<void> close() async {
+    closed = true;
+    // The real transport closes the handler (nulling the pc) and then tears each
+    // producer down via `transportClosed()` — the path that never emits `@close`
+    // and never queues `stopSending`. Model that here so a producer closed after
+    // its transport cannot hit the `createOffer` branch.
+    for (final producer in producers) {
+      producer.transportDown = true;
+    }
+  }
 
   @override
   dynamic noSuchMethod(Invocation invocation) => null;
 }
 
 class FakeProducer implements ms.Producer {
-  FakeProducer({required this.id, required this.tag, this.encodings = const []});
+  FakeProducer({
+    required this.id,
+    required this.tag,
+    this.encodings = const [],
+    this.transport,
+  });
+
+  /// The transport that created us, so [close] can tell whether the peer
+  /// connection is still live when it is asked to tear down.
+  final FakeTransport? transport;
+
+  /// Set when the owning transport closes first: the handler and its pc are gone,
+  /// so closing now takes the clean `transportClosed()` path, not `createOffer`.
+  bool transportDown = false;
 
   @override
   final String id;
@@ -292,6 +320,12 @@ class FakeProducer implements ms.Producer {
   bool closed = false;
   bool isPaused = false;
 
+  /// Reproduce the `createOffer: Error (null)` a producer on a never-connected
+  /// send transport throws when closed — the real mediasoup `@close` runs
+  /// `createOffer` on a peer connection that never finished negotiating. Set by
+  /// a test to prove the session's guarded close swallows it.
+  bool throwOnClose = false;
+
   /// Every layer the server steered us to, so the debounce can be asserted on.
   final List<int> maxSpatialLayers = [];
 
@@ -302,7 +336,17 @@ class FakeProducer implements ms.Producer {
   void resume() => isPaused = false;
 
   @override
-  void close() => closed = true;
+  void close() {
+    if (closed) return;
+    // Only a producer closed while its transport's pc is still live runs
+    // `createOffer` and throws (issue #7). Once the transport has closed first,
+    // `transportClosed` is set and this is a clean no-op.
+    if (throwOnClose && !transportDown) {
+      transport?.offerAttempts++;
+      throw StateError('Unable to RTCPeerConnection::createOffer: Error (null)');
+    }
+    closed = true;
+  }
 
   @override
   Future<void> setMaxSpatialLayer(int spatialLayer) async =>

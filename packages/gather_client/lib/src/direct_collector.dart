@@ -81,11 +81,32 @@ const _handshakeGrace = Duration(seconds: 5);
 /// for as long as the process runs while receiving nothing.
 ///
 /// Gather's server heartbeats every 3–9s, so silence is unambiguous well before
-/// this. Generous anyway: being wrong costs a reconnect and a fresh state dump, but
-/// reconnecting a *working* socket every 45s would be its own bug.
+/// this. Being wrong costs a reconnect and a fresh state dump, so it has to clear
+/// the 9s ceiling with room to spare — but it used to be 45s, which meant a phone
+/// that lost its network the dirty way (half-open, no FIN) went on claiming a live
+/// office, and claiming *presence to others*, for most of a minute. 12s is one
+/// missed server heartbeat past the 9s ceiling: long enough not to reconnect a
+/// merely-slow socket, short enough that "nobody can see me" is not a 45-second
+/// silence.
 ///
-/// Mirrors `SILENCE_LIMIT_MS` in `bridge/lib/direct.js`; the two must not drift.
-const _silenceLimit = Duration(seconds: 45);
+/// The bridge's `SILENCE_LIMIT_MS` in `bridge/lib/direct.js` stays at its own
+/// value: it is a different runtime on a real network, not a phone changing cells,
+/// and does not share this failure mode. The two are allowed to differ now.
+const _silenceLimit = Duration(seconds: 12);
+
+/// How long our own `SpaceUser` may be missing from an otherwise-healthy roster
+/// before we treat it as "other people cannot see us" and begin recovery.
+///
+/// Distinct from [_silenceLimit]: there the socket is deaf and nothing arrives;
+/// here frames flow and the roster is current, but it does not contain a present,
+/// placed *us*. A few seconds of grace absorbs the ordinary gap between a
+/// reconnect's first partial dump and the patch that re-places our own row, so a
+/// blink of absence never raises anything — see the recovery ladder in [_flush].
+const _selfAbsentLimit = Duration(seconds: 5);
+
+/// How long a silent re-enter gets to put us back on the roster before the
+/// recovery ladder stops being quiet and reconnects the socket outright.
+const _reenterGrace = Duration(seconds: 4);
 
 const _maxBackoff = Duration(seconds: 30);
 
@@ -116,6 +137,11 @@ class DirectCollector implements Collector {
     // watchdog is to let a connection actually fall silent, and a suite that waited
     // [_silenceLimit] to find out would add 45 seconds to every run.
     this.silenceLimit = _silenceLimit,
+    // Same seam, for the presence ladder: a test proves the self-row watchdog by
+    // letting a real roster arrive without us in it, and must not wait out the
+    // production 5s + 4s to see the re-enter and the reconnect.
+    this.selfAbsentLimit = _selfAbsentLimit,
+    this.reenterGrace = _reenterGrace,
         // A named parameter cannot be a private initializing formal, so these are
         // assigned the long way round — same as `BridgeClient` and `AppState`.
         // ignore: prefer_initializing_formals
@@ -133,6 +159,14 @@ class DirectCollector implements Collector {
   /// [_silenceLimit] for why this exists and why it is as long as it is.
   final Duration silenceLimit;
 
+  /// How long our own row may be missing before the quiet re-enter. See
+  /// [_selfAbsentLimit].
+  final Duration selfAbsentLimit;
+
+  /// How long a silent re-enter gets before the loud reconnect. See
+  /// [_reenterGrace].
+  final Duration reenterGrace;
+
   final GatherAuth _auth;
   final String _socketUrl;
 
@@ -142,6 +176,7 @@ class DirectCollector implements Collector {
 
   /// Explicitly configured space, if any; otherwise resolved per connect.
   final String? _configuredSpaceId;
+  @override
   String? spaceId;
 
   GameProtocolReader reader = GameProtocolReader();
@@ -152,11 +187,23 @@ class DirectCollector implements Collector {
   Timer? _heartbeatTimer;
   Duration _backoff = const Duration(seconds: 1);
   bool _stopped = false;
+
+  /// Whether the device reports a usable transport. False suspends every
+  /// reconnect: offline is a known dead end, and retrying into it only spins the
+  /// CPU and burns battery (issue #8). Defaults true so nothing changes until
+  /// [AppState] seeds it from `connectivity_plus`.
+  bool _reachable = true;
   bool _healthy = false;
   String? _lastDetail;
   bool _dirty = false;
   int _frames = 0;
   int _connects = 0;
+
+  /// Whether the one-shot calendar-signal scan has run and logged. A diagnostic to
+  /// learn whether Gather broadcasts colleague calendar entities
+  /// (`BaseCombinedCalendarEvent`, `SpaceUser.hasConnectedCalendars`) over this
+  /// socket, the way the desktop reads them — settled once per connection.
+  bool _calendarScanned = false;
 
   /// Whether `enterSpace` has gone out on the current socket. Reset per connect.
   bool _entered = false;
@@ -164,6 +211,32 @@ class DirectCollector implements Collector {
 
   /// When a frame last arrived. The watchdog's whole state — see [_silenceLimit].
   DateTime? _lastFrameAt;
+
+  /// Whether we have been visible to others at least once on this connection. Flips
+  /// an absent self row from "a dump still arriving" into "we have disappeared", so
+  /// the ladder reacts to the loss at once instead of waiting out the cold-start
+  /// grace. Reset per connect.
+  bool _wasVisible = false;
+
+  /// Since when our own row has been missing from an otherwise-live roster, or
+  /// null while we can see ourselves. The clock behind [_selfAbsentLimit].
+  DateTime? _selfDoubtSince;
+
+  /// A silent re-enter is outstanding: we have re-sent `enterSpace` and are
+  /// waiting [_reenterGrace] to see ourselves come back before reconnecting.
+  bool _reentering = false;
+  DateTime? _reenterAt;
+
+  /// Whether the outstanding re-enter was raised by the walk engine rather than by a
+  /// missing self row. It matters because the two have opposite repair signals: a
+  /// self-absent re-enter is healed the moment [GameProtocolReader.selfVisible] turns
+  /// true again, but a walk-triggered one runs *while* we are still visible — the
+  /// server reports us connected and placed and simply ignores our moves. Letting
+  /// `selfVisible` clear a walk re-enter would drop it on the very next flush, before
+  /// any move was confirmed: the loud reconnect would never fire and each later
+  /// buffer overflow would send a fresh `enterSpace`. So a walk re-enter is cleared
+  /// only by a confirmed move ([noteMovesConfirmed]) or escalated after [reenterGrace].
+  bool _reenterFromWalk = false;
 
   /// txnId -> the action it was, so an ack can be named. Cleared per connect.
   final Map<String, String> _awaiting = {};
@@ -233,6 +306,9 @@ class DirectCollector implements Collector {
         ...reader.stats(),
         'frames': _frames,
         'connects': _connects,
+        // The current reconnect delay. Exposed so a test can prove the backoff climbs
+        // across frameless connects and resets on a frame — the whole of issue #8.
+        'backoffMs': _backoff.inMilliseconds,
         'spaceId': spaceId,
         'authUserId': reader.authUserId,
         'entered': _entered,
@@ -270,6 +346,35 @@ class DirectCollector implements Collector {
     _backoff = const Duration(seconds: 1);
     _connectNow();
     return (ok: true, detail: 'reconnecting; a full state dump follows immediately');
+  }
+
+  /// Suspends every reconnect while the device has no transport, and resumes from
+  /// the backoff floor when one returns (issue #8).
+  ///
+  /// Offline is a known dead end: the deaf-watchdog would otherwise spin connect
+  /// attempts that cannot succeed, which is exactly when the phone has least battery
+  /// to spare. Going offline tears the socket down and stands still; a returning
+  /// transport reconnects at once. [AppState] also calls [resync] on a transport
+  /// change, and the `_retryTimer` guard keeps the two from firing twice.
+  ///
+  /// Tearing the socket down here is not the whole of it: an [_openConnection]
+  /// already awaiting auth or the WebSocket handshake would otherwise complete and
+  /// install a live socket *after* this ran. `_reachable` is re-checked past every
+  /// await in that path, so an in-flight open begun while reachable closes itself
+  /// rather than slip a connection past the stand-down (issue #8).
+  @override
+  void setReachable(bool reachable) {
+    if (reachable == _reachable) return;
+    _reachable = reachable;
+    if (_stopped) return;
+    if (!reachable) {
+      _clearTimers();
+      unawaited(_closeSocket());
+      _setHealth(false, 'offline — waiting for a network');
+      return;
+    }
+    _backoff = const Duration(seconds: 1);
+    _scheduleRetry();
   }
 
   /// Takes one step. What the D-pad sends.
@@ -449,7 +554,23 @@ class DirectCollector implements Collector {
     return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
+  /// Asks to be let into a locked area.
+  ///
+  /// The action is `requestToAccess` (model `MapArea`), from the action surface in
+  /// `docs/protocol/client-action-surface.md` — it takes no arguments, so the frame
+  /// is the bare two-element `[model, id]`, addressed to the area's id exactly as
+  /// [wave] is addressed to the recipient's. The server records an
+  /// `AreaAccessRequest`; on acceptance a patch flips our admission and the map lets
+  /// us walk in, through the same `AreaAccessRequest` rows [SpaceMapBuilder] already
+  /// folds into `canEnterRoom`.
+  @override
+  ({bool ok, String? detail}) requestToAccess(String areaId) {
+    if (areaId.isEmpty) return (ok: false, detail: 'no area to ask about');
+    return _send('requestToAccess', model: 'MapArea', id: areaId);
+  }
+
   /// Puts a hand up, or takes it down. A bare bool, not a map.
+  @override
   ({bool ok, String? detail}) setHandRaised(bool raised) =>
       _act('setHandRaised', raised);
 
@@ -511,6 +632,29 @@ class DirectCollector implements Collector {
   @override
   ({bool ok, String? detail}) setActive(bool active) =>
       _send('reportActivity', model: 'Connection', id: null, args: {'isActive': active});
+
+  @override
+  void notePresenceDoubt() {
+    // Stronger evidence than an absent row — the walk engine watched move after
+    // move go unapplied — so skip the [_selfAbsentLimit] wait and begin the quiet
+    // re-enter at once. From there the ladder in [_checkSelfPresence] is the same.
+    if (_entered) {
+      _beginRecovery('the walk engine saw moves the server never applied', fromWalk: true);
+    }
+  }
+
+  @override
+  void noteMovesConfirmed() {
+    // A roster finally landed us on a tile we had stepped onto: the server is
+    // applying our moves again, which is the one unambiguous proof that a
+    // walk-triggered re-enter took. Nothing else can clear it — [selfVisible] was
+    // true the whole time — so without this the re-enter would hang until the grace
+    // escalated it into a needless reconnect.
+    if (_reentering && _reenterFromWalk) {
+      _log('direct: a move was confirmed — walk-triggered recovery took');
+      _notePresenceOk();
+    }
+  }
 
   /// One action against our own `SpaceUser` row, on the socket we already hold.
   ///
@@ -633,7 +777,7 @@ class DirectCollector implements Collector {
   }
 
   void _scheduleRetry() {
-    if (_stopped || _retryTimer != null) return;
+    if (_stopped || !_reachable || _retryTimer != null) return;
     final wait = _backoff;
     final next = _backoff * 2;
     _backoff = next > _maxBackoff ? _maxBackoff : next;
@@ -664,15 +808,22 @@ class DirectCollector implements Collector {
     return (id: spaces.first.id, spaceUserId: spaces.first.spaceUserId);
   }
 
+  /// Opens a connection unless we are stopped or the device has no transport.
+  ///
+  /// Every connect funnels through here — [start], [resync] and the retry timer —
+  /// so the offline gate lives here rather than at each caller. Without it a
+  /// `resync()` (which `AppState.verifyLink()` fires on app resume) would open a
+  /// socket straight into no network, defeating the stand-down (issue #8).
   void _connectNow() {
+    if (_stopped || !_reachable) return;
     unawaited(_openConnection());
   }
 
   Future<void> _openConnection() async {
-    if (_stopped) return;
+    if (_stopped || !_reachable) return;
     _clearTimers();
     await _closeSocket();
-    if (_stopped) return;
+    if (_stopped || !_reachable) return;
 
     final String token;
     final ({String id, String? spaceUserId})? resolved;
@@ -691,7 +842,9 @@ class DirectCollector implements Collector {
       _scheduleRetry();
       return;
     }
-    if (_stopped) return;
+    // The transport may have dropped while we were awaiting auth: a connect begun
+    // while reachable must not install a socket after the offline signal (issue #8).
+    if (_stopped || !_reachable) return;
 
     if (resolved == null) {
       _setHealth(false, 'no space to join — open a space in Gather once');
@@ -728,15 +881,29 @@ class DirectCollector implements Collector {
       _scheduleRetry();
       return;
     }
-    if (_stopped) {
+    // The socket opened, but the WebSocket handshake may have outlived a transport
+    // drop. Close it rather than install a live connection the stand-down thought it
+    // had prevented — the `onDone` guard keys on `_ws`, which is still null here, so
+    // nothing reschedules (issue #8).
+    if (_stopped || !_reachable) {
       await ws.close();
       return;
     }
 
     _ws = ws;
     _connects++;
-    _backoff = const Duration(seconds: 1);
+    // Backoff is NOT reset here. An open socket is not a working one: in a dead
+    // zone the connect succeeds and the socket is immediately deaf, so resetting
+    // on connect pinned the retry at 1s forever (issue #8). The floor is restored
+    // only once a frame actually arrives — see [_onFrame] — so repeated
+    // connect-then-deaf cycles keep climbing 1s→2s→…→30s.
     _entered = false;
+    // A fresh socket owes its own presence proof; last connection's doubt or
+    // outstanding re-enter must not carry over and reconnect a healthy new one.
+    _wasVisible = false;
+    _selfDoubtSince = null;
+    _reentering = false;
+    _reenterAt = null;
     _log('direct: connected to space $resolvedSpace');
 
     try {
@@ -875,6 +1042,7 @@ class DirectCollector implements Collector {
   /// `onDone`, because [_closeSocket] nulls `_ws` first and the `onDone` handler
   /// guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
   bool _isSilent() {
+    if (!_reachable) return false;
     final last = _lastFrameAt;
     if (last == null) return false;
     final since = DateTime.now().difference(last);
@@ -941,7 +1109,17 @@ class DirectCollector implements Collector {
     // watchdog asks is whether the socket still carries anything at all, not whether
     // anything interesting happened.
     _lastFrameAt = DateTime.now();
+    // A frame is proof the pipe carries data: this is the honest moment to reset
+    // the reconnect backoff, not the bare socket-open (issue #8).
+    _backoff = const Duration(seconds: 1);
     if (reader.ingest(frame)) _dirty = true;
+
+    // One-shot: does Gather push colleague calendar entities over this socket? A
+    // diagnostic that names colleague emails, so it runs only in a build made with
+    // `--dart-define=GCAL_DEBUG=true` and is absent — not just quiet — otherwise.
+    if (const bool.fromEnvironment('GCAL_DEBUG') && !_calendarScanned) {
+      _scanCalendarSignals(frame);
+    }
 
     // The state dump is what names us, so this is the first moment the late path
     // can enter. Cheap to ask: it returns immediately once done.
@@ -959,6 +1137,105 @@ class DirectCollector implements Collector {
       _interactions.add(event);
     }
   }
+
+  /// Walks a decoded frame once looking for the calendar entities the desktop reads —
+  /// `BaseCombinedCalendarEvent` collections and the `SpaceUser.hasConnectedCalendars`
+  /// /`activeCalendarInferredId`/`calculatedPrimaryCalendarEmail` fields — and logs
+  /// what it finds, so a pulled log answers whether this space broadcasts colleague
+  /// calendars at all before we build a parser against them.
+  ///
+  /// Settles once: the moment it finds a signal it logs and stops; failing that it
+  /// gives the dump [_calendarScanProbeFrames] frames to arrive and then logs the
+  /// negative. Bounded by a node budget so a 100-person state dump cannot stall the
+  /// message handler.
+  void _scanCalendarSignals(Object? frame) {
+    final calKeys = <String>{};
+    var combinedEvents = 0;
+    var budget = 200000;
+
+    // Per-user tally: the question is not just "are the keys present" but "are they
+    // populated for real colleagues" — how many carry an email we could query, and
+    // how many are mid-meeting right now by Gather's own inference.
+    var userRows = 0;
+    var withEmail = 0;
+    var connectedTrue = 0;
+    var withInferred = 0;
+    final samples = <String>[];
+
+    void walk(Object? node) {
+      if (budget-- <= 0) return;
+      if (node is Map) {
+        // A SpaceUser row carries the calendar fields directly. Detect it by the
+        // presence of the connection flag, then read its calendar shape once.
+        if (node.containsKey('hasConnectedCalendars') ||
+            node.containsKey('calculatedPrimaryCalendarEmail')) {
+          userRows++;
+          final email = node['calculatedPrimaryCalendarEmail'];
+          final connected = node['hasConnectedCalendars'];
+          final inferred = node['activeCalendarInferredId'];
+          final hasEmail = email is String && email.isNotEmpty;
+          if (hasEmail) withEmail++;
+          if (connected == true) connectedTrue++;
+          if (inferred != null && '$inferred'.isNotEmpty) withInferred++;
+          if (samples.length < 8 && (hasEmail || connected == true)) {
+            final name = node['name'] ?? node['displayName'] ?? '?';
+            samples.add('$name: email=${hasEmail ? email : '-'} '
+                'connected=${connected == true} '
+                'inMeeting=${inferred != null && '$inferred'.isNotEmpty}');
+          }
+        }
+        node.forEach((k, v) {
+          final key = k is String ? k : k.toString();
+          final lower = key.toLowerCase();
+          if (lower.contains('calendar')) {
+            calKeys.add(key);
+            // A collection of calendar events — count rows if one is broadcast.
+            if (lower.contains('calendarevent') || lower.contains('combinedcalendar')) {
+              if (v is Map) {
+                combinedEvents += v.length;
+              } else if (v is List) {
+                combinedEvents += v.length;
+              }
+            }
+          }
+          walk(v);
+        });
+      } else if (node is List) {
+        for (final e in node) {
+          if (budget <= 0) break;
+          walk(e);
+        }
+      }
+    }
+
+    walk(frame);
+
+    // Wait for the full state dump before tallying, so the per-user counts reflect the
+    // whole roster rather than whichever delta happened to carry the first signal.
+    final found = calKeys.isNotEmpty && hasState;
+    if (found) {
+      _calendarScanned = true;
+      _log('gcal-wire: signals present — keys={${calKeys.join(', ')}}; '
+          'combinedEvents=$combinedEvents');
+      _log('gcal-wire: users=$userRows withEmail=$withEmail '
+          'connected=$connectedTrue inMeetingNow=$withInferred');
+      for (final s in samples) {
+        _log('gcal-wire: sample — $s');
+      }
+      return;
+    }
+    // No signal yet. Give the dump a few frames before concluding it is simply absent.
+    if (hasState && _frames >= _calendarScanProbeFrames) {
+      _calendarScanned = true;
+      _log('gcal-wire: no calendar signals after $_frames frames '
+          '(userCount=${reader.userCount}) — this space does not broadcast '
+          'colleague calendars on the game socket');
+    }
+  }
+
+  /// How many frames to let arrive before concluding the socket carries no calendar
+  /// data — enough for the full state dump to land after the handshake.
+  static const int _calendarScanProbeFrames = 20;
 
   void _flush() {
     // First, because the block below is what was lying. `_frames` is cumulative and
@@ -987,9 +1264,111 @@ class DirectCollector implements Collector {
       // Inside the grace window we leave the status alone: a server heartbeat
       // routinely arrives before the first FullStateChunk.
     }
+
+    // A live socket carrying a roster that does not contain a present us. Checked
+    // every tick, not only when the roster changed: going missing is the roster
+    // *losing* our row, which is a change like any other, but a roster that then
+    // sits still must not let the doubt expire unseen.
+    _checkSelfPresence();
+
     if (!_dirty) return;
     _dirty = false;
     if (!_rosters.isClosed) _rosters.add(reader.roster());
+  }
+
+  /// Watches an otherwise-healthy roster for the loss of *us*, and heals it.
+  ///
+  /// Two rungs, quiet then loud (see [_beginRecovery] and [_forceReconnect]).
+  /// Gated on having entered and on the dump having had [_handshakeGrace] to place
+  /// us, because before that an absent self row is a connect in progress rather
+  /// than a disappearance. The whole point is the case [healthy] cannot see: the
+  /// inbound light is green — frames arrive, the roster is current — and yet other
+  /// people's offices do not have us in them.
+  void _checkSelfPresence() {
+    if (!_entered || !hasState) return;
+
+    if (reader.selfVisible) {
+      _wasVisible = true;
+      // A walk-triggered re-enter cannot be judged by visibility: it was raised
+      // precisely because we are visible yet the server ignores our moves. Leave it
+      // latched for a confirmed move ([noteMovesConfirmed]) to clear, and only
+      // escalate when the grace runs out — the same loud rung as a self-absent
+      // re-enter that never took. Any other state is genuinely well: clear it.
+      if (_reentering && _reenterFromWalk) {
+        final at = _reenterAt;
+        if (at != null && DateTime.now().difference(at) > reenterGrace) {
+          _forceReconnect('a re-enter did not get our moves flowing again');
+        }
+        return;
+      }
+      _notePresenceOk();
+      return;
+    }
+
+    // Not a present, placed us. Once we have been visible this connection, that is
+    // a disappearance and the clock starts at once. Before we have ever been
+    // visible it is more likely a dump still assembling, so hold off until the
+    // handshake has had [_handshakeGrace] to place us — which also covers the
+    // enter that never took at all, just more slowly.
+    final now = DateTime.now();
+    if (!_wasVisible) {
+      final handshakeAt = _handshakeAt;
+      if (handshakeAt == null || now.difference(handshakeAt) < _handshakeGrace) return;
+    }
+
+    if (_reentering) {
+      final at = _reenterAt;
+      if (at != null && now.difference(at) > reenterGrace) {
+        _forceReconnect('a re-enter did not bring our own row back');
+      }
+      return;
+    }
+    final since = _selfDoubtSince ??= now;
+    if (now.difference(since) > selfAbsentLimit) {
+      _beginRecovery('our own row has been missing for '
+          '${now.difference(since).inMilliseconds}ms');
+    }
+  }
+
+  /// We can see ourselves again: drop every bit of recovery state so the next
+  /// disappearance starts its clock from scratch.
+  void _notePresenceOk() {
+    _selfDoubtSince = null;
+    _reentering = false;
+    _reenterAt = null;
+    _reenterFromWalk = false;
+  }
+
+  /// The quiet first rung: re-send `enterSpace` on the socket we already hold and
+  /// give it [_reenterGrace] to take, without a word to the user. Most presence
+  /// blips are a dropped enter, and this fixes them before anyone notices.
+  ///
+  /// A no-op while a re-enter is already outstanding, while stopped, or while a
+  /// reconnect is already scheduled — the ladder owns one attempt at a time, and
+  /// the deaf watchdog ([_isSilent]) owns the socket once it has decided to retry.
+  void _beginRecovery(String why, {bool fromWalk = false}) {
+    final ws = _ws;
+    if (_reentering || _stopped || _retryTimer != null) return;
+    if (ws == null || ws.readyState != WebSocket.open) return;
+    _log('direct: presence doubt — $why; re-entering');
+    _entered = false;
+    _maybeEnter();
+    _reentering = true;
+    _reenterAt = DateTime.now();
+    _reenterFromWalk = fromWalk;
+  }
+
+  /// The loud second rung: the re-enter did not bring us back, so stop believing
+  /// the socket and reconnect from scratch — which replays the whole dump and
+  /// enters again. This is where the banner finally appears; everything before it
+  /// was silent on purpose, so a working app stays a working app through a blink.
+  void _forceReconnect(String why) {
+    _log('direct: $why — reconnecting');
+    _notePresenceOk();
+    _clearTimers();
+    unawaited(_closeSocket());
+    _setHealth(false, 'reconnecting — restoring your presence');
+    _scheduleRetry();
   }
 }
 

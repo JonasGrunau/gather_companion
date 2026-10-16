@@ -19,6 +19,7 @@ import 'call_screen.dart';
 import 'control_bar.dart';
 import 'dpad.dart';
 import 'person_avatar.dart';
+import 'person_calendar_sheet.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -718,6 +719,19 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     }
   }
 
+  /// Walks to the tapped person and takes the card down. [AppState.goTo] relocates to
+  /// the nearest free tile, so we land *beside* them, not on the tile they occupy. A
+  /// refusal (offline, mid-reconnect, nowhere to stand) comes back as a line to show —
+  /// the same "say why nothing happened" the floor's own refused tap gets.
+  Future<void> _goToPerson(MapPerson person) async {
+    setState(() => _selectedPerson = null);
+    final error = await widget.state.goTo(person.x.round(), person.y.round());
+    if (!mounted || error == null) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(_railClearSnack(error));
+  }
+
   /// Roughly a fingertip, in logical pixels. Half of the 44pt Apple asks for, because
   /// this is a radius and that is a diameter.
   static const _thumb = 22.0;
@@ -977,6 +991,46 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     _zoom.forward(from: 0);
   }
 
+  /// Whether my own avatar has scrolled off the visible map, so there is a camera to
+  /// bring back. Point-based on the avatar centre; false when we have no position or no
+  /// layout yet. Reads [_view] so a [ListenableBuilder] on it recomputes as the floor
+  /// is panned.
+  bool _meOffScreen() {
+    if (_viewport.isEmpty || _child.isEmpty) return false;
+    final me = widget.state.mePerson;
+    if (me == null) return false;
+    final at = _motion.positionOf(me, _motion.now);
+    final childPt = Offset(
+      (at.dx + 0.5) * artTileSize * _base,
+      (at.dy + 0.5) * artTileSize * _base,
+    );
+    final screen = MatrixUtils.transformPoint(_view.value, childPt);
+    return !Rect.fromLTWH(0, 0, _viewport.width, _viewport.height).contains(screen);
+  }
+
+  /// Bring the camera back to my avatar after a pan has left it off screen. In Gameboy
+  /// mode re-engage the centred lock; otherwise ease the view back to the opening frame
+  /// on me, reusing the double-tap zoom animation so it is a camera move, not a cut.
+  void _backToMe() {
+    final me = widget.state.mePerson;
+    if (me == null || _child.isEmpty) return;
+    if (widget.state.gameboyMode) {
+      _lockCamera();
+      return;
+    }
+    _stopFollowing();
+    final at = _motion.positionOf(me, _motion.now);
+    final target = framedOn(
+      at: Offset((at.dx + 0.5) * artTileSize * _base, (at.dy + 0.5) * artTileSize * _base),
+      viewport: _viewport,
+      child: _child,
+      zoom: _openingZoom,
+    );
+    _zoomTo = Matrix4Tween(begin: _view.value, end: target)
+        .animate(CurvedAnimation(parent: _zoom, curve: Curves.easeOutCubic));
+    _zoom.forward(from: 0);
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = widget.state;
@@ -1182,30 +1236,66 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                 child: _PersonCard(
                   state: state,
                   person: _selectedPerson!,
+                  onGoHere: () => _goToPerson(_selectedPerson!),
                   onWave: () => _waveAtPerson(_selectedPerson!),
+                  onPlans: () => showPersonCalendar(context, state, _selectedPerson!.label,
+                      email: _selectedPerson!.calendarEmail),
                   onClear: () => setState(() => _selectedPerson = null),
                 ),
               ),
             ),
           ),
+        // Lost yourself off the edge of the floor? One tap brings the camera back. Shares
+        // the bottom slot with the pills above, and defers to all of them — a selection
+        // or a walk already has the slot and the camera's attention. Recomputed on every
+        // pan via [_view] and on every footstep via [_motion] — the avatar can leave the
+        // frame by the floor moving under it or by walking off the edge, and [_motion]'s
+        // interpolated legs notify only from its own ticker, not from [update]. The
+        // [Positioned] is always mounted but collapses to nothing while there is no
+        // avatar to chase off screen.
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: kGutter,
+          child: SafeArea(
+            top: false,
+            child: Center(
+              child: ListenableBuilder(
+                listenable: Listenable.merge([_view, _motion]),
+                builder: (_, _) {
+                  final show = _selected == null &&
+                      _selectedPerson == null &&
+                      _blockedNote == null &&
+                      !state.onRoute &&
+                      _meOffScreen();
+                  return show ? _BackToMe(onTap: _backToMe) : const SizedBox.shrink();
+                },
+              ),
+            ),
+          ),
+        ),
       ],
     );
   }
 }
 
-/// A tapped person's card: their face and name, a wave, and a way to put it down.
-/// Sits where the Go-here pill sits, and is never shown alongside it.
+/// A tapped person's card: their face and name, a walk over to them, a wave, and a way
+/// to put it down. Sits where the Go-here pill sits, and is never shown alongside it.
 class _PersonCard extends StatelessWidget {
   const _PersonCard({
     required this.state,
     required this.person,
+    required this.onGoHere,
     required this.onWave,
+    required this.onPlans,
     required this.onClear,
   });
 
   final AppState state;
   final MapPerson person;
+  final VoidCallback onGoHere;
   final VoidCallback onWave;
+  final VoidCallback onPlans;
   final VoidCallback onClear;
 
   @override
@@ -1216,64 +1306,134 @@ class _PersonCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(t.radius),
       elevation: 3,
       shadowColor: Colors.black.withValues(alpha: 0.28),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            PersonAvatar(
-              id: person.id,
-              label: person.label,
-              photoUrl: state.photoUrlFor(person.id),
-              size: 36,
-              availability: person.availability,
-              dotRing: t.card,
-            ),
-            const SizedBox(width: 10),
-            Flexible(
-              // Flexible, not a fixed max width: the avatar, Wave control, close
-              // button, gaps and padding can already fill a narrow phone, so a long
-              // name has to shrink and ellipsize into what is left rather than claim
-              // its full intrinsic width and overflow the row.
-              child: Text(
-                person.label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Material(
-              color: t.brand.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(17),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(17),
-                onTap: onWave,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.waving_hand_rounded, size: 16, color: t.brand),
-                      const SizedBox(width: 6),
-                      Text('Wave', style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
-                    ],
+      child: ConstrainedBox(
+        // A fixed card width rather than one that hugs its content: with the close pinned
+        // to the top-right corner the identity row has to span something, and a bounded
+        // width keeps the action pills on their own tidy line below instead of a Wrap that
+        // pushed the close and the calendar chip onto a ragged second row.
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 6, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Identity and the dismiss, on one line: face, name, and the close pinned to
+              // the corner where a card's close belongs.
+              Row(
+                children: [
+                  PersonAvatar(
+                    id: person.id,
+                    label: person.label,
+                    photoUrl: state.photoUrlFor(person.id),
+                    size: 36,
+                    availability: person.availability,
+                    dotRing: t.card,
                   ),
-                ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      person.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+                    // Names the otherwise icon-only control for a screen reader, as the
+                    // rail's own clear control is named.
+                    tooltip: 'Dismiss',
+                    onPressed: onClear,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
               ),
-            ),
-            IconButton(
-              icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
-              // Names the otherwise icon-only control for a screen reader, as the
-              // rail's own clear control is named.
-              tooltip: 'Dismiss',
-              onPressed: onClear,
-              visualDensity: VisualDensity.compact,
-            ),
-          ],
+              const SizedBox(height: 8),
+              // The verbs, on their own row: walk over, wave, and — only where there is a
+              // readable calendar — an icon-only Plans chip. A Wrap so a large text scale
+              // can still spill them onto a second line, but at ordinary sizes they sit flush
+              // left on one tidy row.
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  // Walk over, in the same pill shape as Wave: a person is somewhere you can
+                  // go as well as someone you can hail. [_goToPerson] lands beside them.
+                  _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
+                  _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
+                  // Only where there is a calendar to show: a person whose shared calendar
+                  // this account can read, keyed off their wire email (a display-name guess
+                  // misses most of the roster). Icon-only — the two verbs beside it carry
+                  // words, so a third would crowd the row; the calendar glyph is its own
+                  // label. Same brand pill, so it restyles under the Gameboy palette for free.
+                  if (state.googleAvailable &&
+                      state.hasCalendarFor(person.label, email: person.calendarEmail))
+                    _CardAction(
+                      icon: Icons.event_note_rounded,
+                      tooltip: 'Plans',
+                      onTap: onPlans,
+                    ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
+  }
+}
+
+/// One brand-tinted pill on the person card — an icon and a word. Wave and Go here are
+/// the same control twice, so they share a shape rather than each spelling it out. With
+/// no [label] it collapses to a square icon-only chip (the Plans glyph), named for a
+/// screen reader by [tooltip] instead; the round-pill radius is kept so all three sit on
+/// the same shape.
+class _CardAction extends StatelessWidget {
+  const _CardAction({
+    required this.icon,
+    this.label,
+    this.tooltip,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String? label;
+  final String? tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final iconOnly = label == null;
+    final child = Material(
+      color: t.brand.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(17),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(17),
+        onTap: onTap,
+        child: Padding(
+          // Square for the icon-only chip so the glyph sits centred, wider when a word
+          // follows it.
+          padding: iconOnly
+              ? const EdgeInsets.all(8)
+              : const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: t.brand),
+              if (label != null) ...[
+                const SizedBox(width: 6),
+                Text(label!,
+                    style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+    final tip = tooltip;
+    return tip == null ? child : Tooltip(message: tip, child: child);
   }
 }
 
@@ -1316,6 +1476,56 @@ class _BlockedNote extends StatelessWidget {
                 style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: ink),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A pan can carry your own avatar off the floor; this brings the camera back. Shown
+/// only while nothing is selected (it shares the Go-here pill's slot), so it is a
+/// neutral card rather than the brand-coloured action — it is a way back, not a verb.
+class _BackToMe extends StatelessWidget {
+  const _BackToMe({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    // Shape, colour and clip all on the [Material], with no [ClipRRect] or wrapping
+    // [ExcludeSemantics] — the same pattern as [_Kart], and for the same two reasons:
+    // ink is painted by the nearest Material in its own box, so a clip *below* it never
+    // catches the splash and the ripple spreads past the rounded corners; and excluding
+    // the descendants to hand the label to the outer node takes the [InkWell]'s tap
+    // action with them, leaving assistive tech a labelled button it cannot press.
+    return Semantics(
+      button: true,
+      label: 'Back to me',
+      child: Material(
+        color: t.card,
+        borderRadius: BorderRadius.circular(t.radius + 4),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.my_location_rounded, size: 18, color: t.foreground),
+                const SizedBox(width: 8),
+                Text(
+                  'Back to me',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: t.foreground,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

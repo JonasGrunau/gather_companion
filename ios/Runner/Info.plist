@@ -106,5 +106,24 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<!--
+		Screen sharing (issue #43). `flutter_webrtc` reads both of these at
+		getDisplayMedia time:
+
+		- RTCScreenSharingExtension is the bundle id of the Broadcast Upload
+		  Extension, used to point RPSystemBroadcastPickerView straight at our
+		  extension instead of letting the system list every broadcaster.
+		- RTCAppGroupIdentifier is the App Group the extension and the app both
+		  join; the captured frames cross between the two processes over a socket
+		  on a file inside it.
+
+		Both must match the extension target's bundle id and entitlements exactly.
+		See ios/BroadcastExtension/README.md for the one Xcode step that wires the
+		target up.
+	-->
+	<key>RTCScreenSharingExtension</key>
+	<string>com.jonasgrunau.gatherCompanion.Broadcast</string>
+	<key>RTCAppGroupIdentifier</key>
+	<string>group.com.jonasgrunau.gatherCompanion.screenshare</string>
 </dict>
 </plist>

@@ -826,13 +826,22 @@ Availability alone is no better, because people close the app without touching i
 
 ### 📋 What the screens show
 
-Three tabs on a floating rail: **Activity**, **Office**, **Settings**, opening on
-Activity. The office is the map above; who is following you sits in its app bar as a
-pill beside the head count, absent when nobody is — zero is the permanent normal
-state, and a pill saying so all day is furniture. Settings holds the connection, the
-party switch, the mic and camera check, and whether the paired computer can still
-wake the app. Everything live is *now* — read from the Gather socket, not from
-history.
+Five tabs on a floating rail: **Warp**, **Office**, **Activity**, **Plans**,
+**Settings**, opening on Warp. The office is the map above; who is following you sits
+in its app bar as a pill beside the head count, absent when nobody is — zero is the
+permanent normal state, and a pill saying so all day is furniture. Settings holds the
+connection, the party switch, the mic and camera check, and whether the paired
+computer can still wake the app.
+
+All of that is *now* — read from the Gather socket, not from history. **Plans** is the
+one exception: meetings you schedule ahead of time, and the only screen whose contents
+are this phone's own rather than Gather's. Gather has no calendar to read — its game
+socket carries no scheduled-event model — so a plan lives in the phone's keychain, not
+on Gather. Each can pin a Gather room so the card walks you there when the hour comes,
+and raises a local reminder before it starts (optionally mirrored into the phone's own
+calendar, which is the one bridge back to the Google/Outlook account Gather reads). In
+Gameboy mode, where the floating rail stands down, every tab — Plans included — is
+reached through the handheld's Select menu.
 
 ### 🎙️ Gather's controls, on the phone
 
@@ -847,7 +856,7 @@ Mic and camera drive a real capture session and publish to Gather's SFU, the sam
 mediasoup media plane the desktop client uses, with Gather's own three-layer
 simulcast declared and the server steering which layer is sent. Whoever is standing
 near you shows up as faces on a call screen, everybody the SFU is sending plus your
-own camera. The SFU is connected on the first publish rather than at join, because a
+own tile, always shown — your camera when it is on, an avatar when it is not. The SFU is connected on the first publish rather than at join, because a
 companion app is in a pocket far more often than it is used to talk. Mute is two
 things on purpose: a device mute, which is what makes iOS drop its recording
 indicator, and a `produce-pause`, which is what makes a colleague's client draw the

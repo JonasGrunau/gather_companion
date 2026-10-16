@@ -36,6 +36,7 @@ import '../src/directory.dart';
 import '../theme/gather_theme.dart';
 import 'call_screen.dart';
 import 'person_avatar.dart';
+import 'person_calendar_sheet.dart';
 
 class DialScreen extends StatefulWidget {
   const DialScreen({super.key, required this.state, this.visible = true});
@@ -58,6 +59,11 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   /// One at a time — a second tap mid-warp is ignored rather than queued.
   String? _warping;
 
+  /// The search box's text and its trimmed, lower-cased-at-match query. Typing
+  /// here narrows the directory in place; empty means show everything.
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
+
   /// Drives the subtitle's warp-in. Restarted whenever the tab becomes visible,
   /// which is free to tick exactly then: the shell wraps each tab in a
   /// `TickerMode` that enables in the same frame the tab is selected.
@@ -74,6 +80,9 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
     // The shell's own [ListenableBuilder] misses availability and cluster changes;
     // this is the signal that carries them. See the library comment.
     state.directoryChanges.addListener(_onDirectoryChanged);
+    // The list already rebuilds on directory churn; re-filtering on each keystroke
+    // is the same cheap setState.
+    _search.addListener(() => setState(() => _query = _search.text.trim()));
     if (widget.visible) _warp.forward(from: 0);
   }
 
@@ -87,12 +96,23 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   @override
   void dispose() {
     state.directoryChanges.removeListener(_onDirectoryChanged);
+    _search.dispose();
     _warp.dispose();
     super.dispose();
   }
 
   void _onDirectoryChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// Whether a contact survives the current search. An empty query keeps
+  /// everyone; otherwise their name or their status line must contain it.
+  bool _matches(Contact c) {
+    if (_query.isEmpty) return true;
+    final q = _query.toLowerCase();
+    if (c.label.toLowerCase().contains(q)) return true;
+    final s = c.status?.text;
+    return s != null && s.toLowerCase().contains(q);
   }
 
   /// Warps, then opens the faces on success. The sentence a refusal returns is
@@ -151,13 +171,28 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   Widget build(BuildContext context) {
     final t = context.tokens;
     final bottomInset = MediaQuery.paddingOf(context).bottom;
+    // The shell declines the keyboard inset for the whole tab stack so the office
+    // map never resizes (home_shell zeros `viewInsets` and sets
+    // `resizeToAvoidBottomInset: false`). But this tab *does* take text, and with
+    // that inset gone the last matches sit trapped behind the keyboard the search
+    // field raises. Read the real height straight off the view — unaffected by the
+    // shell's MediaQuery override — and pad the scroll tail by it, so the list can
+    // clear the keyboard without disturbing the map's no-resize contract.
+    final view = View.of(context);
+    final keyboardInset = view.viewInsets.bottom / view.devicePixelRatio;
 
+    final searching = _query.isNotEmpty;
     final contacts = state.directory;
-    final meetings = state.meetings;
     final recents = _recentContacts(contacts);
 
-    final present = contacts.where((c) => c.isPresent).toList(growable: false);
-    final offline = contacts.where((c) => !c.isPresent).toList(growable: false);
+    final meetings = state.meetings
+        .where((m) => !searching || m.members.any(_matches))
+        .toList(growable: false);
+    final present =
+        contacts.where((c) => c.isPresent && _matches(c)).toList(growable: false);
+    final offline =
+        contacts.where((c) => !c.isPresent && _matches(c)).toList(growable: false);
+    final noMatches = searching && meetings.isEmpty && present.isEmpty && offline.isEmpty;
 
     return Scaffold(
       backgroundColor: t.background,
@@ -176,8 +211,22 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
             child: CustomScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
               slivers: [
-            if (recents.isNotEmpty)
-              SliverToBoxAdapter(child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson)),
+            if (!searching && recents.isNotEmpty)
+              SliverToBoxAdapter(
+                key: const ValueKey('dial-recents'),
+                child: _RecentsRail(state: state, contacts: recents, onTap: _warpToPerson),
+              ),
+
+            SliverToBoxAdapter(
+              key: const ValueKey('dial-search-field'),
+              child: _SearchField(controller: _search, active: searching),
+            ),
+
+            if (noMatches)
+              SliverToBoxAdapter(
+                key: const ValueKey('dial-nomatch'),
+                child: _Empty('No one matches "$_query".'),
+              ),
 
             if (meetings.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Happening now')),
@@ -192,25 +241,32 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
               ),
             ],
 
-            SliverToBoxAdapter(child: _SectionHeader(present.isEmpty ? 'Nobody here' : 'In the office')),
-            if (present.isEmpty)
-              const SliverToBoxAdapter(child: _Empty("Nobody's in the office right now."))
-            else
-              SliverList.builder(
-                itemCount: present.length,
-                itemBuilder: (context, i) {
-                  final c = present[i];
-                  final canWarp = state.canWarpTo(c);
-                  return _ContactTile(
-                    state: state,
-                    contact: c,
-                    busy: _warping == c.id,
-                    canWarp: canWarp,
-                    onTap: canWarp ? () => _warpToPerson(c) : null,
-                    onWave: () => _waveAt(c),
-                  );
-                },
-              ),
+            // While searching, the people list is purely the matches — the
+            // "Nobody here" prompt belongs to the unfiltered tab, not a query that
+            // simply found no present people. A search that matched only offline
+            // people drops this section entirely rather than heading an empty slot
+            // "Nobody here"; the Away section below already carries those matches.
+            if (!noMatches && (!searching || present.isNotEmpty)) ...[
+              SliverToBoxAdapter(child: _SectionHeader(present.isEmpty ? 'Nobody here' : 'In the office')),
+              if (present.isEmpty && !searching)
+                const SliverToBoxAdapter(child: _Empty("Nobody's in the office right now."))
+              else
+                SliverList.builder(
+                  itemCount: present.length,
+                  itemBuilder: (context, i) {
+                    final c = present[i];
+                    final canWarp = state.canWarpTo(c);
+                    return _ContactTile(
+                      state: state,
+                      contact: c,
+                      busy: _warping == c.id,
+                      canWarp: canWarp,
+                      onTap: canWarp ? () => _warpToPerson(c) : null,
+                      onWave: () => _waveAt(c),
+                    );
+                  },
+                ),
+            ],
 
             if (offline.isNotEmpty) ...[
               const SliverToBoxAdapter(child: _SectionHeader('Away')),
@@ -221,7 +277,7 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
               ),
             ],
 
-                SliverToBoxAdapter(child: SizedBox(height: bottomInset + 32)),
+                SliverToBoxAdapter(child: SizedBox(height: bottomInset + keyboardInset + 32)),
               ],
             ),
           ),
@@ -323,8 +379,13 @@ class _MeetingCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final title = meeting.roomName ?? _conversationLabel(meeting.members);
-    final subtitle = '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
-        '${meeting.includesMe ? ' · you' : ''}';
+    // While a tap is resolving, the subtitle narrates the wait: warpToMeeting may
+    // spend a few seconds letting a freshly-reconnected roster place the room before
+    // it can walk in. See AppState.warpToMeeting.
+    final subtitle = busy
+        ? 'Finding directions…'
+        : '${meeting.members.length + (meeting.includesMe ? 1 : 0)} people'
+            '${meeting.includesMe ? ' · you' : ''}';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(kTextGutter, 4, kTextGutter, 8),
@@ -437,6 +498,12 @@ class _ContactTile extends StatelessWidget {
     final t = context.tokens;
     final present = contact.isPresent;
     final status = contact.status?.text;
+    // In-meeting (from Gather's cluster) and, when their calendar is visible, when
+    // they free up. Only drawn for a present row — a badge on an offline person would
+    // claim a liveness we do not have.
+    final presence = present ? state.presenceFor(contact) : const PersonPresence(inMeeting: false);
+    final showCalendar = state.googleAvailable &&
+        state.hasCalendarFor(contact.label, email: contact.calendarEmail);
 
     return Opacity(
       opacity: present ? 1 : 0.5,
@@ -465,7 +532,10 @@ class _ContactTile extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(color: t.foreground, fontSize: 16, fontWeight: FontWeight.w500),
                     ),
-                    if (status != null && status.isNotEmpty) ...[
+                    if (presence.hasBadge) ...[
+                      const SizedBox(height: 3),
+                      _PresenceBadge(presence: presence),
+                    ] else if (status != null && status.isNotEmpty) ...[
                       const SizedBox(height: 2),
                       Text(
                         status,
@@ -478,12 +548,100 @@ class _ContactTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
+              if (showCalendar && present) ...[
+                _PlansButton(
+                  onTap: () => showPersonCalendar(context, state, contact.label,
+                      email: contact.calendarEmail),
+                  label: contact.label,
+                ),
+                const SizedBox(width: 8),
+              ],
               if (onWave != null && present) ...[
                 _WaveButton(onTap: busy ? null : onWave, label: contact.label),
                 const SizedBox(width: 8),
               ],
               if (canWarp) _JoinButton(busy: busy, label: 'Warp', icon: Icons.call_rounded),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The status line a mid-meeting person gets instead of their set status: "In a
+/// meeting", or "Free in 25 min" when their calendar tells us when it ends. A small
+/// amber dot marks it as a live state rather than a typed one.
+class _PresenceBadge extends StatelessWidget {
+  const _PresenceBadge({required this.presence});
+
+  final PersonPresence presence;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final freeIn = presence.freeIn;
+    final text = freeIn == null ? 'In a meeting' : 'Free in ${_freeInLabel(freeIn)}';
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: const BoxDecoration(color: Color(0xFFF59E0B), shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: t.mutedForeground, fontSize: 13),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// How long until someone frees up, rounded to whole minutes. Under a minute reads as
+/// "<1 min" rather than "0 min"; an hour or more picks up an `h`.
+String _freeInLabel(Duration d) {
+  final mins = d.inMinutes;
+  if (mins < 1) return '<1 min';
+  if (mins < 60) return '$mins min';
+  final h = mins ~/ 60;
+  final m = mins % 60;
+  return m == 0 ? '${h}h' : '${h}h ${m}m';
+}
+
+/// A quiet round button that opens a person's shared calendar, matched to the Wave
+/// button so the two sit together without either shouting.
+class _PlansButton extends StatelessWidget {
+  const _PlansButton({required this.onTap, required this.label});
+
+  final VoidCallback onTap;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final plansOf = "${_firstName(label)}'s plans";
+    return Semantics(
+      button: true,
+      label: plansOf,
+      child: Tooltip(
+        message: plansOf,
+        child: Material(
+          color: t.card,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Icon(Icons.event_note_rounded, size: 18, color: t.mutedForeground),
+            ),
           ),
         ),
       ),
@@ -554,6 +712,50 @@ class _JoinButton extends StatelessWidget {
                 Text(label, style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
               ],
             ),
+    );
+  }
+}
+
+/// The search box at the top of the directory. Narrows the list as you type;
+/// matches a person on their name or their status line. Styled off the same theme
+/// tokens as the status sheet's field so the two inputs read as one app.
+class _SearchField extends StatelessWidget {
+  const _SearchField({required this.controller, required this.active});
+
+  final TextEditingController controller;
+
+  /// Whether there is a query — gates the trailing clear button so an empty box
+  /// shows only the search glyph.
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(kTextGutter, 12, kTextGutter, 4),
+      child: TextField(
+        controller: controller,
+        textInputAction: TextInputAction.search,
+        decoration: InputDecoration(
+          isDense: true,
+          filled: true,
+          fillColor: t.card,
+          hintText: 'Search people',
+          hintStyle: TextStyle(color: t.mutedForeground),
+          prefixIcon: Icon(Icons.search_rounded, color: t.mutedForeground),
+          suffixIcon: active
+              ? IconButton(
+                  onPressed: controller.clear,
+                  icon: Icon(Icons.close_rounded, color: t.mutedForeground),
+                  tooltip: 'Clear',
+                )
+              : null,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(t.radius),
+            borderSide: BorderSide.none,
+          ),
+        ),
+      ),
     );
   }
 }

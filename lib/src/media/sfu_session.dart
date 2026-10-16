@@ -131,6 +131,11 @@ class SfuSession {
   SfuSignalling? _node;
   ms.Device? _device;
   ms.Transport? _sendTransport;
+
+  /// The send transport's last reported ICE/DTLS state, or null before the
+  /// first `connectionstatechange`. The send-heal watchdog reads it to tell a
+  /// transport that actually connected from one that only ever acked a produce.
+  String? _sendState;
   final Map<SfuTag, ms.Producer> _producers = {};
 
   String? _sfuAddr;
@@ -161,6 +166,15 @@ class SfuSession {
 
   /// Peers we have asked the server to send us.
   final Set<String> _subscribed = {};
+
+  /// Peers the SFU has refused to let us consume since the last successful one.
+  ///
+  /// The discriminator the receive-path watchdog keys on. A room where everyone
+  /// is legitimately silent also builds no consumers, but it produces no
+  /// denials either, so this stays empty and the watchdog never fires — it is
+  /// only the deaf join, where every `consume-request` comes back
+  /// `consume-not-allowed`, that fills this.
+  final Set<String> _consumeDenied = {};
 
   /// Peers we want but the router could not place yet. See [_addressFor].
   final Set<String> _awaitingAddr = {};
@@ -514,7 +528,29 @@ class SfuSession {
     // genuinely different failure from anything on the socket, and without this
     // line it is invisible from the logs.
     transport.on('connectionstatechange', (Map data) {
-      _log('sfu: send transport is ${data['connectionState']}');
+      final state = '${data['connectionState']}';
+      _sendState = state;
+      _log('sfu: send transport is $state');
+      if (state == 'connected' || state == 'completed') {
+        // Healthy now, so any armed watchdog and its climbed backoff are stale.
+        _sendHealTimer?.cancel();
+        _sendHealTimer = null;
+        _sendHealBackoff = const Duration(seconds: 6);
+      } else if (state == 'failed' ||
+          state == 'disconnected' ||
+          state == 'closed' ||
+          state == 'connecting') {
+        // An explicit failure, or a `connecting` that may silently stall. The
+        // initial publish arms the watchdog, but once `connected` cancels it a
+        // later `refreshTurn -> restartIce` drops the transport back to
+        // `connecting` with nothing re-arming the timer — so a stall there goes
+        // uncovered. Re-arm on `connecting` too. A `disconnected` can still
+        // recover on its own, so this does not rebuild immediately — it arms the
+        // watchdog, whose grace window re-checks the state before tearing
+        // anything down. `_scheduleSendHeal` is idempotent, so a normal
+        // `connecting -> connected` arms then harmlessly stands down.
+        _scheduleSendHeal();
+      }
     });
 
     // Nothing may produce on this until the handler has built its peer
@@ -610,6 +646,12 @@ class SfuSession {
       transport.produce(
         track: track,
         stream: stream,
+        // The capture lifecycle is owned by CaptureEngine/_ensureCapture, not by
+        // mediasoup. With the package default (`stopTracks: true`), closing a
+        // producer during a send-heal rebuild would `track.stop()` and dispose
+        // the shared capture stream; the republish then hands those dead tracks
+        // back and the room hears silence. Leave the tracks alone on close.
+        stopTracks: false,
         source: tag == SfuTag.screen
             ? 'screen'
             : (tag == SfuTag.audio ? 'mic' : 'webcam'),
@@ -634,6 +676,11 @@ class SfuSession {
       _producers[tag] = producer;
       _log('sfu: publishing ${tag.wire} as ${producer.id}');
       _reportOutboundRtp(tag, producer);
+      // `produce` is acked the moment the signalling lands, long before the
+      // send transport's ICE completes — so a produce can succeed onto a
+      // transport that never connects. Arm the watchdog that notices that and
+      // rebuilds, rather than leaving a live-looking producer carrying nothing.
+      _scheduleSendHeal();
     } finally {
       _pendingProducer = null;
     }
@@ -740,7 +787,7 @@ class SfuSession {
   Future<void> unpublish(SfuTag tag) async {
     final producer = _producers.remove(tag);
     if (producer == null) return;
-    producer.close();
+    _closeProducerQuietly(producer);
     _node?.emit('produce-close', {'tag': tag.wire});
   }
 
@@ -982,6 +1029,244 @@ class SfuSession {
     });
   }
 
+  Timer? _recvHealTimer;
+
+  /// How long the watchdog waits before each heal attempt.
+  ///
+  /// Five seconds to start, doubling to a thirty-second cap. The first delay is
+  /// a grace window: a single transient denial during normal churn is healed by
+  /// the ordinary retry paths long before this fires, so only a cascade that is
+  /// still silent after the grace triggers a rebuild.
+  Duration _recvHealBackoff = const Duration(seconds: 5);
+
+  /// Set while [_rebuildReceive] runs, so overlapping fires do not stack.
+  bool _healing = false;
+
+  Timer? _sendHealTimer;
+
+  /// How long the send-side watchdog waits before each heal attempt.
+  ///
+  /// Six seconds to start, doubling to a thirty-second cap. The first delay is
+  /// the grace window a healthy transport connects well within, so an ordinary
+  /// ICE negotiation is never mistaken for a stall.
+  Duration _sendHealBackoff = const Duration(seconds: 6);
+
+  /// Set while [_rebuildSend] runs, so overlapping fires do not stack.
+  bool _healingSend = false;
+
+  /// Arm the watchdog that heals a receive path which never came up.
+  ///
+  /// Shaped like [_scheduleAddrRetry]: a self-cancelling one-shot with a
+  /// reentrancy guard and a `_stopped` check. The lazy recv transport is only
+  /// built on the first successful consume, so a join where the SFU denies every
+  /// consume builds no transport and stays deaf for the whole call. This notices
+  /// the "subscribed to peers but holding no consumers, and denials are why"
+  /// state and heals the receive path, retrying with growing backoff until the
+  /// stranded peers finally land (which cancels it from the success hook).
+  ///
+  /// The unit is the peer, not the room. A denial for one colleague strands only
+  /// them, so a busy call where everyone else has sound still heals that one — it
+  /// does not stand down just because some other consumer exists.
+  void _scheduleRecvHeal() {
+    if (_recvHealTimer != null || _stopped) return;
+    _recvHealTimer = Timer(_recvHealBackoff, () async {
+      _recvHealTimer = null;
+
+      // Drop denials from peers we no longer subscribe to. unsubscribe() leaves
+      // the denial behind, so without this a stale denial from a departed peer
+      // reads as evidence that the current cluster is deaf, and could rebuild a
+      // healthy in-flight receive path for the peer that replaced it.
+      _consumeDenied.removeWhere((srcId) => !_subscribed.contains(srcId));
+
+      // Re-evaluate against current state, not the state that armed us. Nothing
+      // to heal if we were stopped or no subscribed peer is stranded — a peer is
+      // stranded only when it was denied and we still hold no consumer for it, so
+      // a denial that has since been consumed, or one left by a departed peer,
+      // does not count. Reset the backoff and stand down.
+      final stranded = _strandedPeers();
+      if (_stopped || stranded.isEmpty) {
+        _recvHealBackoff = const Duration(seconds: 5);
+        return;
+      }
+
+      // A fully deaf room (no consumer at all) takes the global rebuild, which
+      // also clears a recv transport that came up poisoned. A partial failure —
+      // the room has sound and only some peers are stranded — re-requests just
+      // those peers, leaving every working transport and consumer untouched.
+      if (_consumers.isEmpty) {
+        await _rebuildReceive();
+      } else {
+        await _healStranded(stranded);
+      }
+
+      // Grow the backoff and re-arm. The heal re-issues consumes but does not
+      // guarantee one succeeds, so the watchdog keeps trying for the life of the
+      // call; a successful consume that leaves no peer stranded is the only thing
+      // that cancels it.
+      final next = _recvHealBackoff.inSeconds * 2;
+      _recvHealBackoff = Duration(seconds: next > 30 ? 30 : next);
+      _scheduleRecvHeal();
+    });
+  }
+
+  /// Whether we hold a consumer for [srcId] on any tag.
+  bool _hasConsumer(String srcId) =>
+      SfuTag.values.any((tag) => _consumers.containsKey('$srcId|${tag.wire}'));
+
+  /// Subscribed peers the SFU denied and for whom we still hold no consumer.
+  ///
+  /// The denial is the fault signal and the missing consumer is the symptom;
+  /// both have to hold for a peer to need healing. Filtering on [_subscribed]
+  /// keeps a departed peer's stale denial from counting.
+  Set<String> _strandedPeers() => _subscribed
+      .where((srcId) => _consumeDenied.contains(srcId) && !_hasConsumer(srcId))
+      .toSet();
+
+  /// Re-request the receive path for a handful of stranded peers.
+  ///
+  /// The partial-failure twin of [_rebuildReceive]: same per-peer clear and
+  /// re-request, but it touches no transport, so the colleagues who already have
+  /// sound never glitch. The denial is left in place deliberately — if the
+  /// re-request is denied again the peer stays stranded and the watchdog climbs;
+  /// a built consumer is what clears it, in [_consume].
+  Future<void> _healStranded(Set<String> stranded) async {
+    _log('sfu: ${stranded.length} subscribed peer(s) denied while the room is '
+        'receiving; re-requesting them');
+    for (final srcId in stranded) {
+      _peerNode.remove(srcId);
+      _announced.remove(srcId);
+      for (final tag in SfuTag.values) {
+        _closeConsumer(srcId, tag);
+      }
+      // Re-assert the standing the SFU authorises consumes against, the same
+      // grant subscribe() makes before asking.
+      allow(srcId, allowed: true);
+      unawaited(_requestPeer(srcId));
+    }
+  }
+
+  /// Tear down and rebuild the receive path for every subscribed peer.
+  ///
+  /// The receive half of [_onNodeReconnected], applied across all peers rather
+  /// than one node's, and deliberately touching nothing on the send side: the
+  /// send transport and our producers are left alone, so a heal never interrupts
+  /// outbound audio. Re-requesting each peer drives a fresh `consume-try`, which
+  /// is what finally builds the recv transport that the deaf join never got.
+  Future<void> _rebuildReceive() async {
+    if (_healing) return;
+    _healing = true;
+    try {
+      _log('sfu: no inbound media on a non-empty cluster; '
+          'rebuilding the receive path');
+
+      final peers = _subscribed.toList();
+
+      // Forget the receive state for every peer, the same clears a reconnect
+      // does for one node's peers.
+      for (final srcId in peers) {
+        _peerNode.remove(srcId);
+        _announced.remove(srcId);
+        for (final tag in SfuTag.values) {
+          _closeConsumer(srcId, tag);
+        }
+      }
+
+      // Close every recv transport. In the pure deaf case there are none, so
+      // this is a no-op there; it also covers a recv transport that came up
+      // poisoned and is itself the reason nothing flows.
+      for (final transport in _recvTransports.values) {
+        transport.close();
+      }
+      _recvTransports.clear();
+
+      // Fail any consume still in flight rather than let it sit out its
+      // twenty-second timeout — the transport it was waiting on is gone.
+      for (final pending in _pendingConsumers.values) {
+        if (!pending.isCompleted) {
+          pending.completeError(const SfuException('receive path rebuilt'));
+        }
+      }
+
+      // Re-assert the standing the SFU authorises consumes against before
+      // asking again — cheap insurance that mirrors reconnect recovery.
+      final node = _node;
+      if (node != null) _replayAllow(node);
+      _sendConversation();
+
+      for (final srcId in peers) {
+        unawaited(_requestPeer(srcId));
+      }
+
+      // Next watchdog fire re-evaluates against denials that arrive after the
+      // rebuild, not the ones that triggered it.
+      _consumeDenied.clear();
+    } finally {
+      _healing = false;
+    }
+  }
+
+  /// Arm the watchdog that heals a send path the SFU accepted but never
+  /// connected.
+  ///
+  /// The twin of [_scheduleRecvHeal], for the outbound direction. `produce`
+  /// succeeds the instant the signalling lands — long before the send
+  /// transport's ICE/DTLS completes — so on a transient blip the transport can
+  /// sit in `connecting` with a producer the server has accepted riding
+  /// nothing: the colleague's client draws us publishing, the room gets no
+  /// media, and nothing times out because the produce already succeeded. This
+  /// notices "we hold a producer but the transport never reached connected" and
+  /// rebuilds, so the camera or microphone comes back on its own rather than
+  /// after the user leaves the meeting and re-enters.
+  void _scheduleSendHeal() {
+    if (_sendHealTimer != null || _stopped) return;
+    _sendHealTimer = Timer(_sendHealBackoff, () async {
+      _sendHealTimer = null;
+
+      // Re-evaluate against current state, not the state that armed us. Nothing
+      // to heal if we were stopped, hold no producers, or the transport has
+      // since connected — reset the backoff and stand down. A republish after a
+      // rebuild re-arms this through [publish], so standing down on an empty
+      // producer set never strands the send path.
+      final connected = _sendState == 'connected' || _sendState == 'completed';
+      if (_stopped || _producers.isEmpty || connected) {
+        _sendHealBackoff = const Duration(seconds: 6);
+        return;
+      }
+
+      await _rebuildSend();
+
+      // Grow the backoff and re-arm. The rebuild announces a republish but does
+      // not guarantee the next transport connects, so the watchdog keeps trying
+      // for the life of the call; a `connected` statechange is the only thing
+      // that cancels it.
+      final next = _sendHealBackoff.inSeconds * 2;
+      _sendHealBackoff = Duration(seconds: next > 30 ? 30 : next);
+      _scheduleSendHeal();
+    });
+  }
+
+  /// Tear down and rebuild the send path after the transport failed to connect.
+  ///
+  /// The send half of [_onNodeReconnected], reached from the watchdog rather
+  /// than a socket drop. Fails any publish still in flight so it does not sit
+  /// out its own twenty-second timeout, closes the producers and the poisoned
+  /// transport through the guarded close, then asks the owner to put its tracks
+  /// back — which builds a fresh send transport on the next publish. Touches
+  /// nothing on the receive side.
+  Future<void> _rebuildSend() async {
+    if (_healingSend) return;
+    _healingSend = true;
+    try {
+      _log('sfu: send transport never connected; rebuilding the send path');
+      _failPendingProducer(
+          const SfuException('send path rebuilt before it connected'));
+      _closeSendTransportQuietly();
+      _announceRepublish();
+    } finally {
+      _healingSend = false;
+    }
+  }
+
   /// Set by [stop], so timers and retries do not outlive the session.
   bool _stopped = false;
 
@@ -1036,6 +1321,14 @@ class SfuSession {
       case 'consume-try':
         final srcId = n.data['srcId'];
         if (srcId is! String) return;
+        // The full-state announcement is the SFU answering for this peer, so it
+        // resolves any earlier denial even when it carries no tracks: a peer
+        // denied and then legitimately muted publishes an empty map, and leaving
+        // the denial behind would strand it forever — _strandedPeers() would see
+        // "denied, no consumer" and the watchdog would re-request it every
+        // 5–30s. A consume with tracks clears the denial in _consume anyway;
+        // this covers the empty case that never builds a consumer.
+        _consumeDenied.remove(srcId);
         final map = _map(n.data['producerIdMap']);
         _announced[srcId] = {
           for (final entry in map.entries)
@@ -1146,8 +1439,19 @@ class SfuSession {
       // upstream who does know what to do with it.
       case 'move-off':
       case 'disable-video':
+        _log('sfu: ${n.name} ${n.data}');
+
+      // The SFU has refused a consume. On its own this is merely logged, but a
+      // refusal is also the one signal that distinguishes a deaf join — where
+      // every request comes back this way and no recv transport is ever built —
+      // from a legitimately quiet room. Record who was refused and arm the
+      // receive-path watchdog; it leaves normal churn alone and only rebuilds a
+      // cluster that is still silent after the grace window.
       case 'consume-not-allowed':
         _log('sfu: ${n.name} ${n.data}');
+        final srcId = n.data['srcId'];
+        if (srcId is String) _consumeDenied.add(srcId);
+        _scheduleRecvHeal();
     }
   }
 
@@ -1341,6 +1645,19 @@ class SfuSession {
       );
       _consumers[key] = consumer;
 
+      // This consumer clears its own peer's fault signal — but only its own. A
+      // consumer for one colleague says nothing about another's denial, so
+      // clearing the whole set here would erase a still-stranded peer's evidence
+      // before the watchdog could act on it. Cancel the heal and reset the
+      // backoff only once nothing is left stranded, so a later cascade starts
+      // from the full grace window rather than mid-climb.
+      _consumeDenied.remove(srcId);
+      if (_strandedPeers().isEmpty) {
+        _recvHealTimer?.cancel();
+        _recvHealTimer = null;
+        _recvHealBackoff = const Duration(seconds: 5);
+      }
+
       // Unusual, and easy to miss: the SFU wants telling that the consumer was
       // actually built. Measured going *back* to the server after its own ack.
       node.emit('consume-created', {
@@ -1491,9 +1808,7 @@ class SfuSession {
     final moved = _forgetPeersOn(url);
 
     if (url == _sfuAddr) {
-      _dropProducers();
-      _sendTransport?.close();
-      _sendTransport = null;
+      _closeSendTransportQuietly();
       _replayAllow(node);
       _sendConversation();
       _announceRepublish();
@@ -1510,9 +1825,7 @@ class SfuSession {
     _moving = true;
     try {
       final old = _sfuAddr;
-      _dropProducers();
-      _sendTransport?.close();
-      _sendTransport = null;
+      _closeSendTransportQuietly();
       _node = null;
       _sfuAddr = null;
       if (old != null) await _dropNode(old);
@@ -1579,9 +1892,61 @@ class SfuSession {
   /// from creating.
   void _dropProducers() {
     for (final producer in _producers.values) {
-      producer.close();
+      _closeProducerQuietly(producer);
     }
     _producers.clear();
+  }
+
+  /// Close a producer without letting a half-built peer connection's throw
+  /// escape.
+  ///
+  /// A producer on a send transport whose ICE never completed still has a
+  /// live-looking RTCPeerConnection, and mediasoup's `@close` path runs
+  /// `createOffer` on it — which throws `Unable to
+  /// RTCPeerConnection::createOffer: Error (null)` on a pc that never finished
+  /// negotiating. `FlexQueue` swallows it, but the throw aborts the rest of the
+  /// teardown and leaves `_producers`/`_sendTransport` half-cleared. Closing in
+  /// a guard keeps the state honest.
+  void _closeProducerQuietly(ms.Producer producer) {
+    try {
+      producer.close();
+    } on Object catch (error) {
+      _log('sfu: closing a producer threw (ignored): $error');
+    }
+  }
+
+  /// Close the send transport and its producers, swallowing the `createOffer`
+  /// throw a never-connected transport raises on close. Leaves `_sendTransport`
+  /// null and `_sendState` cleared so a fresh transport cannot inherit a stale
+  /// "connected".
+  ///
+  /// Order matters: close the transport *before* dropping the producers. The
+  /// transport's `@close` listener queues a `stopSending` task — which runs
+  /// `createOffer` on the handler's peer connection — but it is guarded by
+  /// `if (_closed) return;` and only queues while the transport is still open.
+  ///
+  /// `Transport.close()` is `async` and we do not await it, so it runs only up
+  /// to its first `await` before yielding back here: it sets `_closed = true`
+  /// synchronously, then suspends at `await _handler.close()` — the producers
+  /// are *not* yet torn down via `transportClosed()` when `_dropProducers`
+  /// runs. So `_dropProducers` still calls `producer.close()` on live
+  /// producers and the `@close` listener still fires. The fix is safe because
+  /// `_closed` is already `true` by then: the listener removes the producer and
+  /// returns early, never queuing `stopSending` against a pc about to vanish.
+  /// Calling `_dropProducers` first (the old order) left `_closed` false, so
+  /// the listener queued `stopSending`, which later hit the nulled pc (#7).
+  void _closeSendTransportQuietly() {
+    final transport = _sendTransport;
+    _sendTransport = null;
+    _sendState = null;
+    if (transport != null) {
+      try {
+        transport.close();
+      } on Object catch (error) {
+        _log('sfu: closing the send transport threw (ignored): $error');
+      }
+    }
+    _dropProducers();
   }
 
   void _announceRepublish() {
@@ -1621,6 +1986,15 @@ class SfuSession {
     _turnTimer = null;
     _addrRetry?.cancel();
     _addrRetry = null;
+    _recvHealTimer?.cancel();
+    _recvHealTimer = null;
+    _consumeDenied.clear();
+    _recvHealBackoff = const Duration(seconds: 5);
+    _healing = false;
+    _sendHealTimer?.cancel();
+    _sendHealTimer = null;
+    _sendHealBackoff = const Duration(seconds: 6);
+    _healingSend = false;
     _spatialDebounce?.cancel();
     _spatialDebounce = null;
     _awaitingAddr.clear();
@@ -1639,8 +2013,7 @@ class SfuSession {
     _subscribed.clear();
     _peerNode.clear();
 
-    _sendTransport?.close();
-    _sendTransport = null;
+    _closeSendTransportQuietly();
     for (final transport in _recvTransports.values) {
       transport.close();
     }

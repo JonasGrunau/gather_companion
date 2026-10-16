@@ -49,6 +49,7 @@ class FakeCollector implements Collector {
   ({int x, int y}) _me = kSelfStartTile;
   String _myDirection = 'Down';
   bool _mySpeaking = false;
+  bool _myHandRaised = false;
   final Map<String, _Standing> _people = {};
 
   /// What the write side was asked to do, kept so a harness can show it and a
@@ -79,7 +80,24 @@ class FakeCollector implements Collector {
   bool get hasState => true;
 
   @override
-  SpaceMap? mapFor(String? floorId) => schematicOffice();
+  String? spaceId = 'space';
+
+  /// When false, [mapFor] returns null — standing in for the fresh empty reader a
+  /// real reconnect swaps in, so a test can prove the held office survives it.
+  bool hasMap = true;
+
+  /// When set, the fake has a plan only for this floor; any other floor reads null,
+  /// the way a floor you have just stepped onto has not loaded yet — so a test can
+  /// move self across floors and watch the held office drop rather than draw the
+  /// wrong floor's geometry. Null (the default) answers for every floor with the one
+  /// schematic office, which is what the single-floor tests assume.
+  String? mapFloorId;
+
+  @override
+  SpaceMap? mapFor(String? floorId) =>
+      hasMap && (mapFloorId == null || floorId == null || floorId == mapFloorId)
+          ? schematicOffice()
+          : null;
   @override
   SpaceArt? artFor(String? floorId, {bool dark = true}) => null;
   @override
@@ -181,6 +199,7 @@ class FakeCollector implements Collector {
           direction: _myDirection,
           speaking: _mySpeaking,
           clusterId: inCall ? kHuddleCluster : null,
+          handRaised: _myHandRaised,
         ),
         for (final s in _people.values)
           officeRow(
@@ -229,12 +248,27 @@ class FakeCollector implements Collector {
     return (ok: true, detail: null);
   }
 
+  @override
+  ({bool ok, String? detail}) setHandRaised(bool raised) {
+    _myHandRaised = raised;
+    publish();
+    return (ok: true, detail: null);
+  }
+
   // The rest write nothing a sim can show — recorded no-ops that succeed, so the
   // callers (status sheet, control bar) resolve instead of throwing.
   @override
   ({bool ok, String? detail}) setGait(Gait gait) => (ok: true, detail: null);
+
+  /// Availability values we were told to set, in order — so the issue #41
+  /// self-heal's re-assert can be asserted.
+  final List<String> availabilitiesSet = [];
   @override
-  ({bool ok, String? detail}) setAvailability(String availability) => (ok: true, detail: null);
+  ({bool ok, String? detail}) setAvailability(String availability) {
+    availabilitiesSet.add(availability);
+    return (ok: true, detail: null);
+  }
+
   @override
   ({bool ok, String? detail}) setCustomStatus({required String text, String? emoji, DateTime? clearAt}) => (ok: true, detail: null);
   @override
@@ -257,10 +291,40 @@ class FakeCollector implements Collector {
     return (ok: true, detail: null);
   }
 
+  /// Every area id we have been asked to be let into, in order — so a test can
+  /// assert a locked meeting link turned into a `requestToAccess` for the right room.
+  final List<String> accessRequests = [];
+  @override
+  ({bool ok, String? detail}) requestToAccess(String areaId) {
+    if (failSends) return (ok: false, detail: 'not connected to Gather');
+    accessRequests.add(areaId);
+    return (ok: true, detail: null);
+  }
+
   @override
   ({bool ok, String? detail}) leaveCluster() => (ok: true, detail: null);
+
+  /// Active flags we were told, in order — the other half of the #41 re-assert.
+  final List<bool> activesSet = [];
   @override
-  ({bool ok, String? detail}) setActive(bool active) => (ok: true, detail: null);
+  ({bool ok, String? detail}) setActive(bool active) {
+    activesSet.add(active);
+    return (ok: true, detail: null);
+  }
+
+  /// How many times [notePresenceDoubt] has been raised, so a test can assert the
+  /// walk engine's stall signal reached the collector.
+  int presenceDoubts = 0;
+
+  @override
+  void notePresenceDoubt() => presenceDoubts++;
+
+  /// How many times [noteMovesConfirmed] has been raised, so a test can assert the
+  /// walk engine's recovery-took signal reached the collector.
+  int movesConfirmed = 0;
+
+  @override
+  void noteMovesConfirmed() => movesConfirmed++;
 
   /// How many times [resync] has been asked for, so a test can assert that a
   /// network change forced a reconnect.
@@ -272,4 +336,12 @@ class FakeCollector implements Collector {
     publish();
     return (ok: true, detail: 'simulator; a fresh roster follows');
   }
+
+  /// Reachability flags we were told, in order — so a test can assert AppState's
+  /// connectivity signal reached the collector (issue #8). A no-op otherwise: the
+  /// simulator has no socket to suspend.
+  final List<bool> reachablesSet = [];
+
+  @override
+  void setReachable(bool reachable) => reachablesSet.add(reachable);
 }
