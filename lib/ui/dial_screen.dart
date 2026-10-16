@@ -170,6 +170,15 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
   Widget build(BuildContext context) {
     final t = context.tokens;
     final bottomInset = MediaQuery.paddingOf(context).bottom;
+    // The shell declines the keyboard inset for the whole tab stack so the office
+    // map never resizes (home_shell zeros `viewInsets` and sets
+    // `resizeToAvoidBottomInset: false`). But this tab *does* take text, and with
+    // that inset gone the last matches sit trapped behind the keyboard the search
+    // field raises. Read the real height straight off the view — unaffected by the
+    // shell's MediaQuery override — and pad the scroll tail by it, so the list can
+    // clear the keyboard without disturbing the map's no-resize contract.
+    final view = View.of(context);
+    final keyboardInset = view.viewInsets.bottom / view.devicePixelRatio;
 
     final searching = _query.isNotEmpty;
     final contacts = state.directory;
@@ -233,8 +242,10 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
 
             // While searching, the people list is purely the matches — the
             // "Nobody here" prompt belongs to the unfiltered tab, not a query that
-            // simply found no present people (the no-match line above covers that).
-            if (!noMatches) ...[
+            // simply found no present people. A search that matched only offline
+            // people drops this section entirely rather than heading an empty slot
+            // "Nobody here"; the Away section below already carries those matches.
+            if (!noMatches && (!searching || present.isNotEmpty)) ...[
               SliverToBoxAdapter(child: _SectionHeader(present.isEmpty ? 'Nobody here' : 'In the office')),
               if (present.isEmpty && !searching)
                 const SliverToBoxAdapter(child: _Empty("Nobody's in the office right now."))
@@ -265,7 +276,7 @@ class _DialScreenState extends State<DialScreen> with SingleTickerProviderStateM
               ),
             ],
 
-                SliverToBoxAdapter(child: SizedBox(height: bottomInset + 32)),
+                SliverToBoxAdapter(child: SizedBox(height: bottomInset + keyboardInset + 32)),
               ],
             ),
           ),
