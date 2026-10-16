@@ -95,5 +95,20 @@ void main() {
     test('a /m/ short link is still gated on the host', () {
       expect(GatherLink.tryParse('https://gather.town.evil.com/m/ktvILgXphb'), isNull);
     });
+
+    test('a room hint with a literal percent survives, not double-decoded', () {
+      // Uri.queryParameters already percent-decodes, so `%25` arrives as a literal `%`.
+      // Decoding a second time would throw a FormatException on the bare `%` and break
+      // the card build; the value must be used as-is.
+      final link = GatherLink.tryParse(
+          'https://app.v2.gather.town/app/spc/Office?room=100%25%20Focus');
+      expect(link?.roomHint, '100% Focus');
+    });
+
+    test('a room hint in the path tail with a literal percent survives', () {
+      final link = GatherLink.tryParse(
+          'https://app.v2.gather.town/app/spc/Office/50%25%20Done');
+      expect(link?.roomHint, '50% Done');
+    });
   });
 }

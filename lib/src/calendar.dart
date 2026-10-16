@@ -38,9 +38,10 @@ class PlannedMeeting {
 
   final String title;
 
-  /// Start and end, in the phone's local time. Stored as ISO-8601 and parsed back
-  /// with [DateTime.parse] — which keeps the offset that was written, so a meeting
-  /// does not slide an hour when the phone crosses a daylight boundary before it.
+  /// Start and end, in the phone's local time. Persisted as a UTC ISO-8601 instant
+  /// (the `…Z` form) and converted back to local on load, so the meeting names the
+  /// same moment after the phone changes time zone — a bare local string carries no
+  /// offset and would be re-read in the new zone, sliding the instant and its reminder.
   final DateTime startsAt;
   final DateTime endsAt;
 
@@ -95,8 +96,8 @@ class PlannedMeeting {
   Map<String, Object?> toJson() => {
         'id': id,
         'title': title,
-        'startsAt': startsAt.toIso8601String(),
-        'endsAt': endsAt.toIso8601String(),
+        'startsAt': startsAt.toUtc().toIso8601String(),
+        'endsAt': endsAt.toUtc().toIso8601String(),
         'roomStableId': roomStableId,
         'roomName': roomName,
         'floorId': floorId,
@@ -112,8 +113,8 @@ class PlannedMeeting {
   factory PlannedMeeting.fromJson(Map<String, Object?> json) => PlannedMeeting(
         id: json['id']! as String,
         title: json['title']! as String,
-        startsAt: DateTime.parse(json['startsAt']! as String),
-        endsAt: DateTime.parse(json['endsAt']! as String),
+        startsAt: DateTime.parse(json['startsAt']! as String).toLocal(),
+        endsAt: DateTime.parse(json['endsAt']! as String).toLocal(),
         roomStableId: json['roomStableId'] as String?,
         roomName: json['roomName'] as String?,
         floorId: json['floorId'] as String?,

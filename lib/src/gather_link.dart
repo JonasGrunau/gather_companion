@@ -46,10 +46,11 @@ class GatherLink {
 
   /// Parses [location] into a [GatherLink], or null when it is not a Gather link.
   ///
-  /// Accepts only `*.gather.town` hosts with an `/app/<spaceId>/…` path. The space id
-  /// is percent-decoded (Gather ids embed a backslash the URL escapes). A room hint
-  /// is taken from the first recognised query parameter, falling back to the path
-  /// segment past the space name.
+  /// Accepts only `*.gather.town` hosts with an `/app/<spaceId>/…` path. `Uri` already
+  /// percent-decodes its path segments and query values (so a Gather id's escaped
+  /// backslash arrives decoded) — they are used as-is, never decoded a second time. A
+  /// room hint is taken from the first recognised query parameter, falling back to the
+  /// path segment past the space name.
   static GatherLink? tryParse(String? location) {
     if (location == null) return null;
     final trimmed = location.trim();
@@ -66,14 +67,14 @@ class GatherLink {
     // the URL, so this carries only the code and the caller resolves it over REST.
     final mAt = segments.indexOf('m');
     if (mAt == 0 && segments.length > 1) {
-      final code = Uri.decodeComponent(segments[1]).trim();
+      final code = segments[1].trim();
       if (code.isNotEmpty) return GatherLink(spaceId: '', meetingLinkId: code);
     }
 
     final appAt = segments.indexOf('app');
     if (appAt < 0 || appAt + 1 >= segments.length) return null;
 
-    final spaceId = Uri.decodeComponent(segments[appAt + 1]).trim();
+    final spaceId = segments[appAt + 1].trim();
     if (spaceId.isEmpty) return null;
 
     return GatherLink(spaceId: spaceId, roomHint: _roomHint(uri, segments, appAt));
@@ -82,11 +83,11 @@ class GatherLink {
   static String? _roomHint(Uri uri, List<String> segments, int appAt) {
     for (final key in _roomParams) {
       final value = uri.queryParameters[key]?.trim();
-      if (value != null && value.isNotEmpty) return Uri.decodeComponent(value);
+      if (value != null && value.isNotEmpty) return value;
     }
     // Past `/app/<spaceId>/<name>`, any further segment is a room within the space.
     if (segments.length > appAt + 3) {
-      final tail = Uri.decodeComponent(segments[appAt + 3]).trim();
+      final tail = segments[appAt + 3].trim();
       if (tail.isNotEmpty) return tail;
     }
     return null;

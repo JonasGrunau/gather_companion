@@ -70,7 +70,7 @@ class _PersonCalendarSheet extends StatelessWidget {
               ),
               const SizedBox(height: 12),
               Flexible(
-                child: FutureBuilder<List<GoogleEvent>?>(
+                child: FutureBuilder<PersonCalendar>(
                   future: state.calendarForLabel(label, email: email),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState != ConnectionState.done) {
@@ -85,15 +85,25 @@ class _PersonCalendarSheet extends StatelessWidget {
                         ),
                       );
                     }
-                    final events = snapshot.data;
-                    if (events == null) {
+                    final result = snapshot.data;
+                    if (result == null ||
+                        result.status == CalendarLookup.noCalendar) {
                       return _Hint(
                         icon: Icons.event_busy_outlined,
                         text: '$firstName has not shared a calendar with you.',
                       );
                     }
+                    if (result.status == CalendarLookup.unavailable) {
+                      // A read that failed — offline or refused — is not an empty
+                      // calendar; saying "nothing planned" would be a lie.
+                      return _Hint(
+                        icon: Icons.cloud_off_outlined,
+                        text: 'Couldn’t load $firstName’s calendar. Check your '
+                            'connection and try again.',
+                      );
+                    }
                     final upcoming = [
-                      for (final e in events) if (!e.isPast) e,
+                      for (final e in result.events) if (!e.isPast) e,
                     ]..sort((a, b) => a.startsAt.compareTo(b.startsAt));
                     if (upcoming.isEmpty) {
                       return _Hint(

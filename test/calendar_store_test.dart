@@ -56,6 +56,23 @@ void main() {
     expect(after.deviceEventId, 'dev-99');
   });
 
+  test('times are persisted as UTC instants and round-trip to the same moment', () {
+    // A bare local ISO string carries no offset, so after a time-zone change it would
+    // be re-read in the new zone and the meeting would slide. Persisting the UTC `…Z`
+    // form pins the instant; it is converted back to local on load.
+    final before = _meeting(start: DateTime(2026, 10, 13, 9, 30));
+    final json = before.toJson();
+
+    expect(json['startsAt'], endsWith('Z'));
+    expect(json['endsAt'], endsWith('Z'));
+    expect(DateTime.parse(json['startsAt']! as String).isUtc, isTrue);
+
+    final after = PlannedMeeting.fromJson(json);
+    expect(after.startsAt.isUtc, isFalse); // handed back in local time
+    expect(after.startsAt.isAtSameMomentAs(before.startsAt), isTrue);
+    expect(after.endsAt.isAtSameMomentAs(before.endsAt), isTrue);
+  });
+
   test('remindAt is the start minus the lead, and a bare meeting defaults to five', () {
     final m = PlannedMeeting(
       id: 'x',

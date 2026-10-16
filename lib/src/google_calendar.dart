@@ -85,6 +85,14 @@ class GoogleEvent {
   bool get isPast => endsAt.isBefore(DateTime.now());
 }
 
+/// Thrown by [GoogleCalendar.fetchEventsFor] when a colleague's calendar cannot be
+/// read at all — offline, access refused, or every fallback failed. Kept distinct from
+/// a calendar that read cleanly and is simply empty, so the person sheet can say "could
+/// not load" instead of claiming the colleague has nothing planned.
+class CalendarUnavailable implements Exception {
+  const CalendarUnavailable();
+}
+
 /// A parsed `start`/`end` block: the instant plus whether it was a date-only
 /// (all-day) value, which the two carry together because the flag is lost once the
 /// `DateTime` is built.
@@ -309,27 +317,56 @@ class GoogleCalendar {
     if (token == null) return const [];
 
     final now = _now();
-    final url = Uri.parse(_eventsEndpoint).replace(queryParameters: {
+    final query = {
       'timeMin': now.toUtc().toIso8601String(),
       'timeMax': now.add(window).toUtc().toIso8601String(),
       // Expands recurring events into their instances and sorts them, so the tab
       // shows "the 10am standup on Tuesday" rather than one opaque recurrence rule.
       'singleEvents': 'true',
       'orderBy': 'startTime',
-      'maxResults': '50',
-    });
+      'maxResults': '250',
+    };
 
     try {
-      final body = await _get(url, token);
-      final items = body['items'];
-      if (items is! List) return const [];
-      return [
-        for (final item in items)
-          if (item is Map<String, Object?>) ?GoogleEvent.fromJson(item),
-      ];
+      return await _listAllEvents(_eventsEndpoint, token, query);
     } on Object {
       return const [];
     }
+  }
+
+  /// Every page of an `events.list` query, following `nextPageToken` with the original
+  /// bounds and accumulating each page's items — a single page caps at 250, and a busy
+  /// window runs past that, so reading only the first page silently drops the tail.
+  /// Throws on any HTTP failure; the caller decides whether that is an empty list, a
+  /// free/busy fallback, or a surfaced error.
+  Future<List<GoogleEvent>> _listAllEvents(
+    String endpoint,
+    String token,
+    Map<String, String> query,
+  ) async {
+    final out = <GoogleEvent>[];
+    String? pageToken;
+    // A guard against a server that never stops handing back a next-page token.
+    for (var page = 0; page < 50; page++) {
+      final url = Uri.parse(endpoint).replace(queryParameters: {
+        ...query,
+        'pageToken': ?pageToken,
+      });
+      final body = await _get(url, token);
+      final items = body['items'];
+      if (items is List) {
+        for (final item in items) {
+          if (item is Map<String, Object?>) {
+            final event = GoogleEvent.fromJson(item);
+            if (event != null) out.add(event);
+          }
+        }
+      }
+      final next = body['nextPageToken'];
+      if (next is! String || next.isEmpty) break;
+      pageToken = next;
+    }
+    return out;
   }
 
   /// A lowercased **display name → calendar id** map of every calendar this account
@@ -346,25 +383,34 @@ class GoogleCalendar {
     final token = await _accessTokenOrNull();
     if (token == null) return const {};
 
-    final url = Uri.parse(_calendarListEndpoint).replace(queryParameters: {
-      'minAccessRole': 'freeBusyReader',
-      'showHidden': 'true',
-    });
-
+    final out = <String, String>{};
     try {
-      final body = await _get(url, token);
-      final items = body['items'];
-      if (items is! List) return const {};
-      final out = <String, String>{};
-      for (final item in items) {
-        if (item is! Map) continue;
-        if (item['primary'] == true) continue;
-        final id = (item['id'] as String?)?.trim();
-        final name =
-            ((item['summaryOverride'] as String?) ?? (item['summary'] as String?))
-                ?.trim();
-        if (id == null || id.isEmpty || name == null || name.isEmpty) continue;
-        out.putIfAbsent(name.toLowerCase(), () => id);
+      String? pageToken;
+      // Paged like the event reads: a colleague whose calendar falls on a later page
+      // would otherwise be invisible, and the Dial's calendar button never appear.
+      for (var page = 0; page < 50; page++) {
+        final url = Uri.parse(_calendarListEndpoint).replace(queryParameters: {
+          'minAccessRole': 'freeBusyReader',
+          'showHidden': 'true',
+          'pageToken': ?pageToken,
+        });
+        final body = await _get(url, token);
+        final items = body['items'];
+        if (items is List) {
+          for (final item in items) {
+            if (item is! Map) continue;
+            if (item['primary'] == true) continue;
+            final id = (item['id'] as String?)?.trim();
+            final name =
+                ((item['summaryOverride'] as String?) ?? (item['summary'] as String?))
+                    ?.trim();
+            if (id == null || id.isEmpty || name == null || name.isEmpty) continue;
+            out.putIfAbsent(name.toLowerCase(), () => id);
+          }
+        }
+        final next = body['nextPageToken'];
+        if (next is! String || next.isEmpty) break;
+        pageToken = next;
       }
       return out;
     } on Object {
@@ -381,79 +427,80 @@ class GoogleCalendar {
   /// as a [_freeBusy] query, which every sharing level permits. Those come back as
   /// title-less "Busy" blocks — enough to show when the person is occupied and when
   /// they free up, without leaking a detail they did not share.
+  /// Throws [CalendarUnavailable] when the calendar cannot be read at all — no token,
+  /// or both the events read and the free/busy fallback failed — which the caller must
+  /// tell apart from a calendar that read cleanly and is simply empty.
   Future<List<GoogleEvent>> fetchEventsFor(
     String calendarId, {
     Duration window = const Duration(days: 7),
   }) async {
     final token = await _accessTokenOrNull();
-    if (token == null) return const [];
+    if (token == null) throw const CalendarUnavailable();
 
     final now = _now();
     final timeMin = now.toUtc().toIso8601String();
     final timeMax = now.add(window).toUtc().toIso8601String();
-    final url = Uri.parse('$_calendarsBase/${Uri.encodeComponent(calendarId)}/events')
-        .replace(queryParameters: {
+    final endpoint = '$_calendarsBase/${Uri.encodeComponent(calendarId)}/events';
+    final query = {
       'timeMin': timeMin,
       'timeMax': timeMax,
       'singleEvents': 'true',
       'orderBy': 'startTime',
-      'maxResults': '50',
-    });
+      'maxResults': '250',
+    };
 
     try {
-      final body = await _get(url, token);
-      final items = body['items'];
-      if (items is! List) return const [];
-      return [
-        for (final item in items)
-          if (item is Map<String, Object?>) ?GoogleEvent.fromJson(item),
-      ];
+      return await _listAllEvents(endpoint, token, query);
     } on Object {
       // Most often a 403 from a free/busy-only share. Fall back rather than show a
-      // person as having an empty calendar when they are in fact just private.
+      // person as having an empty calendar when they are in fact just private; if the
+      // fallback fails too, _freeBusy throws CalendarUnavailable and it propagates.
       return _freeBusy(calendarId, token, timeMin: timeMin, timeMax: timeMax);
     }
   }
 
   /// The busy blocks on [calendarId] as title-less events, for a calendar shared
-  /// free/busy only. Empty on failure.
+  /// free/busy only. A well-formed answer with no blocks is an empty list; a failed
+  /// request throws [CalendarUnavailable] so the caller does not read "offline" as
+  /// "nothing planned".
   Future<List<GoogleEvent>> _freeBusy(
     String calendarId,
     String token, {
     required String timeMin,
     required String timeMax,
   }) async {
+    final Map<String, Object?> body;
     try {
-      final body = await _postJson(_freeBusyEndpoint, token, {
+      body = await _postJson(_freeBusyEndpoint, token, {
         'timeMin': timeMin,
         'timeMax': timeMax,
         'items': [
           {'id': calendarId},
         ],
       });
-      final calendars = body['calendars'];
-      if (calendars is! Map) return const [];
-      final entry = calendars[calendarId];
-      final busy = entry is Map ? entry['busy'] : null;
-      if (busy is! List) return const [];
-      final out = <GoogleEvent>[];
-      for (var i = 0; i < busy.length; i++) {
-        final block = busy[i];
-        if (block is! Map) continue;
-        final start = DateTime.tryParse(block['start'] as String? ?? '');
-        final end = DateTime.tryParse(block['end'] as String? ?? '');
-        if (start == null || end == null) continue;
-        out.add(GoogleEvent(
-          id: 'busy-$i',
-          title: 'Busy',
-          startsAt: start.toLocal(),
-          endsAt: end.toLocal(),
-        ));
-      }
-      return out;
     } on Object {
-      return const [];
+      throw const CalendarUnavailable();
     }
+    final calendars = body['calendars'];
+    if (calendars is! Map) return const [];
+    final entry = calendars[calendarId];
+    final busy = entry is Map ? entry['busy'] : null;
+    if (busy is! List) return const [];
+    final out = <GoogleEvent>[];
+    for (var i = 0; i < busy.length; i++) {
+      final block = busy[i];
+      if (block is! Map) continue;
+      final start = DateTime.tryParse(block['start'] as String? ?? '');
+      final end = DateTime.tryParse(block['end'] as String? ?? '');
+      if (start == null || end == null) continue;
+      out.add(GoogleEvent(
+        id: 'busy-$i',
+        title: 'Busy',
+        startsAt: start.toLocal(),
+        endsAt: end.toLocal(),
+      ));
+    }
+    return out;
   }
 
   /// A valid access token, refreshing it if the cached one has expired or there is

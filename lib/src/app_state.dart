@@ -46,6 +46,57 @@ import '../ui/gameboy_theme.dart' show GameboyThemeId;
 ///    what happened while the app was open is empty exactly when it would be worth
 ///    reading. Events exist to be notified about. `_onFold` hands each one to
 ///    [Notifier] and lets it go.
+/// How a colleague's calendar lookup resolved, for the "their plans" sheet. Keeps the
+/// three outcomes distinct so the sheet never reads an unreadable calendar as an empty
+/// one: no calendar matched, a calendar that could not be read now, or a clean read.
+enum CalendarLookup { noCalendar, unavailable, ok }
+
+/// The result of [AppState.calendarForLabel]: a [CalendarLookup] status and, when the
+/// status is [CalendarLookup.ok], the events read (possibly none).
+class PersonCalendar {
+  const PersonCalendar(this.status, this.events);
+
+  final CalendarLookup status;
+  final List<GoogleEvent> events;
+
+  static const noCalendar = PersonCalendar(CalendarLookup.noCalendar, []);
+  static const unavailable = PersonCalendar(CalendarLookup.unavailable, []);
+  factory PersonCalendar.ok(List<GoogleEvent> events) =>
+      PersonCalendar(CalendarLookup.ok, events);
+}
+
+/// When a colleague next frees up, given their cached calendar [events] and [now], or
+/// null when nothing timed is on them right now.
+///
+/// Merges overlapping and back-to-back timed events into one continuous busy span and
+/// returns the gap to the end of the span covering [now]. Taking the soonest single
+/// end instead under-reports: at 09:45 a 10:00 and an 11:00 meeting would read "free in
+/// 15 min" while the next one is already running — they are busy until 11:00.
+@visibleForTesting
+Duration? freeInFromEvents(List<GoogleEvent> events, DateTime now) {
+  final timed = [
+    for (final e in events)
+      if (!e.allDay && e.endsAt.isAfter(e.startsAt)) e,
+  ]..sort((a, b) => a.startsAt.compareTo(b.startsAt));
+
+  DateTime? busyUntil;
+  for (final e in timed) {
+    if (busyUntil == null) {
+      // Open a span only on an event that is active right now.
+      if (!e.startsAt.isAfter(now) && e.endsAt.isAfter(now)) busyUntil = e.endsAt;
+      continue;
+    }
+    // Extend while the next event starts at or before the running end (overlap or
+    // back-to-back); the first real gap ends the continuous busy period.
+    if (!e.startsAt.isAfter(busyUntil)) {
+      if (e.endsAt.isAfter(busyUntil)) busyUntil = e.endsAt;
+    } else {
+      break;
+    }
+  }
+  return busyUntil?.difference(now);
+}
+
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -2489,6 +2540,18 @@ class AppState extends ChangeNotifier {
   final Map<String, DateTime> _peopleEventsAt = {};
   static const _peopleEventsTtl = Duration(minutes: 5);
 
+  /// One shared read per calendar id while it is in flight. A cold-cache Dial rebuild,
+  /// the completion of another calendar's load, and opening a person's sheet can each
+  /// ask for the same calendar at once; they await this one future instead of
+  /// multiplying requests on a slow connection.
+  final Map<String, Future<List<GoogleEvent>?>> _peopleEventsInFlight = {};
+
+  /// Bumped on every connect and disconnect so a Google read that was already in flight
+  /// when the account changed can tell it is stale and drop its result rather than
+  /// repopulating state the disconnect just cleared (or seeding the new account's cache
+  /// with the old one's events).
+  int _googleSession = 0;
+
   /// The upcoming Google Calendar events, soonest first. Empty when no account is
   /// connected or the build has no OAuth client. The Plans tab renders these beside
   /// the local plans, without the walk/delete a plan carries.
@@ -2543,6 +2606,10 @@ class AppState extends ChangeNotifier {
       return error;
     }
     _googleConnected = await google.isConnected;
+    // New session: reject any read still in flight from before this connect, and tag
+    // the reads below as belonging to it.
+    _googleSession++;
+    _peopleEventsInFlight.clear();
     _gcalLog('gcal: connect — connected=$_googleConnected');
     notifyListeners();
     await refreshGoogleEvents();
@@ -2554,12 +2621,16 @@ class AppState extends ChangeNotifier {
   Future<void> disconnectGoogle() async {
     final google = _googleCalendar;
     if (google == null) return;
+    // Invalidate before the await: any read in flight now carries the old session and
+    // must not repopulate the state cleared below when it lands.
+    _googleSession++;
     await google.disconnect();
     _googleConnected = false;
     _googleEvents = const [];
     _calendarIndex = const {};
     _peopleEvents.clear();
     _peopleEventsAt.clear();
+    _peopleEventsInFlight.clear();
     notifyListeners();
   }
 
@@ -2568,7 +2639,12 @@ class AppState extends ChangeNotifier {
   Future<void> refreshGoogleEvents() async {
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return;
-    _googleEvents = await google.fetchUpcoming();
+    final gen = _googleSession;
+    final events = await google.fetchUpcoming();
+    // A disconnect or account switch landed while this was fetching — drop the result
+    // rather than repopulating the tab with the gone account's events.
+    if (gen != _googleSession) return;
+    _googleEvents = events;
     notifyListeners();
   }
 
@@ -2578,7 +2654,10 @@ class AppState extends ChangeNotifier {
   Future<void> _buildCalendarIndex() async {
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return;
-    _calendarIndex = await google.fetchCalendarIndex();
+    final gen = _googleSession;
+    final index = await google.fetchCalendarIndex();
+    if (gen != _googleSession) return;
+    _calendarIndex = index;
     // The decisive diagnostic: these are the names a colleague's Gather label must
     // match (lowercased) for the Dial's calendar button to appear. Empty here means
     // nobody has shared a calendar with this account — or the share has no name.
@@ -2674,17 +2753,20 @@ class AppState extends ChangeNotifier {
   }
 
   /// The upcoming events on a colleague's calendar — keyed by their wire [email] when
-  /// Gather gave us one, else matched to [label] — soonest first. Returns null when no
-  /// calendar resolves, distinct from an empty list, which is a matched-but-clear
-  /// calendar. Powers the "their plans" sheet, reached from the map's person card
-  /// (label only) and the Dial (which also has the email).
-  Future<List<GoogleEvent>?> calendarForLabel(String label, {String? email}) async {
+  /// Gather gave us one, else matched to [label]. Carries one of three outcomes the
+  /// "their plans" sheet must tell apart: no calendar resolved ([CalendarLookup.noCalendar]),
+  /// a calendar that could not be read right now ([CalendarLookup.unavailable], so the
+  /// sheet says "could not load" rather than claiming an empty schedule), or a clean
+  /// read ([CalendarLookup.ok]) whose list may itself be empty. Reached from the map's
+  /// person card (label only) and the Dial (which also has the email).
+  Future<PersonCalendar> calendarForLabel(String label, {String? email}) async {
     final google = _googleCalendar;
-    if (google == null || !_googleConnected) return null;
+    if (google == null || !_googleConnected) return PersonCalendar.noCalendar;
     final calendarId = _calendarKeyFor(label, email);
-    if (calendarId == null) return null;
+    if (calendarId == null) return PersonCalendar.noCalendar;
     final events = await _fetchPeopleEvents(calendarId);
-    return events ?? const [];
+    if (events == null) return PersonCalendar.unavailable;
+    return PersonCalendar.ok(events);
   }
 
   /// Whether a colleague has a calendar this account can ask about — the gate the UI
@@ -2705,21 +2787,42 @@ class AppState extends ChangeNotifier {
     return calendarId != null;
   }
 
-  /// One colleague's events, cached for [_peopleEventsTtl]. Returns null when the
-  /// fetch is already in flight for a cold cache (so a sync caller shows nothing yet
-  /// rather than blocking), else the cached or freshly read list.
+  /// One colleague's events, cached for [_peopleEventsTtl]. Returns the cached or freshly
+  /// read list, or null when the calendar could not be read at all (offline or refused) —
+  /// distinct from an empty list, which is a calendar that read cleanly with nothing on it.
+  ///
+  /// Concurrent asks for the same calendar share one in-flight read ([_peopleEventsInFlight]),
+  /// and a read whose session has since changed (a disconnect or account switch mid-flight)
+  /// drops its result rather than seeding the new account's cache.
   Future<List<GoogleEvent>?> _fetchPeopleEvents(String calendarId) async {
     final at = _peopleEventsAt[calendarId];
     final cached = _peopleEvents[calendarId];
     if (cached != null && at != null && _now().difference(at) < _peopleEventsTtl) {
       return cached;
     }
+    final inFlight = _peopleEventsInFlight[calendarId];
+    if (inFlight != null) return inFlight;
+
     final google = _googleCalendar;
     if (google == null) return cached;
-    final events = await google.fetchEventsFor(calendarId);
-    _peopleEvents[calendarId] = events;
-    _peopleEventsAt[calendarId] = _now();
-    return events;
+
+    final gen = _googleSession;
+    final future = () async {
+      try {
+        final events = await google.fetchEventsFor(calendarId);
+        if (gen != _googleSession) return null;
+        _peopleEvents[calendarId] = events;
+        _peopleEventsAt[calendarId] = _now();
+        return events;
+      } on CalendarUnavailable {
+        // Leave any existing cache untouched; tell the caller it could not be read now.
+        return null;
+      } finally {
+        _peopleEventsInFlight.remove(calendarId);
+      }
+    }();
+    _peopleEventsInFlight[calendarId] = future;
+    return future;
   }
 
   /// What to show under a person's name in the Dial: whether they are mid-conversation
@@ -2755,16 +2858,7 @@ class AppState extends ChangeNotifier {
       return null;
     }
 
-    final now = _now();
-    Duration? soonestEnd;
-    for (final e in cached) {
-      if (e.allDay) continue;
-      if (!e.startsAt.isAfter(now) && e.endsAt.isAfter(now)) {
-        final gap = e.endsAt.difference(now);
-        if (soonestEnd == null || gap < soonestEnd) soonestEnd = gap;
-      }
-    }
-    return soonestEnd;
+    return freeInFromEvents(cached, _now());
   }
 
   /// The live-map room a read-only Google event points at, when its location is a

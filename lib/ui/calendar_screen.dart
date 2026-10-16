@@ -14,6 +14,8 @@
 /// this list is *writable* — the `+` opens a sheet, and each row edits.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:gather_client/gather_client.dart';
 
@@ -22,13 +24,51 @@ import '../src/calendar.dart';
 import '../src/google_calendar.dart';
 import '../theme/gather_theme.dart';
 
-class CalendarScreen extends StatelessWidget {
+/// The Plans list splits entries into upcoming vs past and labels day headers and the
+/// live "Go to meeting" button against the current time. Those checks run on build, but
+/// the screen's only other trigger is [AppState] — which an idle space does not notify
+/// as the clock moves. So a ticker rebuilds it on its own: once a minute, and on resume,
+/// a meeting crosses from upcoming to past, a header flips TODAY→TOMORROW, and the live
+/// button appears at the start and clears at the end without needing a roster change.
+class CalendarScreen extends StatefulWidget {
   const CalendarScreen({super.key, required this.state});
 
   final AppState state;
 
   @override
+  State<CalendarScreen> createState() => _CalendarScreenState();
+}
+
+class _CalendarScreenState extends State<CalendarScreen> with WidgetsBindingObserver {
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // A minute is finer than any boundary the list draws (whole-minute times, calendar
+    // days) and cheap — a rebuild of a short list against unchanged data.
+    _tick = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState lifecycleState) {
+    // Minutes may have passed with the timer paused in the background; catch up at once.
+    if (lifecycleState == AppLifecycleState.resumed && mounted) setState(() {});
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final state = widget.state;
     final t = context.tokens;
     // Read above the `Scaffold`: the shell folds the rail's height into the bottom
     // padding, which a `Scaffold` body is entitled to take off again. The trailing
