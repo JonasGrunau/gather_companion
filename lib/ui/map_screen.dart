@@ -1306,74 +1306,78 @@ class _PersonCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(t.radius),
       elevation: 3,
       shadowColor: Colors.black.withValues(alpha: 0.28),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            // One Wrap over four atomic items — identity, both pills, close. The avatar,
-            // pills and close button are all fixed-width, so at a large text scale on a
-            // narrow phone they outrun a single Row and clip into a RenderFlex overflow;
-            // even the two pills together do not fit one line there. Wrapping each item
-            // independently lets them flow onto further lines as the scale demands, and
-            // leaves the one-line layout untouched at ordinary sizes.
-            return Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 10,
-              runSpacing: 6,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    PersonAvatar(
-                      id: person.id,
-                      label: person.label,
-                      photoUrl: state.photoUrlFor(person.id),
-                      size: 36,
-                      availability: person.availability,
-                      dotRing: t.card,
-                    ),
-                    const SizedBox(width: 10),
-                    ConstrainedBox(
-                      // Bounded by the card's own width (minus the avatar and its gap) so
-                      // a long name ellipsizes within this chunk rather than forcing it
-                      // wider than the card.
-                      constraints: BoxConstraints(maxWidth: constraints.maxWidth - 46),
-                      child: Text(
-                        person.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  ],
-                ),
-                // Walk over, in the same pill shape as Wave: a person is somewhere you
-                // can go as well as someone you can hail. [_goToPerson] lands beside them.
-                _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
-                _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
-                // Only where there is a calendar to show: a person whose shared calendar
-                // this account can read, keyed off their wire email (a display-name guess
-                // misses most of the roster). Icon-only — the two verbs next to it carry
-                // words, so a third would crowd the card; the calendar glyph is its own
-                // label. Same brand pill, so it restyles under the Gameboy palette for free.
-                if (state.googleAvailable &&
-                    state.hasCalendarFor(person.label, email: person.calendarEmail))
-                  _CardAction(
-                    icon: Icons.event_note_rounded,
-                    tooltip: 'Plans',
-                    onTap: onPlans,
+      child: ConstrainedBox(
+        // A fixed card width rather than one that hugs its content: with the close pinned
+        // to the top-right corner the identity row has to span something, and a bounded
+        // width keeps the action pills on their own tidy line below instead of a Wrap that
+        // pushed the close and the calendar chip onto a ragged second row.
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 6, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Identity and the dismiss, on one line: face, name, and the close pinned to
+              // the corner where a card's close belongs.
+              Row(
+                children: [
+                  PersonAvatar(
+                    id: person.id,
+                    label: person.label,
+                    photoUrl: state.photoUrlFor(person.id),
+                    size: 36,
+                    availability: person.availability,
+                    dotRing: t.card,
                   ),
-                IconButton(
-                  icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
-                  // Names the otherwise icon-only control for a screen reader, as the
-                  // rail's own clear control is named.
-                  tooltip: 'Dismiss',
-                  onPressed: onClear,
-                  visualDensity: VisualDensity.compact,
-                ),
-              ],
-            );
-          },
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      person.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+                    // Names the otherwise icon-only control for a screen reader, as the
+                    // rail's own clear control is named.
+                    tooltip: 'Dismiss',
+                    onPressed: onClear,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              // The verbs, on their own row: walk over, wave, and — only where there is a
+              // readable calendar — an icon-only Plans chip. A Wrap so a large text scale
+              // can still spill them onto a second line, but at ordinary sizes they sit flush
+              // left on one tidy row.
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  // Walk over, in the same pill shape as Wave: a person is somewhere you can
+                  // go as well as someone you can hail. [_goToPerson] lands beside them.
+                  _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
+                  _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
+                  // Only where there is a calendar to show: a person whose shared calendar
+                  // this account can read, keyed off their wire email (a display-name guess
+                  // misses most of the roster). Icon-only — the two verbs beside it carry
+                  // words, so a third would crowd the row; the calendar glyph is its own
+                  // label. Same brand pill, so it restyles under the Gameboy palette for free.
+                  if (state.googleAvailable &&
+                      state.hasCalendarFor(person.label, email: person.calendarEmail))
+                    _CardAction(
+                      icon: Icons.event_note_rounded,
+                      tooltip: 'Plans',
+                      onTap: onPlans,
+                    ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
