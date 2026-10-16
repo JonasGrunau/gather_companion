@@ -146,6 +146,13 @@ abstract interface class Collector {
   /// `handRaisedAt` on our roster row.
   ({bool ok, String? detail}) setHandRaised(bool raised);
 
+  /// Asks to be let into a locked area — a `MapArea` by its id. Fire-and-forget:
+  /// the server records an `AreaAccessRequest`, and when the host accepts it the
+  /// acceptance arrives as a patch the map already reads (it flips
+  /// `canEnterRoom`). The id is the area's [SpaceRoom.id], the same one a resolved
+  /// `/m/<link>` carries as `areaId`.
+  ({bool ok, String? detail}) requestToAccess(String areaId);
+
   /// Steps out of the huddle without walking away from it.
   ({bool ok, String? detail}) leaveCluster();
 

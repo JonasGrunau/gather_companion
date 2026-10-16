@@ -5,7 +5,12 @@ import 'package:flutter/foundation.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_events/gather_events.dart';
 
+import 'calendar.dart';
+import 'calendar_mirror.dart';
+import 'calendar_store.dart';
 import 'credentials.dart';
+import 'gather_link.dart';
+import 'google_calendar.dart';
 import 'directory.dart';
 import 'link_status.dart';
 import 'map_person.dart';
@@ -41,6 +46,57 @@ import '../ui/gameboy_theme.dart' show GameboyThemeId;
 ///    what happened while the app was open is empty exactly when it would be worth
 ///    reading. Events exist to be notified about. `_onFold` hands each one to
 ///    [Notifier] and lets it go.
+/// How a colleague's calendar lookup resolved, for the "their plans" sheet. Keeps the
+/// three outcomes distinct so the sheet never reads an unreadable calendar as an empty
+/// one: no calendar matched, a calendar that could not be read now, or a clean read.
+enum CalendarLookup { noCalendar, unavailable, ok }
+
+/// The result of [AppState.calendarForLabel]: a [CalendarLookup] status and, when the
+/// status is [CalendarLookup.ok], the events read (possibly none).
+class PersonCalendar {
+  const PersonCalendar(this.status, this.events);
+
+  final CalendarLookup status;
+  final List<GoogleEvent> events;
+
+  static const noCalendar = PersonCalendar(CalendarLookup.noCalendar, []);
+  static const unavailable = PersonCalendar(CalendarLookup.unavailable, []);
+  factory PersonCalendar.ok(List<GoogleEvent> events) =>
+      PersonCalendar(CalendarLookup.ok, events);
+}
+
+/// When a colleague next frees up, given their cached calendar [events] and [now], or
+/// null when nothing timed is on them right now.
+///
+/// Merges overlapping and back-to-back timed events into one continuous busy span and
+/// returns the gap to the end of the span covering [now]. Taking the soonest single
+/// end instead under-reports: at 09:45 a 10:00 and an 11:00 meeting would read "free in
+/// 15 min" while the next one is already running — they are busy until 11:00.
+@visibleForTesting
+Duration? freeInFromEvents(List<GoogleEvent> events, DateTime now) {
+  final timed = [
+    for (final e in events)
+      if (!e.allDay && e.endsAt.isAfter(e.startsAt)) e,
+  ]..sort((a, b) => a.startsAt.compareTo(b.startsAt));
+
+  DateTime? busyUntil;
+  for (final e in timed) {
+    if (busyUntil == null) {
+      // Open a span only on an event that is active right now.
+      if (!e.startsAt.isAfter(now) && e.endsAt.isAfter(now)) busyUntil = e.endsAt;
+      continue;
+    }
+    // Extend while the next event starts at or before the running end (overlap or
+    // back-to-back); the first real gap ends the continuous busy period.
+    if (!e.startsAt.isAfter(busyUntil)) {
+      if (e.endsAt.isAfter(busyUntil)) busyUntil = e.endsAt;
+    } else {
+      break;
+    }
+  }
+  return busyUntil?.difference(now);
+}
+
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -71,6 +127,15 @@ class AppState extends ChangeNotifier {
     // Test seam for the resync cooldown clock. Production reads the wall clock.
     DateTime Function()? now,
     UiPreferences? uiPreferences,
+    CalendarStore? calendarStore,
+    // The device-calendar bridge. Defaulted to a no-op so a widget test — or any
+    // build without the native plugin — never touches a real calendar; `main.dart`
+    // supplies the plugin-backed one.
+    CalendarMirror? calendarMirror,
+    // The read-only Google Calendar connection, or null when this build has no OAuth
+    // client configured (every test, and a placeholder build). Null reads as "not
+    // offered": the Plans tab shows local plans only and never tries to connect.
+    GoogleCalendar? googleCalendar,
   }) : _notifier = notifier ?? Notifier(),
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
@@ -82,6 +147,10 @@ class AppState extends ChangeNotifier {
        _bridgeStore = bridge ?? BridgeSettingsStore(),
        _log = log ?? _noop,
        _uiPrefs = uiPreferences ?? UiPreferences(),
+       _calendarStore = calendarStore ?? CalendarStore(),
+       _calendarMirror = calendarMirror ?? const NoopCalendarMirror(),
+       // ignore: prefer_initializing_formals
+       _googleCalendar = googleCalendar,
        _buildCollector = buildCollector ??
            ((auth, spaceId) =>
                DirectCollector(auth: auth, spaceId: spaceId, log: log ?? _noop)),
@@ -99,6 +168,9 @@ class AppState extends ChangeNotifier {
   final GatherCredentialStore _credentialStore;
   final BridgeSettingsStore _bridgeStore;
   final UiPreferences _uiPrefs;
+  final CalendarStore _calendarStore;
+  final CalendarMirror _calendarMirror;
+  final GoogleCalendar? _googleCalendar;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -654,6 +726,7 @@ class AppState extends ChangeNotifier {
           direction: row.direction,
           gait: gaitOf(row.speed),
           availability: row.availability,
+          calendarEmail: row.calendarEmail,
         ),
       );
     }
@@ -745,6 +818,12 @@ class AppState extends ChangeNotifier {
     _gameboyMode = await _uiPrefs.loadGameboyMode();
     _gameboyTheme = GameboyThemeId.fromId(await _uiPrefs.loadGameboyThemeId());
     _soundEffects = await _uiPrefs.loadSoundEffects();
+    _plannedMeetings = await _calendarStore.load();
+    _mirrorCalendarId = await _uiPrefs.loadMirrorCalendarId();
+    // Fire-and-forget: a connected Google account fills the Plans tab a beat after
+    // launch, and a failed read just leaves it empty. Not awaited — it must not hold
+    // boot behind a network round trip.
+    unawaited(_restoreGoogle());
 
     // Launched straight into Gameboy mode with sounds on: no setter ran to warm
     // the SFX player, so do it here while there is no call yet. The restore itself
@@ -766,6 +845,11 @@ class AppState extends ChangeNotifier {
     _loaded = true;
     await _notifier.init();
     notifyListeners();
+
+    // After the notifier is up: scheduled reminders do not survive a reinstall or a
+    // reboot, so the stored plans re-arm theirs here. Unawaited — it is a background
+    // catch-up, not something the first frame waits on.
+    unawaited(_rescheduleAllReminders());
 
     if (_credentials.isComplete) _attach();
   }
@@ -812,6 +896,15 @@ class AppState extends ChangeNotifier {
   Future<void> unpair() async {
     await _bridgeStore.clear();
     await _credentialStore.clear();
+    // The plans go with the pairing. They are pinned to rooms in a specific space,
+    // so a phone re-paired into another one would carry a calendar of places that
+    // are not there. Their reminders go too; the mirrored calendar events are the
+    // user's own account's now and are left alone.
+    for (final meeting in _plannedMeetings) {
+      await _notifier.cancelReminder(_reminderId(meeting));
+    }
+    _plannedMeetings = const [];
+    await _calendarStore.clear();
     _settings = BridgeSettings.empty;
     _credentials = GatherCredentials.empty;
     _spaceId = null;
@@ -1439,6 +1532,11 @@ class AppState extends ChangeNotifier {
   /// network-change watcher has something to resync.
   @visibleForTesting
   void debugAttachCollector(Collector collector) => _collector = collector;
+
+  /// Test seam: stand in the authenticated REST client a `/m/<code>` walk reaches
+  /// for, so the resolve→floor→knock path can be driven without a live login.
+  @visibleForTesting
+  void debugAttachAuth(GatherAuth auth) => _auth = auth;
 
   /// Test seam: drive [_onConnectivityChanged] without a plugin behind it.
   @visibleForTesting
@@ -2230,6 +2328,732 @@ class AppState extends ChangeNotifier {
     // through somebody else's desk. Arrive at the best of them anyway, the way
     // `shouldTeleport` does.
     return _travelTo(map, walk, at, wanted.first, occupied);
+  }
+
+  // ---- planned meetings ------------------------------------------------------
+  //
+  // A calendar that is entirely this phone's own. Gather has none to read or write
+  // — its Calendar Panel mirrors a Google/Outlook account, and the game socket
+  // carries no scheduled event — so a plan made here is saved in [_calendarStore]
+  // (the keychain) and reaches Gather only if the user opts to mirror it into the
+  // phone's own calendar (see [_calendarMirror] and [setMirrorCalendar]).
+
+  List<PlannedMeeting> _plannedMeetings = const [];
+
+  /// The planned meetings, soonest first. The Plans tab renders straight off this.
+  List<PlannedMeeting> get plannedMeetings {
+    final out = [..._plannedMeetings];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Test seam: lets a widget test stand up the Plans tab without a keychain.
+  @visibleForTesting
+  set debugPlannedMeetings(List<PlannedMeeting> meetings) {
+    _plannedMeetings = meetings;
+    notifyListeners();
+  }
+
+  /// The device calendar plans are mirrored into, or null when mirroring is off.
+  String? _mirrorCalendarId;
+  String? get mirrorCalendarId => _mirrorCalendarId;
+
+  /// A notification id for a meeting's reminder, derived from its stable id. A
+  /// positive 31-bit int because that is what the platforms accept, and kept a pure
+  /// function of the id so cancelling finds the same slot scheduling used.
+  ///
+  /// Hashed by hand rather than with [String.hashCode]: the Dart VM seeds string
+  /// hashes randomly per process, so `id.hashCode` returns a different number on the
+  /// next launch. That id has to survive a restart — boot reschedules from it, and
+  /// an edit or delete cancels by it — so a hash that moved would orphan the old
+  /// notification and schedule a duplicate. This FNV-1a over the id's code units is
+  /// deterministic across launches and platforms.
+  int _reminderId(PlannedMeeting m) {
+    var hash = 0x811c9dc5;
+    for (final unit in m.id.codeUnits) {
+      hash = ((hash ^ unit) * 0x01000193) & 0xffffffff;
+    }
+    return hash & 0x7fffffff;
+  }
+
+  /// Adds a plan: saves it, schedules its reminder, and best-effort mirrors it to
+  /// the phone's calendar. Returns null on success or a sentence for the user.
+  ///
+  /// The local save is the commit — a plan is kept the moment the keychain takes
+  /// it. The reminder and the mirror are consequences of a saved plan, not
+  /// conditions of saving one: a reminder that will not schedule or a calendar that
+  /// refuses the write are not reasons to tell the user their meeting was lost.
+  Future<String?> addMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    var saved = meeting;
+
+    // Mirror first, so the device-event id it hands back is part of the record the
+    // store persists — otherwise a crash between save and mirror would orphan the
+    // calendar event with nothing pointing at it.
+    saved = await _mirror(saved);
+
+    _plannedMeetings = [..._plannedMeetings, saved];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that meeting.';
+    }
+
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Replaces a plan with an edited copy, keeping its id. Re-mirrors and
+  /// re-schedules so a moved time carries its reminder and calendar entry with it.
+  Future<String?> updateMeeting(PlannedMeeting meeting) async {
+    final before = _plannedMeetings;
+    final at = _plannedMeetings.indexWhere((m) => m.id == meeting.id);
+    if (at < 0) return addMeeting(meeting);
+
+    // Carry the existing device-event id across so the mirror updates in place
+    // rather than leaving the old event behind and creating a second. A failed
+    // re-mirror clears that id (see [_mirror]) so the local reminder arms as the
+    // fallback instead of staying suppressed behind an event that never moved.
+    var saved = meeting.withDeviceEventId(_plannedMeetings[at].deviceEventId);
+    saved = await _mirror(saved);
+
+    final next = [..._plannedMeetings];
+    next[at] = saved;
+    _plannedMeetings = next;
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not save that change.';
+    }
+
+    await _notifier.cancelReminder(_reminderId(saved));
+    await _scheduleReminder(saved);
+    return null;
+  }
+
+  /// Removes a plan, its reminder and its mirrored calendar event. Optimistic: the
+  /// row leaves the list at once and is put back only if the store write fails.
+  Future<String?> deleteMeeting(String id) async {
+    final before = _plannedMeetings;
+    final gone = _plannedMeetings.where((m) => m.id == id).toList();
+    if (gone.isEmpty) return null;
+
+    _plannedMeetings = [for (final m in _plannedMeetings) if (m.id != id) m];
+    notifyListeners();
+    try {
+      await _calendarStore.save(_plannedMeetings);
+    } on Object {
+      _plannedMeetings = before;
+      notifyListeners();
+      return 'Could not delete that meeting.';
+    }
+
+    for (final m in gone) {
+      await _notifier.cancelReminder(_reminderId(m));
+      if (m.deviceEventId != null && _mirrorCalendarId != null) {
+        await _calendarMirror.delete(m.deviceEventId, calendarId: _mirrorCalendarId!);
+      }
+    }
+    return null;
+  }
+
+  /// Walks (or warps) to where a planned meeting is set to happen.
+  ///
+  /// Resolves [PlannedMeeting.roomStableId] against the live map and walks in with
+  /// [goToRoom], the same machinery the "Go here" card and [warpToMeeting] use.
+  /// Falls back to a tile hop when the plan carries only coordinates, and refuses
+  /// cleanly when the room is on another floor or the map has not arrived — a plan
+  /// can be made offline, but it can only be walked to once there is a floor to
+  /// walk on.
+  Future<String?> walkToMeeting(PlannedMeeting meeting) async {
+    final map = this.map;
+    if (map == null) return 'Still reading the floor plan.';
+
+    final myFloor = _myRow()?.floorId;
+    if (myFloor != null && meeting.floorId != null && meeting.floorId != myFloor) {
+      return '${meeting.roomName ?? 'That room'} is on another floor.';
+    }
+
+    final stableId = meeting.roomStableId;
+    if (stableId != null) {
+      for (final room in map.rooms) {
+        if (room.stableId != stableId) continue;
+        return goToRoom(
+          room,
+          toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+        );
+      }
+    }
+
+    final x = meeting.x, y = meeting.y;
+    if (x != null && y != null && x.isFinite && y.isFinite) {
+      return warpToTile(x.round(), y.round());
+    }
+
+    return meeting.roomName == null
+        ? 'This meeting has no place set.'
+        : "Can't find ${meeting.roomName} on the floor plan.";
+  }
+
+  /// The rooms a plan can be pinned to, for the create sheet's place picker — every
+  /// named room on the floor I am on, soonest resolved. Empty until the map has
+  /// arrived, which is the same gate [walkToMeeting] enforces.
+  List<SpaceRoom> get plannableRooms {
+    final rooms = map?.rooms ?? const <SpaceRoom>[];
+    return [
+      for (final room in rooms)
+        if (room.name != null && room.name!.isNotEmpty) room,
+    ];
+  }
+
+  // ---- Google Calendar (read-only) -------------------------------------------
+  //
+  // The events the desktop Calendar Panel shows, read from the source Gather itself
+  // reads — a connected Google account — rather than from Gather, which carries no
+  // scheduled event on the wire. Separate from [_plannedMeetings] because it is the
+  // opposite kind of thing: not a plan this phone owns and can edit, but one it only
+  // mirrors. The Plans tab renders both, the Google ones read-only.
+
+  List<GoogleEvent> _googleEvents = const [];
+
+  /// Lowercased **display name → calendar id** of the calendars this Google account
+  /// can see besides its own — the colleagues who shared one. Built once per connect
+  /// (names rarely change within a session) and consulted by [calendarForPerson] to
+  /// turn a tapped person into a calendar to read. Empty when disconnected.
+  Map<String, String> _calendarIndex = const {};
+
+  /// Labels already logged by [hasCalendarFor], so the per-frame Dial gate records
+  /// each colleague's match-or-miss once instead of on every rebuild. Diagnostic
+  /// only — the match itself is a pure index lookup.
+  final Set<String> _gcalMatchLogged = {};
+
+  /// A short-lived cache of one colleague's events, keyed by calendar id, so tapping
+  /// the same person twice — or the Dial polling presence — does not re-hit Google
+  /// each time. Entries expire via [_peopleEventsAt].
+  final Map<String, List<GoogleEvent>> _peopleEvents = {};
+  final Map<String, DateTime> _peopleEventsAt = {};
+  static const _peopleEventsTtl = Duration(minutes: 5);
+
+  /// One shared read per calendar id while it is in flight. A cold-cache Dial rebuild,
+  /// the completion of another calendar's load, and opening a person's sheet can each
+  /// ask for the same calendar at once; they await this one future instead of
+  /// multiplying requests on a slow connection.
+  final Map<String, Future<List<GoogleEvent>?>> _peopleEventsInFlight = {};
+
+  /// Bumped on every connect and disconnect so a Google read that was already in flight
+  /// when the account changed can tell it is stale and drop its result rather than
+  /// repopulating state the disconnect just cleared (or seeding the new account's cache
+  /// with the old one's events).
+  int _googleSession = 0;
+
+  /// The upcoming Google Calendar events, soonest first. Empty when no account is
+  /// connected or the build has no OAuth client. The Plans tab renders these beside
+  /// the local plans, without the walk/delete a plan carries.
+  List<GoogleEvent> get googleEvents {
+    final out = [..._googleEvents];
+    out.sort((a, b) => a.startsAt.compareTo(b.startsAt));
+    return out;
+  }
+
+  /// Whether a Google account is connected. Drives the Plans tab's connect/disconnect
+  /// action. Updated by [connectGoogle]/[disconnectGoogle] and seeded at boot.
+  bool _googleConnected = false;
+  bool get googleConnected => _googleConnected;
+
+  /// Whether this build can offer a Google connection at all — false when no OAuth
+  /// client was compiled in (every test, a placeholder build), so the UI can hide
+  /// the action rather than offer one that cannot work.
+  bool get googleAvailable => _googleCalendar != null;
+
+  /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
+  /// batch of events. Called from [boot]; best-effort, never fails the launch.
+  /// A diagnostic log line for the calendar feature, emitted only in a build made with
+  /// `--dart-define=GCAL_DEBUG=true`. These lines name colleague calendar emails, so
+  /// they stay out of a normal build's `media.log` and are turned on only to trace why
+  /// an availability badge is or is not showing.
+  void _gcalLog(String line) {
+    if (const bool.fromEnvironment('GCAL_DEBUG')) _log(line);
+  }
+
+  Future<void> _restoreGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) {
+      _gcalLog('gcal: restore — no calendar service (build carries no client id)');
+      return;
+    }
+    _googleConnected = await google.isConnected;
+    _gcalLog('gcal: restore — connected=$_googleConnected (refresh token in keychain)');
+    if (_googleConnected) {
+      await refreshGoogleEvents();
+      unawaited(_buildCalendarIndex());
+    }
+  }
+
+  /// Runs the Google consent flow and, on success, pulls the events in. Returns null
+  /// on success or a cancel, or a sentence for the user on a real failure.
+  Future<String?> connectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return 'Google Calendar is not set up in this build.';
+    final error = await google.connect();
+    if (error != null) {
+      _gcalLog('gcal: connect — failed: $error');
+      return error;
+    }
+    _googleConnected = await google.isConnected;
+    // New session: reject any read still in flight from before this connect, and tag
+    // the reads below as belonging to it.
+    _googleSession++;
+    _peopleEventsInFlight.clear();
+    _gcalLog('gcal: connect — connected=$_googleConnected');
+    notifyListeners();
+    await refreshGoogleEvents();
+    unawaited(_buildCalendarIndex());
+    return null;
+  }
+
+  /// Forgets the Google account and clears its events from the tab.
+  Future<void> disconnectGoogle() async {
+    final google = _googleCalendar;
+    if (google == null) return;
+    // Invalidate before the await: any read in flight now carries the old session and
+    // must not repopulate the state cleared below when it lands.
+    _googleSession++;
+    await google.disconnect();
+    _googleConnected = false;
+    _googleEvents = const [];
+    _calendarIndex = const {};
+    _peopleEvents.clear();
+    _peopleEventsAt.clear();
+    _peopleEventsInFlight.clear();
+    notifyListeners();
+  }
+
+  /// Re-reads the upcoming Google events. A no-op when disconnected; swallows a
+  /// failed read (the service returns an empty list) rather than surfacing it.
+  Future<void> refreshGoogleEvents() async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return;
+    final gen = _googleSession;
+    final events = await google.fetchUpcoming();
+    // A disconnect or account switch landed while this was fetching — drop the result
+    // rather than repopulating the tab with the gone account's events.
+    if (gen != _googleSession) return;
+    _googleEvents = events;
+    notifyListeners();
+  }
+
+  /// Reads the index of shared calendars and rebuilds [_calendarIndex]. Best-effort;
+  /// a failure leaves the tab working with only the user's own events and no
+  /// per-person calendars, which is what an account with nothing shared to it sees.
+  Future<void> _buildCalendarIndex() async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return;
+    final gen = _googleSession;
+    final index = await google.fetchCalendarIndex();
+    if (gen != _googleSession) return;
+    _calendarIndex = index;
+    // The decisive diagnostic: these are the names a colleague's Gather label must
+    // match (lowercased) for the Dial's calendar button to appear. Empty here means
+    // nobody has shared a calendar with this account — or the share has no name.
+    _gcalLog('gcal: calendar index — ${_calendarIndex.length} shared: '
+        '${_calendarIndex.keys.join(', ')}');
+    notifyListeners();
+  }
+
+  /// Seeds the shared-calendar index and marks Google connected, so the name-matching
+  /// the Dial depends on can be driven without a live OAuth account.
+  @visibleForTesting
+  void debugSeedCalendarIndex(Map<String, String> index) {
+    _calendarIndex = Map.of(index);
+    _googleConnected = true;
+    _gcalMatchLogged.clear();
+  }
+
+  /// The calendar id for a person shown in Gather as [label], or null when none in the
+  /// index is a confident match. The single resolver every calendar lookup goes
+  /// through, so the Dial gate, the "free in" countdown and the plans sheet all agree
+  /// on who a label points at.
+  ///
+  /// Matching is deliberately loose because the two names rarely line up: Gather shows
+  /// a short handle ("jaime", "dr. simon") while a shared calendar is named for the
+  /// whole person or their address ("Jaime García", `jaime@safenow.de`). An exact hit
+  /// wins outright; failing that, a label name-token that is a full word of a
+  /// calendar's name — or the local part of its email, or a prefix of one of its words
+  /// — counts as a match. Tokens shorter than three characters and role words
+  /// ("extern", "dr") are dropped so they cannot carry a match on their own.
+  ///
+  /// Ambiguity is resolved to *nothing*, never a guess: if the label matches two
+  /// different calendars, it resolves to null rather than risk showing one colleague's
+  /// schedule under another's name. That keeps the loosened matching safe — the cost of
+  /// a near-collision is a hidden button, not a wrong one.
+  String? _calendarIdForLabel(String label) {
+    final key = label.trim().toLowerCase();
+    if (key.isEmpty) return null;
+    final exact = _calendarIndex[key];
+    if (exact != null) return exact;
+
+    final labelTokens = _nameTokens(key);
+    if (labelTokens.isEmpty) return null;
+    final ids = <String>{};
+    for (final entry in _calendarIndex.entries) {
+      if (_calendarMatchesTokens(entry.key, labelTokens)) ids.add(entry.value);
+    }
+    // One confident calendar, or nothing — two means we cannot tell them apart.
+    return ids.length == 1 ? ids.first : null;
+  }
+
+  /// Whether a calendar named [calKey] (a display name or an email) carries any of a
+  /// label's [labelTokens] as one of its own name words. Emails are reduced to their
+  /// local part first, so the shared domain (`…@safenow.de`) cannot match everyone.
+  bool _calendarMatchesTokens(String calKey, Set<String> labelTokens) {
+    final at = calKey.indexOf('@');
+    final calTokens = _nameTokens(at >= 0 ? calKey.substring(0, at) : calKey);
+    for (final want in labelTokens) {
+      for (final have in calTokens) {
+        if (have == want) return true;
+        // A handle is often a prefix of the full name ("jaime" in "jaimeg"); require
+        // four characters so short fragments ("jan" in "janet") do not over-reach.
+        if (want.length >= 4 && have.startsWith(want)) return true;
+      }
+    }
+    return false;
+  }
+
+  /// The significant lowercase name words in [s]: alphanumeric runs of three or more
+  /// characters that are not role words. Splits on anything else, so "dr. simon",
+  /// "garcía-lópez" and "jaime (extern)" all reduce to the names that identify a person.
+  static Set<String> _nameTokens(String s) {
+    const stop = {'extern', 'intern', 'team', 'the', 'und', 'and', 'von', 'der', 'die'};
+    return {
+      for (final t in s.toLowerCase().split(RegExp(r'[^a-z0-9äöüß]+')))
+        if (t.length >= 3 && !stop.contains(t)) t,
+    };
+  }
+
+  /// The Google calendar id to read for a colleague, preferring the exact calendar
+  /// [email] Gather hands us on the wire over a guessed name match.
+  ///
+  /// The email is the strong key: `fetchEventsFor` passes it straight to Google, which
+  /// answers free/busy for any address inside the same Workspace domain without the
+  /// colleague sharing anything by name — the mechanism the desktop uses. Only when no
+  /// email arrived (a colleague who never connected a calendar to Gather) does it fall
+  /// back to matching their Gather label against a calendar shared directly with this
+  /// account. Null when disconnected or neither key resolves.
+  String? _calendarKeyFor(String label, String? email) {
+    if (!_googleConnected) return null;
+    final trimmed = email?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+    return _calendarIdForLabel(label);
+  }
+
+  /// The upcoming events on a colleague's calendar — keyed by their wire [email] when
+  /// Gather gave us one, else matched to [label]. Carries one of three outcomes the
+  /// "their plans" sheet must tell apart: no calendar resolved ([CalendarLookup.noCalendar]),
+  /// a calendar that could not be read right now ([CalendarLookup.unavailable], so the
+  /// sheet says "could not load" rather than claiming an empty schedule), or a clean
+  /// read ([CalendarLookup.ok]) whose list may itself be empty. Reached from the map's
+  /// person card (label only) and the Dial (which also has the email).
+  Future<PersonCalendar> calendarForLabel(String label, {String? email}) async {
+    final google = _googleCalendar;
+    if (google == null || !_googleConnected) return PersonCalendar.noCalendar;
+    final calendarId = _calendarKeyFor(label, email);
+    if (calendarId == null) return PersonCalendar.noCalendar;
+    final events = await _fetchPeopleEvents(calendarId);
+    if (events == null) return PersonCalendar.unavailable;
+    return PersonCalendar.ok(events);
+  }
+
+  /// Whether a colleague has a calendar this account can ask about — the gate the UI
+  /// uses to offer a "Plans" affordance only where it will land on something. True as
+  /// soon as Gather gave us their [email]; otherwise a name match against a directly
+  /// shared calendar. Cheap and synchronous.
+  bool hasCalendarFor(String label, {String? email}) {
+    final logKey = label.trim().toLowerCase();
+    final calendarId = _calendarKeyFor(label, email);
+    // Log each distinct colleague once: whether we resolved by email or name (or
+    // missed), visible in a pulled log rather than guessed at.
+    if (_googleConnected && _gcalMatchLogged.add(logKey)) {
+      final how = calendarId == null
+          ? 'MISS'
+          : (email != null && email.trim().isNotEmpty ? 'HIT email' : 'HIT name');
+      _gcalLog('gcal: dial match — "$logKey" -> $how (index has ${_calendarIndex.length})');
+    }
+    return calendarId != null;
+  }
+
+  /// One colleague's events, cached for [_peopleEventsTtl]. Returns the cached or freshly
+  /// read list, or null when the calendar could not be read at all (offline or refused) —
+  /// distinct from an empty list, which is a calendar that read cleanly with nothing on it.
+  ///
+  /// Concurrent asks for the same calendar share one in-flight read ([_peopleEventsInFlight]),
+  /// and a read whose session has since changed (a disconnect or account switch mid-flight)
+  /// drops its result rather than seeding the new account's cache.
+  Future<List<GoogleEvent>?> _fetchPeopleEvents(String calendarId) async {
+    final at = _peopleEventsAt[calendarId];
+    final cached = _peopleEvents[calendarId];
+    if (cached != null && at != null && _now().difference(at) < _peopleEventsTtl) {
+      return cached;
+    }
+    final inFlight = _peopleEventsInFlight[calendarId];
+    if (inFlight != null) return inFlight;
+
+    final google = _googleCalendar;
+    if (google == null) return cached;
+
+    final gen = _googleSession;
+    final future = () async {
+      try {
+        final events = await google.fetchEventsFor(calendarId);
+        if (gen != _googleSession) return null;
+        _peopleEvents[calendarId] = events;
+        _peopleEventsAt[calendarId] = _now();
+        return events;
+      } on CalendarUnavailable {
+        // Leave any existing cache untouched; tell the caller it could not be read now.
+        return null;
+      } finally {
+        _peopleEventsInFlight.remove(calendarId);
+      }
+    }();
+    _peopleEventsInFlight[calendarId] = future;
+    return future;
+  }
+
+  /// What to show under a person's name in the Dial: whether they are mid-conversation
+  /// and, when their calendar is visible, when they free up.
+  ///
+  /// "In a meeting" is Gather's own `clusterId` — a shared non-null value is a bubble,
+  /// the same signal the call screen keys on, and needs no calendar. The "free in X"
+  /// refinement needs an end time, which only their calendar carries: when that is
+  /// cached (a tap, or a prior look, warmed it) and an event spans now, the gap to its
+  /// end is the countdown. A cold cache is warmed in the background and surfaces on the
+  /// next rebuild, so the badge fills in rather than blocking the list.
+  PersonPresence presenceFor(Contact c) {
+    final inMeeting = c.clusterId != null;
+    // "Free in X" qualifies a meeting we can already see — it is never promoted on
+    // its own for someone merely heads-down at their desk with a calendar block.
+    // Gather's own cluster is the gate: no bubble, no countdown. This keeps the
+    // availability claim honest (they are demonstrably busy right now) and matches
+    // where the colleague is actually sitting in a call with the event's other invitees.
+    final freeIn = inMeeting ? _freeInFor(c) : null;
+    return PersonPresence(inMeeting: inMeeting, freeIn: freeIn);
+  }
+
+  Duration? _freeInFor(Contact c) {
+    if (!_googleConnected) return null;
+    final calendarId = _calendarKeyFor(c.label, c.calendarEmail);
+    if (calendarId == null) return null;
+
+    final at = _peopleEventsAt[calendarId];
+    final cached = _peopleEvents[calendarId];
+    if (cached == null || at == null || _now().difference(at) >= _peopleEventsTtl) {
+      // Warm the cache for next time; ignore the result here.
+      unawaited(_fetchPeopleEvents(calendarId).then((_) => notifyListeners()));
+      return null;
+    }
+
+    return freeInFromEvents(cached, _now());
+  }
+
+  /// The live-map room a read-only Google event points at, when its location is a
+  /// Gather link naming a room in *this* space — else null, which hides the Plans
+  /// tab's "Go to meeting" rather than risk a wrong jump. A link to another space, or
+  /// one that names only the space with no resolvable room, resolves to null by
+  /// design (the approved behaviour: walk in only when a room is carried).
+  SpaceRoom? gatherRoomFor(GoogleEvent event) {
+    final link = GatherLink.tryParse(event.location);
+    if (link == null) return null;
+    final here = _currentMapSpaceId;
+    if (here == null || link.spaceId != here) return null;
+    final hint = link.roomHint?.trim().toLowerCase();
+    if (hint == null || hint.isEmpty) return null;
+    final map = this.map;
+    if (map == null) return null;
+    for (final room in map.rooms) {
+      final name = room.name?.trim().toLowerCase();
+      if (name != null && name.isNotEmpty && name == hint) return room;
+    }
+    return null;
+  }
+
+  /// Whether the Plans tab should offer a "Go to meeting" button for [event].
+  ///
+  /// True when the location is a Gather link this phone can act on: either an
+  /// `/app/<spaceId>/…` link naming a room in this space, resolvable against the live
+  /// map right now ([gatherRoomFor]), or a `/m/<code>` short link, whose space and
+  /// room are not in the URL and are resolved on tap by [walkToGoogleEvent]. A short
+  /// link to another space answers true here and explains itself on tap, because the
+  /// only way to know where it points is to ask.
+  bool canGoToMeeting(GoogleEvent event) {
+    if (gatherRoomFor(event) != null) return true;
+    return GatherLink.tryParse(event.location)?.meetingLinkId != null;
+  }
+
+  /// Walks into the Gather room a Google event names, the same routing "Walk here"
+  /// and [walkToMeeting] use. A `/m/<code>` short link is resolved over REST first.
+  /// Returns null on success, or a sentence to show the user: a failure, or — when
+  /// the room is locked and we are not admitted — word that we have asked to be let
+  /// in rather than set off on a walk the server would silently refuse.
+  Future<String?> walkToGoogleEvent(GoogleEvent event) async {
+    final room = gatherRoomFor(event);
+    if (room != null) return _enterOrAsk(room);
+
+    final linkId = GatherLink.tryParse(event.location)?.meetingLinkId;
+    if (linkId != null) return _walkToMeetingLink(linkId);
+
+    return "Can't find that room on the floor plan.";
+  }
+
+  /// Resolves a `/m/<code>` short link to its room on *this* floor, then walks in or
+  /// asks to be let in. The code carries no ids, so this is the one step that must
+  /// reach the network; a link to another space is as far as a single walk goes.
+  Future<String?> _walkToMeetingLink(String linkId) async {
+    final auth = _auth;
+    if (auth == null) return 'Not connected to Gather.';
+
+    final MeetingLinkInfo info;
+    try {
+      info = await resolveMeetingLink(auth, linkId);
+    } on Object {
+      return "Couldn't open that meeting link.";
+    }
+
+    final here = _currentMapSpaceId;
+    if (here == null || info.spaceId != here) {
+      return 'That meeting is in another Gather space.';
+    }
+
+    final room = map?.rooms.where((r) => r.id == info.areaId).firstOrNull;
+    if (room == null) return "Can't find that room on the floor plan.";
+
+    return _enterOrAsk(room);
+  }
+
+  /// Walks into [room], or — when it is locked and we are not admitted — asks to be
+  /// let in instead. The second case is the one the floor plan cannot act on alone:
+  /// a locked door is opened by the host accepting an `AreaAccessRequest`, and once
+  /// they do the map lets us walk in on the next try.
+  Future<String?> _enterOrAsk(SpaceRoom room) {
+    if (room.locked && !canEnter(room)) return Future.value(_askToEnter(room));
+    return goToRoom(
+      room,
+      toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+    );
+  }
+
+  /// Asks the host to be let into a locked [room]. Fire-and-forget: the acceptance,
+  /// when it comes, arrives as a patch the map already reads.
+  String _askToEnter(SpaceRoom room) {
+    final collector = _collector;
+    if (collector == null) return 'Not connected to Gather.';
+    final sent = collector.requestToAccess(room.id);
+    if (!sent.ok) return sent.detail ?? "Couldn't ask to join.";
+    return 'Asked to join ${room.name ?? 'the meeting'} — walk in once you are let in.';
+  }
+
+  /// The device calendars the user could mirror plans into. Empty when permission
+  /// has not been granted or the build has no calendar plugin (the no-op mirror).
+  Future<List<MirrorCalendar>> writableCalendars() => _calendarMirror.writableCalendars();
+
+  /// Chooses the device calendar to mirror plans into, or null to stop mirroring,
+  /// and brings every existing plan into line with the choice: turning mirroring on
+  /// pushes the plans that are not yet there, turning it off leaves the calendar
+  /// events in place (they are the user's now) but forgets their ids and re-arms the
+  /// app's own reminders; switching between calendars does both — forgets the ids
+  /// into the calendar being left, then pushes every future plan into the new one.
+  Future<void> setMirrorCalendar(String? calendarId) async {
+    if (_mirrorCalendarId == calendarId) return;
+    final leavingACalendar = _mirrorCalendarId != null;
+    _mirrorCalendarId = calendarId;
+    await _uiPrefs.saveMirrorCalendarId(calendarId);
+    notifyListeners();
+
+    // Leaving a calendar (turning off, or switching away): the stored device-event
+    // ids name events in the calendar we just left, so they mean nothing here now.
+    // Forget them — the events themselves stay put, they are the user's — and re-arm
+    // the local reminder for every future plan, which those ids had been suppressing.
+    // Without this the plans go silent: no app reminder, and no alert in the new
+    // calendar either, because the backfill below skips anything that still looks
+    // mirrored.
+    if (leavingACalendar) {
+      _plannedMeetings = [
+        for (final m in _plannedMeetings)
+          m.deviceEventId == null ? m : m.withDeviceEventId(null),
+      ];
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+      for (final m in _plannedMeetings) {
+        await _scheduleReminder(m);
+      }
+    }
+
+    if (calendarId == null) return;
+
+    // Mirroring is on now (freshly, or onto a different calendar): push every future
+    // plan not already in this calendar. When a write lands, cancel the app's own
+    // reminder for it — the calendar event carries the OS's alert, and keeping ours
+    // would buzz the phone twice for one meeting.
+    var changed = false;
+    final next = [..._plannedMeetings];
+    for (var i = 0; i < next.length; i++) {
+      if (next[i].isPast || next[i].deviceEventId != null) continue;
+      final mirrored = await _mirror(next[i]);
+      if (mirrored.deviceEventId != null) {
+        next[i] = mirrored;
+        changed = true;
+        await _notifier.cancelReminder(_reminderId(mirrored));
+      }
+    }
+    if (changed) {
+      _plannedMeetings = next;
+      notifyListeners();
+      await _calendarStore.save(_plannedMeetings);
+    }
+  }
+
+  /// Writes a plan into the chosen device calendar and returns the copy to store.
+  ///
+  /// Mirroring off: the meeting is returned unchanged. Mirroring on: the returned
+  /// copy carries the new device-event id on success, or has any stale id *cleared*
+  /// on failure — so an update whose write did not land falls back to the app's own
+  /// reminder rather than being suppressed by an id pointing at an event that was
+  /// never (re)written. Never throws — the mirror's own contract.
+  Future<PlannedMeeting> _mirror(PlannedMeeting meeting) async {
+    final calendarId = _mirrorCalendarId;
+    if (calendarId == null) return meeting;
+    final eventId = await _calendarMirror.createOrUpdate(meeting, calendarId: calendarId);
+    return meeting.withDeviceEventId(eventId);
+  }
+
+  /// Schedules a meeting's reminder, unless it is mirrored into the device calendar
+  /// — that event carries the OS's own alert, and scheduling ours too would buzz
+  /// the phone twice for one meeting. A past meeting schedules nothing; the notifier
+  /// guards that too, but checking here keeps a reminder id from being spent on it.
+  Future<void> _scheduleReminder(PlannedMeeting meeting) async {
+    if (meeting.isPast) return;
+    if (meeting.deviceEventId != null) return;
+    if (meeting.remindAt.isBefore(_now())) return;
+    await _notifier.scheduleReminder(
+      id: _reminderId(meeting),
+      when: meeting.remindAt,
+      title: 'Upcoming: ${meeting.title}',
+      body: meeting.roomName == null ? 'Starting soon' : 'In ${meeting.roomName}',
+    );
+  }
+
+  /// Re-arms every future meeting's reminder. Scheduled notifications do not
+  /// survive a reinstall or a reboot, so [boot] replays them off the stored list —
+  /// the same reason the list is reloaded there rather than kept only in memory.
+  Future<void> _rescheduleAllReminders() async {
+    for (final meeting in _plannedMeetings) {
+      await _scheduleReminder(meeting);
+    }
   }
 
   /// The desk Gather has given me, or null if it has given me none.

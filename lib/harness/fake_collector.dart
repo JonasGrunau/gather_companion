@@ -291,6 +291,16 @@ class FakeCollector implements Collector {
     return (ok: true, detail: null);
   }
 
+  /// Every area id we have been asked to be let into, in order — so a test can
+  /// assert a locked meeting link turned into a `requestToAccess` for the right room.
+  final List<String> accessRequests = [];
+  @override
+  ({bool ok, String? detail}) requestToAccess(String areaId) {
+    if (failSends) return (ok: false, detail: 'not connected to Gather');
+    accessRequests.add(areaId);
+    return (ok: true, detail: null);
+  }
+
   @override
   ({bool ok, String? detail}) leaveCluster() => (ok: true, detail: null);
 
