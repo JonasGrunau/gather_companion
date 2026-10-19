@@ -548,6 +548,18 @@ class DirectCollector implements Collector {
     return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
+  /// Knocks on a locked area. Like [wave], a bare `[model, id]` frame with no
+  /// args — `requestToAccess` is permissioned `RequestToAccess` on `MapArea` and
+  /// takes nothing (`docs/protocol/client-action-surface.md`). The id is the area's
+  /// `MapEntityIdentifier` — [SpaceRoom.stableId] — because that is what the
+  /// resulting `AreaAccessRequest.areaId` is joined against; `MapArea.id` would land
+  /// a request nobody can read.
+  @override
+  ({bool ok, String? detail}) requestToAccess(String areaStableId) {
+    if (areaStableId.isEmpty) return (ok: false, detail: 'no room to ask about');
+    return _send('requestToAccess', model: 'MapArea', id: areaStableId);
+  }
+
   /// Puts a hand up, or takes it down. A bare bool, not a map.
   @override
   ({bool ok, String? detail}) setHandRaised(bool raised) =>

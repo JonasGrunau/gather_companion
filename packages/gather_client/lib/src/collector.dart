@@ -138,6 +138,14 @@ abstract interface class Collector {
   /// as a `WaveEvent` naming the recipient — but, unlike an emote, not back to us.
   ({bool ok, String? detail}) wave(String targetSpaceUserId);
 
+  /// Asks to be let into a locked area — the knock the desktop's "request access"
+  /// modal sends. Bare fire-and-forget like [wave]; the answer arrives as an
+  /// `AreaAccessRequest` on the roster, and a host accepting it flips
+  /// `canEnterRoom` true via `SpaceMapBuilder._admitted`. [areaStableId] is
+  /// `SpaceRoom.stableId`, not `.id` — the server keys the request on the area's
+  /// `MapEntityIdentifier`, so sending `.id` creates a request that joins nothing.
+  ({bool ok, String? detail}) requestToAccess(String areaStableId);
+
   /// Says whether we are talking. This is the speaking ring.
   ({bool ok, String? detail}) setSpeaking(bool speaking);
 

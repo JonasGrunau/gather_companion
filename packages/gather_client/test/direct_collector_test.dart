@@ -411,6 +411,18 @@ void main() {
       expect(c.wave('').ok, isFalse);
     });
 
+    test('requestToAccess knocks on the MapArea by stableId, with no third argument',
+        () async {
+      final (c, conn) = await connected();
+
+      // Like a wave: the id is the area's, not 'me-1', and the frame is the bare
+      // two-element tuple — `requestToAccess` takes no args (issue #69).
+      expect(c.requestToAccess('area-7').ok, isTrue);
+      expect((await lastFrame(conn, 'requestToAccess'))['args'], ['MapArea', 'area-7']);
+
+      expect(c.requestToAccess('').ok, isFalse);
+    });
+
     test('every one of them refuses before it knows which avatar is ours', () {
       final c = build();
       expect(c.setAvailability('Busy').ok, isFalse);

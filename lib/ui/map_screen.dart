@@ -47,8 +47,9 @@ import 'person_avatar.dart';
 /// does. Using the tab's own `paddingOf` — which already carries both insets *and*
 /// the safe area — double-counts the safe area and floats it a home-indicator too
 /// high.
-SnackBar _railClearSnack(String message) => SnackBar(
+SnackBar _railClearSnack(String message, {SnackBarAction? action}) => SnackBar(
       content: Text(message),
+      action: action,
       behavior: SnackBarBehavior.floating,
       margin: const EdgeInsets.fromLTRB(
         kGutter,
@@ -609,9 +610,15 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     final room = target.room;
     if (room != null && !widget.state.canEnter(room)) {
       setState(() => _selected = null);
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
+      // A door we can knock on gets the button; one with no stableId to knock on —
+      // nothing to key an `AreaAccessRequest` to — stays the plain sentence (issue #69).
+      if (room.stableId != null) {
+        _offerAccess(room);
+      } else {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
+      }
       return;
     }
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
@@ -701,6 +708,30 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         : state.goToRoom(room, toward: (x: target.x, y: target.y));
   }
 
+  /// Offers the shut door rather than only naming it: a snackbar whose "Request
+  /// access" action knocks via [AppState.requestAccess] (issue #69). On success the
+  /// knock's own "Asked to be let in" line arrives on [AppState.notices] and replaces
+  /// this; only a failure (no stableId, offline) is shown from here.
+  void _offerAccess(SpaceRoom room) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(_railClearSnack(
+        '${room.name ?? 'That room'} is locked.',
+        action: SnackBarAction(
+          label: 'Request access',
+          onPressed: () {
+            final result = widget.state.requestAccess(room);
+            if (result.detail != null && mounted) {
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(_railClearSnack(result.detail!));
+            }
+          },
+        ),
+      ));
+  }
+
   /// Waves at the selected person and takes the card down. There is no feed echo for
   /// our own wave, so the line shown here is the only confirmation it went — the same
   /// reason the dial confirms in words.
@@ -759,6 +790,14 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(_railClearSnack(notice));
+    });
+    // A locked door the server refused mid-walk, or one AppState wants to offer: same
+    // "Request access" snackbar as a tap, shown here because this is the screen a walk
+    // happens on (issue #69).
+    _accessOffers = widget.state.accessOffers.listen((room) {
+      if (!mounted) return;
+      setState(() => _selected = null);
+      _offerAccess(room);
     });
     _followRequests = widget.state.followMe.listen((_) {
       // Claimed, so the latch below does not ride the same walk a second time
@@ -915,10 +954,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   }
 
   StreamSubscription<String>? _notices;
+  StreamSubscription<SpaceRoom>? _accessOffers;
 
   @override
   void dispose() {
     unawaited(_notices?.cancel());
+    unawaited(_accessOffers?.cancel());
     unawaited(_followRequests?.cancel());
     unawaited(_recentre?.cancel());
     _follow.dispose();

@@ -2497,6 +2497,52 @@ class AppState extends ChangeNotifier {
   Stream<String> get notices => _notices.stream;
   final _notices = StreamController<String>.broadcast();
 
+  /// Locked rooms the office should offer a "Request access" button for — a map tap
+  /// on a shut door, or the server refusing a move into one (issue #69). Broadcast
+  /// for the same reason as [notices]: news with a control to catch it, not a queue.
+  Stream<SpaceRoom> get accessOffers => _accessOffers.stream;
+  final _accessOffers = StreamController<SpaceRoom>.broadcast();
+
+  /// A room we have knocked on and want to walk into the moment the host lets us in.
+  /// Set by [requestAccess], cleared once the door opens (or the request is replaced).
+  SpaceRoom? _pendingAccess;
+
+  /// Knocks on a locked area and arms the auto-walk for when the host accepts.
+  ///
+  /// Fire-and-forget on the wire: `ok` means "asked", not "in". Acceptance arrives as
+  /// an `AreaAccessRequest` patch that flips [canEnter] true, which [_tryEnterPending]
+  /// — pumped off every roster — turns into a walk, mirroring the desktop's
+  /// `moveSpaceUserToMapArea` on accept.
+  ({bool ok, String? detail}) requestAccess(SpaceRoom room) {
+    final stableId = room.stableId;
+    if (stableId == null) return (ok: false, detail: 'cannot ask about this room');
+    final result = _collector?.requestToAccess(stableId) ??
+        (ok: false, detail: 'not connected to Gather');
+    if (result.ok) {
+      _pendingAccess = room;
+      _notices.add('Asked to be let into ${room.name ?? 'the room'}.');
+    }
+    return result;
+  }
+
+  /// Walks into a room we knocked on, the instant the host's acceptance opens it.
+  ///
+  /// Driven off the roster rather than the `AreaAccessRequest` event directly: the
+  /// accepted request is what rebuilds the map's `admits` set, so [canEnter] going
+  /// true is the one signal that the door — not just the request — is open. Clears
+  /// the pending room first so a roster that lands while the walk is being laid does
+  /// not fire a second one.
+  void _tryEnterPending() {
+    final room = _pendingAccess;
+    if (room == null || !canEnter(room)) return;
+    _pendingAccess = null;
+    _notices.add("You're in — walking over.");
+    unawaited(goToRoom(
+      room,
+      toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+    ));
+  }
+
   /// A walk the office should keep the camera on until it arrives.
   ///
   /// The desk button lives in the dock and sends you somewhere that is usually off
@@ -2564,9 +2610,12 @@ class AppState extends ChangeNotifier {
   /// })
   /// ```
   ///
-  /// The modal at the end is Gather asking whether to knock. This app has nowhere to
-  /// put that yet, so it says what happened and stops — [Walk] would otherwise
-  /// re-plan into the same shut door four times over.
+  /// The modal at the end is Gather asking whether to knock. A locked *area* this app
+  /// can offer — the refused room goes out on [accessOffers] and the map turns it into
+  /// a "Request access" button (issue #69). A locked *meeting* it cannot: that needs
+  /// `requestToJoin` with a live meetingId the refusal does not carry, so it stays a
+  /// plain notice. Either way [Walk] is released first — it would otherwise re-plan
+  /// into the same shut door four times over.
   void _noteRefusal(BusEvent event) {
     const locked = 'UserIsNotPermittedToEnterLockedArea';
     const meeting = 'UserIsNotPermittedToEnterMeetingArea';
@@ -2590,21 +2639,35 @@ class AppState extends ChangeNotifier {
     _log('move: refused entry — ${event.name} area=${event.payload['areaId'] ?? '?'}');
     _walk?.release();
     notifyListeners();
+
+    // A locked area with a room we can name and a stableId to knock on: offer the
+    // door rather than just reporting it shut. Everything else — a meeting, or an
+    // area the floor plan has not placed — stays a plain sentence.
+    final room = event.name == meeting ? null : _refusalRoom(event);
+    if (room != null && room.stableId != null && !_accessOffers.isClosed) {
+      _accessOffers.add(room);
+      return;
+    }
     _notices.add(_refusalText(event, meeting: event.name == meeting));
   }
 
-  /// What to say about a refusal, naming the room when the floor plan knows it.
+  /// The room a refusal names, or null when the floor plan has not placed it.
   ///
   /// `areaId` is the area's `stableId_USE_THIS_INSTEAD_OF_ID`, which is the id
   /// [SpaceRoom.stableId] carries — matching it against [SpaceRoom.id] finds nothing.
-  String _refusalText(BusEvent event, {required bool meeting}) {
-    if (meeting) return 'That meeting is private.';
+  SpaceRoom? _refusalRoom(BusEvent event) {
     final areaId = event.payload['areaId'];
     for (final room in map?.rooms ?? const <SpaceRoom>[]) {
-      final name = room.name;
-      if (room.stableId == areaId && name != null) return '$name is locked.';
+      if (room.stableId == areaId) return room;
     }
-    return 'That room is locked.';
+    return null;
+  }
+
+  /// What to say about a refusal, naming the room when the floor plan knows it.
+  String _refusalText(BusEvent event, {required bool meeting}) {
+    if (meeting) return 'That meeting is private.';
+    final name = _refusalRoom(event)?.name;
+    return name != null ? '$name is locked.' : 'That room is locked.';
   }
 
   /// Test seam: the event bus without a socket to deliver it.
@@ -2801,6 +2864,10 @@ class AppState extends ChangeNotifier {
           // After the fold, when `inCall` reflects this roster: a hand raised in a
           // meeting we have since walked out of comes down here.
           _lowerHandIfOutOfMeeting();
+          // Last: this roster may carry the `AreaAccessRequest` acceptance that opens
+          // a door we knocked on, and the walk should start on the same roster that
+          // rebuilt the map rather than a beat later (issue #69).
+          _tryEnterPending();
         }),
       )
       ..add(
@@ -3188,6 +3255,7 @@ class AppState extends ChangeNotifier {
     _positions.dispose();
     _directoryChanges.dispose();
     unawaited(_notices.close());
+    unawaited(_accessOffers.close());
     unawaited(_followMe.close());
     unawaited(_recentre.close());
     // A face resolved a millisecond before the app closed would otherwise
