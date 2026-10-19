@@ -19,6 +19,7 @@ import 'call_screen.dart';
 import 'control_bar.dart';
 import 'dpad.dart';
 import 'person_avatar.dart';
+import 'person_calendar_sheet.dart';
 
 /// The office, drawn — with Gather's own artwork.
 ///
@@ -47,8 +48,9 @@ import 'person_avatar.dart';
 /// does. Using the tab's own `paddingOf` — which already carries both insets *and*
 /// the safe area — double-counts the safe area and floats it a home-indicator too
 /// high.
-SnackBar _railClearSnack(String message) => SnackBar(
+SnackBar _railClearSnack(String message, {SnackBarAction? action}) => SnackBar(
       content: Text(message),
+      action: action,
       behavior: SnackBarBehavior.floating,
       margin: const EdgeInsets.fromLTRB(
         kGutter,
@@ -613,9 +615,15 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
     final room = target.room;
     if (room != null && !widget.state.canEnter(room)) {
       setState(() => _selected = null);
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
+      // A door we can knock on gets the button; one with no stableId to knock on —
+      // nothing to key an `AreaAccessRequest` to — stays the plain sentence (issue #69).
+      if (room.stableId != null) {
+        _offerAccess(room);
+      } else {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(_railClearSnack('${room.name ?? 'That room'} is locked.'));
+      }
       return;
     }
     if (target.x == widget.state.myTile?.x && target.y == widget.state.myTile?.y &&
@@ -705,6 +713,30 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
         : state.goToRoom(room, toward: (x: target.x, y: target.y));
   }
 
+  /// Offers the shut door rather than only naming it: a snackbar whose "Request
+  /// access" action knocks via [AppState.requestAccess] (issue #69). On success the
+  /// knock's own "Asked to be let in" line arrives on [AppState.notices] and replaces
+  /// this; only a failure (no stableId, offline) is shown from here.
+  void _offerAccess(SpaceRoom room) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(_railClearSnack(
+        '${room.name ?? 'That room'} is locked.',
+        action: SnackBarAction(
+          label: 'Request access',
+          onPressed: () {
+            final result = widget.state.requestAccess(room);
+            if (result.detail != null && mounted) {
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(_railClearSnack(result.detail!));
+            }
+          },
+        ),
+      ));
+  }
+
   /// Waves at the selected person and takes the card down. There is no feed echo for
   /// our own wave, so the line shown here is the only confirmation it went — the same
   /// reason the dial confirms in words.
@@ -763,6 +795,14 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(_railClearSnack(notice));
+    });
+    // A locked door the server refused mid-walk, or one AppState wants to offer: same
+    // "Request access" snackbar as a tap, shown here because this is the screen a walk
+    // happens on (issue #69).
+    _accessOffers = widget.state.accessOffers.listen((room) {
+      if (!mounted) return;
+      setState(() => _selected = null);
+      _offerAccess(room);
     });
     _followRequests = widget.state.followMe.listen((_) {
       // Claimed, so the latch below does not ride the same walk a second time
@@ -919,10 +959,12 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
   }
 
   StreamSubscription<String>? _notices;
+  StreamSubscription<SpaceRoom>? _accessOffers;
 
   @override
   void dispose() {
     unawaited(_notices?.cancel());
+    unawaited(_accessOffers?.cancel());
     unawaited(_followRequests?.cancel());
     unawaited(_recentre?.cancel());
     _follow.dispose();
@@ -1241,6 +1283,8 @@ class _PlanState extends State<_Plan> with TickerProviderStateMixin {
                   person: _selectedPerson!,
                   onGoHere: () => _goToPerson(_selectedPerson!),
                   onWave: () => _waveAtPerson(_selectedPerson!),
+                  onPlans: () => showPersonCalendar(context, state, _selectedPerson!.label,
+                      email: _selectedPerson!.calendarEmail),
                   onClear: () => setState(() => _selectedPerson = null),
                 ),
               ),
@@ -1288,6 +1332,7 @@ class _PersonCard extends StatelessWidget {
     required this.person,
     required this.onGoHere,
     required this.onWave,
+    required this.onPlans,
     required this.onClear,
   });
 
@@ -1295,6 +1340,7 @@ class _PersonCard extends StatelessWidget {
   final MapPerson person;
   final VoidCallback onGoHere;
   final VoidCallback onWave;
+  final VoidCallback onPlans;
   final VoidCallback onClear;
 
   @override
@@ -1305,62 +1351,78 @@ class _PersonCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(t.radius),
       elevation: 3,
       shadowColor: Colors.black.withValues(alpha: 0.28),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            // One Wrap over four atomic items — identity, both pills, close. The avatar,
-            // pills and close button are all fixed-width, so at a large text scale on a
-            // narrow phone they outrun a single Row and clip into a RenderFlex overflow;
-            // even the two pills together do not fit one line there. Wrapping each item
-            // independently lets them flow onto further lines as the scale demands, and
-            // leaves the one-line layout untouched at ordinary sizes.
-            return Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 10,
-              runSpacing: 6,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    PersonAvatar(
-                      id: person.id,
-                      label: person.label,
-                      photoUrl: state.photoUrlFor(person.id),
-                      size: 36,
-                      availability: person.availability,
-                      dotRing: t.card,
+      child: ConstrainedBox(
+        // A fixed card width rather than one that hugs its content: with the close pinned
+        // to the top-right corner the identity row has to span something, and a bounded
+        // width keeps the action pills on their own tidy line below instead of a Wrap that
+        // pushed the close and the calendar chip onto a ragged second row.
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 6, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Identity and the dismiss, on one line: face, name, and the close pinned to
+              // the corner where a card's close belongs.
+              Row(
+                children: [
+                  PersonAvatar(
+                    id: person.id,
+                    label: person.label,
+                    photoUrl: state.photoUrlFor(person.id),
+                    size: 36,
+                    availability: person.availability,
+                    dotRing: t.card,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      person.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
                     ),
-                    const SizedBox(width: 10),
-                    ConstrainedBox(
-                      // Bounded by the card's own width (minus the avatar and its gap) so
-                      // a long name ellipsizes within this chunk rather than forcing it
-                      // wider than the card.
-                      constraints: BoxConstraints(maxWidth: constraints.maxWidth - 46),
-                      child: Text(
-                        person.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
-                      ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
+                    // Names the otherwise icon-only control for a screen reader, as the
+                    // rail's own clear control is named.
+                    tooltip: 'Dismiss',
+                    onPressed: onClear,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              // The verbs, on their own row: walk over, wave, and — only where there is a
+              // readable calendar — an icon-only Plans chip. A Wrap so a large text scale
+              // can still spill them onto a second line, but at ordinary sizes they sit flush
+              // left on one tidy row.
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  // Walk over, in the same pill shape as Wave: a person is somewhere you can
+                  // go as well as someone you can hail. [_goToPerson] lands beside them.
+                  _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
+                  _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
+                  // Only where there is a calendar to show: a person whose shared calendar
+                  // this account can read, keyed off their wire email (a display-name guess
+                  // misses most of the roster). Icon-only — the two verbs beside it carry
+                  // words, so a third would crowd the row; the calendar glyph is its own
+                  // label. Same brand pill, so it restyles under the Gameboy palette for free.
+                  if (state.googleAvailable &&
+                      state.hasCalendarFor(person.label, email: person.calendarEmail))
+                    _CardAction(
+                      icon: Icons.event_note_rounded,
+                      tooltip: 'Plans',
+                      onTap: onPlans,
                     ),
-                  ],
-                ),
-                // Walk over, in the same pill shape as Wave: a person is somewhere you
-                // can go as well as someone you can hail. [_goToPerson] lands beside them.
-                _CardAction(icon: Icons.turn_right_rounded, label: 'Go here', onTap: onGoHere),
-                _CardAction(icon: Icons.waving_hand_rounded, label: 'Wave', onTap: onWave),
-                IconButton(
-                  icon: Icon(Icons.close_rounded, size: 18, color: t.mutedForeground),
-                  // Names the otherwise icon-only control for a screen reader, as the
-                  // rail's own clear control is named.
-                  tooltip: 'Dismiss',
-                  onPressed: onClear,
-                  visualDensity: VisualDensity.compact,
-                ),
-              ],
-            );
-          },
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1368,36 +1430,55 @@ class _PersonCard extends StatelessWidget {
 }
 
 /// One brand-tinted pill on the person card — an icon and a word. Wave and Go here are
-/// the same control twice, so they share a shape rather than each spelling it out.
+/// the same control twice, so they share a shape rather than each spelling it out. With
+/// no [label] it collapses to a square icon-only chip (the Plans glyph), named for a
+/// screen reader by [tooltip] instead; the round-pill radius is kept so all three sit on
+/// the same shape.
 class _CardAction extends StatelessWidget {
-  const _CardAction({required this.icon, required this.label, required this.onTap});
+  const _CardAction({
+    required this.icon,
+    this.label,
+    this.tooltip,
+    required this.onTap,
+  });
 
   final IconData icon;
-  final String label;
+  final String? label;
+  final String? tooltip;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
-    return Material(
+    final iconOnly = label == null;
+    final child = Material(
       color: t.brand.withValues(alpha: 0.18),
       borderRadius: BorderRadius.circular(17),
       child: InkWell(
         borderRadius: BorderRadius.circular(17),
         onTap: onTap,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          // Square for the icon-only chip so the glyph sits centred, wider when a word
+          // follows it.
+          padding: iconOnly
+              ? const EdgeInsets.all(8)
+              : const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(icon, size: 16, color: t.brand),
-              const SizedBox(width: 6),
-              Text(label, style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+              if (label != null) ...[
+                const SizedBox(width: 6),
+                Text(label!,
+                    style: TextStyle(color: t.brand, fontSize: 14, fontWeight: FontWeight.w600)),
+              ],
             ],
           ),
         ),
       ),
     );
+    final tip = tooltip;
+    return tip == null ? child : Tooltip(message: tip, child: child);
   }
 }
 

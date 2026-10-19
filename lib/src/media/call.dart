@@ -37,7 +37,9 @@ class CallState {
     this.publishingVideo = false,
     this.publishingScreen = false,
     this.participants = const [],
+    this.connecting = const {},
     this.detail,
+    this.needsHandoff = false,
   });
 
   final LocalMediaState media;
@@ -49,6 +51,14 @@ class CallState {
   /// could no longer stand in. The screen that draws video reaches for
   /// `LiveCall.streamFor` instead, which is the same split `localStream` uses.
   final List<CallParticipant> participants;
+
+  /// srcIds of peers the SFU is still placing — subscribed, no media address
+  /// yet. Not participants (they carry no track), and not the same as somebody
+  /// sitting silent: these are mid-connect. The tiles for them read
+  /// "connecting…" so a walk-up colleague is not mistaken for a quiet one and
+  /// nobody restarts waiting on a peer the session is already chasing. Sourced
+  /// from `SfuSession.connectingPeers`.
+  final Set<String> connecting;
 
   /// Whether the room is actually receiving each track, as opposed to us merely
   /// having it open.
@@ -64,6 +74,15 @@ class CallState {
   /// What went wrong, if the last thing asked for did not happen. A sentence, for
   /// putting in front of a person.
   final String? detail;
+
+  /// Whether the call is up but has not been able to publish a wanted track for
+  /// several seconds — the state that offers the "Pull session over to this app"
+  /// banner (issue #67). Set when another device has taken the call over (a
+  /// single takeover the 5s stuck-timer catches, or the sticky `displaced` latch)
+  /// or any other stall that leaves the room unable to hear or see us. A bool
+  /// rather than a string match on [detail], because the banner is a distinct
+  /// surface with its own button, not just a worse sentence.
+  final bool needsHandoff;
 
   bool get micOn => media.capturing && media.audioEnabled;
   bool get cameraOn => media.hasVideo;
@@ -89,8 +108,10 @@ class CallState {
     bool? publishingVideo,
     bool? publishingScreen,
     List<CallParticipant>? participants,
+    Set<String>? connecting,
     String? detail,
     bool clearDetail = false,
+    bool? needsHandoff,
   }) =>
       CallState(
         media: media ?? this.media,
@@ -98,7 +119,9 @@ class CallState {
         publishingVideo: publishingVideo ?? this.publishingVideo,
         publishingScreen: publishingScreen ?? this.publishingScreen,
         participants: participants ?? this.participants,
+        connecting: connecting ?? this.connecting,
         detail: clearDetail ? null : (detail ?? this.detail),
+        needsHandoff: needsHandoff ?? this.needsHandoff,
       );
 
   @override
@@ -107,7 +130,7 @@ class CallState {
         if (publishingAudio) 'audio',
         if (publishingVideo) 'video',
         if (publishingScreen) 'screen',
-      ].join('+')})';
+      ].join('+')}${needsHandoff ? ', needsHandoff' : ''})';
 }
 
 /// Somebody else in the call, as the UI needs to know them.
@@ -266,6 +289,19 @@ abstract class Call {
   /// dead session and wait out the deaf-timer. A rebuild is the recovery a dropped
   /// socket gets, fired without waiting for the person to tap anything.
   Future<void> rebuild();
+
+  /// Forcibly reclaim publishing onto the current node — the "Pull session over
+  /// to this app" button (issue #67).
+  ///
+  /// For the case [CallState.needsHandoff] flags: the call is up but cannot
+  /// publish, because another device of yours has taken it over or the send path
+  /// is wedged on a stale transport the ordinary heals could not clear. This
+  /// clears the sticky `displaced` stand-down, throws away the stuck session, and
+  /// rebuilds fresh transports on the current node with whatever we were
+  /// publishing — the deliberate "new session" that is the only way back from a
+  /// takeover. Returns null on success or a sentence explaining why not, the same
+  /// contract as [setMicOn].
+  Future<String?> pullSessionOver();
 
   Future<void> dispose();
 }

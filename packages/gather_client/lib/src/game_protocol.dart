@@ -281,6 +281,7 @@ class RosterRow {
     this.profilePictureId,
     this.deskId,
     this.status,
+    this.calendarEmail,
     this.handRaised = false,
   });
 
@@ -375,6 +376,11 @@ class RosterRow {
 
   /// The line under their name, if it has not expired.
   final PersonStatus? status;
+
+  /// Their primary calendar address (`calculatedPrimaryCalendarEmail`), or null when
+  /// they have not connected a calendar to Gather. The key a companion app uses to ask
+  /// Google about their availability, since the Gather wire carries no other email.
+  final String? calendarEmail;
 
   /// Whether their hand is up in a meeting.
   ///
@@ -517,6 +523,7 @@ class _Row {
   String? availability;
   String? profilePictureId;
   String? deskId;
+  String? calendarEmail;
   bool handRaised = false;
   bool gone = false;
 }
@@ -754,7 +761,13 @@ class GameProtocolReader {
       // traffic the coalescing window exists to prevent. The map is read from
       // `mapBuilder` when it is wanted.
       mapBuilder.apply(model, patch);
-      return false;
+      // The one map row that is somebody moving: an `AreaAccessRequest` is a door
+      // opening for a named person. Nothing else republishes when a lone knock is
+      // accepted in an idle space, so the auto-walk that waits on it (`AppState.
+      // _tryEnterPending`, pumped off the roster) would hang until an unrelated
+      // presence patch happened by. One row, not the 2200 of a dump, so treating it
+      // as roster-affecting costs nothing the coalescing window cares about (#69).
+      return model == 'AreaAccessRequest';
     }
 
     if (model == 'MeetingParticipant' || model == 'MeetingJoinRequest') {
@@ -987,6 +1000,15 @@ class GameProtocolReader {
     if (data.containsKey('profilePictureId')) {
       set(row.profilePictureId, _nullableString(data['profilePictureId']),
           (v) => row.profilePictureId = v);
+    }
+
+    // The calendar address Gather resolved for this person — the one identity on the
+    // wire that maps a space-user to their Google/Outlook calendar, so a companion app
+    // can ask about their availability without a name-match. Present only for people
+    // who have connected a calendar; a plain string, patched like any other column.
+    if (data.containsKey('calculatedPrimaryCalendarEmail')) {
+      set(row.calendarEmail, _nullableString(data['calculatedPrimaryCalendarEmail']),
+          (v) => row.calendarEmail = v);
     }
 
     // Read the same way, and nullable for the same reason: plenty of people in a
@@ -1236,6 +1258,7 @@ class GameProtocolReader {
         profilePictureId: row.profilePictureId,
         deskId: row.deskId,
         status: _statusFor(row.id, now),
+        calendarEmail: row.calendarEmail,
         handRaised: row.handRaised,
       ));
     }
