@@ -184,4 +184,11 @@ abstract interface class Collector {
   /// resumes — reconnecting from the backoff floor — when one returns. Offline is a
   /// known dead end: retrying into it only burns CPU and battery (issue #8).
   void setReachable(bool reachable);
+
+  /// Evaluates the deaf-socket watchdog right now instead of waiting for the next
+  /// publish tick. The iOS resume path calls this: a suspended app's publish timer is
+  /// frozen, so a socket that went deaf while backgrounded is not noticed until the
+  /// first tick after thaw. Returns true when it acted — teardown and reconnect are
+  /// already under way, so the caller need do nothing more.
+  bool pokeLiveness();
 }

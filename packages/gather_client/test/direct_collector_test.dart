@@ -619,6 +619,64 @@ void main() {
       );
     });
 
+    // pokeLiveness is the resume path's hand-crank on the deaf-socket watchdog (#70):
+    // iOS freezes the publish timer while the app is suspended, so [_isSilent] cannot
+    // fire on its own. It is a thin delegate to [_isSilent] — the deaf path, where it
+    // tears the socket down and reconnects, is covered by the silence tests below, and
+    // the resume wiring that honours its return value lives in the app's
+    // network_reconnect_test. There is no collector-level test of the *deaf* poke
+    // because the 250ms publish tick heals a deaf socket within one interval, so the
+    // poke can only be observed as the sole actor inside a sub-tick race. This asserts
+    // the one deterministic half: on a live socket the poke reports it did nothing.
+    test('pokeLiveness leaves a live socket alone', () async {
+      // The common resume case: a glance at the phone with the socket still carrying
+      // frames. The poke must report it did nothing and not churn the connection.
+      final c = build(silenceLimit: const Duration(milliseconds: 400))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      // A fresh frame keeps the socket demonstrably alive right before the poke.
+      conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(c.pokeLiveness(), isFalse, reason: 'a live socket has nothing to tear down');
+      expect(gather.connections, hasLength(1), reason: 'and must not be reconnected');
+      expect(c.healthy, isTrue);
+    });
+
+    test('pokeLiveness leaves an already-closed socket to its pending retry', () async {
+      // The thaw race (#70 review). On resume two things run in some order: the socket's
+      // `onDone` — the OS killed the TCP connection while suspended — which nulls `_ws`
+      // and arms a retry, and `verifyLink()`'s poke. If `onDone` wins, `_ws` is null but
+      // `_lastFrameAt` still holds the pre-suspend timestamp, now long expired. A poke
+      // that acted here would cancel the just-armed retry and re-arm it at doubled
+      // backoff, *delaying* the very recovery the poke exists to speed up — and its true
+      // return would make `verifyLink()` skip the immediate `resync()`. It must report it
+      // did nothing and leave the pending retry alone.
+      final c = build(silenceLimit: const Duration(milliseconds: 300))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      expect(gather.connections, hasLength(1));
+
+      // The server drops the connection: the client's `onDone` fires, nulls `_ws` and
+      // arms the ~1s retry. Nothing refreshes `_lastFrameAt` after this.
+      await conn.socket.close();
+      await firstWhere(c.statuses, (s) => !s.healthy, reason: 'the close is noticed');
+
+      // Past the 300ms silence limit but inside the ~1s retry window: `_lastFrameAt` now
+      // reads deaf, yet a retry is already pending.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(c.pokeLiveness(), isFalse,
+          reason: 'a closed socket with recovery already in flight has nothing to poke');
+      expect(gather.connections, hasLength(1), reason: 'the poke must not itself reconnect');
+
+      // The retry that `onDone` armed still fires — the poke neither cancelled nor
+      // delayed it.
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the pending retry reconnects')
+          .timeout(const Duration(seconds: 3));
+      expect(gather.connections.length, greaterThanOrEqualTo(2));
+    });
+
     test('a socket still carrying heartbeats is left alone', () async {
       // The other half, and the one that matters more: reconnecting a working socket
       // every few seconds would be worse than the bug being fixed. Nothing here is

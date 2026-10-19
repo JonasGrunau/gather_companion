@@ -3198,6 +3198,10 @@ class AppState extends ChangeNotifier {
   Future<void> verifyLink() async {
     final collector = _collector;
     if (collector == null) return;
+    // A suspended app's health flag is stale: the socket may have gone deaf while the
+    // publish timer was frozen, yet `healthy` still reads true. Evaluate the watchdog
+    // now rather than waiting up to one publish interval for the first tick after thaw.
+    if (collector.pokeLiveness()) return; // deaf: teardown + retry already under way
     if (collector.healthy && collector.hasState) return;
     await collector.resync();
   }
