@@ -1427,29 +1427,47 @@ class _TileFrame extends StatelessWidget {
               // One height for the row, set by the name. Each plate used to size
               // itself, so the mute pip — a 13-point glyph — sat a few points
               // shorter than the line of text beside it.
-              child: IntrinsicHeight(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Flexible(child: _Plate(text: tile.label)),
-                    // Stands in for the mute pip while a peer is mid-connect:
-                    // they have no track yet, so "muted" would be a guess, but
-                    // "connecting…" is the true state and the one that tells a
-                    // person to wait a beat rather than restart.
-                    if (tile.connecting) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.sync, text: 'Connecting…'),
-                    ] else if (tile.muted) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.mic_off, text: ''),
-                    ],
-                    if (tile.sharingScreen) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.screen_share_outlined, text: ''),
-                    ],
-                  ],
-                ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // A spotlight thumbnail is 72 logical pixels wide, leaving
+                  // ~56 for this row after its insets — too little for the name
+                  // plus a spelt-out "Connecting…", which would overflow and
+                  // clip. Below this width the status drops to its icon alone,
+                  // keeping a screen-reader label; the roomier overview and big
+                  // tiles keep the words.
+                  final compact = constraints.maxWidth < 120;
+                  return IntrinsicHeight(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Flexible(child: _Plate(text: tile.label)),
+                        // Stands in for the mute pip while a peer is mid-connect:
+                        // they have no track yet, so "muted" would be a guess,
+                        // but "connecting…" is the true state and the one that
+                        // tells a person to wait a beat rather than restart.
+                        if (tile.connecting) ...[
+                          const SizedBox(width: 6),
+                          Semantics(
+                            label: 'Connecting…',
+                            child: _Plate(
+                              icon: Icons.sync,
+                              text: compact ? '' : 'Connecting…',
+                            ),
+                          ),
+                        ] else if (tile.muted) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(icon: Icons.mic_off, text: ''),
+                        ],
+                        if (tile.sharingScreen) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(
+                              icon: Icons.screen_share_outlined, text: ''),
+                        ],
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
           ],

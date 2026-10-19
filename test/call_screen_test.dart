@@ -692,6 +692,61 @@ void main() {
     });
   });
 
+  group('the connecting status', () {
+    // 72×96 is a spotlight strip thumbnail; 200×150 is an overview/big tile.
+    Future<void> frame(WidgetTester tester, {required double width}) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: width,
+              height: width * 4 / 3,
+              child: const TileFrame(
+                tile: CallTile(
+                  id: 'luca',
+                  label: 'Luca',
+                  isSelf: false,
+                  videoLive: false,
+                  muted: false,
+                  sharingScreen: false,
+                  connecting: true,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('fits a narrow thumbnail without overflowing', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await frame(tester, width: 72);
+
+      // The spelt-out plate took its full text width and overran the ~56 pixels
+      // a thumbnail leaves, clipping the status and squeezing the name. On a
+      // narrow tile it drops to the icon, and the row lays out clean.
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsNothing,
+          reason: 'the words are dropped where they do not fit');
+      expect(find.byIcon(Icons.sync), findsOneWidget,
+          reason: 'the icon still marks the state');
+      expect(find.bySemanticsLabel('Connecting…'), findsOneWidget,
+          reason: 'a screen reader still hears the state the words carried');
+
+      semantics.dispose();
+    });
+
+    testWidgets('keeps the words on a roomy tile', (tester) async {
+      await frame(tester, width: 200);
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsOneWidget,
+          reason: 'the overview and big tiles have room for the words');
+    });
+  });
+
   group('the spotlight — manual and automatic', () {
     // A shared cluster, so a change in who is talking actually reaches the
     // screen: [AppState] only republishes a speaking change for members of your

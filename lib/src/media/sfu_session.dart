@@ -1001,8 +1001,12 @@ class SfuSession {
         // diffs against the desired set, so a peer quietly removed from it is
         // never asked for again.
         _log('sfu: the router cannot place $srcId yet; will ask again');
-        if (_awaitingAddr.add(srcId)) _publishRemotes();
-        _scheduleAddrRetry();
+        if (_awaitingAddr.add(srcId)) {
+          _publishRemotes();
+          _expediteAddrRetry();
+        } else {
+          _scheduleAddrRetry();
+        }
         return;
       }
 
@@ -1022,8 +1026,12 @@ class SfuSession {
       if (_priority.contains(srcId)) _sendPriority();
     } on Object catch (error) {
       _log('sfu: asking for $srcId failed: $error');
-      if (_awaitingAddr.add(srcId)) _publishRemotes();
-      _scheduleAddrRetry();
+      if (_awaitingAddr.add(srcId)) {
+        _publishRemotes();
+        _expediteAddrRetry();
+      } else {
+        _scheduleAddrRetry();
+      }
     }
   }
 
@@ -1060,6 +1068,28 @@ class SfuSession {
       _addrRetryBackoff = Duration(seconds: next > 10 ? 10 : next);
       _scheduleAddrRetry();
     });
+  }
+
+  /// Pull the next address retry forward for a peer that has only just started
+  /// awaiting.
+  ///
+  /// The retry timer and its [_addrRetryBackoff] are shared across every
+  /// awaiting peer, so while one unplaced peer widens the backoff toward its
+  /// ten-second cap, a *second* walk-up arriving then would inherit that long
+  /// wait for its own first re-ask — the very stall this fix set out to kill,
+  /// just for the second arrival. Reset the backoff to one second and re-arm so
+  /// the newcomer is re-asked within the window its client needs. Only ever
+  /// brings the deadline forward: an already-armed one-second timer is as fast
+  /// as we go, so it is left alone rather than cancelled and postponed.
+  void _expediteAddrRetry() {
+    if (_stopped) return;
+    if (_addrRetry != null && _addrRetryBackoff <= const Duration(seconds: 1)) {
+      return;
+    }
+    _addrRetryBackoff = const Duration(seconds: 1);
+    _addrRetry?.cancel();
+    _addrRetry = null;
+    _scheduleAddrRetry();
   }
 
   Timer? _recvHealTimer;

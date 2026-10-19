@@ -195,6 +195,60 @@ void main() {
       });
     });
 
+    test('a second walk-up is retried fast too, not stuck behind the first '
+        "peer's widened backoff", () {
+      // The retry timer and its backoff are shared across awaiting peers. While
+      // peer A stays unplaced the backoff widens toward its ten-second cap; a
+      // peer B that only starts awaiting then must not inherit that long wait
+      // for its *first* re-ask — that is the walk-up stall of issue #65, just
+      // for the second arrival. B's miss resets the shared backoff so it is
+      // chased within ~1s, not whenever A's far-out timer next happens to fire.
+      const them2 = 'acct-them-2';
+      fakeAsync((clock) {
+        rig.addresses.remove(them);
+        rig.addresses.remove(them2);
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+
+        // Let A's shared backoff widen well past one second (fires at 1, 3, 7s;
+        // at 8s the next is armed ~7s out at the widened backoff).
+        clock.elapse(const Duration(seconds: 8));
+        clock.flushMicrotasks();
+
+        // B starts awaiting now; its address lands a beat later.
+        rig.session.subscribe(them2).ignore();
+        clock.flushMicrotasks();
+        rig.addresses[them2] = nodeA;
+
+        // `consume-request` is a `sendWithResponse`, so it lands in the node's
+        // `asked`, not `said`. The node socket only opens once somebody is
+        // placed on it, so its absence is itself proof nothing has been asked.
+        bool askedFor(String id) {
+          final socket = rig.sockets[nodeA];
+          if (socket == null) return false;
+          return socket.asked.any(
+              (f) => f.method == 'consume-request' && f.args['srcId'] == id);
+        }
+
+        clock.elapse(const Duration(milliseconds: 500));
+        clock.flushMicrotasks();
+        expect(askedFor(them2), isFalse,
+            reason: "B's first retry waits ~1s, it does not busy-loop");
+
+        clock.elapse(const Duration(milliseconds: 700));
+        clock.flushMicrotasks();
+        expect(askedFor(them2), isTrue,
+            reason: 'B is retried about a second after it started awaiting, '
+                "not stuck behind A's widened backoff");
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
     test('consume-try builds a consumer, and an empty map takes it away',
         () async {
       await rig.session.start();
