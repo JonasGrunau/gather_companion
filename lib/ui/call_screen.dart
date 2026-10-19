@@ -1662,12 +1662,22 @@ class CallBanner extends StatelessWidget {
         // never disagree about who is in the call.
         final (:title, :subtitle) = callBannerTextFor(state);
         final fill = t.card;
+        // Issue #41: the desktop client on this same account locked and forced our
+        // shared user Offline, so the server is tearing the call down under us. Say so
+        // in place of the "Tap to see everyone" line rather than letting the call
+        // blink out unexplained; the self-heal clears this the moment the desktop
+        // releases its hold.
+        final interrupted = state.callInterrupted;
+        final shownSubtitle = interrupted
+            ? 'Paused by your desktop Gather — reconnecting…'
+            : subtitle;
+        final subtitleColor = interrupted ? t.danger : t.mutedForeground;
 
         return Padding(
           padding: const EdgeInsets.fromLTRB(_bannerGap, _bannerGap, _bannerGap, 0),
           child: Semantics(
             button: true,
-            label: '$title. $subtitle',
+            label: '$title. $shownSubtitle',
             child: ExcludeSemantics(
               child: Material(
                 color: fill,
@@ -1702,13 +1712,15 @@ class CallBanner extends StatelessWidget {
                                 ),
                               ),
                               Text(
-                                subtitle,
+                                shownSubtitle,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
                                   fontSize: 12,
                                   height: 1.3,
-                                  color: t.mutedForeground,
+                                  color: subtitleColor,
+                                  fontWeight:
+                                      interrupted ? FontWeight.w600 : null,
                                 ),
                               ),
                             ],

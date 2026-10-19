@@ -16,6 +16,7 @@ import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
@@ -142,6 +143,38 @@ void main() {
 
       expect(find.text('In a call with Ada'), findsOneWidget);
       expect(find.text('Tap to see Ada'), findsOneWidget);
+    });
+
+    testWidgets('a desktop lock replaces the tap line with "paused" (issue #41)',
+        (tester) async {
+      final state = AppState()
+        ..debugCall = const CallState()
+        ..debugAttachCollector(FakeCollector())
+        ..setActive(true);
+      // In a call with Ada.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Active'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.inCall, isTrue);
+      await banner(tester, state);
+      // Normally the second line invites a tap.
+      expect(find.text('Tap to see Ada'), findsOneWidget);
+
+      // The desktop on this same account locks: our shared user drops Offline and
+      // the server is tearing the call down under us. The banner says so.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Offline'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.callInterrupted, isTrue);
+      await tester.pump();
+
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+      expect(find.text('Tap to see Ada'), findsNothing);
+
+      // Drain the self-heal's reconnect and cooldown timers so the tree disposes clean.
+      await tester.pump(const Duration(seconds: 4));
     });
 
     testWidgets('two and more, from the conversation alone', (tester) async {

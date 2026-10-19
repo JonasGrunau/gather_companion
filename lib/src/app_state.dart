@@ -909,6 +909,13 @@ class AppState extends ChangeNotifier {
   /// so a Mac that stays asleep cannot keep us in a reconnect loop forever.
   static const _selfHealMaxStrikes = 4;
 
+  /// True while another device on this shared account (the desktop, issue #41) has
+  /// forced us Offline mid-call and the self-heal is fighting it. Drives the in-call
+  /// banner so the drop is explained rather than silent, and clears the moment the
+  /// desktop releases its hold. Set and cleared in [_noteSelfHealth].
+  bool _callInterrupted = false;
+  bool get callInterrupted => _callInterrupted;
+
   /// Wakes the tree when my own availability or status line changes.
   ///
   /// The presence tracker judges everybody else's rows and deliberately not mine, so
@@ -963,6 +970,9 @@ class AppState extends ChangeNotifier {
     // availability tells us anything; wait for one.
     if (availability == null) return;
     if (availability != 'Offline') {
+      // Were we fighting an external Offline? If so, this roster is the desktop
+      // releasing its hold.
+      final wasEpisode = _selfHealStrikes > 0 || _selfHealRebuilt;
       // Healthy again: reset the ladder so the next episode starts its count from
       // scratch.
       _selfHealCooldown?.cancel();
@@ -970,10 +980,22 @@ class AppState extends ChangeNotifier {
       _selfHealCooling = false;
       _selfHealStrikes = 0;
       _selfHealRebuilt = false;
+      _callInterrupted = false;
+      // The desktop released its hold. Our during-lock rebuild (below) was torn down
+      // again by the server while the lock persisted, so the live session is dead.
+      // Rebuild it now rather than waiting out the ~90s websocket reconnect ladder —
+      // that wait is the ~45s "joined but no call shown" gap in issue #41. rebuild()
+      // no-ops when there is no session, so a recovery we are no longer in a call for
+      // costs nothing.
+      if (wasEpisode) unawaited(_call?.rebuild() ?? Future<void>.value());
       return;
     }
     // Only our own, in-call, foreground presence is ours to defend.
     if (!_active || !inCall) return;
+
+    // Explain the drop while we fight it: the call UI shows a banner rather than
+    // blinking out silently (issue #41).
+    _callInterrupted = true;
 
     // One re-assert per cooldown, so a roster four times a second does not become a
     // re-assert four times a second.
