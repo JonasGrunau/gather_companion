@@ -473,10 +473,21 @@ class SfuSession {
       _log('sfu: the cached send transport was built on $_sendTransportAddr but '
           'we are on $_sfuAddr now; rebuilding it on this node');
       _closeSendTransportQuietly();
+      // Dropping the transport dropped every producer, not just the one this
+      // publish is putting back. Ask the owner to restore the rest too, or a mic
+      // dropped by a camera-triggered rebuild (or vice versa) stays silent until
+      // the next unrelated tap (issue #67).
+      _announceRepublish();
     }
 
     final node = _node;
     final device = _device;
+    // The node this transport is being built on, captured now — before the awaits
+    // below. A silent move landing mid-build changes `_sfuAddr` under us, and
+    // binding the finished transport to the *current* `_sfuAddr` would label an
+    // old-node transport with the new node's addr, defeating the cache check that
+    // is meant to catch exactly that drift (issue #67).
+    final addr = _sfuAddr;
     if (node == null || device == null) {
       throw const SfuException('publish before start');
     }
@@ -616,8 +627,10 @@ class SfuSession {
     await transport.handler.ready;
 
     // Bind the transport to the node it was built on, so a later silent move is
-    // visible as a mismatch rather than reused blind.
-    _sendTransportAddr = _sfuAddr;
+    // visible as a mismatch rather than reused blind. `addr` is the node captured
+    // above, not the live `_sfuAddr`, which a move during the awaits may have
+    // already advanced.
+    _sendTransportAddr = addr;
     _sendTransport = transport;
     return transport;
   }

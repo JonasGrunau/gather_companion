@@ -655,6 +655,94 @@ void main() {
       });
     });
 
+    test('turning an unrelated track off leaves the banner up while the mic is '
+        'still stuck (#67)', () {
+      fakeAsync((clock) {
+        final localEngine = FakeCaptureEngine();
+        final localRig = Rig();
+        final localCall = LiveCall(
+          auth: GatherAuth(
+            credentials: const GatherCredentials(refreshToken: 'unused'),
+          ),
+          spaceId: spaceId,
+          srcId: me,
+          engine: localEngine,
+          buildSfu: () => localRig.session,
+          voice: VoiceActivity(hold: Duration.zero),
+        );
+
+        localCall.setListeningTo({them}).ignore();
+        clock.flushMicrotasks();
+
+        // The mic is stuck: unmuted, but the node refuses every produce.
+        localRig.node(nodeA).failingWith['produce'] = 'produce refused';
+        localCall.setMicOn(true).ignore();
+        clock.flushMicrotasks();
+        clock.elapse(const Duration(seconds: 5));
+        clock.flushMicrotasks();
+        expect(localCall.state.needsHandoff, isTrue,
+            reason: 'the stuck mic raised the banner');
+
+        // Turning the camera off is a deliberate stand-down for the *camera*, not
+        // a cure for the mic. The old single global clear lowered the banner here;
+        // it must now stay up because a wanted track is still off the wire.
+        localCall.setCameraOn(false).ignore();
+        clock.elapse(Duration.zero);
+        clock.flushMicrotasks();
+        expect(localCall.state.needsHandoff, isTrue,
+            reason: 'the mic is still stuck, so the banner stays up');
+
+        localCall.dispose().ignore();
+        localRig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('a reclaim onto a session that still cannot publish reports the failure '
+        'and keeps the banner (#67)', () async {
+      // Every node this call builds refuses produce, so the reclaim rebuilds a
+      // fresh session that is just as unable to put the mic back.
+      final rigs = <Rig>[];
+      final localEngine = FakeCaptureEngine();
+      final localCall = LiveCall(
+        auth: GatherAuth(
+          credentials: const GatherCredentials(refreshToken: 'unused'),
+        ),
+        spaceId: spaceId,
+        srcId: me,
+        engine: localEngine,
+        buildSfu: () {
+          final r = Rig()..nodeRefusals['produce'] = 'produce refused';
+          rigs.add(r);
+          return r.session;
+        },
+        voice: VoiceActivity(hold: Duration.zero),
+      );
+      addTearDown(() async {
+        await localCall.dispose();
+        for (final r in rigs) {
+          await r.close();
+        }
+      });
+
+      await localCall.setMicOn(true);
+      for (var i = 0; i < 3; i++) {
+        rigs[0].node().push('double-connected', const {});
+      }
+      await settle();
+      await settle();
+      expect(localCall.state.needsHandoff, isTrue);
+
+      final detail = await localCall.pullSessionOver();
+      await settle();
+
+      expect(detail, isNotNull,
+          reason: 'the fresh session still cannot publish, so this is not '
+              'success');
+      expect(localCall.state.needsHandoff, isTrue,
+          reason: 'the banner stays up for another try, not a silent dead call');
+    });
+
     test('three double-connected notices raise the banner immediately, no wait',
         () async {
       await call.setMicOn(true);

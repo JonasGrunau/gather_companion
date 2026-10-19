@@ -463,6 +463,13 @@ class _CallScreenState extends State<CallScreen> {
                         sharing: widget.state.call.screenOn,
                         onToggleShare: _toggleShare,
                       ),
+                      // The reclaim banner, below the header so it never covers
+                      // Back or the screen-share control, and in the column so it
+                      // reserves its own space rather than floating over the faces
+                      // — clear of the landscape control rail on the right too
+                      // (issue #67).
+                      if (widget.state.call.needsHandoff)
+                        _HandoffBanner(state: widget.state),
                       Expanded(
                         child: tiles.isEmpty
                             ? const _Nobody()
@@ -514,20 +521,6 @@ class _CallScreenState extends State<CallScreen> {
                   ],
                 ),
               ),
-              // The reclaim banner, over the top of the faces when another device
-              // has taken the call (issue #67). A top strip rather than the map
-              // pill, since the call screen has no banner of its own — this is
-              // where the person is looking when the room goes quiet.
-              if (widget.state.call.needsHandoff)
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: SafeArea(
-                    bottom: false,
-                    child: _HandoffBanner(state: widget.state),
-                  ),
-                ),
             ],
           );
         },
