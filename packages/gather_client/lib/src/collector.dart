@@ -138,6 +138,14 @@ abstract interface class Collector {
   /// as a `WaveEvent` naming the recipient — but, unlike an emote, not back to us.
   ({bool ok, String? detail}) wave(String targetSpaceUserId);
 
+  /// Asks to be let into a locked area — the knock the desktop's "request access"
+  /// modal sends. Bare fire-and-forget like [wave]; the answer arrives as an
+  /// `AreaAccessRequest` on the roster, and a host accepting it flips
+  /// `canEnterRoom` true via `SpaceMapBuilder._admitted`. [areaStableId] is
+  /// `SpaceRoom.stableId`, not `.id` — the server keys the request on the area's
+  /// `MapEntityIdentifier`, so sending `.id` creates a request that joins nothing.
+  ({bool ok, String? detail}) requestToAccess(String areaStableId);
+
   /// Says whether we are talking. This is the speaking ring.
   ({bool ok, String? detail}) setSpeaking(bool speaking);
 
@@ -145,13 +153,6 @@ abstract interface class Collector {
   /// it stays until this is called again, and every other client sees it as
   /// `handRaisedAt` on our roster row.
   ({bool ok, String? detail}) setHandRaised(bool raised);
-
-  /// Asks to be let into a locked area — a `MapArea` by its id. Fire-and-forget:
-  /// the server records an `AreaAccessRequest`, and when the host accepts it the
-  /// acceptance arrives as a patch the map already reads (it flips
-  /// `canEnterRoom`). The id is the area's [SpaceRoom.id], the same one a resolved
-  /// `/m/<link>` carries as `areaId`.
-  ({bool ok, String? detail}) requestToAccess(String areaId);
 
   /// Steps out of the huddle without walking away from it.
   ({bool ok, String? detail}) leaveCluster();

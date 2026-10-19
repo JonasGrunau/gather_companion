@@ -975,12 +975,17 @@ void main() {
       expect(standing(room, x: -5, y: -5).canEnter(room), isFalse);
     });
 
-    test('a refusal from Gather stops the walk and names the room', () async {
+    test('a refusal on a locked area offers the door rather than just naming it', () async {
+      // Issue #69: a locked area we can knock on comes out on `accessOffers` so the
+      // map turns it into a "Request access" button — not a terminal notice.
       final room = door(stableId: 'boardroom');
       final state = standing(room, x: -5, y: -5)..debugOnRoute = true;
+      final offered = <SpaceRoom>[];
       final said = <String>[];
-      final sub = state.notices.listen(said.add);
-      addTearDown(sub.cancel);
+      final offers = state.accessOffers.listen(offered.add);
+      final notices = state.notices.listen(said.add);
+      addTearDown(offers.cancel);
+      addTearDown(notices.cancel);
 
       state.debugNoteEvent(BusEvent(
         name: 'UserIsNotPermittedToEnterLockedArea',
@@ -991,7 +996,8 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      expect(said, ['Boardroom is locked.']);
+      expect(offered.map((r) => r.name), ['Boardroom']);
+      expect(said, isEmpty, reason: 'the offer replaces the plain sentence');
     });
 
     test('a refusal aimed at somebody else is not ours to report', () async {

@@ -258,27 +258,6 @@ void main() {
       expect(sent['args'], ['SpaceUser', 'me-1']);
     });
 
-    test('requestToAccess addresses a MapArea by id, with no arguments', () async {
-      final c = build()..start();
-      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
-      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
-
-      expect(c.requestToAccess('area-9').ok, isTrue);
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-
-      final sent = await conn.waitFor('requestToAccess');
-      // Unlike every other action, addressed to the area and not our own avatar —
-      // and no third element, like the no-arg actions.
-      expect(sent['args'], ['MapArea', 'area-9']);
-    });
-
-    test('requestToAccess refuses an empty area id before sending', () {
-      final c = build()..start();
-      final sent = c.requestToAccess('');
-      expect(sent.ok, isFalse);
-      expect(sent.detail, contains('no area'));
-    });
-
     test('each gait names its own action', () async {
       final c = build()..start();
       final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
@@ -432,6 +411,18 @@ void main() {
       expect(c.wave('').ok, isFalse);
     });
 
+    test('requestToAccess knocks on the MapArea by stableId, with no third argument',
+        () async {
+      final (c, conn) = await connected();
+
+      // Like a wave: the id is the area's, not 'me-1', and the frame is the bare
+      // two-element tuple — `requestToAccess` takes no args (issue #69).
+      expect(c.requestToAccess('area-7').ok, isTrue);
+      expect((await lastFrame(conn, 'requestToAccess'))['args'], ['MapArea', 'area-7']);
+
+      expect(c.requestToAccess('').ok, isFalse);
+    });
+
     test('every one of them refuses before it knows which avatar is ours', () {
       final c = build();
       expect(c.setAvailability('Busy').ok, isFalse);
@@ -558,6 +549,32 @@ void main() {
 
       expect(events, isEmpty);
     });
+  });
+
+  test('a lone access-request acceptance republishes the roster (#69)', () async {
+    // When a host admits a knock in an otherwise-idle space, the only patch is the
+    // `AreaAccessRequest` addmodel — nobody moved. Map rows deliberately do not
+    // republish the roster, but this one must: the auto-walk that waits for the door
+    // (`AppState._tryEnterPending`) is pumped off the roster and would otherwise hang
+    // until an unrelated presence patch happened by.
+    final c = build()..start();
+    final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+    await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+    var after = 0;
+    final sub = c.rosters.listen((_) => after++);
+    conn.delta([
+      {
+        'op': 'addmodel',
+        'model': 'AreaAccessRequest',
+        'data': {'id': 'aar-1', 'areaId': 'area-7', 'spaceUserId': 'me-1'},
+      },
+    ]);
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await sub.cancel();
+
+    expect(after, greaterThan(0),
+        reason: 'the admit alone must publish a roster to pump the auto-walk');
   });
 
   test('a reconnect gets a whole fresh dump, which is why resync is a reconnect',

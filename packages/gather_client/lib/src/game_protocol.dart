@@ -761,7 +761,13 @@ class GameProtocolReader {
       // traffic the coalescing window exists to prevent. The map is read from
       // `mapBuilder` when it is wanted.
       mapBuilder.apply(model, patch);
-      return false;
+      // The one map row that is somebody moving: an `AreaAccessRequest` is a door
+      // opening for a named person. Nothing else republishes when a lone knock is
+      // accepted in an idle space, so the auto-walk that waits on it (`AppState.
+      // _tryEnterPending`, pumped off the roster) would hang until an unrelated
+      // presence patch happened by. One row, not the 2200 of a dump, so treating it
+      // as roster-affecting costs nothing the coalescing window cares about (#69).
+      return model == 'AreaAccessRequest';
     }
 
     if (model == 'MeetingParticipant' || model == 'MeetingJoinRequest') {

@@ -554,19 +554,16 @@ class DirectCollector implements Collector {
     return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
-  /// Asks to be let into a locked area.
-  ///
-  /// The action is `requestToAccess` (model `MapArea`), from the action surface in
-  /// `docs/protocol/client-action-surface.md` — it takes no arguments, so the frame
-  /// is the bare two-element `[model, id]`, addressed to the area's id exactly as
-  /// [wave] is addressed to the recipient's. The server records an
-  /// `AreaAccessRequest`; on acceptance a patch flips our admission and the map lets
-  /// us walk in, through the same `AreaAccessRequest` rows [SpaceMapBuilder] already
-  /// folds into `canEnterRoom`.
+  /// Knocks on a locked area. Like [wave], a bare `[model, id]` frame with no
+  /// args — `requestToAccess` is permissioned `RequestToAccess` on `MapArea` and
+  /// takes nothing (`docs/protocol/client-action-surface.md`). The id is the area's
+  /// `MapEntityIdentifier` — [SpaceRoom.stableId] — because that is what the
+  /// resulting `AreaAccessRequest.areaId` is joined against; `MapArea.id` would land
+  /// a request nobody can read.
   @override
-  ({bool ok, String? detail}) requestToAccess(String areaId) {
-    if (areaId.isEmpty) return (ok: false, detail: 'no area to ask about');
-    return _send('requestToAccess', model: 'MapArea', id: areaId);
+  ({bool ok, String? detail}) requestToAccess(String areaStableId) {
+    if (areaStableId.isEmpty) return (ok: false, detail: 'no room to ask about');
+    return _send('requestToAccess', model: 'MapArea', id: areaStableId);
   }
 
   /// Puts a hand up, or takes it down. A bare bool, not a map.
