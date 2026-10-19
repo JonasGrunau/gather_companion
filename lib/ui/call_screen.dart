@@ -80,6 +80,7 @@ class CallTile {
     this.speaking = false,
     this.reactions = const [],
     this.handRaised = false,
+    this.connecting = false,
   });
 
   /// `SpaceUser.id` when we could place them, otherwise the media `srcId`. Only
@@ -106,6 +107,15 @@ class CallTile {
   /// stays until lowered. Ours comes from `AppState.myHandRaised` (local-first);
   /// everybody else's from their `RosterRow.handRaised`.
   final bool handRaised;
+
+  /// Whether the SFU is still placing this peer — subscribed, no media yet.
+  ///
+  /// A walk-up colleague whose own client is still registering reads as this,
+  /// not as a silent one: the tile says "connecting…" so the moment is legible
+  /// and nobody restarts the app waiting on a peer the session is already
+  /// chasing. Cleared the instant their media lands and they become a real
+  /// participant. Sourced from `CallState.connecting`.
+  final bool connecting;
 
   /// Whether this tile has a frame to show, as opposed to a face to draw.
   ///
@@ -463,6 +473,13 @@ class _CallScreenState extends State<CallScreen> {
                         sharing: widget.state.call.screenOn,
                         onToggleShare: _toggleShare,
                       ),
+                      // The reclaim banner, below the header so it never covers
+                      // Back or the screen-share control, and in the column so it
+                      // reserves its own space rather than floating over the faces
+                      // — clear of the landscape control rail on the right too
+                      // (issue #67).
+                      if (widget.state.call.needsHandoff)
+                        _HandoffBanner(state: widget.state),
                       Expanded(
                         child: tiles.isEmpty
                             ? const _Nobody()
@@ -658,6 +675,12 @@ List<CallTile> _tiles(AppState state) {
       speaking: row.speaking ?? false,
       reactions: state.reactions.forPerson(row.id),
       handRaised: row.handRaised,
+      // The one bucket an unplaced peer can land in: subscribed, no media, so
+      // never a participant. Bridged to the media plane's srcId through
+      // `userAccountId`, the same join every other srcId lookup makes. This is
+      // what tells a walk-up colleague apart from somebody sitting silent.
+      connecting: row.userAccountId != null &&
+          call.connecting.contains(row.userAccountId),
     ));
   }
   return tiles;
@@ -1411,22 +1434,47 @@ class _TileFrame extends StatelessWidget {
               // One height for the row, set by the name. Each plate used to size
               // itself, so the mute pip — a 13-point glyph — sat a few points
               // shorter than the line of text beside it.
-              child: IntrinsicHeight(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Flexible(child: _Plate(text: tile.label)),
-                    if (tile.muted) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.mic_off, text: ''),
-                    ],
-                    if (tile.sharingScreen) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.screen_share_outlined, text: ''),
-                    ],
-                  ],
-                ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // A spotlight thumbnail is 72 logical pixels wide, leaving
+                  // ~56 for this row after its insets — too little for the name
+                  // plus a spelt-out "Connecting…", which would overflow and
+                  // clip. Below this width the status drops to its icon alone,
+                  // keeping a screen-reader label; the roomier overview and big
+                  // tiles keep the words.
+                  final compact = constraints.maxWidth < 120;
+                  return IntrinsicHeight(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Flexible(child: _Plate(text: tile.label)),
+                        // Stands in for the mute pip while a peer is mid-connect:
+                        // they have no track yet, so "muted" would be a guess,
+                        // but "connecting…" is the true state and the one that
+                        // tells a person to wait a beat rather than restart.
+                        if (tile.connecting) ...[
+                          const SizedBox(width: 6),
+                          Semantics(
+                            label: 'Connecting…',
+                            child: _Plate(
+                              icon: Icons.sync,
+                              text: compact ? '' : 'Connecting…',
+                            ),
+                          ),
+                        ] else if (tile.muted) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(icon: Icons.mic_off, text: ''),
+                        ],
+                        if (tile.sharingScreen) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(
+                              icon: Icons.screen_share_outlined, text: ''),
+                        ],
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
           ],
@@ -1658,6 +1706,10 @@ class CallBanner extends StatelessWidget {
       listenable: state,
       builder: (context, _) {
         final t = context.tokens;
+        // Another device has the call, or the send path is stuck: the pill gives
+        // way to the reclaim banner (issue #67), which opens nothing — its one
+        // button pulls the session here rather than opening the call screen.
+        if (state.call.needsHandoff) return _HandoffBanner(state: state);
         // The call screen's own list, so the banner and the screen it opens can
         // never disagree about who is in the call.
         final (:title, :subtitle) = callBannerTextFor(state);
@@ -1838,6 +1890,124 @@ class _CallMark extends StatelessWidget {
         border: Border.all(color: t.ok.withValues(alpha: 0.3)),
       ),
       child: Icon(Icons.call_rounded, size: 20, color: t.ok),
+    );
+  }
+}
+
+/// The "Connection lost to another device" banner, with the one button that
+/// reclaims the call (issue #67).
+///
+/// Drawn in place of the normal pill on the map and as a top strip inside the
+/// open call screen, whenever [CallState.needsHandoff] is set — a single-device
+/// takeover the stuck-watch caught, a latched `displaced`, or any other stall
+/// that has left the room unable to hear or see us. Tapping the button runs
+/// [AppState.pullSessionOver], which clears the stand-down and rebuilds fresh
+/// transports on the current node; the banner lowers on its own when that
+/// succeeds, because the new call state carries `needsHandoff: false`.
+///
+/// Stateful for the same reason the control bar's `_run` is: a failed reclaim
+/// puts its sentence in the one snack bar the rest of the app uses, and that
+/// needs `mounted` and a `ScaffoldMessenger` from the element.
+class _HandoffBanner extends StatefulWidget {
+  const _HandoffBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_HandoffBanner> createState() => _HandoffBannerState();
+}
+
+class _HandoffBannerState extends State<_HandoffBanner> {
+  /// True while a reclaim is in flight, so a second tap cannot stack a second
+  /// rebuild behind the first.
+  bool _pulling = false;
+
+  Future<void> _pull() async {
+    if (_pulling) return;
+    setState(() => _pulling = true);
+    // Same contract as control_bar's `_run`: null is silent success, a sentence
+    // goes in the shared snack bar.
+    final failed = await widget.state.pullSessionOver();
+    if (!mounted) return;
+    setState(() => _pulling = false);
+    if (failed != null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(failed)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      child: Material(
+        color: t.card,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(t.radius + 10),
+          side: BorderSide(color: t.border),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.phonelink_erase_rounded, size: 20, color: t.warn),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Connection lost to another device',
+                      style: TextStyle(
+                        fontSize: 14,
+                        height: 1.25,
+                        fontWeight: FontWeight.w600,
+                        color: t.foreground,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Material(
+                color: t.brand,
+                borderRadius: BorderRadius.circular(t.radius),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  onTap: _pulling ? null : _pull,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minHeight: 44),
+                    child: Center(
+                      child: _pulling
+                          ? SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation(
+                                    t.primaryForeground),
+                              ),
+                            )
+                          : Text(
+                              'Pull session over to this app',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: t.primaryForeground,
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

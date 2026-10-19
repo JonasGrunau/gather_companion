@@ -12,6 +12,7 @@ export 'src/collector.dart';
 export 'src/direct_collector.dart';
 export 'src/game_protocol.dart';
 export 'src/gather_auth.dart';
+export 'src/meeting_link.dart';
 export 'src/msgpack.dart';
 export 'src/party.dart';
 export 'src/profile_photos.dart';

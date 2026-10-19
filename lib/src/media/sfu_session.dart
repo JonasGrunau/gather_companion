@@ -25,6 +25,7 @@ library;
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:mediasfu_mediasoup_client/mediasfu_mediasoup_client.dart' as ms;
@@ -132,6 +133,16 @@ class SfuSession {
   ms.Device? _device;
   ms.Transport? _sendTransport;
 
+  /// The `_sfuAddr` the cached [_sendTransport] was built on, or null when there
+  /// is no cached transport. A send transport is ICE and DTLS to one specific
+  /// node, so a transport built on the old node is worthless after a silent move
+  /// — the SFU answers its `produce` with `no such transport`. The silent move is
+  /// the whole of issue #67: `_assign` can update `_sfuAddr`/`_node` while the old
+  /// `_sendTransport` survives, so [_sendTransportOrCreate] has to notice the two
+  /// have drifted apart and build fresh, rather than trusting a cache that is
+  /// bound to nothing.
+  String? _sendTransportAddr;
+
   /// The send transport's last reported ICE/DTLS state, or null before the
   /// first `connectionstatechange`. The send-heal watchdog reads it to tell a
   /// transport that actually connected from one that only ever acked a produce.
@@ -180,6 +191,15 @@ class SfuSession {
   final Set<String> _awaitingAddr = {};
   Timer? _addrRetry;
 
+  /// How long the address-retry waits before each re-ask.
+  ///
+  /// One second to start, doubling to a ten-second cap. The first delay is the
+  /// whole point: a colleague walks up while their own client is still
+  /// registering its stream, so the router has no address for a breath — and a
+  /// retry a second later catches it, where the old flat ten-second period was
+  /// slower than a person's patience and made them restart into the same wait.
+  Duration _addrRetryBackoff = const Duration(seconds: 1);
+
   /// Nodes whose socket is currently down, so a later `healthy` reads as a
   /// reconnection rather than as the first connect.
   final Set<String> _nodeDown = {};
@@ -207,10 +227,33 @@ class SfuSession {
   /// Fires whenever [remotes] changes — a track arriving, going, or being paused.
   Stream<List<RemoteMedia>> get remoteChanges => _remotes.stream;
 
+  /// Peers we have subscribed to but the router has no media address for yet.
+  ///
+  /// They are connecting, not silent: somebody who just walked up while their
+  /// own client is still registering its stream. The UI marks their tile so a
+  /// person reads "connecting…" rather than mistaking them for a colleague
+  /// sitting with mic and camera off — and so nobody restarts the app waiting on
+  /// a peer the retry is already chasing. Changes here ride [remoteChanges].
+  Set<String> get connectingPeers => Set.unmodifiable(_awaitingAddr);
+
   /// Whether we are ready to publish. False until [start] has run through.
   bool get ready => _device?.loaded == true && _node != null;
 
   String? get sfuAddr => _sfuAddr;
+
+  /// Test seam: reproduce a silent SFU node change (issue #67).
+  ///
+  /// The real move has no cordon and no socket drop — the server simply starts
+  /// answering `get-addr` with a new node — so a device cannot be made to perform
+  /// it on cue, and nothing in the modelled protocol closes the send transport
+  /// the way `cordon-sfu` does. This repoints `_sfuAddr`/`_node` at [addr] while
+  /// leaving the cached `_sendTransport` exactly where it was, which is the
+  /// drifted state [_sendTransportOrCreate] has to notice.
+  @visibleForTesting
+  Future<void> debugSilentMove(String addr) async {
+    _sfuAddr = addr;
+    _node = await _nodeAt(addr);
+  }
 
   /// Everything every node says unprompted, merged.
   ///
@@ -437,10 +480,32 @@ class SfuSession {
   /// on a conversation that may never happen.
   Future<ms.Transport> _sendTransportOrCreate() async {
     final existing = _sendTransport;
-    if (existing != null) return existing;
+    // Only return the cache if it was built on the node we are on *now*. After a
+    // silent SFU move (issue #67) `_sfuAddr` has changed under a surviving
+    // transport, and reusing it produces onto a node that has never heard of it
+    // — `produce ack {error: no such transport}`, then the send path never comes
+    // back without a restart. A drifted transport is torn down and rebuilt fresh
+    // on the current node instead.
+    if (existing != null && _sendTransportAddr == _sfuAddr) return existing;
+    if (existing != null) {
+      _log('sfu: the cached send transport was built on $_sendTransportAddr but '
+          'we are on $_sfuAddr now; rebuilding it on this node');
+      _closeSendTransportQuietly();
+      // Dropping the transport dropped every producer, not just the one this
+      // publish is putting back. Ask the owner to restore the rest too, or a mic
+      // dropped by a camera-triggered rebuild (or vice versa) stays silent until
+      // the next unrelated tap (issue #67).
+      _announceRepublish();
+    }
 
     final node = _node;
     final device = _device;
+    // The node this transport is being built on, captured now — before the awaits
+    // below. A silent move landing mid-build changes `_sfuAddr` under us, and
+    // binding the finished transport to the *current* `_sfuAddr` would label an
+    // old-node transport with the new node's addr, defeating the cache check that
+    // is meant to catch exactly that drift (issue #67).
+    final addr = _sfuAddr;
     if (node == null || device == null) {
       throw const SfuException('publish before start');
     }
@@ -516,6 +581,18 @@ class SfuSession {
         // seconds of a dead unmute button, for a refusal the server sent
         // immediately.
         _failPendingProducer(error);
+        // `no such transport` means this send transport was built on a node the
+        // server has silently moved us off (issue #67). The addr check in
+        // [_sendTransportOrCreate] catches the move on the *next* publish, but a
+        // produce already in flight when the move lands needs its own recovery —
+        // otherwise the send path sits dead until the person leaves and rejoins.
+        // Rebuild it, but not inline: we are three frames deep inside this
+        // transport's own `produce()` task, and closing the transport under
+        // itself risks reentrancy and the m-line reorder that corrupts the peer
+        // connection. Defer to a microtask, past the end of this task.
+        if (_isStaleTransport(error)) {
+          scheduleMicrotask(_forceSendRebuild);
+        }
       }
     });
 
@@ -567,6 +644,11 @@ class SfuSession {
     // (measured 2026-09-17, `build/call-capture/media8.log`).
     await transport.handler.ready;
 
+    // Bind the transport to the node it was built on, so a later silent move is
+    // visible as a mismatch rather than reused blind. `addr` is the node captured
+    // above, not the live `_sfuAddr`, which a move during the awaits may have
+    // already advanced.
+    _sendTransportAddr = addr;
     _sendTransport = transport;
     return transport;
   }
@@ -983,8 +1065,12 @@ class SfuSession {
         // diffs against the desired set, so a peer quietly removed from it is
         // never asked for again.
         _log('sfu: the router cannot place $srcId yet; will ask again');
-        _awaitingAddr.add(srcId);
-        _scheduleAddrRetry();
+        if (_awaitingAddr.add(srcId)) {
+          _publishRemotes();
+          _expediteAddrRetry();
+        } else {
+          _scheduleAddrRetry();
+        }
         return;
       }
 
@@ -994,7 +1080,7 @@ class SfuSession {
         'srcStreamId': _spaceId,
         'requested': true,
       });
-      _awaitingAddr.remove(srcId);
+      if (_awaitingAddr.remove(srcId)) _publishRemotes();
       _log('sfu: subscribed to $srcId on $url');
 
       // The quality we asked for lives on the node too, so a peer we have just
@@ -1004,29 +1090,70 @@ class SfuSession {
       if (_priority.contains(srcId)) _sendPriority();
     } on Object catch (error) {
       _log('sfu: asking for $srcId failed: $error');
-      _awaitingAddr.add(srcId);
-      _scheduleAddrRetry();
+      if (_awaitingAddr.add(srcId)) {
+        _publishRemotes();
+        _expediteAddrRetry();
+      } else {
+        _scheduleAddrRetry();
+      }
     }
   }
 
   /// Keep asking the router about people it could not place.
   ///
-  /// Ten seconds is slow enough to be free — one small frame per unplaced peer —
-  /// and quick enough that somebody who walks up while their own client is still
-  /// connecting is heard within a breath rather than never.
+  /// Shaped like [_scheduleRecvHeal]: a self-cancelling one-shot with a
+  /// reentrancy guard and a `_stopped` check, re-arming with a growing
+  /// [_addrRetryBackoff] rather than a flat period. The first re-ask lands a
+  /// second after the router said "no address yet", which is the window a
+  /// walk-up colleague's own client needs to finish registering — fast enough
+  /// that waiting beats restarting, where the old flat ten seconds was slower
+  /// than the person and sent them into a leave/rejoin that only re-armed the
+  /// same wait. It widens to a ten-second cap so a peer who never places costs
+  /// one small frame, not a busy-loop.
   void _scheduleAddrRetry() {
     if (_addrRetry != null || _stopped) return;
-    _addrRetry = Timer.periodic(const Duration(seconds: 10), (timer) {
+    _addrRetry = Timer(_addrRetryBackoff, () {
+      _addrRetry = null;
+
+      final pruned = _awaitingAddr.length;
       _awaitingAddr.removeWhere((srcId) => !_subscribed.contains(srcId));
+      if (_awaitingAddr.length != pruned) _publishRemotes();
+
       if (_awaitingAddr.isEmpty || _stopped) {
-        timer.cancel();
-        _addrRetry = null;
+        _addrRetryBackoff = const Duration(seconds: 1);
         return;
       }
+
       for (final srcId in _awaitingAddr.toList()) {
         unawaited(_requestPeer(srcId));
       }
+
+      final next = _addrRetryBackoff.inSeconds * 2;
+      _addrRetryBackoff = Duration(seconds: next > 10 ? 10 : next);
+      _scheduleAddrRetry();
     });
+  }
+
+  /// Pull the next address retry forward for a peer that has only just started
+  /// awaiting.
+  ///
+  /// The retry timer and its [_addrRetryBackoff] are shared across every
+  /// awaiting peer, so while one unplaced peer widens the backoff toward its
+  /// ten-second cap, a *second* walk-up arriving then would inherit that long
+  /// wait for its own first re-ask — the very stall this fix set out to kill,
+  /// just for the second arrival. Reset the backoff to one second and re-arm so
+  /// the newcomer is re-asked within the window its client needs. Only ever
+  /// brings the deadline forward: an already-armed one-second timer is as fast
+  /// as we go, so it is left alone rather than cancelled and postponed.
+  void _expediteAddrRetry() {
+    if (_stopped) return;
+    if (_addrRetry != null && _addrRetryBackoff <= const Duration(seconds: 1)) {
+      return;
+    }
+    _addrRetryBackoff = const Duration(seconds: 1);
+    _addrRetry?.cancel();
+    _addrRetry = null;
+    _scheduleAddrRetry();
   }
 
   Timer? _recvHealTimer;
@@ -1267,6 +1394,59 @@ class SfuSession {
     }
   }
 
+  /// A produce refusal that means the send transport no longer exists on the
+  /// node — not that the track or the credentials are wrong.
+  ///
+  /// The server sends it after a silent move (issue #67): the transport was
+  /// built on the old node, `produce` lands on the new one, and the new node has
+  /// never heard of the transport. Keyed on both phrasings because the exact
+  /// wording is the one assumption here no capture has pinned down; the
+  /// distinct-enough `transport` wording keeps a bad-auth or codec refusal from
+  /// being mistaken for this.
+  bool _isStaleTransport(Object error) =>
+      error is SfuException &&
+      (error.message.contains('no such transport') ||
+          error.message.contains('unknown transport'));
+
+  /// Tear down the stale send transport and ask the owner to republish, once.
+  ///
+  /// The issue-#67 twin of [_rebuildSend], reached from a `produce` that was
+  /// refused `no such transport` rather than from the never-connected watchdog.
+  /// Deferred to a microtask by its caller, so by the time this runs the
+  /// offending `produce()` task has unwound and closing the transport is safe.
+  /// Shares the [_healingSend] guard with [_rebuildSend] so the watchdog and this
+  /// can never both be rebuilding the send path at once — the single
+  /// mutual-exclusion point for the whole send side.
+  Future<void> _forceSendRebuild() async {
+    if (_healingSend || _stopped) return;
+    _healingSend = true;
+    try {
+      _log('sfu: produce was refused on a stale transport; rebuilding the send '
+          'path on the current node (issue #67)');
+      _failPendingProducer(
+          const SfuException('send path rebuilt: transport was stale'));
+      _closeSendTransportQuietly();
+      _announceRepublish();
+    } finally {
+      _healingSend = false;
+    }
+  }
+
+  /// Undo [_standDown], so publishing can resume — the deliberate "new session"
+  /// the [displaced] doc comment names as the only way back.
+  ///
+  /// [displaced] is sticky on purpose: a silent retry would restart the fight
+  /// with the other client that standing down existed to end. This is not a
+  /// retry — it is the person's explicit "pull the session over here", which is
+  /// an answer to that fight (they are about to quit Gather on the other device,
+  /// or have decided this phone wins). Resetting the flapping counter too, so the
+  /// takeover gets the full three-notice grace again rather than latching on the
+  /// first notice after being reclaimed.
+  void clearDisplaced() {
+    _displaced = false;
+    _doubleConnected = 0;
+  }
+
   /// Set by [stop], so timers and retries do not outlive the session.
   bool _stopped = false;
 
@@ -1276,7 +1456,7 @@ class SfuSession {
   /// packets we drop on the floor, which is somebody's battery.
   Future<void> unsubscribe(String srcId) async {
     if (!_subscribed.remove(srcId)) return;
-    _awaitingAddr.remove(srcId);
+    if (_awaitingAddr.remove(srcId)) _publishRemotes();
     _spatial.remove(srcId);
 
     final url = _peerNode.remove(srcId);
@@ -1938,6 +2118,7 @@ class SfuSession {
   void _closeSendTransportQuietly() {
     final transport = _sendTransport;
     _sendTransport = null;
+    _sendTransportAddr = null;
     _sendState = null;
     if (transport != null) {
       try {
@@ -1986,6 +2167,7 @@ class SfuSession {
     _turnTimer = null;
     _addrRetry?.cancel();
     _addrRetry = null;
+    _addrRetryBackoff = const Duration(seconds: 1);
     _recvHealTimer?.cancel();
     _recvHealTimer = null;
     _consumeDenied.clear();

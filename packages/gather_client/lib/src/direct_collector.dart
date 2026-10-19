@@ -199,6 +199,12 @@ class DirectCollector implements Collector {
   int _frames = 0;
   int _connects = 0;
 
+  /// Whether the one-shot calendar-signal scan has run and logged. A diagnostic to
+  /// learn whether Gather broadcasts colleague calendar entities
+  /// (`BaseCombinedCalendarEvent`, `SpaceUser.hasConnectedCalendars`) over this
+  /// socket, the way the desktop reads them — settled once per connection.
+  bool _calendarScanned = false;
+
   /// Whether `enterSpace` has gone out on the current socket. Reset per connect.
   bool _entered = false;
   DateTime? _handshakeAt;
@@ -1105,6 +1111,13 @@ class DirectCollector implements Collector {
     _backoff = const Duration(seconds: 1);
     if (reader.ingest(frame)) _dirty = true;
 
+    // One-shot: does Gather push colleague calendar entities over this socket? A
+    // diagnostic that names colleague emails, so it runs only in a build made with
+    // `--dart-define=GCAL_DEBUG=true` and is absent — not just quiet — otherwise.
+    if (const bool.fromEnvironment('GCAL_DEBUG') && !_calendarScanned) {
+      _scanCalendarSignals(frame);
+    }
+
     // The state dump is what names us, so this is the first moment the late path
     // can enter. Cheap to ask: it returns immediately once done.
     _maybeEnter();
@@ -1121,6 +1134,105 @@ class DirectCollector implements Collector {
       _interactions.add(event);
     }
   }
+
+  /// Walks a decoded frame once looking for the calendar entities the desktop reads —
+  /// `BaseCombinedCalendarEvent` collections and the `SpaceUser.hasConnectedCalendars`
+  /// /`activeCalendarInferredId`/`calculatedPrimaryCalendarEmail` fields — and logs
+  /// what it finds, so a pulled log answers whether this space broadcasts colleague
+  /// calendars at all before we build a parser against them.
+  ///
+  /// Settles once: the moment it finds a signal it logs and stops; failing that it
+  /// gives the dump [_calendarScanProbeFrames] frames to arrive and then logs the
+  /// negative. Bounded by a node budget so a 100-person state dump cannot stall the
+  /// message handler.
+  void _scanCalendarSignals(Object? frame) {
+    final calKeys = <String>{};
+    var combinedEvents = 0;
+    var budget = 200000;
+
+    // Per-user tally: the question is not just "are the keys present" but "are they
+    // populated for real colleagues" — how many carry an email we could query, and
+    // how many are mid-meeting right now by Gather's own inference.
+    var userRows = 0;
+    var withEmail = 0;
+    var connectedTrue = 0;
+    var withInferred = 0;
+    final samples = <String>[];
+
+    void walk(Object? node) {
+      if (budget-- <= 0) return;
+      if (node is Map) {
+        // A SpaceUser row carries the calendar fields directly. Detect it by the
+        // presence of the connection flag, then read its calendar shape once.
+        if (node.containsKey('hasConnectedCalendars') ||
+            node.containsKey('calculatedPrimaryCalendarEmail')) {
+          userRows++;
+          final email = node['calculatedPrimaryCalendarEmail'];
+          final connected = node['hasConnectedCalendars'];
+          final inferred = node['activeCalendarInferredId'];
+          final hasEmail = email is String && email.isNotEmpty;
+          if (hasEmail) withEmail++;
+          if (connected == true) connectedTrue++;
+          if (inferred != null && '$inferred'.isNotEmpty) withInferred++;
+          if (samples.length < 8 && (hasEmail || connected == true)) {
+            final name = node['name'] ?? node['displayName'] ?? '?';
+            samples.add('$name: email=${hasEmail ? email : '-'} '
+                'connected=${connected == true} '
+                'inMeeting=${inferred != null && '$inferred'.isNotEmpty}');
+          }
+        }
+        node.forEach((k, v) {
+          final key = k is String ? k : k.toString();
+          final lower = key.toLowerCase();
+          if (lower.contains('calendar')) {
+            calKeys.add(key);
+            // A collection of calendar events — count rows if one is broadcast.
+            if (lower.contains('calendarevent') || lower.contains('combinedcalendar')) {
+              if (v is Map) {
+                combinedEvents += v.length;
+              } else if (v is List) {
+                combinedEvents += v.length;
+              }
+            }
+          }
+          walk(v);
+        });
+      } else if (node is List) {
+        for (final e in node) {
+          if (budget <= 0) break;
+          walk(e);
+        }
+      }
+    }
+
+    walk(frame);
+
+    // Wait for the full state dump before tallying, so the per-user counts reflect the
+    // whole roster rather than whichever delta happened to carry the first signal.
+    final found = calKeys.isNotEmpty && hasState;
+    if (found) {
+      _calendarScanned = true;
+      _log('gcal-wire: signals present — keys={${calKeys.join(', ')}}; '
+          'combinedEvents=$combinedEvents');
+      _log('gcal-wire: users=$userRows withEmail=$withEmail '
+          'connected=$connectedTrue inMeetingNow=$withInferred');
+      for (final s in samples) {
+        _log('gcal-wire: sample — $s');
+      }
+      return;
+    }
+    // No signal yet. Give the dump a few frames before concluding it is simply absent.
+    if (hasState && _frames >= _calendarScanProbeFrames) {
+      _calendarScanned = true;
+      _log('gcal-wire: no calendar signals after $_frames frames '
+          '(userCount=${reader.userCount}) — this space does not broadcast '
+          'colleague calendars on the game socket');
+    }
+  }
+
+  /// How many frames to let arrive before concluding the socket carries no calendar
+  /// data — enough for the full state dump to land after the handshake.
+  static const int _calendarScanProbeFrames = 20;
 
   void _flush() {
     // First, because the block below is what was lying. `_frames` is cumulative and

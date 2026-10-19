@@ -281,6 +281,7 @@ class RosterRow {
     this.profilePictureId,
     this.deskId,
     this.status,
+    this.calendarEmail,
     this.handRaised = false,
   });
 
@@ -375,6 +376,11 @@ class RosterRow {
 
   /// The line under their name, if it has not expired.
   final PersonStatus? status;
+
+  /// Their primary calendar address (`calculatedPrimaryCalendarEmail`), or null when
+  /// they have not connected a calendar to Gather. The key a companion app uses to ask
+  /// Google about their availability, since the Gather wire carries no other email.
+  final String? calendarEmail;
 
   /// Whether their hand is up in a meeting.
   ///
@@ -517,6 +523,7 @@ class _Row {
   String? availability;
   String? profilePictureId;
   String? deskId;
+  String? calendarEmail;
   bool handRaised = false;
   bool gone = false;
 }
@@ -995,6 +1002,15 @@ class GameProtocolReader {
           (v) => row.profilePictureId = v);
     }
 
+    // The calendar address Gather resolved for this person — the one identity on the
+    // wire that maps a space-user to their Google/Outlook calendar, so a companion app
+    // can ask about their availability without a name-match. Present only for people
+    // who have connected a calendar; a plain string, patched like any other column.
+    if (data.containsKey('calculatedPrimaryCalendarEmail')) {
+      set(row.calendarEmail, _nullableString(data['calculatedPrimaryCalendarEmail']),
+          (v) => row.calendarEmail = v);
+    }
+
     // Read the same way, and nullable for the same reason: plenty of people in a
     // space have never claimed a desk, and losing one is a `null` patch rather
     // than a missing key.
@@ -1242,6 +1258,7 @@ class GameProtocolReader {
         profilePictureId: row.profilePictureId,
         deskId: row.deskId,
         status: _statusFor(row.id, now),
+        calendarEmail: row.calendarEmail,
         handRaised: row.handRaised,
       ));
     }

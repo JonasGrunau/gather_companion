@@ -140,7 +140,22 @@ flutter run -t lib/main_harness.dart -d <sim-udid> \
 plane) through `AppState`'s constructor seams, so the real pair→home flow, the
 walkable Office (tap a tile to walk), party mode, the feed and the Dial directory
 all run with no wire. Scenarios, the `idb describe-all → tap → screenshot` loop, and
-the tap targets are in **`docs/sim_harness.md`**. The harness entrypoint and fakes
+the tap targets are in **`docs/sim_harness.md`**.
+
+**Device run with Google Calendar (Plans tab):** the OAuth client id is not in
+source — the real entrypoint reads it from a build-time define. Without it
+`googleAvailable` is false and the "Connect Google Calendar" banner never shows,
+so a device build meant for Plans/Calendar testing **must** pass it:
+
+```sh
+flutter run -d <device-udid> --profile \
+  --dart-define=GOOGLE_CLIENT_ID=<ios-oauth-client-id>.apps.googleusercontent.com
+```
+
+`--profile` (AOT) for untethered use, not `--debug` (host-tethered JIT). The id is
+a public PKCE client (no secret); the device signing hacks it rides are local and
+uncommitted — see the memory note `ios-device-build-signing` /
+`google-calendar-connection`. The harness entrypoint and fakes
 live outside the app (`lib/main_harness.dart`, `lib/harness/`), but the seams they
 ride are production code: this change adds the `Collector` interface in
 `gather_client` and routes `AppState`, `Walk`, `PartyMode` and `DirectCollector`

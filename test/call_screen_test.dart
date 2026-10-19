@@ -81,6 +81,53 @@ void main() {
     });
   });
 
+  group('the handoff banner (issue #67)', () {
+    const handoff = CallState(needsHandoff: true);
+
+    testWidgets('replaces the map pill, titled, with the reclaim button',
+        (tester) async {
+      final call = FakeCall();
+      final state = AppState()
+        ..debugCall = handoff
+        ..debugAttachCall(call);
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(body: CallBanner(state: state)),
+      ));
+      await tester.pump();
+
+      expect(find.text('Connection lost to another device'), findsOneWidget);
+      final button = find.text('Pull session over to this app');
+      expect(button, findsOneWidget);
+      // The ordinary "In a call" pill gives way entirely.
+      expect(find.textContaining('In a call'), findsNothing);
+
+      await tester.tap(button);
+      await tester.pump();
+      expect(call.pulls, 1, reason: 'the button reclaims the session');
+    });
+
+    testWidgets('appears inside the open call screen too', (tester) async {
+      final call = FakeCall();
+      final state = AppState()
+        ..debugCall = handoff
+        ..debugAttachCall(call);
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: CallScreen(state: state, buildTile: inertTile),
+      ));
+      await tester.pump();
+
+      expect(find.text('Connection lost to another device'), findsOneWidget);
+      final button = find.text('Pull session over to this app');
+      expect(button, findsOneWidget);
+
+      await tester.tap(button);
+      await tester.pump();
+      expect(call.pulls, 1);
+    });
+  });
+
   group('the banner says who you are with', () {
     test('in every size of call, named or not', () {
       String both(List<String?> people) {
@@ -689,6 +736,61 @@ void main() {
 
       await frame(true);
       expect(find.byIcon(Icons.front_hand), findsOneWidget);
+    });
+  });
+
+  group('the connecting status', () {
+    // 72×96 is a spotlight strip thumbnail; 200×150 is an overview/big tile.
+    Future<void> frame(WidgetTester tester, {required double width}) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: width,
+              height: width * 4 / 3,
+              child: const TileFrame(
+                tile: CallTile(
+                  id: 'luca',
+                  label: 'Luca',
+                  isSelf: false,
+                  videoLive: false,
+                  muted: false,
+                  sharingScreen: false,
+                  connecting: true,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('fits a narrow thumbnail without overflowing', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await frame(tester, width: 72);
+
+      // The spelt-out plate took its full text width and overran the ~56 pixels
+      // a thumbnail leaves, clipping the status and squeezing the name. On a
+      // narrow tile it drops to the icon, and the row lays out clean.
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsNothing,
+          reason: 'the words are dropped where they do not fit');
+      expect(find.byIcon(Icons.sync), findsOneWidget,
+          reason: 'the icon still marks the state');
+      expect(find.bySemanticsLabel('Connecting…'), findsOneWidget,
+          reason: 'a screen reader still hears the state the words carried');
+
+      semantics.dispose();
+    });
+
+    testWidgets('keeps the words on a roomy tile', (tester) async {
+      await frame(tester, width: 200);
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsOneWidget,
+          reason: 'the overview and big tiles have room for the words');
     });
   });
 
