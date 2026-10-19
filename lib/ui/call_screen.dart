@@ -480,6 +480,10 @@ class _CallScreenState extends State<CallScreen> {
                       // (issue #67).
                       if (widget.state.call.needsHandoff)
                         _HandoffBanner(state: widget.state),
+                      // The tab-surface banner is covered by this opaque route, so
+                      // the interruption notice is repeated here while the desktop
+                      // holds us Offline (issue #41).
+                      if (widget.state.callInterrupted) const _InterruptBar(),
                       Expanded(
                         child: tiles.isEmpty
                             ? const _Nobody()
@@ -1692,6 +1696,48 @@ class _Plate extends StatelessWidget {
 /// over the office, and then the selected tab's blue wash, which made it look
 /// selected. Held off the edges by the same gap it leaves under the app bar, so it
 /// sits in an even margin rather than a wide one at the sides and a tight one on top.
+/// The one sentence the desktop-lock interruption shows, in every place it shows
+/// (issue #41): the tab-surface [CallBanner]'s subtitle and, because the opened
+/// faces route covers those surfaces, the [_InterruptBar] on [CallScreen] itself.
+/// Kept in one place so the two never drift apart.
+const _kInterruptedText = 'Paused by your desktop Gather — reconnecting…';
+
+/// The interruption notice on the call screen itself (issue #41).
+///
+/// The tab-surface banner does not follow you onto the opened faces — that route
+/// is opaque and sits over them — so the screen carries its own copy. Danger
+/// toned, the same sentence the banner shows, so the drop is explained wherever
+/// you happen to be looking when the desktop pulls the call out from under us.
+class _InterruptBar extends StatelessWidget {
+  const _InterruptBar();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: t.danger.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(t.radius),
+          border: Border.all(color: t.danger.withValues(alpha: 0.5)),
+        ),
+        child: Text(
+          _kInterruptedText,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: t.danger,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class CallBanner extends StatelessWidget {
   const CallBanner({super.key, required this.state});
 
@@ -1714,12 +1760,20 @@ class CallBanner extends StatelessWidget {
         // never disagree about who is in the call.
         final (:title, :subtitle) = callBannerTextFor(state);
         final fill = t.card;
+        // Issue #41: the desktop client on this same account locked and forced our
+        // shared user Offline, so the server is tearing the call down under us. Say so
+        // in place of the "Tap to see everyone" line rather than letting the call
+        // blink out unexplained; the self-heal clears this the moment the desktop
+        // releases its hold.
+        final interrupted = state.callInterrupted;
+        final shownSubtitle = interrupted ? _kInterruptedText : subtitle;
+        final subtitleColor = interrupted ? t.danger : t.mutedForeground;
 
         return Padding(
           padding: const EdgeInsets.fromLTRB(_bannerGap, _bannerGap, _bannerGap, 0),
           child: Semantics(
             button: true,
-            label: '$title. $subtitle',
+            label: '$title. $shownSubtitle',
             child: ExcludeSemantics(
               child: Material(
                 color: fill,
@@ -1754,13 +1808,15 @@ class CallBanner extends StatelessWidget {
                                 ),
                               ),
                               Text(
-                                subtitle,
+                                shownSubtitle,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
                                   fontSize: 12,
                                   height: 1.3,
-                                  color: t.mutedForeground,
+                                  color: subtitleColor,
+                                  fontWeight:
+                                      interrupted ? FontWeight.w600 : null,
                                 ),
                               ),
                             ],
@@ -1805,7 +1861,13 @@ class CallBannerHeader extends StatelessWidget {
           alignment: Alignment.topCenter,
           // A zero-height, full-width box when there is no call, so the strip
           // collapses to nothing rather than leaving a gap above the content.
-          child: state.inCall
+          //
+          // Held open while `callInterrupted` even once `inCall` has gone false
+          // (issue #41): a prolonged desktop lock drains the media peers and
+          // releases the roster cluster within ~12s, so `inCall` drops while the
+          // interruption is still live — and the banner that explains it must not
+          // vanish at the very moment it is most needed.
+          child: state.inCall || state.callInterrupted
               ? CallBanner(state: state)
               : const SizedBox(width: double.infinity),
         ),

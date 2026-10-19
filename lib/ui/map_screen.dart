@@ -169,7 +169,11 @@ class _MapScreenState extends State<MapScreen> {
               // Not in Gameboy mode: the handheld draws its own call banner inside
               // the LCD (see `gameboy_shell.dart`), so an app-themed pill here would
               // both double it and sit outside the screen well's pixel grammar.
-              child: widget.state.inCall && !widget.state.gameboyMode
+              // Held open while `callInterrupted` even once `inCall` has gone false
+              // (issue #41): a prolonged desktop lock drains the call within ~12s,
+              // so the notice that explains the drop must outlast live membership.
+              child: (widget.state.inCall || widget.state.callInterrupted) &&
+                      !widget.state.gameboyMode
                   ? CallBanner(key: const ValueKey('call'), state: widget.state)
                   : widget.state.link.isDisrupted
                       ? _LinkBanner(key: const ValueKey('link'), offline: widget.state.link.isOffline)

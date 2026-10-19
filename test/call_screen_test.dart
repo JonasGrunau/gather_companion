@@ -16,6 +16,7 @@ import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
@@ -189,6 +190,105 @@ void main() {
 
       expect(find.text('In a call with Ada'), findsOneWidget);
       expect(find.text('Tap to see Ada'), findsOneWidget);
+    });
+
+    testWidgets('a desktop lock replaces the tap line with "paused" (issue #41)',
+        (tester) async {
+      final state = AppState()
+        ..debugCall = const CallState()
+        ..debugAttachCollector(FakeCollector())
+        ..setActive(true);
+      // In a call with Ada.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Active'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.inCall, isTrue);
+      await banner(tester, state);
+      // Normally the second line invites a tap.
+      expect(find.text('Tap to see Ada'), findsOneWidget);
+
+      // The desktop on this same account locks: our shared user drops Offline and
+      // the server is tearing the call down under us. The banner says so.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Offline'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.callInterrupted, isTrue);
+      await tester.pump();
+
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+      expect(find.text('Tap to see Ada'), findsNothing);
+
+      // Drain the self-heal's reconnect and cooldown timers so the tree disposes clean.
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    /// An in-call state whose shared user is Active, foreground, with a collector
+    /// attached — everything the self-heal needs to recognise an external Offline
+    /// as a desktop lock rather than our own doing.
+    AppState inCall() {
+      final state = AppState()
+        ..debugCall = const CallState()
+        ..debugAttachCollector(FakeCollector())
+        ..setActive(true);
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Active'),
+        person('ada', 'Ada'),
+      ]));
+      return state;
+    }
+
+    void lock(AppState state) => state.debugApplyRoster(Roster(selfId: 'me', rows: [
+          const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Offline'),
+          person('ada', 'Ada'),
+        ]));
+
+    testWidgets('the notice follows onto the opened call screen, which the tab '
+        'banner cannot reach (issue #41)', (tester) async {
+      final state = inCall();
+      expect(state.inCall, isTrue);
+      // The opaque faces route, opened over the tab surfaces.
+      await show(tester, state);
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsNothing);
+
+      lock(state);
+      expect(state.callInterrupted, isTrue);
+      await tester.pump();
+
+      // Shown on the call screen itself, not only on the surfaces it covers.
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('the tab banner outlasts the call while the lock drags past the '
+        'cluster hold (issue #41)', (tester) async {
+      final state = inCall();
+      lock(state);
+      expect(state.callInterrupted, isTrue);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(body: CallBannerHeader(state: state)),
+      ));
+      await tester.pump();
+      expect(find.byType(CallBanner), findsOneWidget);
+
+      // The lock drags on: the conversation is released and the media peers drain,
+      // so `inCall` goes false — but the desktop has not lifted the hold, so the
+      // notice that explains the drop must stay put.
+      state.debugApplyRoster(const Roster(selfId: 'me', rows: [
+        RosterRow(id: 'me', name: 'Jonas', clusterId: null, availability: 'Offline'),
+      ]));
+      // Past the ≤12s cluster hold, where `inCall` finally drops.
+      await tester.pump(const Duration(seconds: 13));
+      expect(state.inCall, isFalse);
+      expect(state.callInterrupted, isTrue);
+      expect(find.byType(CallBanner), findsOneWidget);
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 4));
     });
 
     testWidgets('two and more, from the conversation alone', (tester) async {

@@ -157,24 +157,50 @@ void main() {
     withClock((clock) {
       final (:state, :call, :collector) = inACall(clock);
 
-      // First lock.
+      // First lock: the during-lock rebuild attempt.
       state.debugApplyRoster(offlineRoster(stillClustered: true));
       clock.flushMicrotasks();
       expect(call.rebuilds, 1);
 
-      // The Mac wakes: we are Active again. The ladder resets.
+      // The Mac wakes: we are Active again. The ladder resets, and the dead session
+      // the lock left behind is rebuilt on the recovery edge (issue #41).
       state.debugApplyRoster(Roster(selfId: 'me', rows: [
         placed('me', cluster: 'c1', account: 'acct-me', availability: 'Active'),
         placed('them', cluster: 'c1', account: 'acct-them', x: 1),
       ]));
       clock.flushMicrotasks();
+      expect(call.rebuilds, 2);
       clock.elapse(const Duration(seconds: 3));
 
       // A second lock is a new episode, fought from scratch.
       state.debugApplyRoster(offlineRoster(stillClustered: true));
       clock.flushMicrotasks();
-      expect(call.rebuilds, 2);
+      expect(call.rebuilds, 3);
       expect(collector.availabilitiesSet, hasLength(2));
+    });
+  });
+
+  test('the desktop unlocking rebuilds the media the lock left dead', () {
+    withClock((clock) {
+      final (:state, :call, :collector) = inACall(clock);
+
+      // Desktop locks: shared user Offline, the banner raised and a during-lock
+      // rebuild attempted.
+      state.debugApplyRoster(offlineRoster(stillClustered: true));
+      clock.flushMicrotasks();
+      expect(call.rebuilds, 1);
+      expect(state.callInterrupted, isTrue);
+
+      // Desktop unlocks: Active again. The session the lock tore down server-side is
+      // rebuilt immediately rather than left for the slow websocket ladder, and the
+      // banner clears.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        placed('me', cluster: 'c1', account: 'acct-me', availability: 'Active'),
+        placed('them', cluster: 'c1', account: 'acct-them', x: 1),
+      ]));
+      clock.flushMicrotasks();
+      expect(call.rebuilds, 2);
+      expect(state.callInterrupted, isFalse);
     });
   });
 
@@ -187,10 +213,11 @@ void main() {
       state.debugApplyRoster(offlineRoster(stillClustered: true));
       clock.flushMicrotasks();
 
-      // Backgrounded Offline is correct, not something to fight.
+      // Backgrounded Offline is correct, not something to fight — and no banner.
       expect(call.rebuilds, 0);
       expect(collector.availabilitiesSet, isEmpty);
       expect(collector.resyncs, 0);
+      expect(state.callInterrupted, isFalse);
     });
   });
 
@@ -262,6 +289,7 @@ void main() {
       expect(state.inCall, isFalse);
       expect(call.rebuilds, 0);
       expect(collector.availabilitiesSet, isEmpty);
+      expect(state.callInterrupted, isFalse);
     });
   });
 }

@@ -804,7 +804,15 @@ class LiveCall implements Call {
     // `_start` disposes the stale session, opens fresh transports, and replays
     // the allow list, the conversation and the subscriptions — but not our
     // producers, since only this class holds the tracks to put back.
-    await _start();
+    //
+    // Published through the single-flight slot (issue #41): a recovery rebuild and
+    // the 1.5s cluster debounce's `setListeningTo` can fire at the same instant, and
+    // `setListeningTo`'s `_sfuOrStart` would otherwise see our not-yet-ready session
+    // and launch a *second* `_start` that disposes the one this rebuild is standing
+    // up — orphaning the producers we are about to republish. Forced (not `??=`)
+    // because a rebuild must discard the stale session, not join an in-flight start
+    // of it; a concurrent `_sfuOrStart` then awaits this start instead of racing one.
+    await (_starting = _start().whenComplete(() => _starting = null));
     String? audioDetail;
     String? videoDetail;
     String? screenDetail;
