@@ -75,7 +75,7 @@ class FakeCollector implements Collector {
   @override
   String? get selfAccountId => kSelfAccountId;
   @override
-  bool get healthy => true;
+  bool healthy = true;
   @override
   bool get hasState => true;
 
@@ -334,4 +334,16 @@ class FakeCollector implements Collector {
 
   @override
   void setReachable(bool reachable) => reachablesSet.add(reachable);
+
+  /// How many times the resume path poked the deaf-socket watchdog, and whether that
+  /// poke should report it acted — the simulator has no socket, so a test sets this to
+  /// stand in for one that went deaf while suspended.
+  int pokeLivenesses = 0;
+  bool pokeLivenessActs = false;
+
+  @override
+  bool pokeLiveness() {
+    pokeLivenesses++;
+    return pokeLivenessActs;
+  }
 }

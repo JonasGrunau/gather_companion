@@ -1073,6 +1073,15 @@ class DirectCollector implements Collector {
   /// production caller, and nothing in the app has any reason to beat by hand.
   void sendHeartbeatNow() => _heartbeat();
 
+  /// Runs the deaf-socket watchdog once, now, outside the publish tick.
+  ///
+  /// [_isSilent] is otherwise only reached from [_flush], which iOS freezes along with
+  /// every other timer while the app is suspended. On resume the app calls this so a
+  /// socket that went deaf in the background is torn down and reconnected immediately,
+  /// rather than lingering until the first tick after thaw. Returns true when it acted.
+  @override
+  bool pokeLiveness() => _isSilent();
+
   void _onFrame(Object? data) {
     if (data is! List<int>) return; // Text on this socket would not be ours.
     Object? frame;

@@ -581,6 +581,31 @@ void main() {
       );
     });
 
+    // pokeLiveness is the resume path's hand-crank on the deaf-socket watchdog (#70):
+    // iOS freezes the publish timer while the app is suspended, so [_isSilent] cannot
+    // fire on its own. It is a thin delegate to [_isSilent] — the deaf path, where it
+    // tears the socket down and reconnects, is covered by the silence tests below, and
+    // the resume wiring that honours its return value lives in the app's
+    // network_reconnect_test. There is no collector-level test of the *deaf* poke
+    // because the 250ms publish tick heals a deaf socket within one interval, so the
+    // poke can only be observed as the sole actor inside a sub-tick race. This asserts
+    // the one deterministic half: on a live socket the poke reports it did nothing.
+    test('pokeLiveness leaves a live socket alone', () async {
+      // The common resume case: a glance at the phone with the socket still carrying
+      // frames. The poke must report it did nothing and not churn the connection.
+      final c = build(silenceLimit: const Duration(milliseconds: 400))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      // A fresh frame keeps the socket demonstrably alive right before the poke.
+      conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(c.pokeLiveness(), isFalse, reason: 'a live socket has nothing to tear down');
+      expect(gather.connections, hasLength(1), reason: 'and must not be reconnected');
+      expect(c.healthy, isTrue);
+    });
+
     test('a socket still carrying heartbeats is left alone', () async {
       // The other half, and the one that matters more: reconnecting a working socket
       // every few seconds would be worse than the bug being fixed. Nothing here is
