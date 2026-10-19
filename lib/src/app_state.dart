@@ -2532,15 +2532,34 @@ class AppState extends ChangeNotifier {
   /// true is the one signal that the door — not just the request — is open. Clears
   /// the pending room first so a roster that lands while the walk is being laid does
   /// not fire a second one.
-  void _tryEnterPending() {
-    final room = _pendingAccess;
-    if (room == null || !canEnter(room)) return;
+  Future<void> _tryEnterPending() async {
+    final pending = _pendingAccess;
+    if (pending == null) return;
+    // Ask the *current* map, not the snapshot taken at knock time. Acceptance
+    // rebuilds the room with a fresh `admits`, and [SpaceMapBuilder] hands back new
+    // [SpaceRoom] objects — the one latched in [_pendingAccess] keeps the shut
+    // `admits` it was born with and would read `canEnter` false forever.
+    final room = _roomByStableId(pending.stableId) ?? pending;
+    if (!canEnter(room)) return;
     _pendingAccess = null;
-    _notices.add("You're in — walking over.");
-    unawaited(goToRoom(
+    // Announce on the outcome, not ahead of it. [goToRoom] returns a reason when no
+    // tile is free or the walk cannot start; saying "walking over" into a walk that
+    // never began is the dead end this whole path exists to remove.
+    final failed = await goToRoom(
       room,
       toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
-    ));
+    );
+    if (_notices.isClosed) return;
+    _notices.add(failed ?? "You're in — walking over.");
+  }
+
+  /// The live room carrying [stableId], or null when the floor plan has not placed it.
+  SpaceRoom? _roomByStableId(String? stableId) {
+    if (stableId == null) return null;
+    for (final room in map?.rooms ?? const <SpaceRoom>[]) {
+      if (room.stableId == stableId) return room;
+    }
+    return null;
   }
 
   /// A walk the office should keep the camera on until it arrives.
@@ -2867,7 +2886,7 @@ class AppState extends ChangeNotifier {
           // Last: this roster may carry the `AreaAccessRequest` acceptance that opens
           // a door we knocked on, and the walk should start on the same roster that
           // rebuilt the map rather than a beat later (issue #69).
-          _tryEnterPending();
+          unawaited(_tryEnterPending());
         }),
       )
       ..add(

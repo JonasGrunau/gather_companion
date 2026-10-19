@@ -551,6 +551,32 @@ void main() {
     });
   });
 
+  test('a lone access-request acceptance republishes the roster (#69)', () async {
+    // When a host admits a knock in an otherwise-idle space, the only patch is the
+    // `AreaAccessRequest` addmodel — nobody moved. Map rows deliberately do not
+    // republish the roster, but this one must: the auto-walk that waits for the door
+    // (`AppState._tryEnterPending`) is pumped off the roster and would otherwise hang
+    // until an unrelated presence patch happened by.
+    final c = build()..start();
+    final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+    await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+    var after = 0;
+    final sub = c.rosters.listen((_) => after++);
+    conn.delta([
+      {
+        'op': 'addmodel',
+        'model': 'AreaAccessRequest',
+        'data': {'id': 'aar-1', 'areaId': 'area-7', 'spaceUserId': 'me-1'},
+      },
+    ]);
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await sub.cancel();
+
+    expect(after, greaterThan(0),
+        reason: 'the admit alone must publish a roster to pump the auto-walk');
+  });
+
   test('a reconnect gets a whole fresh dump, which is why resync is a reconnect',
       () async {
     final c = build()..start();
