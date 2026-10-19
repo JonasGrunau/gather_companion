@@ -1022,6 +1022,14 @@ class DirectCollector implements Collector {
   /// guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
   bool _isSilent() {
     if (!_reachable) return false;
+    // No live socket means recovery is already in flight — a retry armed by `onDone`,
+    // or a connect in progress — and there is nothing to tear down. Acting anyway would
+    // `_clearTimers()` that pending retry and `_scheduleRetry()` a fresh one at *doubled*
+    // backoff, delaying recovery. It also matters on resume: `pokeLiveness()` returning
+    // true here makes `verifyLink()` skip its `resync()`, so a false keeps the immediate,
+    // backoff-reset reconnect that `resync()` gives (the stale `_lastFrameAt` left by a
+    // self-closed socket would otherwise read as deaf). See #70.
+    if (_ws == null) return false;
     final last = _lastFrameAt;
     if (last == null) return false;
     final since = DateTime.now().difference(last);
