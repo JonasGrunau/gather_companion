@@ -180,6 +180,15 @@ class SfuSession {
   final Set<String> _awaitingAddr = {};
   Timer? _addrRetry;
 
+  /// How long the address-retry waits before each re-ask.
+  ///
+  /// One second to start, doubling to a ten-second cap. The first delay is the
+  /// whole point: a colleague walks up while their own client is still
+  /// registering its stream, so the router has no address for a breath — and a
+  /// retry a second later catches it, where the old flat ten-second period was
+  /// slower than a person's patience and made them restart into the same wait.
+  Duration _addrRetryBackoff = const Duration(seconds: 1);
+
   /// Nodes whose socket is currently down, so a later `healthy` reads as a
   /// reconnection rather than as the first connect.
   final Set<String> _nodeDown = {};
@@ -206,6 +215,15 @@ class SfuSession {
 
   /// Fires whenever [remotes] changes — a track arriving, going, or being paused.
   Stream<List<RemoteMedia>> get remoteChanges => _remotes.stream;
+
+  /// Peers we have subscribed to but the router has no media address for yet.
+  ///
+  /// They are connecting, not silent: somebody who just walked up while their
+  /// own client is still registering its stream. The UI marks their tile so a
+  /// person reads "connecting…" rather than mistaking them for a colleague
+  /// sitting with mic and camera off — and so nobody restarts the app waiting on
+  /// a peer the retry is already chasing. Changes here ride [remoteChanges].
+  Set<String> get connectingPeers => Set.unmodifiable(_awaitingAddr);
 
   /// Whether we are ready to publish. False until [start] has run through.
   bool get ready => _device?.loaded == true && _node != null;
@@ -983,8 +1001,12 @@ class SfuSession {
         // diffs against the desired set, so a peer quietly removed from it is
         // never asked for again.
         _log('sfu: the router cannot place $srcId yet; will ask again');
-        _awaitingAddr.add(srcId);
-        _scheduleAddrRetry();
+        if (_awaitingAddr.add(srcId)) {
+          _publishRemotes();
+          _expediteAddrRetry();
+        } else {
+          _scheduleAddrRetry();
+        }
         return;
       }
 
@@ -994,7 +1016,7 @@ class SfuSession {
         'srcStreamId': _spaceId,
         'requested': true,
       });
-      _awaitingAddr.remove(srcId);
+      if (_awaitingAddr.remove(srcId)) _publishRemotes();
       _log('sfu: subscribed to $srcId on $url');
 
       // The quality we asked for lives on the node too, so a peer we have just
@@ -1004,29 +1026,70 @@ class SfuSession {
       if (_priority.contains(srcId)) _sendPriority();
     } on Object catch (error) {
       _log('sfu: asking for $srcId failed: $error');
-      _awaitingAddr.add(srcId);
-      _scheduleAddrRetry();
+      if (_awaitingAddr.add(srcId)) {
+        _publishRemotes();
+        _expediteAddrRetry();
+      } else {
+        _scheduleAddrRetry();
+      }
     }
   }
 
   /// Keep asking the router about people it could not place.
   ///
-  /// Ten seconds is slow enough to be free — one small frame per unplaced peer —
-  /// and quick enough that somebody who walks up while their own client is still
-  /// connecting is heard within a breath rather than never.
+  /// Shaped like [_scheduleRecvHeal]: a self-cancelling one-shot with a
+  /// reentrancy guard and a `_stopped` check, re-arming with a growing
+  /// [_addrRetryBackoff] rather than a flat period. The first re-ask lands a
+  /// second after the router said "no address yet", which is the window a
+  /// walk-up colleague's own client needs to finish registering — fast enough
+  /// that waiting beats restarting, where the old flat ten seconds was slower
+  /// than the person and sent them into a leave/rejoin that only re-armed the
+  /// same wait. It widens to a ten-second cap so a peer who never places costs
+  /// one small frame, not a busy-loop.
   void _scheduleAddrRetry() {
     if (_addrRetry != null || _stopped) return;
-    _addrRetry = Timer.periodic(const Duration(seconds: 10), (timer) {
+    _addrRetry = Timer(_addrRetryBackoff, () {
+      _addrRetry = null;
+
+      final pruned = _awaitingAddr.length;
       _awaitingAddr.removeWhere((srcId) => !_subscribed.contains(srcId));
+      if (_awaitingAddr.length != pruned) _publishRemotes();
+
       if (_awaitingAddr.isEmpty || _stopped) {
-        timer.cancel();
-        _addrRetry = null;
+        _addrRetryBackoff = const Duration(seconds: 1);
         return;
       }
+
       for (final srcId in _awaitingAddr.toList()) {
         unawaited(_requestPeer(srcId));
       }
+
+      final next = _addrRetryBackoff.inSeconds * 2;
+      _addrRetryBackoff = Duration(seconds: next > 10 ? 10 : next);
+      _scheduleAddrRetry();
     });
+  }
+
+  /// Pull the next address retry forward for a peer that has only just started
+  /// awaiting.
+  ///
+  /// The retry timer and its [_addrRetryBackoff] are shared across every
+  /// awaiting peer, so while one unplaced peer widens the backoff toward its
+  /// ten-second cap, a *second* walk-up arriving then would inherit that long
+  /// wait for its own first re-ask — the very stall this fix set out to kill,
+  /// just for the second arrival. Reset the backoff to one second and re-arm so
+  /// the newcomer is re-asked within the window its client needs. Only ever
+  /// brings the deadline forward: an already-armed one-second timer is as fast
+  /// as we go, so it is left alone rather than cancelled and postponed.
+  void _expediteAddrRetry() {
+    if (_stopped) return;
+    if (_addrRetry != null && _addrRetryBackoff <= const Duration(seconds: 1)) {
+      return;
+    }
+    _addrRetryBackoff = const Duration(seconds: 1);
+    _addrRetry?.cancel();
+    _addrRetry = null;
+    _scheduleAddrRetry();
   }
 
   Timer? _recvHealTimer;
@@ -1276,7 +1339,7 @@ class SfuSession {
   /// packets we drop on the floor, which is somebody's battery.
   Future<void> unsubscribe(String srcId) async {
     if (!_subscribed.remove(srcId)) return;
-    _awaitingAddr.remove(srcId);
+    if (_awaitingAddr.remove(srcId)) _publishRemotes();
     _spatial.remove(srcId);
 
     final url = _peerNode.remove(srcId);
@@ -1986,6 +2049,7 @@ class SfuSession {
     _turnTimer = null;
     _addrRetry?.cancel();
     _addrRetry = null;
+    _addrRetryBackoff = const Duration(seconds: 1);
     _recvHealTimer?.cancel();
     _recvHealTimer = null;
     _consumeDenied.clear();

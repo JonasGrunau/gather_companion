@@ -80,6 +80,7 @@ class CallTile {
     this.speaking = false,
     this.reactions = const [],
     this.handRaised = false,
+    this.connecting = false,
   });
 
   /// `SpaceUser.id` when we could place them, otherwise the media `srcId`. Only
@@ -106,6 +107,15 @@ class CallTile {
   /// stays until lowered. Ours comes from `AppState.myHandRaised` (local-first);
   /// everybody else's from their `RosterRow.handRaised`.
   final bool handRaised;
+
+  /// Whether the SFU is still placing this peer — subscribed, no media yet.
+  ///
+  /// A walk-up colleague whose own client is still registering reads as this,
+  /// not as a silent one: the tile says "connecting…" so the moment is legible
+  /// and nobody restarts the app waiting on a peer the session is already
+  /// chasing. Cleared the instant their media lands and they become a real
+  /// participant. Sourced from `CallState.connecting`.
+  final bool connecting;
 
   /// Whether this tile has a frame to show, as opposed to a face to draw.
   ///
@@ -658,6 +668,12 @@ List<CallTile> _tiles(AppState state) {
       speaking: row.speaking ?? false,
       reactions: state.reactions.forPerson(row.id),
       handRaised: row.handRaised,
+      // The one bucket an unplaced peer can land in: subscribed, no media, so
+      // never a participant. Bridged to the media plane's srcId through
+      // `userAccountId`, the same join every other srcId lookup makes. This is
+      // what tells a walk-up colleague apart from somebody sitting silent.
+      connecting: row.userAccountId != null &&
+          call.connecting.contains(row.userAccountId),
     ));
   }
   return tiles;
@@ -1411,22 +1427,47 @@ class _TileFrame extends StatelessWidget {
               // One height for the row, set by the name. Each plate used to size
               // itself, so the mute pip — a 13-point glyph — sat a few points
               // shorter than the line of text beside it.
-              child: IntrinsicHeight(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Flexible(child: _Plate(text: tile.label)),
-                    if (tile.muted) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.mic_off, text: ''),
-                    ],
-                    if (tile.sharingScreen) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.screen_share_outlined, text: ''),
-                    ],
-                  ],
-                ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // A spotlight thumbnail is 72 logical pixels wide, leaving
+                  // ~56 for this row after its insets — too little for the name
+                  // plus a spelt-out "Connecting…", which would overflow and
+                  // clip. Below this width the status drops to its icon alone,
+                  // keeping a screen-reader label; the roomier overview and big
+                  // tiles keep the words.
+                  final compact = constraints.maxWidth < 120;
+                  return IntrinsicHeight(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Flexible(child: _Plate(text: tile.label)),
+                        // Stands in for the mute pip while a peer is mid-connect:
+                        // they have no track yet, so "muted" would be a guess,
+                        // but "connecting…" is the true state and the one that
+                        // tells a person to wait a beat rather than restart.
+                        if (tile.connecting) ...[
+                          const SizedBox(width: 6),
+                          Semantics(
+                            label: 'Connecting…',
+                            child: _Plate(
+                              icon: Icons.sync,
+                              text: compact ? '' : 'Connecting…',
+                            ),
+                          ),
+                        ] else if (tile.muted) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(icon: Icons.mic_off, text: ''),
+                        ],
+                        if (tile.sharingScreen) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(
+                              icon: Icons.screen_share_outlined, text: ''),
+                        ],
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
           ],
