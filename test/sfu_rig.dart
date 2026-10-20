@@ -52,6 +52,14 @@ class Rig {
   /// carry a stale token: seed `{'produce': '...TokenVerificationFailed...'}`.
   final Map<String, String> nodeRefusals = {};
 
+  /// Node urls whose `start()` should hang until [releaseConnect] is called, so a
+  /// test can keep a node connecting while a second caller races to reuse it.
+  final Set<String> slowToConnect = {};
+  final Map<String, Completer<void>> _connectGates = {};
+
+  /// Let a node held by [slowToConnect] finish connecting.
+  void releaseConnect(String url) => _connectGates[url]?.complete();
+
   int republishes = 0;
   bool _closed = false;
 
@@ -120,6 +128,9 @@ class Rig {
             ],
           });
     socket.failingWith.addAll(nodeRefusals);
+    if (slowToConnect.contains(url)) {
+      socket.startGate = (_connectGates[url] = Completer<void>()).future;
+    }
     return socket;
   }
 

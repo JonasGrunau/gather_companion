@@ -160,6 +160,16 @@ class SfuSession {
   /// half the room in a large one.
   final Map<String, SfuSignalling> _nodes = {};
 
+  /// Readiness of each node while it connects and joins, keyed by url.
+  ///
+  /// A node is placed in [_nodes] the instant it is created — before its socket
+  /// connects and before [_joinNode] replays the allow list — so a concurrent
+  /// caller that finds it in the pool would otherwise consume against a node the
+  /// SFU has not yet authorised us on. Every caller awaits this future, so the
+  /// second peer to land on a shared node waits for the first caller's join
+  /// rather than racing past it. Removed once the node is ready or has failed.
+  final Map<String, Future<void>> _nodeReady = {};
+
   /// Which node each peer's media is on, learned from the router.
   final Map<String, String> _peerNode = {};
 
@@ -363,37 +373,53 @@ class SfuSession {
   /// a far node reaches the same reconciliation as one about a colleague on ours.
   Future<SfuSignalling> _nodeAt(String url) async {
     final existing = _nodes[url];
-    if (existing != null) return existing;
+    if (existing != null) {
+      // The node is pooled, but a concurrent caller may still be connecting and
+      // joining it — wait for that to finish before handing back a socket that
+      // cannot yet consume. If the shared attempt failed, the node is gone from
+      // the pool, so recurse to start a fresh one.
+      await _nodeReady[url];
+      final pooled = _nodes[url];
+      return pooled ?? await _nodeAt(url);
+    }
 
     final node = _open(url, null);
     _nodes[url] = node;
     _nodeSubscriptions[url] = node.notifications.listen(_onNotification);
+    final ready = Completer<void>();
+    _nodeReady[url] = ready.future;
     try {
       await _connectNode(node, url);
+
+      // Subscribed *after* the first connect, so the `healthy` event that start()
+      // just consumed does not read as a reconnection.
+      _nodeHealth[url] = node.statuses.listen((status) {
+        if (!status.healthy) {
+          _nodeDown.add(url);
+          return;
+        }
+        if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
+      });
+
+      // Join before the caller consumes. A freshly connected node has only a
+      // token-authed socket; without the allow list and conversation metadata it
+      // refuses every consume (issue #74). Awaited so the first consume-request
+      // follows the join.
+      await _joinNode(node);
     } on Object {
       // Do not leave a half-open node in the pool: the next caller would reuse it
       // and get `not connected` rather than a fresh attempt.
       _nodes.remove(url);
       await _nodeSubscriptions.remove(url)?.cancel();
+      await _nodeHealth.remove(url)?.cancel();
       await node.dispose();
       rethrow;
+    } finally {
+      // Wake any concurrent waiters whichever way this went; a failure leaves the
+      // pool empty so they recreate, a success leaves the ready node in place.
+      ready.complete();
+      _nodeReady.remove(url);
     }
-
-    // Subscribed *after* the first connect, so the `healthy` event that start()
-    // just consumed does not read as a reconnection.
-    _nodeHealth[url] = node.statuses.listen((status) {
-      if (!status.healthy) {
-        _nodeDown.add(url);
-        return;
-      }
-      if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
-    });
-
-    // Join before the caller consumes. A freshly connected node has only a
-    // token-authed socket; without the allow list and conversation metadata it
-    // refuses every consume (issue #74). Awaited so the first consume-request
-    // follows the join.
-    await _joinNode(node);
     return node;
   }
 
@@ -416,6 +442,12 @@ class SfuSession {
         await node.start();
         return;
       } on SfuException catch (error) {
+        // Stop if the session was torn down or this node was dropped/replaced
+        // while connecting. `stop()`/`dispose()` settle the pending `start()`
+        // with a `closed while connecting` SfuException, and calling `start()`
+        // again resets the socket's stopped flag and reopens a node we meant to
+        // discard — so only a genuinely slow-but-live node retries.
+        if (_stopped || !identical(_nodes[url], node)) rethrow;
         if (attempt >= _connectAttempts) rethrow;
         _log('sfu: $url slow to connect '
             '(attempt $attempt/$_connectAttempts); retrying: $error');
@@ -1339,6 +1371,13 @@ class SfuSession {
     for (final node in nodes) {
       await _joinNode(node);
     }
+
+    // The joins above awaited a round trip, during which unsubscribe() may have
+    // dropped peers or a consume may have landed. Re-narrow to peers that are
+    // still stranded and subscribed, so we neither restore a departed peer's
+    // grant nor close a consumer that recovered while we waited.
+    if (_stopped) return;
+    stranded = stranded.intersection(_strandedPeers());
 
     for (final srcId in stranded) {
       _peerNode.remove(srcId);

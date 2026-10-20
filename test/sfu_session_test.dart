@@ -489,6 +489,50 @@ void main() {
         clock.elapse(const Duration(seconds: 1));
       });
     });
+
+    test('two peers sharing a slow node both wait for its join before consuming',
+        () async {
+      rig.session.setAllowed({them, other});
+      rig.session.setConversation(clusterId: 'c1', meetingId: 'm1');
+      await rig.session.start();
+
+      // Both colleagues' media is on the same secondary node, and that node is
+      // slow to connect — the window in which it sits in the pool connected to
+      // nothing but a token-authed socket, un-joined.
+      rig.addresses[them] = nodeB;
+      rig.addresses[other] = nodeB;
+      rig.slowToConnect.add(nodeB);
+
+      final first = rig.session.subscribe(them);
+      final second = rig.session.subscribe(other);
+      await settle();
+      await settle();
+
+      expect(rig.sockets.containsKey(nodeB), isTrue,
+          reason: 'the first caller opened the node');
+      expect(rig.node(nodeB).has('consume-request'), isFalse,
+          reason: 'neither caller may consume a node that is still connecting '
+              'and has not been joined');
+
+      rig.releaseConnect(nodeB);
+      await Future.wait([first, second]);
+      await settle();
+
+      // The second caller reused the pooled node rather than opening its own, so
+      // it is the one that would have raced past the join. Every consume-request
+      // on nodeB — both callers' — still lands after the join (issue #74).
+      final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+      final metadata = order.indexOf('set-player-conversation-metadata');
+      final firstRequest = order.indexOf('consume-request');
+      final requests =
+          order.where((m) => m == 'consume-request').length;
+      expect(metadata, greaterThan(-1));
+      expect(firstRequest, greaterThan(-1));
+      expect(requests, 2, reason: 'both peers were requested');
+      expect(metadata, lessThan(firstRequest),
+          reason: 'a caller that reused the pooled node must await its join, '
+              'not race past it onto an unauthorised socket');
+    });
   });
 
   group('publishing', () {
