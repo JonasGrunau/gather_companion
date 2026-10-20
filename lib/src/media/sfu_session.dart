@@ -321,8 +321,9 @@ class SfuSession {
     _device = device;
     _log('sfu: device loaded');
 
-    _replayAllow(node);
-    _sendConversation();
+    // The allow list and conversation metadata are replayed by [_nodeAt] when it
+    // first connects a node, and kept current on every node by [allow] and
+    // [_sendConversation], so there is nothing node-specific left to do here.
   }
 
   /// Re-send the allow list to [node].
@@ -335,6 +336,22 @@ class SfuSession {
     for (final dstId in _allowed) {
       node.emit('consume-allow', {'dstId': dstId, 'allowed': true});
     }
+  }
+
+  /// Perform the per-node join the SFU authorises consumes against.
+  ///
+  /// The desktop does this on **every** node it connects to, not just the one it
+  /// publishes from: `playerConnectedSFU` replays the allow list and the
+  /// conversation metadata before the first consume, because both live on the
+  /// node. We used to do it only for our own assigned node, so a colleague whose
+  /// media landed on a *second* node got a socket we had connected but never
+  /// joined — every `consume-request` came back `consume-not-allowed`, forever,
+  /// and no restart could clear it because the node assignment is durable
+  /// (issue #74). Awaited so the first consume on this node is ordered strictly
+  /// after the join.
+  Future<void> _joinNode(SfuSignalling node) async {
+    _replayAllow(node);
+    await _sendConversationTo(node);
   }
 
   Timer? _turnTimer;
@@ -352,7 +369,7 @@ class SfuSession {
     _nodes[url] = node;
     _nodeSubscriptions[url] = node.notifications.listen(_onNotification);
     try {
-      await node.start();
+      await _connectNode(node, url);
     } on Object {
       // Do not leave a half-open node in the pool: the next caller would reuse it
       // and get `not connected` rather than a fresh attempt.
@@ -371,7 +388,39 @@ class SfuSession {
       }
       if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
     });
+
+    // Join before the caller consumes. A freshly connected node has only a
+    // token-authed socket; without the allow list and conversation metadata it
+    // refuses every consume (issue #74). Awaited so the first consume-request
+    // follows the join.
+    await _joinNode(node);
     return node;
+  }
+
+  /// How many times a node's connect is given before it is treated as down.
+  static const _connectAttempts = 3;
+
+  /// Connect [node], riding out a slow accept rather than bouncing on it.
+  ///
+  /// A secondary node can be slow to answer the socket — measured at a full ten
+  /// seconds on an overloaded instance (issue #74) — while the underlying socket
+  /// keeps retrying beneath a `start()` that has already timed out. A single
+  /// attempt throws on that first timeout, which disposes the half-open node and
+  /// sends the peer all the way back out to the address-retry loop. Re-calling
+  /// `start()` rejoins the same in-flight attempt with a fresh timeout, so a node
+  /// that is merely slow connects on a later go instead; a node that never answers
+  /// still surfaces after [_connectAttempts].
+  Future<void> _connectNode(SfuSignalling node, String url) async {
+    for (var attempt = 1;; attempt++) {
+      try {
+        await node.start();
+        return;
+      } on SfuException catch (error) {
+        if (attempt >= _connectAttempts) rethrow;
+        _log('sfu: $url slow to connect '
+            '(attempt $attempt/$_connectAttempts); retrying: $error');
+      }
+    }
   }
 
   /// The router's answer to "where is this person's media?".
@@ -913,7 +962,13 @@ class SfuSession {
   void allow(String dstId, {required bool allowed}) {
     if (dstId == _srcId) return;
     if (allowed ? !_allowed.add(dstId) : !_allowed.remove(dstId)) return;
-    _node?.emit('consume-allow', {'dstId': dstId, 'allowed': allowed});
+    // The allow list lives on each node, so a change has to reach every node we
+    // hold a socket to — not just our own. A colleague on a secondary node is
+    // authorised against that node, and telling only `_node` leaves them denied
+    // (issue #74).
+    for (final node in _nodes.values) {
+      node.emit('consume-allow', {'dstId': dstId, 'allowed': allowed});
+    }
   }
 
   /// Which conversation we are publishing into, as the SFU understands it.
@@ -942,18 +997,29 @@ class SfuSession {
   String? _meetingId;
 
   void _sendConversation() {
-    final node = _node;
-    if (node == null) return;
-    unawaited(
-      node.sendWithResponse('set-player-conversation-metadata', {
+    // Every node we talk to needs to know which conversation we are in, not just
+    // the one we publish from — the SFU authorises consumes on a secondary node
+    // against it too (issue #74).
+    for (final node in _nodes.values) {
+      unawaited(_sendConversationTo(node));
+    }
+  }
+
+  /// Tell one [node] which conversation we are in, swallowing its refusal.
+  ///
+  /// Awaitable so [_joinNode] can order the first consume after it; the error is
+  /// logged rather than thrown because a refused metadata is not worth tearing a
+  /// node down over — the consume that follows will say plainly whether the node
+  /// authorised us.
+  Future<void> _sendConversationTo(SfuSignalling node) async {
+    try {
+      await node.sendWithResponse('set-player-conversation-metadata', {
         'meetingId': _meetingId ?? '',
         'clusterId': _clusterId ?? '',
-      }).then(
-        (_) {},
-        onError: (Object error) =>
-            _log('sfu: the conversation metadata was refused: $error'),
-      ),
-    );
+      });
+    } on Object catch (error) {
+      _log('sfu: the conversation metadata was refused: $error');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1259,6 +1325,21 @@ class SfuSession {
   Future<void> _healStranded(Set<String> stranded) async {
     _log('sfu: ${stranded.length} subscribed peer(s) denied while the room is '
         'receiving; re-requesting them');
+
+    // A denial means that node never authorised us, so re-join each node a
+    // stranded peer sits on before re-requesting — re-sending the consume alone
+    // loops forever (issue #74). Done once per node, against the cached socket,
+    // before the peer-node mapping below is cleared.
+    final nodes = <SfuSignalling>{};
+    for (final srcId in stranded) {
+      final url = _peerNode[srcId];
+      final node = url == null ? null : _nodes[url];
+      if (node != null) nodes.add(node);
+    }
+    for (final node in nodes) {
+      await _joinNode(node);
+    }
+
     for (final srcId in stranded) {
       _peerNode.remove(srcId);
       _announced.remove(srcId);
@@ -1987,10 +2068,14 @@ class SfuSession {
 
     final moved = _forgetPeersOn(url);
 
+    // A reconnected socket is joined-fresh too: the node forgot our allow list and
+    // conversation the moment it dropped, so re-join it before re-requesting its
+    // peers or every consume comes back denied (issue #74). Applies to any node,
+    // not just the one we publish from.
+    await _joinNode(node);
+
     if (url == _sfuAddr) {
       _closeSendTransportQuietly();
-      _replayAllow(node);
-      _sendConversation();
       _announceRepublish();
     }
 

@@ -388,6 +388,109 @@ void main() {
     });
   });
 
+  group('a peer on a secondary node (issue #74)', () {
+    const other = 'acct-other';
+
+    test('is joined before it is asked for — allow list and conversation '
+        'metadata, then consume-request', () async {
+      rig.session.setAllowed({them});
+      rig.session.setConversation(clusterId: 'c1', meetingId: 'm1');
+      await rig.session.start();
+
+      // Their media lives on a different node than the one we publish from.
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+
+      final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+      expect(
+        order,
+        containsAll(const [
+          'consume-allow',
+          'set-player-conversation-metadata',
+          'consume-request',
+        ]),
+      );
+      final request = order.indexOf('consume-request');
+      expect(order.indexOf('set-player-conversation-metadata'), lessThan(request),
+          reason: 'a node that has not been joined refuses the consume — the '
+              'whole of issue #74');
+      expect(order.indexOf('consume-allow'), lessThan(request));
+      expect(rig.node(nodeB).argsFor('set-player-conversation-metadata'),
+          {'meetingId': 'm1', 'clusterId': 'c1'});
+      expect(
+        rig.node(nodeB).sent.where(
+            (f) => f.method == 'consume-allow' && f.args['dstId'] == them),
+        isNotEmpty,
+      );
+    });
+
+    test('a later allow and conversation change reach it, not just our own node',
+        () async {
+      rig.session.setAllowed({them});
+      await rig.session.start();
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+      rig.node(nodeB).drain();
+
+      rig.session.allow(other, allowed: true);
+      rig.session.setConversation(clusterId: 'c2', meetingId: 'm2');
+      await settle();
+
+      expect(
+        rig.node(nodeB).sent.where(
+            (f) => f.method == 'consume-allow' && f.args['dstId'] == other),
+        isNotEmpty,
+        reason: 'the allow list lives on every node we hold a socket to',
+      );
+      expect(rig.node(nodeB).argsFor('set-player-conversation-metadata'),
+          {'meetingId': 'm2', 'clusterId': 'c2'});
+    });
+
+    test('a denial on it re-joins the node before re-requesting, even while the '
+        'room already has sound', () {
+      fakeAsync((clock) {
+        rig.session.setAllowed({them, other});
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // One peer on our node, consumed: the room is receiving, so the partial
+        // heal (not the full rebuild) is what runs.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes, isNotEmpty);
+
+        // Another peer on a second node, denied.
+        rig.addresses[other] = nodeB;
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node(nodeB).push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+
+        rig.node(nodeB).drain();
+
+        // Grace window passes; the heal re-joins nodeB, then re-asks.
+        clock.elapse(const Duration(seconds: 6));
+        clock.flushMicrotasks();
+
+        final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+        final request = order.indexOf('consume-request');
+        expect(request, greaterThan(-1),
+            reason: 'the denied peer should be re-requested');
+        expect(order.contains('set-player-conversation-metadata'), isTrue,
+            reason: 'a denial means the node never authorised us — re-join it');
+        expect(order.indexOf('set-player-conversation-metadata'),
+            lessThan(request),
+            reason: 're-sending the consume alone loops forever');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+  });
+
   group('publishing', () {
     test('produce carries the tag Gather keys on, and keeps the producer',
         () async {
