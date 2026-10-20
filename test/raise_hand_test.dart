@@ -14,7 +14,8 @@ import 'package:gather_companion/src/app_state.dart';
 import 'fake_call.dart';
 
 void main() {
-  RosterRow row(String id, {String? cluster, bool handRaised = false}) =>
+  RosterRow row(String id,
+          {String? cluster, bool handRaised = false, num? handRaisedAt}) =>
       RosterRow(
         id: id,
         name: id,
@@ -22,6 +23,7 @@ void main() {
         clusterId: cluster,
         connected: true,
         handRaised: handRaised,
+        handRaisedAt: handRaisedAt,
         x: 3,
         y: 4,
       );
@@ -161,5 +163,127 @@ void main() {
     ]));
 
     expect(rebuilds.length, greaterThan(before));
+  });
+
+  group('the line of raised hands is numbered by who went up first', () {
+    test('earliest hand is first, latest is last', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca', 'mara'];
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 300),
+        row('mara', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+        row('nils', cluster: 'c1', handRaised: true, handRaisedAt: 200),
+      ]));
+
+      // Ordered by handRaisedAt, not by roster order: Mara (100) is first in line.
+      expect(state.handQueuePositions, {'mara': 1, 'nils': 2, 'luca': 3});
+    });
+
+    test('our own hand takes its place by its timestamp', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca'];
+      state.setHandRaised(true);
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', handRaised: true, handRaisedAt: 150),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+      ]));
+
+      expect(state.handQueuePositions, {'luca': 1, 'me': 2});
+    });
+
+    test('a hand with no timestamp sorts to the back', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca', 'mara'];
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+        // No timestamp — an unexpected wire shape, or not seen yet. Still in line,
+        // just at the back rather than jumping the queue.
+        row('mara', cluster: 'c1', handRaised: true),
+      ]));
+
+      expect(state.handQueuePositions, {'luca': 1, 'mara': 2});
+    });
+
+    test('our optimistic raise is in line before the roster echoes it', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca'];
+      state.setHandRaised(true);
+      // Roster has not placed our hand yet — only Luca carries one.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+      ]));
+
+      // Our hand still shows, at the back until its own timestamp arrives.
+      expect(state.handQueuePositions, {'luca': 1, 'me': 2});
+    });
+
+    test('only hands in our own cluster are counted', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca'];
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+        // Another conversation entirely — not our line.
+        row('otto', cluster: 'c2', handRaised: true, handRaisedAt: 50),
+      ]));
+
+      expect(state.handQueuePositions, {'luca': 1});
+    });
+
+    test('no hands up is an empty line', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca'];
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1'),
+      ]));
+
+      expect(state.handQueuePositions, isEmpty);
+    });
+
+    test('lowering our own hand locally drops us from the line at once', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca'];
+      // We went up first, Luca behind us: us 1, Luca 2.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 200),
+      ]));
+      expect(state.handQueuePositions, {'me': 1, 'luca': 2});
+
+      // We lower locally — the self tile drops its badge now, so the line must stop
+      // counting us now. The roster still carries our hand until the echo, but Luca
+      // reads 1, not a stale 2. See [AppState.handQueuePositions].
+      state.setHandRaised(false);
+      expect(state.myHandRaised, isFalse);
+      expect(state.handQueuePositions, {'luca': 1});
+    });
+
+    test('a re-raise that only reorders the line still wakes the screen', () {
+      final (:state, :rebuilds) = wired();
+      state.debugHuddle = ['luca', 'mara'];
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 100),
+        row('mara', cluster: 'c1', handRaised: true, handRaisedAt: 200),
+      ]));
+      expect(state.handQueuePositions, {'luca': 1, 'mara': 2});
+      final before = rebuilds.length;
+
+      // Same two hands up — the set is unchanged — but Luca lowered and re-raised,
+      // so his timestamp is now the later one and the line flips. The screen reads
+      // the order, so this roster has to wake it even though the set stood still.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        row('me', cluster: 'c1'),
+        row('luca', cluster: 'c1', handRaised: true, handRaisedAt: 300),
+        row('mara', cluster: 'c1', handRaised: true, handRaisedAt: 200),
+      ]));
+
+      expect(state.handQueuePositions, {'mara': 1, 'luca': 2});
+      expect(rebuilds.length, greaterThan(before));
+    });
   });
 }
