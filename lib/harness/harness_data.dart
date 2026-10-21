@@ -15,6 +15,9 @@ library;
 
 import 'package:gather_client/gather_client.dart';
 
+import '../src/app_state.dart';
+import '../src/calendar.dart';
+import '../src/google_calendar.dart';
 import '../src/media/call.dart';
 
 /// One made-up colleague.
@@ -190,3 +193,98 @@ RosterRow officeRow(CallPerson p, ({int x, int y}) at, {String direction = 'Down
       speaking: speaking,
       handRaised: handRaised,
     );
+
+// ---- the Plans tab ----------------------------------------------------------
+//
+// The app harness boots with an empty keychain, so the Plans tab would read
+// "No plans yet" and the timeline redesign could not be eyeballed on a bare sim.
+// This seeds a demo day that exercises every branch of the timeline at once:
+// side-by-side double-bookings, a long gap that collapses to a faded band, a
+// leading "Free till HH:MM" the morning after, and a clear day that reads "Free
+// for the day". Local plans only — the app harness carries no Google client, so
+// all-day banners and the colleague sheet still need a real `--dart-define` build.
+
+/// A spread of planned meetings, anchored to [now], that lights up the timeline.
+///
+/// Today's cluster is pinned relative to [now] (not a wall-clock hour) so it is
+/// always in the future and always renders, whatever time the sim is launched;
+/// the later days use fixed clock hours to show a leading free band and an empty
+/// day deterministically.
+List<PlannedMeeting> demoPlannedMeetings(DateTime now) {
+  // The top of the hour after next: today's first block sits on an hour line, so
+  // the grid's labels line up with a block edge, and nothing is already past.
+  final base = DateTime(now.year, now.month, now.day, now.hour)
+      .add(const Duration(hours: 1));
+  final today = DateTime(now.year, now.month, now.day);
+  DateTime day(int offset, int h, [int m = 0]) =>
+      today.add(Duration(days: offset, hours: h, minutes: m));
+
+  PlannedMeeting mk(String id, String title, DateTime s, DateTime e,
+          {String? room, String? stable}) =>
+      PlannedMeeting(
+          id: id, title: title, startsAt: s, endsAt: e, roomStableId: stable, roomName: room);
+
+  return [
+    // Today: a short standup, then an overlapping pair (double-booking → two
+    // lanes), then a >90min gap (collapses to a faded "Nh free") before a wrap-up.
+    mk('demo-standup', 'Standup', base, base.add(const Duration(minutes: 15)),
+        room: 'Huddle', stable: 'room-huddle'),
+    mk('demo-review', 'Design review', base.add(const Duration(hours: 1)),
+        base.add(const Duration(hours: 3)),
+        room: 'Focus', stable: 'room-focus'),
+    mk('demo-1on1', '1:1 with Ada', base.add(const Duration(hours: 1, minutes: 30)),
+        base.add(const Duration(hours: 2)),
+        room: 'Lounge', stable: 'room-lounge'),
+    mk('demo-wrap', 'Wrap-up', base.add(const Duration(hours: 5)),
+        base.add(const Duration(hours: 5, minutes: 45)),
+        room: 'Lounge', stable: 'room-lounge'),
+    // Tomorrow: one afternoon slot on the hour, so the morning reads "Free till 14:00".
+    // (The leading free band is day-top → first event now, so it shows whatever the
+    // hour — an on-the-hour start used to swallow it.)
+    mk('demo-sync', 'Team sync', day(1, 14), day(1, 15),
+        room: 'Huddle', stable: 'room-huddle'),
+    // Day after tomorrow has nothing — but an event on day+3 keeps it in the
+    // rendered range, so it shows as a "Free for the day" marker between the two.
+    mk('demo-roadmap', 'Roadmap planning', day(3, 10), day(3, 11, 30),
+        room: 'Focus', stable: 'room-focus'),
+  ];
+}
+
+/// Canned colleague calendars for the person-peek sheet, keyed by the cast's names, so
+/// tapping someone on the map or Dial opens their timeline on a bare sim — the app
+/// harness has no OAuth account, so the live path would say "no calendar" for everyone.
+///
+/// Spreads the shapes the sheet has to tell apart: a busy morning that frees up, a free
+/// run before a late start, a double-booking under an all-day banner, plus the two
+/// non-event outcomes (nothing shared, and a calendar that would not load).
+Map<String, PersonCalendar> demoPeopleCalendars(DateTime now) {
+  final today = DateTime(now.year, now.month, now.day);
+  DateTime day(int offset, int h, [int m = 0]) =>
+      today.add(Duration(days: offset, hours: h, minutes: m));
+  GoogleEvent ev(String id, String title, DateTime s, DateTime e,
+          {String? location, bool allDay = false}) =>
+      GoogleEvent(id: id, title: title, startsAt: s, endsAt: e, location: location, allDay: allDay);
+
+  return {
+    // Busy morning, then open after lunch — the "when do they free up" case.
+    'Ada': PersonCalendar.ok([
+      ev('ada-1', 'Sprint planning', day(0, 9), day(0, 10, 30), location: 'Focus'),
+      ev('ada-2', 'Interview', day(0, 11), day(0, 11, 45)),
+      ev('ada-3', 'Design crit', day(1, 13), day(1, 14)),
+    ]),
+    // Nothing until mid-afternoon — a long leading "Free till" band.
+    'Grace': PersonCalendar.ok([
+      ev('grace-1', 'Customer call', day(0, 15, 30), day(0, 16, 30), location: 'Lounge'),
+    ]),
+    // An all-day banner over a double-booked afternoon.
+    'Katherine': PersonCalendar.ok([
+      ev('kat-all', 'Offsite', day(0, 0), day(1, 0), allDay: true),
+      ev('kat-1', 'Workshop', day(0, 13), day(0, 15), location: 'Huddle'),
+      ev('kat-2', '1:1', day(0, 14), day(0, 14, 30)),
+    ]),
+    // Shared nothing — the honest "no calendar" state, not an empty one.
+    'Mira': PersonCalendar.noCalendar,
+    // A calendar that is there but would not read right now.
+    'Dorothy': PersonCalendar.unavailable,
+  };
+}

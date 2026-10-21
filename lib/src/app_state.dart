@@ -2762,8 +2762,10 @@ class AppState extends ChangeNotifier {
 
   /// Whether this build can offer a Google connection at all — false when no OAuth
   /// client was compiled in (every test, a placeholder build), so the UI can hide
-  /// the action rather than offer one that cannot work.
-  bool get googleAvailable => _googleCalendar != null;
+  /// the action rather than offer one that cannot work. Seeded colleague calendars
+  /// ([debugPeopleCalendars]) stand in for a real client on the simulator, so the
+  /// Plans affordance on person cards shows there too.
+  bool get googleAvailable => _googleCalendar != null || _debugPeopleCalendars.isNotEmpty;
 
   /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
   /// batch of events. Called from [boot]; best-effort, never fails the launch.
@@ -2869,6 +2871,20 @@ class AppState extends ChangeNotifier {
     _gcalMatchLogged.clear();
   }
 
+  /// Colleague calendars canned by label, for the simulator harness and tests: there is
+  /// no OAuth account on a bare sim, so [calendarForLabel] and [hasCalendarFor] would
+  /// always answer "no calendar" and the person sheet could never be exercised. When
+  /// this is non-empty it short-circuits both, keyed by lowercased label, so tapping a
+  /// seeded colleague opens their timeline. Does not touch the live Google path.
+  Map<String, PersonCalendar> _debugPeopleCalendars = const {};
+  @visibleForTesting
+  set debugPeopleCalendars(Map<String, PersonCalendar> byLabel) {
+    _debugPeopleCalendars = {
+      for (final e in byLabel.entries) e.key.trim().toLowerCase(): e.value,
+    };
+    notifyListeners();
+  }
+
   /// The calendar id for a person shown in Gather as [label], or null when none in the
   /// index is a confident match. The single resolver every calendar lookup goes
   /// through, so the Dial gate, the "free in" countdown and the plans sheet all agree
@@ -2954,6 +2970,9 @@ class AppState extends ChangeNotifier {
   /// read ([CalendarLookup.ok]) whose list may itself be empty. Reached from the map's
   /// person card (label only) and the Dial (which also has the email).
   Future<PersonCalendar> calendarForLabel(String label, {String? email}) async {
+    if (_debugPeopleCalendars.isNotEmpty) {
+      return _debugPeopleCalendars[label.trim().toLowerCase()] ?? PersonCalendar.noCalendar;
+    }
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return PersonCalendar.noCalendar;
     final calendarId = _calendarKeyFor(label, email);
@@ -2968,6 +2987,9 @@ class AppState extends ChangeNotifier {
   /// soon as Gather gave us their [email]; otherwise a name match against a directly
   /// shared calendar. Cheap and synchronous.
   bool hasCalendarFor(String label, {String? email}) {
+    if (_debugPeopleCalendars.isNotEmpty) {
+      return _debugPeopleCalendars.containsKey(label.trim().toLowerCase());
+    }
     final logKey = label.trim().toLowerCase();
     final calendarId = _calendarKeyFor(label, email);
     // Log each distinct colleague once: whether we resolved by email or name (or
