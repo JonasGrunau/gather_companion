@@ -85,6 +85,34 @@ when you need the live wire (e.g. feed work), not the fakes:
 flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
 ```
 
+`GOOGLE_CLIENT_ID` turns on the read-only Google Calendar connection in the Plans
+tab. `lib/main.dart` reads it via `String.fromEnvironment` with **no default**, so
+any build without the define compiles the feature out (`gcal: no GOOGLE_CLIENT_ID
+compiled in — feature disabled`). This is not optional polish — forget it and the
+device build silently loses the feature. **Every real device/release build must
+pass it:**
+
+```sh
+flutter run -d <device> --dart-define=GOOGLE_CLIENT_ID=<iOS OAuth client id>
+```
+
+The id is a *public* OAuth client (PKCE, no secret), kept out of source on purpose.
+Get it from the `gather-companion` Google Cloud project, or combine with
+`--dart-define-from-file`. Add `--dart-define=GCAL_DEBUG=true` to log the gate
+decision.
+
+**The OAuth client's bundle ID must match the bundle the build actually ships**,
+or Google rejects the auth with `redirect_uri_mismatch`/invalid-client. The repo
+default is `com.jonasgrunau.gatherCompanion` (`ios/Runner.xcodeproj`, Release);
+local signing overrides it to `com.michaelalbrecht.gatherCompanion` (see the
+root `AGENTS.md` signing note). Each distinct bundle needs its own iOS OAuth
+client registered under that exact ID.
+
+To mint one: Google Cloud console → `gather-companion` project → APIs & Services
+→ Credentials → Create credentials → OAuth client ID → **iOS** → paste the bundle
+ID. No secret is issued (iOS clients are public/PKCE); copy the resulting client
+ID into the `--dart-define`.
+
 ### Common Patterns
 
 - Sealed classes with exhaustive `switch` expressions and pattern destructuring
