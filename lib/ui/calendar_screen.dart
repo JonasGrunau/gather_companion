@@ -282,14 +282,12 @@ class _TimelineBlock extends StatelessWidget {
       place: (e.location?.isNotEmpty ?? false) ? e.location : null,
       live: live,
       owned: false,
-      onTap: (context) async {
-        // A live Google event whose location resolves to a room here walks you in — the
-        // same affordance the old card's "Go to meeting" gave, now on the whole block.
-        if (!(live && state.canGoToMeeting(e))) return;
-        final messenger = ScaffoldMessenger.of(context);
-        final error = await state.walkToGoogleEvent(e);
-        if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
-      },
+      // A Google event is a read-only mirror — there is nothing to edit, so unlike a
+      // plan the tap cannot open the editor. Instead it opens a detail peek: the block
+      // on the grid may be too short to print the time or place, and this is the only
+      // way to read them off. The peek carries the "Go to meeting" walk when the event
+      // is live and its location resolves to a room here.
+      onTap: (context) => _showGoogleEventPeek(context, state, e),
     );
   }
 
@@ -535,10 +533,16 @@ class _GoogleEventCard extends StatelessWidget {
 /// routing "Walk here" uses. A spinner while the hop runs; a snack when the room has
 /// slipped off the floor plan since the card was built.
 class _GoToMeetingButton extends StatefulWidget {
-  const _GoToMeetingButton({required this.state, required this.event});
+  const _GoToMeetingButton({required this.state, required this.event, this.dismissFirst = false});
 
   final AppState state;
   final GoogleEvent event;
+
+  /// When true the button lives inside a modal (the peek) that sits above the
+  /// Scaffold the snack would land on. The sheet is popped before the result shows,
+  /// so a walk failure or an "Asked to join…" reply isn't hidden behind it — the same
+  /// path [_MeetingEditorState._walkFromEditor] takes from its sheet.
+  final bool dismissFirst;
 
   @override
   State<_GoToMeetingButton> createState() => _GoToMeetingButtonState();
@@ -549,10 +553,12 @@ class _GoToMeetingButtonState extends State<_GoToMeetingButton> {
 
   Future<void> _go() async {
     final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
     setState(() => _busy = true);
     final error = await widget.state.walkToGoogleEvent(widget.event);
     if (!mounted) return;
     setState(() => _busy = false);
+    if (widget.dismissFirst) navigator.pop();
     if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
   }
 
@@ -591,7 +597,126 @@ class _GoToMeetingButtonState extends State<_GoToMeetingButton> {
   }
 }
 
+/// A read-only detail peek for one mirrored Google event, opened by tapping its timeline
+/// block. A Google event cannot be edited here — it is a mirror of a calendar this phone
+/// does not own — so the tap that would open the editor on a plan opens this instead: the
+/// full title, the exact day and time, the place when there is one, and the same "Go to
+/// meeting" walk the live block used to carry, when the event is on and resolves to a room.
+void _showGoogleEventPeek(BuildContext context, AppState state, GoogleEvent event) {
+  final t = context.tokens;
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: t.card,
+    showDragHandle: true,
+    builder: (context) => _GoogleEventPeek(state: state, event: event),
+  );
+}
+
+class _GoogleEventPeek extends StatelessWidget {
+  const _GoogleEventPeek({required this.state, required this.event});
+
+  final AppState state;
+  final GoogleEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final hasPlace = event.location != null && event.location!.isNotEmpty;
+    // Offered whenever the event's location resolves to a room on the floor here — not
+    // only while it is live. Matches the own-plan editor, whose "Walk here" shows the
+    // moment a room is pinned, so a meeting you want to head to early is reachable.
+    final canWarp = state.canGoToMeeting(event);
+    final when = _peekWhen(event);
+    return SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              event.title,
+              style: TextStyle(color: t.foreground, fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 14),
+            _PeekRow(icon: Icons.schedule, text: when),
+            if (hasPlace) ...[
+              const SizedBox(height: 8),
+              _PeekRow(icon: Icons.place_outlined, text: event.location!),
+            ],
+            const SizedBox(height: 8),
+            _PeekRow(icon: Icons.event_available, text: 'Google Calendar'),
+            if (canWarp) ...[
+              const SizedBox(height: 16),
+              _GoToMeetingButton(state: state, event: event, dismissFirst: true),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A line in the Google event peek: an icon beside its text, sharing the look the
+/// colleague calendar's peek uses so the two read as one thing.
+class _PeekRow extends StatelessWidget {
+  const _PeekRow({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 16, color: t.mutedForeground),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(text, style: TextStyle(color: t.foreground, fontSize: 14)),
+        ),
+      ],
+    );
+  }
+}
+
+/// "Today" / "Tomorrow" / a weekday / a date, to set the peek's time in a day.
+String _peekDay(DateTime at) {
+  final delta = _calendarDaysUntil(at);
+  if (delta == 0) return 'Today';
+  if (delta == 1) return 'Tomorrow';
+  if (delta > 1 && delta < 7) return _weekdays[at.weekday - 1];
+  return '${at.day} ${_months[at.month - 1]}';
+}
+
 String _googleTimeRange(GoogleEvent e) => '${_time(e.startsAt)}–${_time(e.endsAt)}';
+
+/// The peek's one-line "when". A same-day event reads its day once ("Today · 09:00–10:00"
+/// or "Today · All day"); an event that crosses days spells out both ends so an overnight
+/// meeting isn't mistaken for a one-hour one and a multi-day span shows its length.
+///
+/// Google gives all-day events an *exclusive* end — a single Monday all-day event ends at
+/// Tuesday 00:00 — so the last day shown is the day before [GoogleEvent.endsAt] for all-day
+/// events, which also collapses the common one-day case back to "Today · All day".
+String _peekWhen(GoogleEvent e) {
+  final startDay = _peekDay(e.startsAt);
+  if (e.allDay) {
+    final lastDay = e.endsAt.subtract(const Duration(days: 1));
+    final sameDay = _isSameCalendarDay(e.startsAt, lastDay);
+    return sameDay
+        ? '$startDay · All day'
+        : '$startDay – ${_peekDay(lastDay)} · All day';
+  }
+  if (_isSameCalendarDay(e.startsAt, e.endsAt)) {
+    return '$startDay · ${_googleTimeRange(e)}';
+  }
+  return '$startDay ${_time(e.startsAt)} – ${_peekDay(e.endsAt)} ${_time(e.endsAt)}';
+}
+
+bool _isSameCalendarDay(DateTime a, DateTime b) =>
+    a.year == b.year && a.month == b.month && a.day == b.day;
 
 class _Empty extends StatelessWidget {
   const _Empty({required this.bottomInset});
