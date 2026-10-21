@@ -85,6 +85,22 @@ when you need the live wire (e.g. feed work), not the fakes:
 flutter run -d <device> --dart-define=GATHER_PAIR=127.0.0.1:7799:<token>
 ```
 
+`GOOGLE_CLIENT_ID` turns on the read-only Google Calendar connection in the Plans
+tab. `lib/main.dart` reads it via `String.fromEnvironment` with **no default**, so
+any build without the define compiles the feature out (`gcal: no GOOGLE_CLIENT_ID
+compiled in — feature disabled`). This is not optional polish — forget it and the
+device build silently loses the feature. **Every real device/release build must
+pass it:**
+
+```sh
+flutter run -d <device> --dart-define=GOOGLE_CLIENT_ID=<iOS OAuth client id>
+```
+
+The id is a *public* OAuth client (PKCE, no secret), kept out of source on purpose.
+Get it from the `gather-companion` Google Cloud project (iOS client, bundle
+`com.michaelalbrecht.gatherCompanion`), or combine with `--dart-define-from-file`.
+Add `--dart-define=GCAL_DEBUG=true` to log the gate decision.
+
 ### Common Patterns
 
 - Sealed classes with exhaustive `switch` expressions and pattern destructuring
