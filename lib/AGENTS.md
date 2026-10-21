@@ -97,9 +97,21 @@ flutter run -d <device> --dart-define=GOOGLE_CLIENT_ID=<iOS OAuth client id>
 ```
 
 The id is a *public* OAuth client (PKCE, no secret), kept out of source on purpose.
-Get it from the `gather-companion` Google Cloud project (iOS client, bundle
-`com.michaelalbrecht.gatherCompanion`), or combine with `--dart-define-from-file`.
-Add `--dart-define=GCAL_DEBUG=true` to log the gate decision.
+Get it from the `gather-companion` Google Cloud project, or combine with
+`--dart-define-from-file`. Add `--dart-define=GCAL_DEBUG=true` to log the gate
+decision.
+
+**The OAuth client's bundle ID must match the bundle the build actually ships**,
+or Google rejects the auth with `redirect_uri_mismatch`/invalid-client. The repo
+default is `com.jonasgrunau.gatherCompanion` (`ios/Runner.xcodeproj`, Release);
+local signing overrides it to `com.michaelalbrecht.gatherCompanion` (see the
+root `AGENTS.md` signing note). Each distinct bundle needs its own iOS OAuth
+client registered under that exact ID.
+
+To mint one: Google Cloud console → `gather-companion` project → APIs & Services
+→ Credentials → Create credentials → OAuth client ID → **iOS** → paste the bundle
+ID. No secret is issued (iOS clients are public/PKCE); copy the resulting client
+ID into the `--dart-define`.
 
 ### Common Patterns
 
