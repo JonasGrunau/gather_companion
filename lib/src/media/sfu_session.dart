@@ -211,6 +211,18 @@ class SfuSession {
   /// re-announce of that peer, not a rebuild, so the working tags never glitch.
   final Set<String> _producerGone = {};
 
+  /// How many times the watchdog has soft-re-announced a stale-tag peer without
+  /// the tag recovering, keyed by `srcId`.
+  ///
+  /// The re-announce in [_reannounceStaleTags] is a repeat `consume-request`,
+  /// and the heal only works if the SFU answers it with a fresh `consume-try`.
+  /// A server that treats the duplicate as a no-op would leave the stale id in
+  /// [_announced] forever and the watchdog climbing against it for the life of
+  /// the call. This counter escalates to a full unsubscribe/resubscribe — a
+  /// `requested:false`→`true` toggle the SFU must answer — once the soft
+  /// re-announce has failed enough times to look like a no-op (issue #61).
+  final Map<String, int> _staleTagRetries = {};
+
   /// Peers we want but the router could not place yet. See [_addressFor].
   final Set<String> _awaitingAddr = {};
   Timer? _addrRetry;
@@ -1362,6 +1374,8 @@ class SfuSession {
         final srcId = key.split('|').first;
         return !_subscribed.contains(srcId) || _consumers.containsKey(key);
       });
+      final stillStale = _staleTagPeers();
+      _staleTagRetries.removeWhere((srcId, _) => !stillStale.contains(srcId));
 
       // Re-evaluate against current state, not the state that armed us. Two
       // faults bring us here: a stranded peer (denied, and we hold no consumer
@@ -1370,7 +1384,7 @@ class SfuSession {
       // producer`). Nothing to heal if we were stopped or neither holds; reset
       // the backoff and stand down.
       final stranded = _strandedPeers();
-      final staleTags = _staleTagPeers();
+      final staleTags = stillStale;
       if (_stopped || (stranded.isEmpty && staleTags.isEmpty)) {
         _recvHealBackoff = const Duration(seconds: 5);
         return;
@@ -1433,21 +1447,84 @@ class SfuSession {
       .map((key) => key.split('|').first)
       .toSet();
 
+  /// Soft re-announces to tolerate before a stale-tag peer is resubscribed.
+  ///
+  /// Two means one bare re-announce fires first — healing the common case where
+  /// the SFU does re-emit, or an organic `consume-try` lands, without glitching
+  /// video — and the hard reset follows on the next tick (~15s in) if it did
+  /// not, fast enough to beat a user restart.
+  static const _staleTagResubscribeAfter = 2;
+
   /// Re-request peers whose consume was refused `no such producer`.
   ///
-  /// Forces a fresh full-state `consume-try` so the SFU re-resolves the live
-  /// producer id for the dead tag. Unlike [_healStranded] this closes no
-  /// consumer — the peer's other tags keep flowing, and the reconcile that
-  /// follows leaves an unchanged video producer in place (see [_reconcileNow]).
-  /// The fault is left in [_producerGone] deliberately: a built consumer is what
-  /// clears it (in [_consume]); if the re-announce still cannot be consumed the
-  /// peer stays in the set and the watchdog climbs.
+  /// First choice is the soft re-announce: a repeat `consume-request` that, if
+  /// the SFU answers it with a fresh full-state `consume-try`, re-resolves the
+  /// live producer id for the dead tag while closing no consumer — the peer's
+  /// video keeps flowing and the reconcile that follows leaves its unchanged
+  /// producer in place (see [_reconcileNow]). The fault is left in
+  /// [_producerGone] deliberately: a built consumer is what clears it (in
+  /// [_consume]); if the re-announce still cannot be consumed the peer stays in
+  /// the set and the watchdog climbs.
+  ///
+  /// That soft path only works if the SFU actually re-emits for a peer we are
+  /// already subscribed to. A server that treats the duplicate request as a
+  /// no-op would leave the stale id in [_announced] forever. So after
+  /// [_staleTagResubscribeAfter] soft tries that did not recover, escalate to a
+  /// full unsubscribe/resubscribe of that one peer — a `requested:false`→`true`
+  /// toggle the SFU must answer with a fresh `consume-try`, independent of
+  /// duplicate-request semantics. That re-consumes the peer's working video
+  /// once, the one-time cost of guaranteed audio recovery (issue #61).
   Future<void> _reannounceStaleTags(Set<String> srcIds) async {
-    _log('sfu: ${srcIds.length} peer(s) hold a stale producer id; '
-        're-announcing to re-resolve the live producer');
     for (final srcId in srcIds) {
-      unawaited(_requestPeer(srcId));
+      final tries = (_staleTagRetries[srcId] ?? 0) + 1;
+      _staleTagRetries[srcId] = tries;
+      if (tries < _staleTagResubscribeAfter) {
+        _log('sfu: $srcId holds a stale producer id; '
+            're-announcing to re-resolve the live producer (try $tries)');
+        unawaited(_requestPeer(srcId));
+      } else {
+        _log('sfu: $srcId still stale after $tries re-announce(s); '
+            'resubscribing to force a fresh announce');
+        _staleTagRetries.remove(srcId);
+        await _resubscribe(srcId);
+      }
     }
+  }
+
+  /// Force a fresh announce for one subscribed peer without forgetting it.
+  ///
+  /// The hard escalation for a stale tag the soft re-announce could not clear.
+  /// It sends the SFU the same `requested:false`→`true` toggle a full
+  /// unsubscribe/resubscribe would — which the server must answer with a fresh
+  /// `consume-try`, independent of duplicate-request semantics — but keeps the
+  /// peer in [_subscribed] throughout. Dropping it there (as `unsubscribe`
+  /// does) across the await would let a concurrent cluster-leave
+  /// `setSubscriptions({})` slip into the gap, find nothing to remove, and then
+  /// have this method restore the departed peer's subscription and reciprocal
+  /// allow grant against the caller's wishes. Holding the membership means a
+  /// concurrent removal still sees the peer and lets it go, while recovery for a
+  /// peer that is still wanted re-consumes its working video once — the one-time
+  /// cost of guaranteed audio recovery (issue #61).
+  Future<void> _resubscribe(String srcId) async {
+    if (!_subscribed.contains(srcId)) return;
+
+    final url = _peerNode.remove(srcId);
+    final node = url == null ? null : _nodes[url];
+    node?.emit('consume-request', {
+      'srcId': srcId,
+      'srcStreamId': _spaceId,
+      'requested': false,
+    });
+
+    // Forget the stale receive state so the fresh announce rebuilds it clean.
+    _announced.remove(srcId);
+    for (final tag in SfuTag.values) {
+      _closeConsumer(srcId, tag);
+    }
+    _publishRemotes();
+
+    if (_stopped || !_subscribed.contains(srcId)) return;
+    await _requestPeer(srcId);
   }
 
   /// Re-request the receive path for a handful of stranded peers.
@@ -1551,6 +1628,7 @@ class SfuSession {
       // rebuild, not the ones that triggered it.
       _consumeDenied.clear();
       _producerGone.clear();
+      _staleTagRetries.clear();
     } finally {
       _healing = false;
     }
@@ -1694,6 +1772,7 @@ class SfuSession {
     allow(srcId, allowed: false);
 
     _announced.remove(srcId);
+    _staleTagRetries.remove(srcId);
     for (final tag in SfuTag.values) {
       _closeConsumer(srcId, tag);
     }
@@ -2068,6 +2147,13 @@ class SfuSession {
       // from the full grace window rather than mid-climb.
       _consumeDenied.remove(srcId);
       _producerGone.remove(key);
+      // Clear the escalation counter only when this peer has no stale tag left.
+      // The counter is keyed by `srcId`, but `_producerGone` is per-tag: a
+      // healthy video (or screen) consume must not reset the ladder while this
+      // peer's audio tag is still gone, or a producer replaced after the first
+      // soft retry would restart escalation at try 1 and could keep broken audio
+      // from ever reaching the hard resubscribe backstop.
+      if (!_staleTagPeers().contains(srcId)) _staleTagRetries.remove(srcId);
       if (_strandedPeers().isEmpty && _staleTagPeers().isEmpty) {
         _recvHealTimer?.cancel();
         _recvHealTimer = null;
@@ -2491,6 +2577,7 @@ class SfuSession {
     _recvHealTimer = null;
     _consumeDenied.clear();
     _producerGone.clear();
+    _staleTagRetries.clear();
     _recvHealBackoff = const Duration(seconds: 5);
     _healing = false;
     _sendHealTimer?.cancel();
