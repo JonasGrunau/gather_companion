@@ -57,6 +57,52 @@ void main() {
     expect(state.link.isReconnecting, isTrue, reason: 'the badge should show at once');
   });
 
+  test('resume evaluates the deaf-socket watchdog before trusting stale health',
+      () async {
+    final (:state, :collector, :tick) = wired();
+
+    // A socket that went deaf while the app was suspended still reports healthy — the
+    // publish timer that would flip it was frozen. The poke is what notices now; when
+    // it acts, teardown and reconnect are already under way, so verifyLink must leave
+    // recovery to it rather than also resyncing (#70).
+    collector.pokeLivenessActs = true;
+    final base = collector.resyncs;
+
+    await state.verifyLink();
+
+    expect(collector.pokeLivenesses, 1, reason: 'resume must poke the watchdog, not trust the flag');
+    expect(collector.resyncs, base, reason: 'the poke is already reconnecting; no second attempt');
+  });
+
+  test('resume with a dead link and nothing deaf to tear down resyncs', () async {
+    final (:state, :collector, :tick) = wired();
+
+    // The poke finds nothing to do (no live socket to go deaf), but the link is down —
+    // so the existing path still applies and verifyLink reconnects.
+    collector.pokeLivenessActs = false;
+    collector.healthy = false;
+    final base = collector.resyncs;
+
+    await state.verifyLink();
+
+    expect(collector.pokeLivenesses, 1);
+    expect(collector.resyncs, base + 1, reason: 'no live link, so reconnect');
+  });
+
+  test('resume on a genuinely healthy link does nothing', () async {
+    final (:state, :collector, :tick) = wired();
+
+    // The common case: a glance at the phone with the socket alive. The poke reports
+    // nothing deaf, health is good, so verifyLink must not churn the connection.
+    collector.pokeLivenessActs = false;
+    collector.healthy = true;
+    final base = collector.resyncs;
+
+    await state.verifyLink();
+
+    expect(collector.resyncs, base, reason: 'a healthy link is left alone');
+  });
+
   test('a transport change rebuilds the media session, to re-mint the SFU token',
       () {
     // The SFU socket sleeps through the handoff on a connection it still believes

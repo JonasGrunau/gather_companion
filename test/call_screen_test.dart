@@ -16,6 +16,7 @@ import 'package:gather_companion/src/media/call.dart';
 import 'package:gather_companion/src/media/media_engine.dart';
 import 'package:gather_companion/src/media/spotlight_director.dart';
 import 'package:gather_companion/src/reactions.dart';
+import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/theme/gather_theme.dart';
 import 'package:gather_companion/ui/call_screen.dart';
 import 'package:gather_companion/ui/control_bar.dart';
@@ -81,6 +82,53 @@ void main() {
     });
   });
 
+  group('the handoff banner (issue #67)', () {
+    const handoff = CallState(needsHandoff: true);
+
+    testWidgets('replaces the map pill, titled, with the reclaim button',
+        (tester) async {
+      final call = FakeCall();
+      final state = AppState()
+        ..debugCall = handoff
+        ..debugAttachCall(call);
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(body: CallBanner(state: state)),
+      ));
+      await tester.pump();
+
+      expect(find.text('Connection lost to another device'), findsOneWidget);
+      final button = find.text('Pull session over to this app');
+      expect(button, findsOneWidget);
+      // The ordinary "In a call" pill gives way entirely.
+      expect(find.textContaining('In a call'), findsNothing);
+
+      await tester.tap(button);
+      await tester.pump();
+      expect(call.pulls, 1, reason: 'the button reclaims the session');
+    });
+
+    testWidgets('appears inside the open call screen too', (tester) async {
+      final call = FakeCall();
+      final state = AppState()
+        ..debugCall = handoff
+        ..debugAttachCall(call);
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: CallScreen(state: state, buildTile: inertTile),
+      ));
+      await tester.pump();
+
+      expect(find.text('Connection lost to another device'), findsOneWidget);
+      final button = find.text('Pull session over to this app');
+      expect(button, findsOneWidget);
+
+      await tester.tap(button);
+      await tester.pump();
+      expect(call.pulls, 1);
+    });
+  });
+
   group('the banner says who you are with', () {
     test('in every size of call, named or not', () {
       String both(List<String?> people) {
@@ -142,6 +190,105 @@ void main() {
 
       expect(find.text('In a call with Ada'), findsOneWidget);
       expect(find.text('Tap to see Ada'), findsOneWidget);
+    });
+
+    testWidgets('a desktop lock replaces the tap line with "paused" (issue #41)',
+        (tester) async {
+      final state = AppState()
+        ..debugCall = const CallState()
+        ..debugAttachCollector(FakeCollector())
+        ..setActive(true);
+      // In a call with Ada.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Active'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.inCall, isTrue);
+      await banner(tester, state);
+      // Normally the second line invites a tap.
+      expect(find.text('Tap to see Ada'), findsOneWidget);
+
+      // The desktop on this same account locks: our shared user drops Offline and
+      // the server is tearing the call down under us. The banner says so.
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Offline'),
+        person('ada', 'Ada'),
+      ]));
+      expect(state.callInterrupted, isTrue);
+      await tester.pump();
+
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+      expect(find.text('Tap to see Ada'), findsNothing);
+
+      // Drain the self-heal's reconnect and cooldown timers so the tree disposes clean.
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    /// An in-call state whose shared user is Active, foreground, with a collector
+    /// attached — everything the self-heal needs to recognise an external Offline
+    /// as a desktop lock rather than our own doing.
+    AppState inCall() {
+      final state = AppState()
+        ..debugCall = const CallState()
+        ..debugAttachCollector(FakeCollector())
+        ..setActive(true);
+      state.debugApplyRoster(Roster(selfId: 'me', rows: [
+        const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Active'),
+        person('ada', 'Ada'),
+      ]));
+      return state;
+    }
+
+    void lock(AppState state) => state.debugApplyRoster(Roster(selfId: 'me', rows: [
+          const RosterRow(id: 'me', name: 'Jonas', clusterId: 'c1', availability: 'Offline'),
+          person('ada', 'Ada'),
+        ]));
+
+    testWidgets('the notice follows onto the opened call screen, which the tab '
+        'banner cannot reach (issue #41)', (tester) async {
+      final state = inCall();
+      expect(state.inCall, isTrue);
+      // The opaque faces route, opened over the tab surfaces.
+      await show(tester, state);
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsNothing);
+
+      lock(state);
+      expect(state.callInterrupted, isTrue);
+      await tester.pump();
+
+      // Shown on the call screen itself, not only on the surfaces it covers.
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 4));
+    });
+
+    testWidgets('the tab banner outlasts the call while the lock drags past the '
+        'cluster hold (issue #41)', (tester) async {
+      final state = inCall();
+      lock(state);
+      expect(state.callInterrupted, isTrue);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(body: CallBannerHeader(state: state)),
+      ));
+      await tester.pump();
+      expect(find.byType(CallBanner), findsOneWidget);
+
+      // The lock drags on: the conversation is released and the media peers drain,
+      // so `inCall` goes false — but the desktop has not lifted the hold, so the
+      // notice that explains the drop must stay put.
+      state.debugApplyRoster(const Roster(selfId: 'me', rows: [
+        RosterRow(id: 'me', name: 'Jonas', clusterId: null, availability: 'Offline'),
+      ]));
+      // Past the ≤12s cluster hold, where `inCall` finally drops.
+      await tester.pump(const Duration(seconds: 13));
+      expect(state.inCall, isFalse);
+      expect(state.callInterrupted, isTrue);
+      expect(find.byType(CallBanner), findsOneWidget);
+      expect(find.text('Paused by your desktop Gather — reconnecting…'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 4));
     });
 
     testWidgets('two and more, from the conversation alone', (tester) async {
@@ -689,6 +836,110 @@ void main() {
 
       await frame(true);
       expect(find.byIcon(Icons.front_hand), findsOneWidget);
+    });
+
+    testWidgets('carries its place in line as a number on the badge',
+        (tester) async {
+      Future<void> frame(int position) async {
+        await tester.pumpWidget(MaterialApp(
+          theme: buildGatherTheme(),
+          home: Scaffold(
+            body: Center(
+              child: SizedBox(
+                width: 200,
+                height: 150,
+                child: TileFrame(
+                  tile: CallTile(
+                    id: 'luca',
+                    label: 'Luca',
+                    isSelf: false,
+                    videoLive: false,
+                    muted: false,
+                    sharingScreen: false,
+                    handRaised: true,
+                    handPosition: position,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ));
+        await tester.pump();
+      }
+
+      final semantics = tester.ensureSemantics();
+
+      // Third in line — the number rides the hand so a person can tell their turn,
+      // drawn on the glyph and spoken in the one badge label.
+      await frame(3);
+      expect(find.byIcon(Icons.front_hand), findsOneWidget);
+      expect(find.text('3'), findsOneWidget);
+      expect(
+        find.bySemanticsLabel('Luca raised their hand, number 3 in line'),
+        findsOneWidget,
+      );
+
+      // No place known yet (our optimistic raise): the bare hand, no number.
+      await frame(0);
+      expect(find.byIcon(Icons.front_hand), findsOneWidget);
+      expect(find.text('0'), findsNothing);
+
+      semantics.dispose();
+    });
+  });
+
+  group('the connecting status', () {
+    // 72×96 is a spotlight strip thumbnail; 200×150 is an overview/big tile.
+    Future<void> frame(WidgetTester tester, {required double width}) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: buildGatherTheme(),
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: width,
+              height: width * 4 / 3,
+              child: const TileFrame(
+                tile: CallTile(
+                  id: 'luca',
+                  label: 'Luca',
+                  isSelf: false,
+                  videoLive: false,
+                  muted: false,
+                  sharingScreen: false,
+                  connecting: true,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('fits a narrow thumbnail without overflowing', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await frame(tester, width: 72);
+
+      // The spelt-out plate took its full text width and overran the ~56 pixels
+      // a thumbnail leaves, clipping the status and squeezing the name. On a
+      // narrow tile it drops to the icon, and the row lays out clean.
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsNothing,
+          reason: 'the words are dropped where they do not fit');
+      expect(find.byIcon(Icons.sync), findsOneWidget,
+          reason: 'the icon still marks the state');
+      expect(find.bySemanticsLabel('Connecting…'), findsOneWidget,
+          reason: 'a screen reader still hears the state the words carried');
+
+      semantics.dispose();
+    });
+
+    testWidgets('keeps the words on a roomy tile', (tester) async {
+      await frame(tester, width: 200);
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('Connecting…'), findsOneWidget,
+          reason: 'the overview and big tiles have room for the words');
     });
   });
 

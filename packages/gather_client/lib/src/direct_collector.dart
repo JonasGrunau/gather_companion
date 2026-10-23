@@ -554,19 +554,16 @@ class DirectCollector implements Collector {
     return _send('sendWave', model: 'SpaceUser', id: targetSpaceUserId);
   }
 
-  /// Asks to be let into a locked area.
-  ///
-  /// The action is `requestToAccess` (model `MapArea`), from the action surface in
-  /// `docs/protocol/client-action-surface.md` — it takes no arguments, so the frame
-  /// is the bare two-element `[model, id]`, addressed to the area's id exactly as
-  /// [wave] is addressed to the recipient's. The server records an
-  /// `AreaAccessRequest`; on acceptance a patch flips our admission and the map lets
-  /// us walk in, through the same `AreaAccessRequest` rows [SpaceMapBuilder] already
-  /// folds into `canEnterRoom`.
+  /// Knocks on a locked area. Like [wave], a bare `[model, id]` frame with no
+  /// args — `requestToAccess` is permissioned `RequestToAccess` on `MapArea` and
+  /// takes nothing (`docs/protocol/client-action-surface.md`). The id is the area's
+  /// `MapEntityIdentifier` — [SpaceRoom.stableId] — because that is what the
+  /// resulting `AreaAccessRequest.areaId` is joined against; `MapArea.id` would land
+  /// a request nobody can read.
   @override
-  ({bool ok, String? detail}) requestToAccess(String areaId) {
-    if (areaId.isEmpty) return (ok: false, detail: 'no area to ask about');
-    return _send('requestToAccess', model: 'MapArea', id: areaId);
+  ({bool ok, String? detail}) requestToAccess(String areaStableId) {
+    if (areaStableId.isEmpty) return (ok: false, detail: 'no room to ask about');
+    return _send('requestToAccess', model: 'MapArea', id: areaStableId);
   }
 
   /// Puts a hand up, or takes it down. A bare bool, not a map.
@@ -1043,6 +1040,14 @@ class DirectCollector implements Collector {
   /// guards on identity — so a forced close never reaches [_scheduleRetry] by itself.
   bool _isSilent() {
     if (!_reachable) return false;
+    // No live socket means recovery is already in flight — a retry armed by `onDone`,
+    // or a connect in progress — and there is nothing to tear down. Acting anyway would
+    // `_clearTimers()` that pending retry and `_scheduleRetry()` a fresh one at *doubled*
+    // backoff, delaying recovery. It also matters on resume: `pokeLiveness()` returning
+    // true here makes `verifyLink()` skip its `resync()`, so a false keeps the immediate,
+    // backoff-reset reconnect that `resync()` gives (the stale `_lastFrameAt` left by a
+    // self-closed socket would otherwise read as deaf). See #70.
+    if (_ws == null) return false;
     final last = _lastFrameAt;
     if (last == null) return false;
     final since = DateTime.now().difference(last);
@@ -1093,6 +1098,15 @@ class DirectCollector implements Collector {
   /// [_heartbeatInterval] — the timer set up in [_openConnection] is the sole
   /// production caller, and nothing in the app has any reason to beat by hand.
   void sendHeartbeatNow() => _heartbeat();
+
+  /// Runs the deaf-socket watchdog once, now, outside the publish tick.
+  ///
+  /// [_isSilent] is otherwise only reached from [_flush], which iOS freezes along with
+  /// every other timer while the app is suspended. On resume the app calls this so a
+  /// socket that went deaf in the background is torn down and reconnected immediately,
+  /// rather than lingering until the first tick after thaw. Returns true when it acted.
+  @override
+  bool pokeLiveness() => _isSilent();
 
   void _onFrame(Object? data) {
     if (data is! List<int>) return; // Text on this socket would not be ours.

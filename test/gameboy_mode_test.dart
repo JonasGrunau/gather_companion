@@ -12,6 +12,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/harness/fake_collector.dart';
 import 'package:gather_companion/src/app_state.dart';
+import 'package:gather_companion/src/calendar.dart';
+import 'package:gather_companion/src/calendar_store.dart';
 import 'package:gather_companion/src/credentials.dart';
 import 'package:gather_companion/src/link_status.dart';
 import 'package:gather_companion/src/media/call.dart';
@@ -68,6 +70,15 @@ class _EmptyBridgeStore extends BridgeSettingsStore {
   Future<BridgeSettings> load() async => BridgeSettings.empty;
   @override
   Future<String?> loadName() async => null;
+}
+
+// The calendar store is keychain-backed like the credential and bridge stores,
+// so it must be faked too: any test that runs a full [AppState.boot] has to stub
+// EVERY channel-backed store, or boot() hangs on the unhandled secure-storage
+// MethodChannel (it never answers under test) until the 10-minute timeout.
+class _EmptyCalendarStore extends CalendarStore {
+  @override
+  Future<List<PlannedMeeting>> load() async => const [];
 }
 
 void main() {
@@ -224,6 +235,7 @@ void main() {
         notifier: _SilentNotifier(),
         credentials: _EmptyCredentialStore(),
         bridge: _EmptyBridgeStore(),
+        calendarStore: _EmptyCalendarStore(),
       );
       await rebooted.boot();
       expect(rebooted.gameboyTheme, GameboyThemeId.safeNow,

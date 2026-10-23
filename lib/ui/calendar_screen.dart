@@ -21,8 +21,10 @@ import 'package:gather_client/gather_client.dart';
 
 import '../src/app_state.dart';
 import '../src/calendar.dart';
+import '../src/day_timeline_layout.dart';
 import '../src/google_calendar.dart';
 import '../theme/gather_theme.dart';
+import 'day_timeline.dart';
 
 /// The Plans list splits entries into upcoming vs past and labels day headers and the
 /// live "Go to meeting" button against the current time. Those checks run on build, but
@@ -31,9 +33,15 @@ import '../theme/gather_theme.dart';
 /// a meeting crosses from upcoming to past, a header flips TODAY→TOMORROW, and the live
 /// button appears at the start and clears at the end without needing a roster change.
 class CalendarScreen extends StatefulWidget {
-  const CalendarScreen({super.key, required this.state});
+  const CalendarScreen({super.key, required this.state, @visibleForTesting this.clock});
 
   final AppState state;
+
+  /// The clock the screen reads "now" from — which day is today, which meetings are
+  /// past. Defaults to [DateTime.now]; tests inject a fixed instant so a fixture's day
+  /// and past/upcoming split don't drift with the wall clock (a meeting pinned to "now"
+  /// otherwise crosses midnight when the suite runs late in the day).
+  final DateTime Function()? clock;
 
   @override
   State<CalendarScreen> createState() => _CalendarScreenState();
@@ -100,7 +108,7 @@ class _CalendarScreenState extends State<CalendarScreen> with WidgetsBindingObse
       body: ListenableBuilder(
         listenable: state,
         builder: (context, _) {
-          final now = DateTime.now();
+          final now = (widget.clock ?? DateTime.now)();
           // One timeline, two sources: plans this phone owns and read-only Google
           // events it only mirrors. Merged and sorted together so a 10am standup from
           // Google and an 11am plan made here sit in one day in the right order.
@@ -134,7 +142,7 @@ class _CalendarScreenState extends State<CalendarScreen> with WidgetsBindingObse
             padding: EdgeInsets.only(top: 8, bottom: bottomInset + 96),
             children: [
               if (showConnect) _ConnectGoogleBanner(state: state),
-              ..._withDayHeaders(context, upcoming),
+              ..._timelineSections(context, upcoming, now),
               if (past.isNotEmpty) ...[
                 const _SectionHeader('EARLIER'),
                 for (final e in past) e.build(context, past: true),
@@ -147,39 +155,220 @@ class _CalendarScreenState extends State<CalendarScreen> with WidgetsBindingObse
   }
 }
 
-/// Upcoming entries, split by day the way the Activity feed is — a wall of times
-/// with no dates stops being readable past the first screen.
-List<Widget> _withDayHeaders(BuildContext context, List<_Entry> entries) {
-  final out = <Widget>[];
-  String? current;
-  for (final e in entries) {
-    final label = _dayLabel(e.startsAt);
-    if (label != current) {
-      out.add(_SectionHeader(label));
-      current = label;
+/// Upcoming entries as one day-headed [DayTimeline] per day — the whole point of the
+/// redesign. Every day from today to the last day an event touches gets a section, so a
+/// clear day shows up as "Free for the day" rather than silently vanishing; a lone
+/// event weeks out would otherwise paint a fortnight of empty days, so the horizon is
+/// capped and the far event just sits at the end of it.
+List<Widget> _timelineSections(BuildContext context, List<_Entry> upcoming, DateTime now) {
+  if (upcoming.isEmpty) return const [];
+  final today = DateTime(now.year, now.month, now.day);
+  final horizon = DateTime(today.year, today.month, today.day + 14);
+
+  // Dense days from today to the horizon, so a clear day shows as "Free for the day"
+  // rather than a silent gap — plus every day a real event actually touches beyond the
+  // horizon. Capping the empty-day fill keeps a lone far-future meeting from painting a
+  // fortnight of blank days, while still giving it its own section so it stays visible
+  // and editable (the only way to reach its edit/delete is its block). Stepping by civil
+  // date, not +24h, keeps the headers right across a daylight-saving change.
+  final days = <DateTime>{};
+  for (var day = today; !day.isAfter(horizon); day = DateTime(day.year, day.month, day.day + 1)) {
+    days.add(day);
+  }
+  for (final e in upcoming) {
+    var day = DateTime(e.startsAt.year, e.startsAt.month, e.startsAt.day);
+    final last = DateTime(e.endsAt.year, e.endsAt.month, e.endsAt.day);
+    while (!day.isAfter(last)) {
+      if (day.isAfter(horizon)) days.add(day);
+      day = DateTime(day.year, day.month, day.day + 1);
     }
-    out.add(e.build(context, past: false));
+  }
+  final ordered = days.toList()..sort();
+
+  final out = <Widget>[];
+  for (final day in ordered) {
+    final dayStart = day;
+    final dayEnd = DateTime(day.year, day.month, day.day + 1);
+    // Every entry that touches this day, clipped to it — a meeting across midnight or a
+    // multi-day all-day event appears on each day it covers, bounded to the day's edges.
+    final timed = <TimelineItem>[];
+    final allDay = <TimelineItem>[];
+    for (var i = 0; i < upcoming.length; i++) {
+      final e = upcoming[i];
+      if (!e.startsAt.isBefore(dayEnd) || !e.endsAt.isAfter(dayStart)) continue;
+      final item = TimelineItem(
+        start: e.startsAt.isBefore(dayStart) ? dayStart : e.startsAt,
+        end: e.endsAt.isAfter(dayEnd) ? dayEnd : e.endsAt,
+        allDay: e.allDay,
+        key: i,
+      );
+      (e.allDay ? allDay : timed).add(item);
+    }
+    out.add(_SectionHeader(_dayLabel(day, now: now)));
+    out.add(DayTimeline(
+      bands: layoutDay(timed, minItemDuration: kTimelineMinSlot),
+      allDay: allDay,
+      blockBuilder: (ctx, item) => upcoming[item.key as int].block(ctx),
+    ));
   }
   return out;
 }
 
-/// One row in the merged Plans timeline: either a [PlannedMeeting] this phone owns
-/// or a read-only [GoogleEvent] it mirrors. Carries just enough — a start, an end and
-/// a card builder — for the screen to sort and group the two kinds as one list.
+/// One entry in the merged Plans timeline: either a [PlannedMeeting] this phone owns or
+/// a read-only [GoogleEvent] it mirrors. Carries a start, an end, whether it is all-day,
+/// a compact [block] for the timeline grid, and the full [build] card still used by the
+/// dimmed "EARLIER" past list.
 class _Entry {
-  _Entry._(this.startsAt, this.endsAt, this._build);
+  _Entry._(this.startsAt, this.endsAt, this.allDay, this._block, this._card);
 
-  factory _Entry.plan(AppState state, PlannedMeeting m) =>
-      _Entry._(m.startsAt, m.endsAt, (context, {required past}) => _MeetingCard(state: state, meeting: m, past: past));
+  factory _Entry.plan(AppState state, PlannedMeeting m) => _Entry._(
+        m.startsAt,
+        m.endsAt,
+        false,
+        (context) => _TimelineBlock.plan(state, m),
+        (context, {required past}) => _MeetingCard(state: state, meeting: m, past: past),
+      );
 
-  factory _Entry.google(AppState state, GoogleEvent e) =>
-      _Entry._(e.startsAt, e.endsAt, (context, {required past}) => _GoogleEventCard(state: state, event: e, past: past));
+  factory _Entry.google(AppState state, GoogleEvent e) => _Entry._(
+        e.startsAt,
+        e.endsAt,
+        e.allDay,
+        (context) => _TimelineBlock.google(state, e),
+        (context, {required past}) => _GoogleEventCard(state: state, event: e, past: past),
+      );
 
   final DateTime startsAt;
   final DateTime endsAt;
-  final Widget Function(BuildContext context, {required bool past}) _build;
+  final bool allDay;
+  final Widget Function(BuildContext context) _block;
+  final Widget Function(BuildContext context, {required bool past}) _card;
 
-  Widget build(BuildContext context, {required bool past}) => _build(context, past: past);
+  Widget block(BuildContext context) => _block(context);
+  Widget build(BuildContext context, {required bool past}) => _card(context, past: past);
+}
+
+/// The compact block a timeline lane draws: a title, its time, a place when pinned, and
+/// a brand ring while it is live. Filled brand for a plan this phone owns, muted for a
+/// read-only Google event, so the two read apart at a glance. Fills whatever height the
+/// grid gives it; the time hides on a block too short to hold it.
+class _TimelineBlock extends StatelessWidget {
+  const _TimelineBlock._({
+    required this.title,
+    required this.time,
+    required this.place,
+    required this.live,
+    required this.owned,
+    required this.onTap,
+  });
+
+  factory _TimelineBlock.plan(AppState state, PlannedMeeting m) {
+    final now = DateTime.now();
+    return _TimelineBlock._(
+      title: m.title,
+      time: _timeRange(m),
+      place: (m.roomName?.isNotEmpty ?? false) ? m.roomName : null,
+      live: !m.startsAt.isAfter(now) && m.endsAt.isAfter(now),
+      owned: true,
+      onTap: (context) => _openEditor(context, state, m),
+    );
+  }
+
+  factory _TimelineBlock.google(AppState state, GoogleEvent e) {
+    final now = DateTime.now();
+    final live = !e.startsAt.isAfter(now) && e.endsAt.isAfter(now);
+    return _TimelineBlock._(
+      title: e.title,
+      time: e.allDay ? 'All day' : _googleTimeRange(e),
+      place: (e.location?.isNotEmpty ?? false) ? e.location : null,
+      live: live,
+      owned: false,
+      // A Google event is a read-only mirror — there is nothing to edit, so unlike a
+      // plan the tap cannot open the editor. Instead it opens a detail peek: the block
+      // on the grid may be too short to print the time or place, and this is the only
+      // way to read them off. The peek carries the "Go to meeting" walk when the event
+      // is live and its location resolves to a room here.
+      onTap: (context) => _showGoogleEventPeek(context, state, e),
+    );
+  }
+
+  final String title;
+  final String time;
+  final String? place;
+  final bool live;
+  final bool owned;
+  final void Function(BuildContext context) onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final bg = owned ? t.brand : t.secondary;
+    final fg = owned ? t.primaryForeground : t.foreground;
+    return Material(
+      color: bg,
+      child: InkWell(
+        onTap: () => onTap(context),
+        child: Container(
+          decoration: live
+              ? BoxDecoration(
+                  border: Border.all(color: t.brand, width: 2),
+                  borderRadius: BorderRadius.circular(t.radius),
+                )
+              : null,
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          child: LayoutBuilder(
+            builder: (context, c) {
+              // A short block holds only the title; the time and then the place appear
+              // as it grows. The thresholds leave headroom so a block never overflows
+              // its lane — the rows are laid out, not scrolled.
+              final showTime = c.maxHeight >= 42;
+              final showPlace = c.maxHeight >= 66 && place != null;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: fg, fontSize: 12.5, fontWeight: FontWeight.w600, height: 1.15),
+                  ),
+                  if (showTime) ...[
+                    const SizedBox(height: 1),
+                    Text(
+                      time,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: fg.withValues(alpha: 0.82),
+                        fontSize: 10.5,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                  if (showPlace) ...[
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        Icon(Icons.place_outlined, size: 11, color: fg.withValues(alpha: 0.7)),
+                        const SizedBox(width: 2),
+                        Flexible(
+                          child: Text(
+                            place!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(color: fg.withValues(alpha: 0.7), fontSize: 10.5),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// The Plans tab's Google connection, as an app-bar action. A cloud-off icon offers
@@ -344,10 +533,16 @@ class _GoogleEventCard extends StatelessWidget {
 /// routing "Walk here" uses. A spinner while the hop runs; a snack when the room has
 /// slipped off the floor plan since the card was built.
 class _GoToMeetingButton extends StatefulWidget {
-  const _GoToMeetingButton({required this.state, required this.event});
+  const _GoToMeetingButton({required this.state, required this.event, this.dismissFirst = false});
 
   final AppState state;
   final GoogleEvent event;
+
+  /// When true the button lives inside a modal (the peek) that sits above the
+  /// Scaffold the snack would land on. The sheet is popped before the result shows,
+  /// so a walk failure or an "Asked to join…" reply isn't hidden behind it — the same
+  /// path [_MeetingEditorState._walkFromEditor] takes from its sheet.
+  final bool dismissFirst;
 
   @override
   State<_GoToMeetingButton> createState() => _GoToMeetingButtonState();
@@ -358,10 +553,12 @@ class _GoToMeetingButtonState extends State<_GoToMeetingButton> {
 
   Future<void> _go() async {
     final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
     setState(() => _busy = true);
     final error = await widget.state.walkToGoogleEvent(widget.event);
     if (!mounted) return;
     setState(() => _busy = false);
+    if (widget.dismissFirst) navigator.pop();
     if (error != null) messenger.showSnackBar(SnackBar(content: Text(error)));
   }
 
@@ -400,7 +597,126 @@ class _GoToMeetingButtonState extends State<_GoToMeetingButton> {
   }
 }
 
+/// A read-only detail peek for one mirrored Google event, opened by tapping its timeline
+/// block. A Google event cannot be edited here — it is a mirror of a calendar this phone
+/// does not own — so the tap that would open the editor on a plan opens this instead: the
+/// full title, the exact day and time, the place when there is one, and the same "Go to
+/// meeting" walk the live block used to carry, when the event is on and resolves to a room.
+void _showGoogleEventPeek(BuildContext context, AppState state, GoogleEvent event) {
+  final t = context.tokens;
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: t.card,
+    showDragHandle: true,
+    builder: (context) => _GoogleEventPeek(state: state, event: event),
+  );
+}
+
+class _GoogleEventPeek extends StatelessWidget {
+  const _GoogleEventPeek({required this.state, required this.event});
+
+  final AppState state;
+  final GoogleEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final hasPlace = event.location != null && event.location!.isNotEmpty;
+    // Offered whenever the event's location resolves to a room on the floor here — not
+    // only while it is live. Matches the own-plan editor, whose "Walk here" shows the
+    // moment a room is pinned, so a meeting you want to head to early is reachable.
+    final canWarp = state.canGoToMeeting(event);
+    final when = _peekWhen(event);
+    return SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              event.title,
+              style: TextStyle(color: t.foreground, fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 14),
+            _PeekRow(icon: Icons.schedule, text: when),
+            if (hasPlace) ...[
+              const SizedBox(height: 8),
+              _PeekRow(icon: Icons.place_outlined, text: event.location!),
+            ],
+            const SizedBox(height: 8),
+            _PeekRow(icon: Icons.event_available, text: 'Google Calendar'),
+            if (canWarp) ...[
+              const SizedBox(height: 16),
+              _GoToMeetingButton(state: state, event: event, dismissFirst: true),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A line in the Google event peek: an icon beside its text, sharing the look the
+/// colleague calendar's peek uses so the two read as one thing.
+class _PeekRow extends StatelessWidget {
+  const _PeekRow({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 16, color: t.mutedForeground),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(text, style: TextStyle(color: t.foreground, fontSize: 14)),
+        ),
+      ],
+    );
+  }
+}
+
+/// "Today" / "Tomorrow" / a weekday / a date, to set the peek's time in a day.
+String _peekDay(DateTime at) {
+  final delta = _calendarDaysUntil(at);
+  if (delta == 0) return 'Today';
+  if (delta == 1) return 'Tomorrow';
+  if (delta > 1 && delta < 7) return _weekdays[at.weekday - 1];
+  return '${at.day} ${_months[at.month - 1]}';
+}
+
 String _googleTimeRange(GoogleEvent e) => '${_time(e.startsAt)}–${_time(e.endsAt)}';
+
+/// The peek's one-line "when". A same-day event reads its day once ("Today · 09:00–10:00"
+/// or "Today · All day"); an event that crosses days spells out both ends so an overnight
+/// meeting isn't mistaken for a one-hour one and a multi-day span shows its length.
+///
+/// Google gives all-day events an *exclusive* end — a single Monday all-day event ends at
+/// Tuesday 00:00 — so the last day shown is the day before [GoogleEvent.endsAt] for all-day
+/// events, which also collapses the common one-day case back to "Today · All day".
+String _peekWhen(GoogleEvent e) {
+  final startDay = _peekDay(e.startsAt);
+  if (e.allDay) {
+    final lastDay = e.endsAt.subtract(const Duration(days: 1));
+    final sameDay = _isSameCalendarDay(e.startsAt, lastDay);
+    return sameDay
+        ? '$startDay · All day'
+        : '$startDay – ${_peekDay(lastDay)} · All day';
+  }
+  if (_isSameCalendarDay(e.startsAt, e.endsAt)) {
+    return '$startDay · ${_googleTimeRange(e)}';
+  }
+  return '$startDay ${_time(e.startsAt)} – ${_peekDay(e.endsAt)} ${_time(e.endsAt)}';
+}
+
+bool _isSameCalendarDay(DateTime a, DateTime b) =>
+    a.year == b.year && a.month == b.month && a.day == b.day;
 
 class _Empty extends StatelessWidget {
   const _Empty({required this.bottomInset});
@@ -787,6 +1103,29 @@ class _MeetingEditorState extends State<_MeetingEditor> {
                 onChanged: (m) => setState(() => _remindMinutes = m),
               ),
             ),
+            // Walk and delete used to live on the meeting's list card. The timeline
+            // draws a compact block with no room for them, so they move here — the one
+            // place an existing meeting is already open for action.
+            if (editing) ...[
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  if (widget.existing!.roomName?.isNotEmpty ?? false)
+                    _Action(
+                      icon: Icons.directions_walk_rounded,
+                      label: 'Walk here',
+                      onTap: _walkFromEditor,
+                    ),
+                  const Spacer(),
+                  _Action(
+                    icon: Icons.delete_outline_rounded,
+                    label: 'Delete',
+                    tint: t.danger,
+                    onTap: _deleteFromEditor,
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 24),
             SizedBox(
               width: double.infinity,
@@ -832,6 +1171,7 @@ class _MeetingEditorState extends State<_MeetingEditor> {
   }
 
   Future<void> _save() async {
+    if (_saving) return;
     final title = _title.text.trim();
     final messenger = ScaffoldMessenger.of(context);
     final navigator = Navigator.of(context);
@@ -891,6 +1231,42 @@ class _MeetingEditorState extends State<_MeetingEditor> {
       if (room.stableId == stableId) return room;
     }
     return null;
+  }
+
+  /// Walks to the meeting being edited, then closes the sheet — the same hop the list
+  /// card's "Walk here" ran, now that the timeline block hands off to this sheet.
+  Future<void> _walkFromEditor() async {
+    if (_saving) return;
+    final existing = widget.existing!;
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final error = await widget.state.walkToMeeting(existing);
+    if (!mounted) return;
+    navigator.pop();
+    messenger.showSnackBar(SnackBar(
+      content: Text(error ?? 'On your way to ${existing.roomName}.'),
+    ));
+  }
+
+  /// Deletes the meeting being edited and closes the sheet; a failure keeps the sheet
+  /// open with the reason.
+  Future<void> _deleteFromEditor() async {
+    // Share the save busy flag so delete and save can't overlap: a delete mid-save could
+    // race `updateMeeting`'s calendar-mirror await and overwrite or resurrect a meeting.
+    // The Save button already disables on `_saving`; this closes the other direction.
+    if (_saving) return;
+    setState(() => _saving = true);
+    final existing = widget.existing!;
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final error = await widget.state.deleteMeeting(existing.id);
+    if (!mounted) return;
+    if (error != null) {
+      setState(() => _saving = false);
+      messenger.showSnackBar(SnackBar(content: Text(error)));
+      return;
+    }
+    navigator.pop();
   }
 }
 
@@ -1082,16 +1458,16 @@ String _durationLabel(int minutes) {
 /// hours, so `inDays` truncates tomorrow to 0 and the header says TODAY. UTC days
 /// are all 24 hours, so the difference is the number of calendar days regardless of
 /// any daylight-saving step in between.
-int _calendarDaysUntil(DateTime at) {
+int _calendarDaysUntil(DateTime at, {DateTime? now}) {
   final day = DateTime.utc(at.year, at.month, at.day);
-  final now = DateTime.now();
-  final today = DateTime.utc(now.year, now.month, now.day);
+  final ref = now ?? DateTime.now();
+  final today = DateTime.utc(ref.year, ref.month, ref.day);
   return day.difference(today).inDays;
 }
 
 /// Short day label for the list headers — TODAY / TOMORROW / weekday / date.
-String _dayLabel(DateTime at) {
-  final delta = _calendarDaysUntil(at);
+String _dayLabel(DateTime at, {DateTime? now}) {
+  final delta = _calendarDaysUntil(at, now: now);
   if (delta == 0) return 'TODAY';
   if (delta == 1) return 'TOMORROW';
   if (delta > 1 && delta < 7) return _weekdays[at.weekday - 1].toUpperCase();

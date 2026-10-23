@@ -47,6 +47,10 @@ class FakeSignalling implements SfuSignalling {
   bool disposed = false;
   bool _connected = false;
 
+  /// Held open mid-`start()` when set, so a test can keep a node connecting while
+  /// a second caller races to reuse it from the pool.
+  Future<void>? startGate;
+
   final _notifications = StreamController<SfuNotification>.broadcast();
   final _statuses = StreamController<SfuStatus>.broadcast();
 
@@ -115,6 +119,7 @@ class FakeSignalling implements SfuSignalling {
 
   @override
   Future<void> start({Duration timeout = const Duration(seconds: 10)}) async {
+    if (startGate != null) await startGate;
     started = true;
     _connected = true;
     if (!_statuses.isClosed) {

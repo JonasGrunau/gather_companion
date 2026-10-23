@@ -720,6 +720,29 @@ flutter run -d <device> \
     "require(require('os').homedir()+'/.gather-app-bridge.json').gather.refreshToken")
 ```
 
+The Plans tab's **Google Calendar** connection is compiled in only when a build
+passes `--dart-define=GOOGLE_CLIENT_ID=<id>`. There is no default in source, so a
+plain `flutter run`/`flutter build` ships without it and the "Connect Google
+Calendar" banner never appears. Every device/release build you want the feature in
+needs the flag:
+
+```sh
+flutter run -d <device> \
+  --dart-define=GOOGLE_CLIENT_ID=<iOS OAuth client id from the gather-companion project>
+```
+
+The id is a public OAuth client (PKCE, no secret) — safe to carry in a launch
+config or a `--dart-define-from-file` JSON, just not committed. `GCAL_DEBUG=true`
+logs whether the gate turned the feature on.
+
+The OAuth client's registered bundle ID has to match the bundle the build ships,
+or Google rejects auth with `redirect_uri_mismatch`. The repo default is
+`com.jonasgrunau.gatherCompanion`; local signing flips it to
+`com.michaelalbrecht.gatherCompanion`, so each needs its own iOS OAuth client.
+Create one in the Google Cloud console under the `gather-companion` project →
+APIs & Services → Credentials → Create credentials → OAuth client ID → iOS, with
+that bundle ID. iOS clients get no secret; copy the client ID into the flag.
+
 Your phone and computer have to be on the same network **to pair**, and for push
 registration afterwards. Presence itself needs neither. Phone platforms ask for
 local-network permission the first time, and for the camera the first time you

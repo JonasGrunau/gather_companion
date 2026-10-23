@@ -25,6 +25,7 @@ library;
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:mediasfu_mediasoup_client/mediasfu_mediasoup_client.dart' as ms;
@@ -89,9 +90,12 @@ class SfuSession {
     SfuSignalling Function(String url, String? sessionId)? openSignalling,
     ms.Device Function()? buildDevice,
     void Function(String)? log,
+    // How long a node may stay down before we give up on it (issue #83). A seam
+    // for tests, which cannot wait out the real five seconds on a virtual clock.
+    Duration nodeDownGrace = const Duration(seconds: 5),
     // Assigned the long way round because a named parameter cannot be a private
     // initializing formal — same as `DirectCollector` and `SfuSignalling`.
-  })  :
+  })  : _nodeDownGraceWindow = nodeDownGrace,
         // ignore: prefer_initializing_formals
         _auth = auth,
         // ignore: prefer_initializing_formals
@@ -132,6 +136,16 @@ class SfuSession {
   ms.Device? _device;
   ms.Transport? _sendTransport;
 
+  /// The `_sfuAddr` the cached [_sendTransport] was built on, or null when there
+  /// is no cached transport. A send transport is ICE and DTLS to one specific
+  /// node, so a transport built on the old node is worthless after a silent move
+  /// — the SFU answers its `produce` with `no such transport`. The silent move is
+  /// the whole of issue #67: `_assign` can update `_sfuAddr`/`_node` while the old
+  /// `_sendTransport` survives, so [_sendTransportOrCreate] has to notice the two
+  /// have drifted apart and build fresh, rather than trusting a cache that is
+  /// bound to nothing.
+  String? _sendTransportAddr;
+
   /// The send transport's last reported ICE/DTLS state, or null before the
   /// first `connectionstatechange`. The send-heal watchdog reads it to tell a
   /// transport that actually connected from one that only ever acked a produce.
@@ -148,6 +162,16 @@ class SfuSession {
   /// this as one media connection would work in a small space and quietly lose
   /// half the room in a large one.
   final Map<String, SfuSignalling> _nodes = {};
+
+  /// Readiness of each node while it connects and joins, keyed by url.
+  ///
+  /// A node is placed in [_nodes] the instant it is created — before its socket
+  /// connects and before [_joinNode] replays the allow list — so a concurrent
+  /// caller that finds it in the pool would otherwise consume against a node the
+  /// SFU has not yet authorised us on. Every caller awaits this future, so the
+  /// second peer to land on a shared node waits for the first caller's join
+  /// rather than racing past it. Removed once the node is ready or has failed.
+  final Map<String, Future<void>> _nodeReady = {};
 
   /// Which node each peer's media is on, learned from the router.
   final Map<String, String> _peerNode = {};
@@ -176,13 +200,64 @@ class SfuSession {
   /// `consume-not-allowed`, that fills this.
   final Set<String> _consumeDenied = {};
 
+  /// Peer tags the SFU refused with `no such producer`, keyed `srcId|tag.wire`
+  /// — the same key as [_consumers].
+  ///
+  /// A stale producer id: the peer republished that tag across a reconnect, so
+  /// the id the client holds from the last announce is gone and the `consume`
+  /// is refused outright. Distinct from [_consumeDenied] (a whole-peer
+  /// `consume-not-allowed`): here the peer is otherwise live — typically video
+  /// is still flowing — and only the one tag is dead. The heal is therefore a
+  /// re-announce of that peer, not a rebuild, so the working tags never glitch.
+  final Set<String> _producerGone = {};
+
+  /// How many times the watchdog has soft-re-announced a stale-tag peer without
+  /// the tag recovering, keyed by `srcId`.
+  ///
+  /// The re-announce in [_reannounceStaleTags] is a repeat `consume-request`,
+  /// and the heal only works if the SFU answers it with a fresh `consume-try`.
+  /// A server that treats the duplicate as a no-op would leave the stale id in
+  /// [_announced] forever and the watchdog climbing against it for the life of
+  /// the call. This counter escalates to a full unsubscribe/resubscribe — a
+  /// `requested:false`→`true` toggle the SFU must answer — once the soft
+  /// re-announce has failed enough times to look like a no-op (issue #61).
+  final Map<String, int> _staleTagRetries = {};
+
   /// Peers we want but the router could not place yet. See [_addressFor].
   final Set<String> _awaitingAddr = {};
   Timer? _addrRetry;
 
+  /// How long the address-retry waits before each re-ask.
+  ///
+  /// One second to start, doubling to a ten-second cap. The first delay is the
+  /// whole point: a colleague walks up while their own client is still
+  /// registering its stream, so the router has no address for a breath — and a
+  /// retry a second later catches it, where the old flat ten-second period was
+  /// slower than a person's patience and made them restart into the same wait.
+  Duration _addrRetryBackoff = const Duration(seconds: 1);
+
   /// Nodes whose socket is currently down, so a later `healthy` reads as a
   /// reconnection rather than as the first connect.
   final Set<String> _nodeDown = {};
+
+  /// Grace timers for nodes that are down, one per node, armed on the down edge.
+  ///
+  /// The twin of [_onNodeReconnected]: that handler only runs if a socket comes
+  /// *back*, so a node that silently dies and never returns — the peer's instance
+  /// drained or gone, the peer since republished elsewhere — would otherwise leave
+  /// everyone on it mapped to a dead url forever. The address cache ([_peerNode])
+  /// is never cleared, the retry loop re-asks the same corpse, and only the peer
+  /// restarting fixes it (issue #83). This fires when that happens and gives up on
+  /// the node so its peers re-resolve. Cancelled the moment the socket returns.
+  final Map<String, Timer> _nodeDownGrace = {};
+
+  /// How long a node may stay down before we forget what was on it.
+  ///
+  /// Matched to the recv-heal grace: long enough that an ordinary transport blip
+  /// heals through [_onNodeReconnected] (which cancels this) before it fires, short
+  /// enough that a genuinely dead node does not strand a colleague for long. Set
+  /// from the constructor so a test can shorten it.
+  final Duration _nodeDownGraceWindow;
 
   final Map<String, StreamSubscription<SfuStatus>> _nodeHealth = {};
 
@@ -207,10 +282,33 @@ class SfuSession {
   /// Fires whenever [remotes] changes — a track arriving, going, or being paused.
   Stream<List<RemoteMedia>> get remoteChanges => _remotes.stream;
 
+  /// Peers we have subscribed to but the router has no media address for yet.
+  ///
+  /// They are connecting, not silent: somebody who just walked up while their
+  /// own client is still registering its stream. The UI marks their tile so a
+  /// person reads "connecting…" rather than mistaking them for a colleague
+  /// sitting with mic and camera off — and so nobody restarts the app waiting on
+  /// a peer the retry is already chasing. Changes here ride [remoteChanges].
+  Set<String> get connectingPeers => Set.unmodifiable(_awaitingAddr);
+
   /// Whether we are ready to publish. False until [start] has run through.
   bool get ready => _device?.loaded == true && _node != null;
 
   String? get sfuAddr => _sfuAddr;
+
+  /// Test seam: reproduce a silent SFU node change (issue #67).
+  ///
+  /// The real move has no cordon and no socket drop — the server simply starts
+  /// answering `get-addr` with a new node — so a device cannot be made to perform
+  /// it on cue, and nothing in the modelled protocol closes the send transport
+  /// the way `cordon-sfu` does. This repoints `_sfuAddr`/`_node` at [addr] while
+  /// leaving the cached `_sendTransport` exactly where it was, which is the
+  /// drifted state [_sendTransportOrCreate] has to notice.
+  @visibleForTesting
+  Future<void> debugSilentMove(String addr) async {
+    _sfuAddr = addr;
+    _node = await _nodeAt(addr);
+  }
 
   /// Everything every node says unprompted, merged.
   ///
@@ -278,8 +376,9 @@ class SfuSession {
     _device = device;
     _log('sfu: device loaded');
 
-    _replayAllow(node);
-    _sendConversation();
+    // The allow list and conversation metadata are replayed by [_nodeAt] when it
+    // first connects a node, and kept current on every node by [allow] and
+    // [_sendConversation], so there is nothing node-specific left to do here.
   }
 
   /// Re-send the allow list to [node].
@@ -294,6 +393,22 @@ class SfuSession {
     }
   }
 
+  /// Perform the per-node join the SFU authorises consumes against.
+  ///
+  /// The desktop does this on **every** node it connects to, not just the one it
+  /// publishes from: `playerConnectedSFU` replays the allow list and the
+  /// conversation metadata before the first consume, because both live on the
+  /// node. We used to do it only for our own assigned node, so a colleague whose
+  /// media landed on a *second* node got a socket we had connected but never
+  /// joined — every `consume-request` came back `consume-not-allowed`, forever,
+  /// and no restart could clear it because the node assignment is durable
+  /// (issue #74). Awaited so the first consume on this node is ordered strictly
+  /// after the join.
+  Future<void> _joinNode(SfuSignalling node) async {
+    _replayAllow(node);
+    await _sendConversationTo(node);
+  }
+
   Timer? _turnTimer;
   StreamSubscription<SfuNotification>? _routerSub;
 
@@ -303,32 +418,90 @@ class SfuSession {
   /// a far node reaches the same reconciliation as one about a colleague on ours.
   Future<SfuSignalling> _nodeAt(String url) async {
     final existing = _nodes[url];
-    if (existing != null) return existing;
+    if (existing != null) {
+      // The node is pooled, but a concurrent caller may still be connecting and
+      // joining it — wait for that to finish before handing back a socket that
+      // cannot yet consume. If the shared attempt failed, the node is gone from
+      // the pool, so recurse to start a fresh one.
+      await _nodeReady[url];
+      final pooled = _nodes[url];
+      return pooled ?? await _nodeAt(url);
+    }
 
     final node = _open(url, null);
     _nodes[url] = node;
     _nodeSubscriptions[url] = node.notifications.listen(_onNotification);
+    final ready = Completer<void>();
+    _nodeReady[url] = ready.future;
     try {
-      await node.start();
+      await _connectNode(node, url);
+
+      // Subscribed *after* the first connect, so the `healthy` event that start()
+      // just consumed does not read as a reconnection.
+      _nodeHealth[url] = node.statuses.listen((status) {
+        if (!status.healthy) {
+          // Arm the give-up grace only on the transition into down, not on every
+          // repeated unhealthy status, so a flapping socket does not keep pushing
+          // the deadline out.
+          if (_nodeDown.add(url)) _armNodeDownGrace(url);
+          return;
+        }
+        _nodeDownGrace.remove(url)?.cancel();
+        if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
+      });
+
+      // Join before the caller consumes. A freshly connected node has only a
+      // token-authed socket; without the allow list and conversation metadata it
+      // refuses every consume (issue #74). Awaited so the first consume-request
+      // follows the join.
+      await _joinNode(node);
     } on Object {
       // Do not leave a half-open node in the pool: the next caller would reuse it
       // and get `not connected` rather than a fresh attempt.
       _nodes.remove(url);
       await _nodeSubscriptions.remove(url)?.cancel();
+      await _nodeHealth.remove(url)?.cancel();
       await node.dispose();
       rethrow;
+    } finally {
+      // Wake any concurrent waiters whichever way this went; a failure leaves the
+      // pool empty so they recreate, a success leaves the ready node in place.
+      ready.complete();
+      _nodeReady.remove(url);
     }
-
-    // Subscribed *after* the first connect, so the `healthy` event that start()
-    // just consumed does not read as a reconnection.
-    _nodeHealth[url] = node.statuses.listen((status) {
-      if (!status.healthy) {
-        _nodeDown.add(url);
-        return;
-      }
-      if (_nodeDown.remove(url)) unawaited(_onNodeReconnected(url));
-    });
     return node;
+  }
+
+  /// How many times a node's connect is given before it is treated as down.
+  static const _connectAttempts = 3;
+
+  /// Connect [node], riding out a slow accept rather than bouncing on it.
+  ///
+  /// A secondary node can be slow to answer the socket — measured at a full ten
+  /// seconds on an overloaded instance (issue #74) — while the underlying socket
+  /// keeps retrying beneath a `start()` that has already timed out. A single
+  /// attempt throws on that first timeout, which disposes the half-open node and
+  /// sends the peer all the way back out to the address-retry loop. Re-calling
+  /// `start()` rejoins the same in-flight attempt with a fresh timeout, so a node
+  /// that is merely slow connects on a later go instead; a node that never answers
+  /// still surfaces after [_connectAttempts].
+  Future<void> _connectNode(SfuSignalling node, String url) async {
+    for (var attempt = 1;; attempt++) {
+      try {
+        await node.start();
+        return;
+      } on SfuException catch (error) {
+        // Stop if the session was torn down or this node was dropped/replaced
+        // while connecting. `stop()`/`dispose()` settle the pending `start()`
+        // with a `closed while connecting` SfuException, and calling `start()`
+        // again resets the socket's stopped flag and reopens a node we meant to
+        // discard — so only a genuinely slow-but-live node retries.
+        if (_stopped || !identical(_nodes[url], node)) rethrow;
+        if (attempt >= _connectAttempts) rethrow;
+        _log('sfu: $url slow to connect '
+            '(attempt $attempt/$_connectAttempts); retrying: $error');
+      }
+    }
   }
 
   /// The router's answer to "where is this person's media?".
@@ -437,10 +610,32 @@ class SfuSession {
   /// on a conversation that may never happen.
   Future<ms.Transport> _sendTransportOrCreate() async {
     final existing = _sendTransport;
-    if (existing != null) return existing;
+    // Only return the cache if it was built on the node we are on *now*. After a
+    // silent SFU move (issue #67) `_sfuAddr` has changed under a surviving
+    // transport, and reusing it produces onto a node that has never heard of it
+    // — `produce ack {error: no such transport}`, then the send path never comes
+    // back without a restart. A drifted transport is torn down and rebuilt fresh
+    // on the current node instead.
+    if (existing != null && _sendTransportAddr == _sfuAddr) return existing;
+    if (existing != null) {
+      _log('sfu: the cached send transport was built on $_sendTransportAddr but '
+          'we are on $_sfuAddr now; rebuilding it on this node');
+      _closeSendTransportQuietly();
+      // Dropping the transport dropped every producer, not just the one this
+      // publish is putting back. Ask the owner to restore the rest too, or a mic
+      // dropped by a camera-triggered rebuild (or vice versa) stays silent until
+      // the next unrelated tap (issue #67).
+      _announceRepublish();
+    }
 
     final node = _node;
     final device = _device;
+    // The node this transport is being built on, captured now — before the awaits
+    // below. A silent move landing mid-build changes `_sfuAddr` under us, and
+    // binding the finished transport to the *current* `_sfuAddr` would label an
+    // old-node transport with the new node's addr, defeating the cache check that
+    // is meant to catch exactly that drift (issue #67).
+    final addr = _sfuAddr;
     if (node == null || device == null) {
       throw const SfuException('publish before start');
     }
@@ -516,6 +711,18 @@ class SfuSession {
         // seconds of a dead unmute button, for a refusal the server sent
         // immediately.
         _failPendingProducer(error);
+        // `no such transport` means this send transport was built on a node the
+        // server has silently moved us off (issue #67). The addr check in
+        // [_sendTransportOrCreate] catches the move on the *next* publish, but a
+        // produce already in flight when the move lands needs its own recovery —
+        // otherwise the send path sits dead until the person leaves and rejoins.
+        // Rebuild it, but not inline: we are three frames deep inside this
+        // transport's own `produce()` task, and closing the transport under
+        // itself risks reentrancy and the m-line reorder that corrupts the peer
+        // connection. Defer to a microtask, past the end of this task.
+        if (_isStaleTransport(error)) {
+          scheduleMicrotask(_forceSendRebuild);
+        }
       }
     });
 
@@ -567,6 +774,11 @@ class SfuSession {
     // (measured 2026-09-17, `build/call-capture/media8.log`).
     await transport.handler.ready;
 
+    // Bind the transport to the node it was built on, so a later silent move is
+    // visible as a mismatch rather than reused blind. `addr` is the node captured
+    // above, not the live `_sfuAddr`, which a move during the awaits may have
+    // already advanced.
+    _sendTransportAddr = addr;
     _sendTransport = transport;
     return transport;
   }
@@ -831,7 +1043,13 @@ class SfuSession {
   void allow(String dstId, {required bool allowed}) {
     if (dstId == _srcId) return;
     if (allowed ? !_allowed.add(dstId) : !_allowed.remove(dstId)) return;
-    _node?.emit('consume-allow', {'dstId': dstId, 'allowed': allowed});
+    // The allow list lives on each node, so a change has to reach every node we
+    // hold a socket to — not just our own. A colleague on a secondary node is
+    // authorised against that node, and telling only `_node` leaves them denied
+    // (issue #74).
+    for (final node in _nodes.values) {
+      node.emit('consume-allow', {'dstId': dstId, 'allowed': allowed});
+    }
   }
 
   /// Which conversation we are publishing into, as the SFU understands it.
@@ -860,18 +1078,29 @@ class SfuSession {
   String? _meetingId;
 
   void _sendConversation() {
-    final node = _node;
-    if (node == null) return;
-    unawaited(
-      node.sendWithResponse('set-player-conversation-metadata', {
+    // Every node we talk to needs to know which conversation we are in, not just
+    // the one we publish from — the SFU authorises consumes on a secondary node
+    // against it too (issue #74).
+    for (final node in _nodes.values) {
+      unawaited(_sendConversationTo(node));
+    }
+  }
+
+  /// Tell one [node] which conversation we are in, swallowing its refusal.
+  ///
+  /// Awaitable so [_joinNode] can order the first consume after it; the error is
+  /// logged rather than thrown because a refused metadata is not worth tearing a
+  /// node down over — the consume that follows will say plainly whether the node
+  /// authorised us.
+  Future<void> _sendConversationTo(SfuSignalling node) async {
+    try {
+      await node.sendWithResponse('set-player-conversation-metadata', {
         'meetingId': _meetingId ?? '',
         'clusterId': _clusterId ?? '',
-      }).then(
-        (_) {},
-        onError: (Object error) =>
-            _log('sfu: the conversation metadata was refused: $error'),
-      ),
-    );
+      });
+    } on Object catch (error) {
+      _log('sfu: the conversation metadata was refused: $error');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -983,8 +1212,12 @@ class SfuSession {
         // diffs against the desired set, so a peer quietly removed from it is
         // never asked for again.
         _log('sfu: the router cannot place $srcId yet; will ask again');
-        _awaitingAddr.add(srcId);
-        _scheduleAddrRetry();
+        if (_awaitingAddr.add(srcId)) {
+          _publishRemotes();
+          _expediteAddrRetry();
+        } else {
+          _scheduleAddrRetry();
+        }
         return;
       }
 
@@ -994,7 +1227,7 @@ class SfuSession {
         'srcStreamId': _spaceId,
         'requested': true,
       });
-      _awaitingAddr.remove(srcId);
+      if (_awaitingAddr.remove(srcId)) _publishRemotes();
       _log('sfu: subscribed to $srcId on $url');
 
       // The quality we asked for lives on the node too, so a peer we have just
@@ -1004,29 +1237,79 @@ class SfuSession {
       if (_priority.contains(srcId)) _sendPriority();
     } on Object catch (error) {
       _log('sfu: asking for $srcId failed: $error');
-      _awaitingAddr.add(srcId);
-      _scheduleAddrRetry();
+      // Drop the cached placement so the retry re-asks the router rather than
+      // reusing the url that just failed. `_nodeUrlFor` caches the address
+      // before the connect it feeds into, so a node that has silently died —
+      // the peer since republished elsewhere — leaves a stale entry here that
+      // the retry loop would otherwise read straight back out, re-attempting the
+      // same corpse forever and leaving the peer inaudible (issue #83). Clearing
+      // it costs one extra router round trip when the failure was transient and
+      // the answer is unchanged.
+      _peerNode.remove(srcId);
+      if (_awaitingAddr.add(srcId)) {
+        _publishRemotes();
+        _expediteAddrRetry();
+      } else {
+        _scheduleAddrRetry();
+      }
     }
   }
 
   /// Keep asking the router about people it could not place.
   ///
-  /// Ten seconds is slow enough to be free — one small frame per unplaced peer —
-  /// and quick enough that somebody who walks up while their own client is still
-  /// connecting is heard within a breath rather than never.
+  /// Shaped like [_scheduleRecvHeal]: a self-cancelling one-shot with a
+  /// reentrancy guard and a `_stopped` check, re-arming with a growing
+  /// [_addrRetryBackoff] rather than a flat period. The first re-ask lands a
+  /// second after the router said "no address yet", which is the window a
+  /// walk-up colleague's own client needs to finish registering — fast enough
+  /// that waiting beats restarting, where the old flat ten seconds was slower
+  /// than the person and sent them into a leave/rejoin that only re-armed the
+  /// same wait. It widens to a ten-second cap so a peer who never places costs
+  /// one small frame, not a busy-loop.
   void _scheduleAddrRetry() {
     if (_addrRetry != null || _stopped) return;
-    _addrRetry = Timer.periodic(const Duration(seconds: 10), (timer) {
+    _addrRetry = Timer(_addrRetryBackoff, () {
+      _addrRetry = null;
+
+      final pruned = _awaitingAddr.length;
       _awaitingAddr.removeWhere((srcId) => !_subscribed.contains(srcId));
+      if (_awaitingAddr.length != pruned) _publishRemotes();
+
       if (_awaitingAddr.isEmpty || _stopped) {
-        timer.cancel();
-        _addrRetry = null;
+        _addrRetryBackoff = const Duration(seconds: 1);
         return;
       }
+
       for (final srcId in _awaitingAddr.toList()) {
         unawaited(_requestPeer(srcId));
       }
+
+      final next = _addrRetryBackoff.inSeconds * 2;
+      _addrRetryBackoff = Duration(seconds: next > 10 ? 10 : next);
+      _scheduleAddrRetry();
     });
+  }
+
+  /// Pull the next address retry forward for a peer that has only just started
+  /// awaiting.
+  ///
+  /// The retry timer and its [_addrRetryBackoff] are shared across every
+  /// awaiting peer, so while one unplaced peer widens the backoff toward its
+  /// ten-second cap, a *second* walk-up arriving then would inherit that long
+  /// wait for its own first re-ask — the very stall this fix set out to kill,
+  /// just for the second arrival. Reset the backoff to one second and re-arm so
+  /// the newcomer is re-asked within the window its client needs. Only ever
+  /// brings the deadline forward: an already-armed one-second timer is as fast
+  /// as we go, so it is left alone rather than cancelled and postponed.
+  void _expediteAddrRetry() {
+    if (_stopped) return;
+    if (_addrRetry != null && _addrRetryBackoff <= const Duration(seconds: 1)) {
+      return;
+    }
+    _addrRetryBackoff = const Duration(seconds: 1);
+    _addrRetry?.cancel();
+    _addrRetry = null;
+    _scheduleAddrRetry();
   }
 
   Timer? _recvHealTimer;
@@ -1054,6 +1337,15 @@ class SfuSession {
   /// Set while [_rebuildSend] runs, so overlapping fires do not stack.
   bool _healingSend = false;
 
+  Timer? _ownNodeRetry;
+
+  /// How long the own-node watchdog waits before each re-assign attempt.
+  ///
+  /// Two seconds to start, doubling to a thirty-second cap. Armed only when a
+  /// move off our publishing node fails because the router is unreachable, so
+  /// the first delay rides out a brief outage before re-asking.
+  Duration _ownNodeRetryBackoff = const Duration(seconds: 2);
+
   /// Arm the watchdog that heals a receive path which never came up.
   ///
   /// Shaped like [_scheduleAddrRetry]: a self-cancelling one-shot with a
@@ -1072,37 +1364,56 @@ class SfuSession {
     _recvHealTimer = Timer(_recvHealBackoff, () async {
       _recvHealTimer = null;
 
-      // Drop denials from peers we no longer subscribe to. unsubscribe() leaves
-      // the denial behind, so without this a stale denial from a departed peer
-      // reads as evidence that the current cluster is deaf, and could rebuild a
-      // healthy in-flight receive path for the peer that replaced it.
+      // Drop faults from peers we no longer subscribe to. unsubscribe() leaves
+      // them behind, so without this a stale denial — or a stale-producer tag —
+      // from a departed peer reads as evidence that the current cluster is sick,
+      // and could rebuild a healthy in-flight receive path for the peer that
+      // replaced it. Also drop any stale-producer tag we have since consumed.
       _consumeDenied.removeWhere((srcId) => !_subscribed.contains(srcId));
+      _producerGone.removeWhere((key) {
+        final srcId = key.split('|').first;
+        return !_subscribed.contains(srcId) || _consumers.containsKey(key);
+      });
+      final stillStale = _staleTagPeers();
+      _staleTagRetries.removeWhere((srcId, _) => !stillStale.contains(srcId));
 
-      // Re-evaluate against current state, not the state that armed us. Nothing
-      // to heal if we were stopped or no subscribed peer is stranded — a peer is
-      // stranded only when it was denied and we still hold no consumer for it, so
-      // a denial that has since been consumed, or one left by a departed peer,
-      // does not count. Reset the backoff and stand down.
+      // Re-evaluate against current state, not the state that armed us. Two
+      // faults bring us here: a stranded peer (denied, and we hold no consumer
+      // for it at all) and a stale-producer tag (the peer is otherwise live —
+      // typically video is flowing — but one tag was refused `no such
+      // producer`). Nothing to heal if we were stopped or neither holds; reset
+      // the backoff and stand down.
       final stranded = _strandedPeers();
-      if (_stopped || stranded.isEmpty) {
+      final staleTags = stillStale;
+      if (_stopped || (stranded.isEmpty && staleTags.isEmpty)) {
         _recvHealBackoff = const Duration(seconds: 5);
         return;
       }
 
-      // A fully deaf room (no consumer at all) takes the global rebuild, which
-      // also clears a recv transport that came up poisoned. A partial failure —
-      // the room has sound and only some peers are stranded — re-requests just
-      // those peers, leaving every working transport and consumer untouched.
-      if (_consumers.isEmpty) {
-        await _rebuildReceive();
-      } else {
-        await _healStranded(stranded);
+      // Stranded peers: a fully deaf room (no consumer at all) takes the global
+      // rebuild, which also clears a recv transport that came up poisoned. A
+      // partial failure — the room has sound and only some peers are stranded —
+      // re-requests just those peers, leaving every working transport and
+      // consumer untouched.
+      if (stranded.isNotEmpty) {
+        if (_consumers.isEmpty) {
+          await _rebuildReceive();
+        } else {
+          await _healStranded(stranded);
+        }
+      }
+
+      // Stale-producer tags: re-announce the peer so the SFU resolves the live
+      // producer. This closes no consumer, so the peer's working tags never
+      // glitch.
+      if (staleTags.isNotEmpty) {
+        await _reannounceStaleTags(staleTags);
       }
 
       // Grow the backoff and re-arm. The heal re-issues consumes but does not
       // guarantee one succeeds, so the watchdog keeps trying for the life of the
-      // call; a successful consume that leaves no peer stranded is the only thing
-      // that cancels it.
+      // call; a successful consume that leaves nothing stranded and no stale tag
+      // is the only thing that cancels it.
       final next = _recvHealBackoff.inSeconds * 2;
       _recvHealBackoff = Duration(seconds: next > 30 ? 30 : next);
       _scheduleRecvHeal();
@@ -1122,6 +1433,100 @@ class SfuSession {
       .where((srcId) => _consumeDenied.contains(srcId) && !_hasConsumer(srcId))
       .toSet();
 
+  /// Peers holding a stale-producer fault on some tag they still cannot consume.
+  ///
+  /// The per-tag twin of [_strandedPeers], for issue #61: a peer whose video is
+  /// flowing but whose audio was refused `no such producer` is not stranded —
+  /// [_hasConsumer] is true for it — yet one tag is still dead. Filtering on
+  /// [_subscribed] and a missing consumer for the exact `srcId|tag` key keeps a
+  /// departed peer's, or an already-resolved, fault from counting.
+  Set<String> _staleTagPeers() => _producerGone
+      .where((key) =>
+          _subscribed.contains(key.split('|').first) &&
+          !_consumers.containsKey(key))
+      .map((key) => key.split('|').first)
+      .toSet();
+
+  /// Soft re-announces to tolerate before a stale-tag peer is resubscribed.
+  ///
+  /// Two means one bare re-announce fires first — healing the common case where
+  /// the SFU does re-emit, or an organic `consume-try` lands, without glitching
+  /// video — and the hard reset follows on the next tick (~15s in) if it did
+  /// not, fast enough to beat a user restart.
+  static const _staleTagResubscribeAfter = 2;
+
+  /// Re-request peers whose consume was refused `no such producer`.
+  ///
+  /// First choice is the soft re-announce: a repeat `consume-request` that, if
+  /// the SFU answers it with a fresh full-state `consume-try`, re-resolves the
+  /// live producer id for the dead tag while closing no consumer — the peer's
+  /// video keeps flowing and the reconcile that follows leaves its unchanged
+  /// producer in place (see [_reconcileNow]). The fault is left in
+  /// [_producerGone] deliberately: a built consumer is what clears it (in
+  /// [_consume]); if the re-announce still cannot be consumed the peer stays in
+  /// the set and the watchdog climbs.
+  ///
+  /// That soft path only works if the SFU actually re-emits for a peer we are
+  /// already subscribed to. A server that treats the duplicate request as a
+  /// no-op would leave the stale id in [_announced] forever. So after
+  /// [_staleTagResubscribeAfter] soft tries that did not recover, escalate to a
+  /// full unsubscribe/resubscribe of that one peer — a `requested:false`→`true`
+  /// toggle the SFU must answer with a fresh `consume-try`, independent of
+  /// duplicate-request semantics. That re-consumes the peer's working video
+  /// once, the one-time cost of guaranteed audio recovery (issue #61).
+  Future<void> _reannounceStaleTags(Set<String> srcIds) async {
+    for (final srcId in srcIds) {
+      final tries = (_staleTagRetries[srcId] ?? 0) + 1;
+      _staleTagRetries[srcId] = tries;
+      if (tries < _staleTagResubscribeAfter) {
+        _log('sfu: $srcId holds a stale producer id; '
+            're-announcing to re-resolve the live producer (try $tries)');
+        unawaited(_requestPeer(srcId));
+      } else {
+        _log('sfu: $srcId still stale after $tries re-announce(s); '
+            'resubscribing to force a fresh announce');
+        _staleTagRetries.remove(srcId);
+        await _resubscribe(srcId);
+      }
+    }
+  }
+
+  /// Force a fresh announce for one subscribed peer without forgetting it.
+  ///
+  /// The hard escalation for a stale tag the soft re-announce could not clear.
+  /// It sends the SFU the same `requested:false`→`true` toggle a full
+  /// unsubscribe/resubscribe would — which the server must answer with a fresh
+  /// `consume-try`, independent of duplicate-request semantics — but keeps the
+  /// peer in [_subscribed] throughout. Dropping it there (as `unsubscribe`
+  /// does) across the await would let a concurrent cluster-leave
+  /// `setSubscriptions({})` slip into the gap, find nothing to remove, and then
+  /// have this method restore the departed peer's subscription and reciprocal
+  /// allow grant against the caller's wishes. Holding the membership means a
+  /// concurrent removal still sees the peer and lets it go, while recovery for a
+  /// peer that is still wanted re-consumes its working video once — the one-time
+  /// cost of guaranteed audio recovery (issue #61).
+  Future<void> _resubscribe(String srcId) async {
+    if (!_subscribed.contains(srcId)) return;
+
+    final url = _peerNode.remove(srcId);
+    final node = url == null ? null : _nodes[url];
+    node?.emit('consume-request', {
+      'srcId': srcId,
+      'srcStreamId': _spaceId,
+      'requested': false,
+    });
+
+    // Forget the stale receive state so the fresh announce rebuilds it clean.
+    _announced.remove(srcId);
+    for (final tag in SfuTag.values) {
+      _closeConsumer(srcId, tag);
+    }
+    _publishRemotes();
+
+    if (_stopped || !_subscribed.contains(srcId)) return;
+    await _requestPeer(srcId);
+  }
+
   /// Re-request the receive path for a handful of stranded peers.
   ///
   /// The partial-failure twin of [_rebuildReceive]: same per-peer clear and
@@ -1132,6 +1537,28 @@ class SfuSession {
   Future<void> _healStranded(Set<String> stranded) async {
     _log('sfu: ${stranded.length} subscribed peer(s) denied while the room is '
         'receiving; re-requesting them');
+
+    // A denial means that node never authorised us, so re-join each node a
+    // stranded peer sits on before re-requesting — re-sending the consume alone
+    // loops forever (issue #74). Done once per node, against the cached socket,
+    // before the peer-node mapping below is cleared.
+    final nodes = <SfuSignalling>{};
+    for (final srcId in stranded) {
+      final url = _peerNode[srcId];
+      final node = url == null ? null : _nodes[url];
+      if (node != null) nodes.add(node);
+    }
+    for (final node in nodes) {
+      await _joinNode(node);
+    }
+
+    // The joins above awaited a round trip, during which unsubscribe() may have
+    // dropped peers or a consume may have landed. Re-narrow to peers that are
+    // still stranded and subscribed, so we neither restore a departed peer's
+    // grant nor close a consumer that recovered while we waited.
+    if (_stopped) return;
+    stranded = stranded.intersection(_strandedPeers());
+
     for (final srcId in stranded) {
       _peerNode.remove(srcId);
       _announced.remove(srcId);
@@ -1197,9 +1624,11 @@ class SfuSession {
         unawaited(_requestPeer(srcId));
       }
 
-      // Next watchdog fire re-evaluates against denials that arrive after the
+      // Next watchdog fire re-evaluates against faults that arrive after the
       // rebuild, not the ones that triggered it.
       _consumeDenied.clear();
+      _producerGone.clear();
+      _staleTagRetries.clear();
     } finally {
       _healing = false;
     }
@@ -1267,6 +1696,59 @@ class SfuSession {
     }
   }
 
+  /// A produce refusal that means the send transport no longer exists on the
+  /// node — not that the track or the credentials are wrong.
+  ///
+  /// The server sends it after a silent move (issue #67): the transport was
+  /// built on the old node, `produce` lands on the new one, and the new node has
+  /// never heard of the transport. Keyed on both phrasings because the exact
+  /// wording is the one assumption here no capture has pinned down; the
+  /// distinct-enough `transport` wording keeps a bad-auth or codec refusal from
+  /// being mistaken for this.
+  bool _isStaleTransport(Object error) =>
+      error is SfuException &&
+      (error.message.contains('no such transport') ||
+          error.message.contains('unknown transport'));
+
+  /// Tear down the stale send transport and ask the owner to republish, once.
+  ///
+  /// The issue-#67 twin of [_rebuildSend], reached from a `produce` that was
+  /// refused `no such transport` rather than from the never-connected watchdog.
+  /// Deferred to a microtask by its caller, so by the time this runs the
+  /// offending `produce()` task has unwound and closing the transport is safe.
+  /// Shares the [_healingSend] guard with [_rebuildSend] so the watchdog and this
+  /// can never both be rebuilding the send path at once — the single
+  /// mutual-exclusion point for the whole send side.
+  Future<void> _forceSendRebuild() async {
+    if (_healingSend || _stopped) return;
+    _healingSend = true;
+    try {
+      _log('sfu: produce was refused on a stale transport; rebuilding the send '
+          'path on the current node (issue #67)');
+      _failPendingProducer(
+          const SfuException('send path rebuilt: transport was stale'));
+      _closeSendTransportQuietly();
+      _announceRepublish();
+    } finally {
+      _healingSend = false;
+    }
+  }
+
+  /// Undo [_standDown], so publishing can resume — the deliberate "new session"
+  /// the [displaced] doc comment names as the only way back.
+  ///
+  /// [displaced] is sticky on purpose: a silent retry would restart the fight
+  /// with the other client that standing down existed to end. This is not a
+  /// retry — it is the person's explicit "pull the session over here", which is
+  /// an answer to that fight (they are about to quit Gather on the other device,
+  /// or have decided this phone wins). Resetting the flapping counter too, so the
+  /// takeover gets the full three-notice grace again rather than latching on the
+  /// first notice after being reclaimed.
+  void clearDisplaced() {
+    _displaced = false;
+    _doubleConnected = 0;
+  }
+
   /// Set by [stop], so timers and retries do not outlive the session.
   bool _stopped = false;
 
@@ -1276,7 +1758,7 @@ class SfuSession {
   /// packets we drop on the floor, which is somebody's battery.
   Future<void> unsubscribe(String srcId) async {
     if (!_subscribed.remove(srcId)) return;
-    _awaitingAddr.remove(srcId);
+    if (_awaitingAddr.remove(srcId)) _publishRemotes();
     _spatial.remove(srcId);
 
     final url = _peerNode.remove(srcId);
@@ -1290,6 +1772,7 @@ class SfuSession {
     allow(srcId, allowed: false);
 
     _announced.remove(srcId);
+    _staleTagRetries.remove(srcId);
     for (final tag in SfuTag.values) {
       _closeConsumer(srcId, tag);
     }
@@ -1588,6 +2071,17 @@ class SfuSession {
       try {
         await _consume(srcId, tag);
         changed = true;
+      } on SfuException catch (error) {
+        _log('sfu: consuming ${tag.wire} from $srcId failed: $error');
+        // A stale producer id after the peer republished this tag across a
+        // reconnect (issue #61). The refusal is terminal on its own — no new
+        // `consume-try` need follow — so record the one dead tag and let the
+        // watchdog re-announce the peer. Kept narrow: a timeout or any other
+        // failure must not start an unbounded re-announce loop.
+        if (error.message.contains('no such producer')) {
+          _producerGone.add(key);
+          _scheduleRecvHeal();
+        }
       } on Object catch (error) {
         _log('sfu: consuming ${tag.wire} from $srcId failed: $error');
       }
@@ -1652,7 +2146,15 @@ class SfuSession {
       // backoff only once nothing is left stranded, so a later cascade starts
       // from the full grace window rather than mid-climb.
       _consumeDenied.remove(srcId);
-      if (_strandedPeers().isEmpty) {
+      _producerGone.remove(key);
+      // Clear the escalation counter only when this peer has no stale tag left.
+      // The counter is keyed by `srcId`, but `_producerGone` is per-tag: a
+      // healthy video (or screen) consume must not reset the ladder while this
+      // peer's audio tag is still gone, or a producer replaced after the first
+      // soft retry would restart escalation at try 1 and could keep broken audio
+      // from ever reaching the hard resubscribe backstop.
+      if (!_staleTagPeers().contains(srcId)) _staleTagRetries.remove(srcId);
+      if (_strandedPeers().isEmpty && _staleTagPeers().isEmpty) {
         _recvHealTimer?.cancel();
         _recvHealTimer = null;
         _recvHealBackoff = const Duration(seconds: 5);
@@ -1763,7 +2265,12 @@ class SfuSession {
   }
 
   bool _closeConsumer(String srcId, SfuTag tag) {
-    final consumer = _consumers.remove('$srcId|${tag.wire}');
+    final key = '$srcId|${tag.wire}';
+    // Whatever reconciled this tag — a close, a mute, a producer-id change —
+    // settles the stale-producer fault too, so it must not keep healing. Done
+    // unconditionally because the #61 case holds no consumer to remove.
+    _producerGone.remove(key);
+    final consumer = _consumers.remove(key);
     if (consumer == null) return false;
     consumer.close();
     return true;
@@ -1791,6 +2298,33 @@ class SfuSession {
     }
   }
 
+  /// Give a down node a grace window to come back before we give up on it.
+  ///
+  /// The down-edge twin of [_onNodeReconnected]. The server tells us when a node
+  /// is *draining* (`cordon-sfu`/`reassign` → [_reassign]) and the health stream
+  /// tells us when a dropped node *returns* ([_onNodeReconnected]), but a node that
+  /// silently dies — the instance gone, the peer since republished elsewhere —
+  /// sends neither: it just stops answering. Without this the peers on it stay
+  /// mapped to a dead url forever, the retry loop re-asks the same corpse, and only
+  /// the peer restarting fixes it (issue #83). If the socket has not come back when
+  /// this fires, treat the node exactly as a drain — [_reassign] forgets its peers
+  /// (clearing the address cache the retry loop reads), moves our own node or drops
+  /// a peer node, and re-asks the router where everyone went. Cancelled the instant
+  /// the socket returns healthy, so an ordinary blip never reaches here.
+  void _armNodeDownGrace(String url) {
+    if (_stopped) return;
+    _nodeDownGrace[url]?.cancel();
+    _nodeDownGrace[url] = Timer(_nodeDownGraceWindow, () {
+      _nodeDownGrace.remove(url);
+      // Re-check against current state: the socket may have come back, the node
+      // may have been dropped another way, or the session may have stopped.
+      if (_stopped || !_nodeDown.contains(url) || !_nodes.containsKey(url)) return;
+      _log('sfu: $url stayed down past grace; giving up on it so its peers '
+          're-resolve (issue #83)');
+      unawaited(_reassign(url));
+    });
+  }
+
   /// A node's socket dropped and came back. Everything it held died with it.
   ///
   /// Transports, producers and consumers all live on the far side of that
@@ -1807,10 +2341,14 @@ class SfuSession {
 
     final moved = _forgetPeersOn(url);
 
+    // A reconnected socket is joined-fresh too: the node forgot our allow list and
+    // conversation the moment it dropped, so re-join it before re-requesting its
+    // peers or every consume comes back denied (issue #74). Applies to any node,
+    // not just the one we publish from.
+    await _joinNode(node);
+
     if (url == _sfuAddr) {
       _closeSendTransportQuietly();
-      _replayAllow(node);
-      _sendConversation();
       _announceRepublish();
     }
 
@@ -1839,18 +2377,64 @@ class SfuSession {
         return;
       }
       _log('sfu: moved to $_sfuAddr');
+      _ownNodeRetryBackoff = const Duration(seconds: 2);
       _announceRepublish();
     } on Object catch (error) {
       // Logged rather than thrown: this runs from a server push, so there is no
       // caller to catch it, and a session that cannot move is still a session
-      // that can receive.
+      // that can receive. But a move that fails because the router is
+      // unreachable leaves us with no publishing node at all — and the old
+      // node's health listener is already gone, so nothing re-triggers this on
+      // its own. Arm a backoff retry so outbound media comes back when the
+      // router does, instead of staying dead until the app restarts (issue #87).
+      //
+      // Roll back any partial assignment first. `_assign` sets `_sfuAddr`/`_node`
+      // *before* it connects the node and loads its capabilities, so a router
+      // that returns an address for a node that then fails to connect leaves
+      // `_sfuAddr` pointing at a node we never finished joining. The retry guard
+      // stands down on `_sfuAddr != null`, so a non-null address here would
+      // suppress every retry and strand outbound media on a dead node. Clearing
+      // it — and dropping the half-open socket — means only a *completed* move
+      // leaves `_sfuAddr` set, which is the only state that should silence the
+      // watchdog.
+      final stranded = _sfuAddr;
+      _sfuAddr = null;
+      _node = null;
+      if (stranded != null) await _dropNode(stranded);
       _log('sfu: could not move to another node: $error');
+      _scheduleOwnNodeRetry();
     } finally {
       _moving = false;
     }
   }
 
   bool _moving = false;
+
+  /// Keep trying to move to another node after a failed [_moveOwnNode].
+  ///
+  /// Shaped like [_scheduleAddrRetry]/[_scheduleRecvHeal]: a self-cancelling
+  /// one-shot with a reentrancy guard and a `_stopped` check, re-arming with a
+  /// growing backoff. The retry body is [_moveOwnNode] itself — its teardown is
+  /// inert on re-entry (the send transport is already gone and `_sfuAddr` is
+  /// null, so no node is dropped), and it re-arms this timer on another failure
+  /// and resets the backoff on success. Only the arming lives here.
+  void _scheduleOwnNodeRetry() {
+    if (_ownNodeRetry != null || _stopped) return;
+    _ownNodeRetry = Timer(_ownNodeRetryBackoff, () {
+      _ownNodeRetry = null;
+      // Re-evaluate against current state: a `cordon-sfu`/`reassign` or a node
+      // reconnection may have re-placed us while we waited, in which case a
+      // retry would tear down a node we are now publishing from. Stand down and
+      // reset the backoff.
+      if (_stopped || _sfuAddr != null) {
+        _ownNodeRetryBackoff = const Duration(seconds: 2);
+        return;
+      }
+      final next = _ownNodeRetryBackoff.inSeconds * 2;
+      _ownNodeRetryBackoff = Duration(seconds: next > 30 ? 30 : next);
+      unawaited(_moveOwnNode());
+    });
+  }
 
   /// Forget everything we knew about the peers on [url], returning who they were.
   ///
@@ -1878,6 +2462,7 @@ class SfuSession {
   Future<void> _dropNode(String url) async {
     await _nodeSubscriptions.remove(url)?.cancel();
     await _nodeHealth.remove(url)?.cancel();
+    _nodeDownGrace.remove(url)?.cancel();
     _nodeDown.remove(url);
     _recvTransports.remove(url)?.close();
     final node = _nodes.remove(url);
@@ -1938,6 +2523,7 @@ class SfuSession {
   void _closeSendTransportQuietly() {
     final transport = _sendTransport;
     _sendTransport = null;
+    _sendTransportAddr = null;
     _sendState = null;
     if (transport != null) {
       try {
@@ -1986,15 +2572,21 @@ class SfuSession {
     _turnTimer = null;
     _addrRetry?.cancel();
     _addrRetry = null;
+    _addrRetryBackoff = const Duration(seconds: 1);
     _recvHealTimer?.cancel();
     _recvHealTimer = null;
     _consumeDenied.clear();
+    _producerGone.clear();
+    _staleTagRetries.clear();
     _recvHealBackoff = const Duration(seconds: 5);
     _healing = false;
     _sendHealTimer?.cancel();
     _sendHealTimer = null;
     _sendHealBackoff = const Duration(seconds: 6);
     _healingSend = false;
+    _ownNodeRetry?.cancel();
+    _ownNodeRetry = null;
+    _ownNodeRetryBackoff = const Duration(seconds: 2);
     _spatialDebounce?.cancel();
     _spatialDebounce = null;
     _awaitingAddr.clear();
@@ -2031,6 +2623,10 @@ class SfuSession {
       await subscription.cancel();
     }
     _nodeHealth.clear();
+    for (final timer in _nodeDownGrace.values) {
+      timer.cancel();
+    }
+    _nodeDownGrace.clear();
     _nodeDown.clear();
     for (final node in _nodes.values.toList()) {
       await node.dispose();

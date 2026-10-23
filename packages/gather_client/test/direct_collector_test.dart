@@ -258,27 +258,6 @@ void main() {
       expect(sent['args'], ['SpaceUser', 'me-1']);
     });
 
-    test('requestToAccess addresses a MapArea by id, with no arguments', () async {
-      final c = build()..start();
-      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
-      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
-
-      expect(c.requestToAccess('area-9').ok, isTrue);
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-
-      final sent = await conn.waitFor('requestToAccess');
-      // Unlike every other action, addressed to the area and not our own avatar —
-      // and no third element, like the no-arg actions.
-      expect(sent['args'], ['MapArea', 'area-9']);
-    });
-
-    test('requestToAccess refuses an empty area id before sending', () {
-      final c = build()..start();
-      final sent = c.requestToAccess('');
-      expect(sent.ok, isFalse);
-      expect(sent.detail, contains('no area'));
-    });
-
     test('each gait names its own action', () async {
       final c = build()..start();
       final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
@@ -432,6 +411,18 @@ void main() {
       expect(c.wave('').ok, isFalse);
     });
 
+    test('requestToAccess knocks on the MapArea by stableId, with no third argument',
+        () async {
+      final (c, conn) = await connected();
+
+      // Like a wave: the id is the area's, not 'me-1', and the frame is the bare
+      // two-element tuple — `requestToAccess` takes no args (issue #69).
+      expect(c.requestToAccess('area-7').ok, isTrue);
+      expect((await lastFrame(conn, 'requestToAccess'))['args'], ['MapArea', 'area-7']);
+
+      expect(c.requestToAccess('').ok, isFalse);
+    });
+
     test('every one of them refuses before it knows which avatar is ours', () {
       final c = build();
       expect(c.setAvailability('Busy').ok, isFalse);
@@ -560,6 +551,32 @@ void main() {
     });
   });
 
+  test('a lone access-request acceptance republishes the roster (#69)', () async {
+    // When a host admits a knock in an otherwise-idle space, the only patch is the
+    // `AreaAccessRequest` addmodel — nobody moved. Map rows deliberately do not
+    // republish the roster, but this one must: the auto-walk that waits for the door
+    // (`AppState._tryEnterPending`) is pumped off the roster and would otherwise hang
+    // until an unrelated presence patch happened by.
+    final c = build()..start();
+    final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+    await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+    var after = 0;
+    final sub = c.rosters.listen((_) => after++);
+    conn.delta([
+      {
+        'op': 'addmodel',
+        'model': 'AreaAccessRequest',
+        'data': {'id': 'aar-1', 'areaId': 'area-7', 'spaceUserId': 'me-1'},
+      },
+    ]);
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await sub.cancel();
+
+    expect(after, greaterThan(0),
+        reason: 'the admit alone must publish a roster to pump the auto-walk');
+  });
+
   test('a reconnect gets a whole fresh dump, which is why resync is a reconnect',
       () async {
     final c = build()..start();
@@ -600,6 +617,64 @@ void main() {
         isTrue,
         reason: 'expected the watchdog to say so, got $lines',
       );
+    });
+
+    // pokeLiveness is the resume path's hand-crank on the deaf-socket watchdog (#70):
+    // iOS freezes the publish timer while the app is suspended, so [_isSilent] cannot
+    // fire on its own. It is a thin delegate to [_isSilent] — the deaf path, where it
+    // tears the socket down and reconnects, is covered by the silence tests below, and
+    // the resume wiring that honours its return value lives in the app's
+    // network_reconnect_test. There is no collector-level test of the *deaf* poke
+    // because the 250ms publish tick heals a deaf socket within one interval, so the
+    // poke can only be observed as the sole actor inside a sub-tick race. This asserts
+    // the one deterministic half: on a live socket the poke reports it did nothing.
+    test('pokeLiveness leaves a live socket alone', () async {
+      // The common resume case: a glance at the phone with the socket still carrying
+      // frames. The poke must report it did nothing and not churn the connection.
+      final c = build(silenceLimit: const Duration(milliseconds: 400))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+
+      // A fresh frame keeps the socket demonstrably alive right before the poke.
+      conn.send({'type': 'Heartbeat', 'timestamp': 1, 'origin': 'Server'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(c.pokeLiveness(), isFalse, reason: 'a live socket has nothing to tear down');
+      expect(gather.connections, hasLength(1), reason: 'and must not be reconnected');
+      expect(c.healthy, isTrue);
+    });
+
+    test('pokeLiveness leaves an already-closed socket to its pending retry', () async {
+      // The thaw race (#70 review). On resume two things run in some order: the socket's
+      // `onDone` — the OS killed the TCP connection while suspended — which nulls `_ws`
+      // and arms a retry, and `verifyLink()`'s poke. If `onDone` wins, `_ws` is null but
+      // `_lastFrameAt` still holds the pre-suspend timestamp, now long expired. A poke
+      // that acted here would cancel the just-armed retry and re-arm it at doubled
+      // backoff, *delaying* the very recovery the poke exists to speed up — and its true
+      // return would make `verifyLink()` skip the immediate `resync()`. It must report it
+      // did nothing and leave the pending retry alone.
+      final c = build(silenceLimit: const Duration(milliseconds: 300))..start();
+      final conn = await firstWhere(gather.onDumped, (_) => true, reason: 'a dump');
+      await firstWhere(c.rosters, (r) => r.selfId != null, reason: 'selfId');
+      expect(gather.connections, hasLength(1));
+
+      // The server drops the connection: the client's `onDone` fires, nulls `_ws` and
+      // arms the ~1s retry. Nothing refreshes `_lastFrameAt` after this.
+      await conn.socket.close();
+      await firstWhere(c.statuses, (s) => !s.healthy, reason: 'the close is noticed');
+
+      // Past the 300ms silence limit but inside the ~1s retry window: `_lastFrameAt` now
+      // reads deaf, yet a retry is already pending.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(c.pokeLiveness(), isFalse,
+          reason: 'a closed socket with recovery already in flight has nothing to poke');
+      expect(gather.connections, hasLength(1), reason: 'the poke must not itself reconnect');
+
+      // The retry that `onDone` armed still fires — the poke neither cancelled nor
+      // delayed it.
+      await firstWhere(gather.onDumped, (_) => true, reason: 'the pending retry reconnects')
+          .timeout(const Duration(seconds: 3));
+      expect(gather.connections.length, greaterThanOrEqualTo(2));
     });
 
     test('a socket still carrying heartbeats is left alone', () async {

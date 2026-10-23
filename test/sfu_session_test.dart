@@ -127,10 +127,123 @@ void main() {
         expect(rig.node().has('consume-request'), isFalse);
 
         rig.addresses[them] = nodeA;
-        clock.elapse(const Duration(seconds: 11));
+        clock.elapse(const Duration(seconds: 2));
         clock.flushMicrotasks();
 
         expect(rig.node().has('consume-request'), isTrue);
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('retries fast on the first miss, not on a flat ten-second clock', () {
+      // The walk-up defect (issue #65): a colleague whose own client is still
+      // registering answers one `addrFound:false`, and the old flat ten-second
+      // retry was slower than a person's patience — they restarted into the same
+      // wait, which only re-armed the same ten seconds. The first re-ask now
+      // lands about a second later, inside the window their client needs, so
+      // waiting beats restarting.
+      fakeAsync((clock) {
+        rig.addresses.remove(them);
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        expect(rig.node().has('consume-request'), isFalse);
+
+        rig.addresses[them] = nodeA;
+
+        clock.elapse(const Duration(milliseconds: 500));
+        clock.flushMicrotasks();
+        expect(rig.node().has('consume-request'), isFalse,
+            reason: 'the first retry waits ~1s, it does not busy-loop');
+
+        clock.elapse(const Duration(milliseconds: 700));
+        clock.flushMicrotasks();
+        expect(rig.node().has('consume-request'), isTrue,
+            reason: 'the first retry lands about a second after the miss, '
+                'not at ten');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('an unplaced peer is reported as connecting until it lands', () {
+      // Feeds the "connecting…" tile: the UI tells a mid-connect walk-up apart
+      // from somebody sitting silent off this set, so nobody restarts waiting on
+      // a peer the retry is already chasing.
+      fakeAsync((clock) {
+        rig.addresses.remove(them);
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        expect(rig.session.connectingPeers, {them},
+            reason: 'subscribed but unplaced — connecting, not silent');
+
+        rig.addresses[them] = nodeA;
+        clock.elapse(const Duration(seconds: 2));
+        clock.flushMicrotasks();
+        expect(rig.session.connectingPeers, isEmpty,
+            reason: 'placed now, so no longer connecting');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('a second walk-up is retried fast too, not stuck behind the first '
+        "peer's widened backoff", () {
+      // The retry timer and its backoff are shared across awaiting peers. While
+      // peer A stays unplaced the backoff widens toward its ten-second cap; a
+      // peer B that only starts awaiting then must not inherit that long wait
+      // for its *first* re-ask — that is the walk-up stall of issue #65, just
+      // for the second arrival. B's miss resets the shared backoff so it is
+      // chased within ~1s, not whenever A's far-out timer next happens to fire.
+      const them2 = 'acct-them-2';
+      fakeAsync((clock) {
+        rig.addresses.remove(them);
+        rig.addresses.remove(them2);
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+
+        // Let A's shared backoff widen well past one second (fires at 1, 3, 7s;
+        // at 8s the next is armed ~7s out at the widened backoff).
+        clock.elapse(const Duration(seconds: 8));
+        clock.flushMicrotasks();
+
+        // B starts awaiting now; its address lands a beat later.
+        rig.session.subscribe(them2).ignore();
+        clock.flushMicrotasks();
+        rig.addresses[them2] = nodeA;
+
+        // `consume-request` is a `sendWithResponse`, so it lands in the node's
+        // `asked`, not `said`. The node socket only opens once somebody is
+        // placed on it, so its absence is itself proof nothing has been asked.
+        bool askedFor(String id) {
+          final socket = rig.sockets[nodeA];
+          if (socket == null) return false;
+          return socket.asked.any(
+              (f) => f.method == 'consume-request' && f.args['srcId'] == id);
+        }
+
+        clock.elapse(const Duration(milliseconds: 500));
+        clock.flushMicrotasks();
+        expect(askedFor(them2), isFalse,
+            reason: "B's first retry waits ~1s, it does not busy-loop");
+
+        clock.elapse(const Duration(milliseconds: 700));
+        clock.flushMicrotasks();
+        expect(askedFor(them2), isTrue,
+            reason: 'B is retried about a second after it started awaiting, '
+                "not stuck behind A's widened backoff");
+
         rig.close().ignore();
         clock.elapse(const Duration(seconds: 1));
       });
@@ -273,6 +386,334 @@ void main() {
           reason: 'whoever was on the old node has to be asked for again');
       expect(rig.republishes, 1);
     });
+
+    test('a router unreachable when our node drains is retried until it answers',
+        () async {
+      // The outage window from issue #87: a cordon tells us to leave our node
+      // while the local network is down, so the move finds no address and
+      // fails. With no retry the old node's health listener is already gone and
+      // outbound media would stay dead until a restart; the watchdog has to keep
+      // trying until the router can place us again. Real timers rather than a
+      // virtual clock, because the move awaits a broadcast-stream cancel that a
+      // fake clock does not settle deterministically.
+      await rig.session.start();
+      await rig.session.subscribe(them);
+      final old = rig.node();
+
+      // Router cannot place us: a cordon arrives mid-outage. `_assign` exhausts
+      // its four address attempts (each answered `addrFound: false`) and fails.
+      rig.addresses.remove(me);
+      rig.router.push('cordon-sfu', {'sfuAddr': nodeA});
+
+      // Wait past the *original* move's last attempt before restoring the
+      // router. `_addressFor(attempts: 4)` re-asks at roughly 0, 0.4, 1.2 and
+      // 2.8s, so a restore any earlier would let that first move succeed on its
+      // own third or fourth attempt and this test would pass with no watchdog at
+      // all. Holding the outage until ~3.2s forces the original move to exhaust
+      // every attempt and fail, so only the retry armed on that failure can
+      // recover — which is the behaviour under test.
+      await Future<void>.delayed(const Duration(milliseconds: 3200));
+
+      expect(rig.session.sfuAddr, isNull,
+          reason: 'the move failed — we hold no publishing node');
+      expect(rig.republishes, 0,
+          reason: 'nothing to republish onto: there is no node yet');
+      expect(old.disposed, isTrue,
+          reason: 'the drained node was dropped before the failed assign');
+
+      // The network comes back and the router can place us again. The original
+      // move is already finished and failed, so the next assign can only come
+      // from the own-node watchdog.
+      rig.addresses[me] = nodeB;
+      rig.addresses[them] = nodeB;
+
+      // The own-node watchdog re-tries on its two-second backoff and lands on
+      // nodeB. Poll past the backoff rather than racing it.
+      for (var i = 0; i < 80 && rig.session.sfuAddr == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+
+      expect(rig.session.sfuAddr, nodeB,
+          reason: 'the retry moved us the moment the router answered');
+      expect(rig.node(nodeB).has('get-rtp-capabilities'), isTrue);
+      expect(rig.republishes, 1,
+          reason: 'a republish is announced once the move finally succeeds');
+    });
+  });
+
+  group('a node that dies silently (issue #83)', () {
+    // The rig's grace window is 20ms; wait past it, then let the recovery settle.
+    Future<void> pastGrace() async {
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      await settle();
+      await settle();
+    }
+
+    test('a peer whose node dies and never returns is re-resolved onto its new '
+        'node, without any cordon', () async {
+      // The incident: a colleague's SFU node stopped answering mid-call — no
+      // cordon-sfu, no reassign, the socket just went quiet. Her address stayed
+      // cached on the dead node, the retry loop re-asked the same corpse, and only
+      // she restarting fixed it. The down-edge grace gives up on the node so the
+      // peer is re-resolved onto wherever they land next.
+      rig.session.setAllowed({them});
+      await rig.session.start();
+
+      // Their media is on a different node than the one we publish from.
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+      expect(rig.node(nodeB).has('consume-request'), isTrue,
+          reason: 'precondition: we asked nodeB for them');
+
+      // nodeB goes silent — unhealthy, every send on it now fails — and never
+      // comes back. Meanwhile the router re-places them on our own node, the way
+      // it would once they republished.
+      final deadNode = rig.node(nodeB);
+      deadNode.drop();
+      rig.addresses[them] = nodeA;
+      rig.node(nodeA).drain();
+
+      // Inside the grace window nothing has been given up on yet.
+      await settle();
+      expect(deadNode.disposed, isFalse, reason: 'still inside the grace window');
+
+      // Past the grace: the dead node is dropped and its peer re-resolved.
+      await pastGrace();
+
+      expect(deadNode.disposed, isTrue,
+          reason: 'the corpse is dropped, not left pooled');
+      expect(rig.node(nodeA).has('consume-request'), isTrue,
+          reason: 'them is asked for again on the node that now carries them');
+      expect(rig.node(nodeA).argsFor('consume-request')!['srcId'], them);
+    });
+
+    test('a transient blip that returns within grace is not given up on',
+        () async {
+      rig.session.setAllowed({them});
+      await rig.session.start();
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+      final socket = rig.node(nodeB);
+      expect(socket.has('consume-request'), isTrue);
+
+      // Drops, then comes straight back — before the grace window elapses.
+      socket.drop();
+      socket.comeBack();
+      await pastGrace();
+
+      expect(socket.disposed, isFalse,
+          reason: 'a node that came back is reconnected, not dropped as dead');
+      expect(identical(rig.sockets[nodeB], socket), isTrue,
+          reason: 'the same pooled socket, re-joined — not replaced');
+    });
+
+    test('our own node dying is a move to a new one, not a peer-forget',
+        () async {
+      await rig.session.start();
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      expect(rig.session.sfuAddr, nodeA);
+      final deadNode = rig.node(nodeA);
+      final before = rig.republishes;
+
+      // Our node goes silent and never comes back; the router will place us on
+      // nodeB. This must move us, not tear our peers down.
+      rig.addresses[me] = nodeB;
+      deadNode.drop();
+      await pastGrace();
+
+      expect(rig.session.sfuAddr, nodeB,
+          reason: 'we moved to the node the router now names');
+      expect(deadNode.disposed, isTrue);
+      expect(rig.republishes, greaterThan(before),
+          reason: 'the move asks the caller to republish onto the new node');
+    });
+
+    test('a post-grace resolve onto a still-failing node does not stick: the '
+        'next answer re-resolves onto where the peer actually went', () async {
+      // The reviewer case: at grace expiry the router still names the dead node,
+      // so the re-resolve re-caches it and the first attempt there fails. If that
+      // failed placement were left in `_peerNode`, every later retry would read it
+      // straight back out and keep asking the corpse — the peer republishes
+      // elsewhere and is never heard. The failed attempt must evict the cache so
+      // the next answer is free to name the real node (issue #83).
+      rig.session.setAllowed({them});
+      await rig.session.start();
+
+      // Their media is on nodeB, which refuses every consume-request from here on
+      // — the node is up enough to connect but cannot serve them, the shape a
+      // just-drained node takes while the router has not caught up.
+      rig.addresses[them] = nodeB;
+      rig.nodeRefusals['consume-request'] = 'refused';
+      await rig.session.subscribe(them);
+      await settle();
+      expect(rig.node(nodeB).has('consume-request'), isTrue,
+          reason: 'precondition: we tried nodeB and it refused');
+
+      // The router now places them on nodeA, which serves them. Nothing re-asks on
+      // its own in this test's time budget, so push the answer the server would:
+      // a fresh consume-try is the full-state announcement that drives a reconcile.
+      rig.nodeRefusals.remove('consume-request');
+      rig.addresses[them] = nodeA;
+      rig.node(nodeA).drain();
+      rig.announce(them, {'audio': 'prod-them-audio'}, url: nodeA);
+      await settle();
+      await settle();
+
+      // The reconcile re-resolved rather than reusing the cached refusing node:
+      // the consume lands on nodeA. A stale `_peerNode[them] == nodeB` would have
+      // sent it back to the node that cannot serve them.
+      expect(rig.node(nodeA).has('consume'), isTrue,
+          reason: 'them is consumed on the node that now carries them');
+      expect(rig.node(nodeA).argsFor('consume')!['srcId'], them);
+    });
+  });
+
+  group('a peer on a secondary node (issue #74)', () {
+    const other = 'acct-other';
+
+    test('is joined before it is asked for — allow list and conversation '
+        'metadata, then consume-request', () async {
+      rig.session.setAllowed({them});
+      rig.session.setConversation(clusterId: 'c1', meetingId: 'm1');
+      await rig.session.start();
+
+      // Their media lives on a different node than the one we publish from.
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+
+      final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+      expect(
+        order,
+        containsAll(const [
+          'consume-allow',
+          'set-player-conversation-metadata',
+          'consume-request',
+        ]),
+      );
+      final request = order.indexOf('consume-request');
+      expect(order.indexOf('set-player-conversation-metadata'), lessThan(request),
+          reason: 'a node that has not been joined refuses the consume — the '
+              'whole of issue #74');
+      expect(order.indexOf('consume-allow'), lessThan(request));
+      expect(rig.node(nodeB).argsFor('set-player-conversation-metadata'),
+          {'meetingId': 'm1', 'clusterId': 'c1'});
+      expect(
+        rig.node(nodeB).sent.where(
+            (f) => f.method == 'consume-allow' && f.args['dstId'] == them),
+        isNotEmpty,
+      );
+    });
+
+    test('a later allow and conversation change reach it, not just our own node',
+        () async {
+      rig.session.setAllowed({them});
+      await rig.session.start();
+      rig.addresses[them] = nodeB;
+      await rig.session.subscribe(them);
+      rig.node(nodeB).drain();
+
+      rig.session.allow(other, allowed: true);
+      rig.session.setConversation(clusterId: 'c2', meetingId: 'm2');
+      await settle();
+
+      expect(
+        rig.node(nodeB).sent.where(
+            (f) => f.method == 'consume-allow' && f.args['dstId'] == other),
+        isNotEmpty,
+        reason: 'the allow list lives on every node we hold a socket to',
+      );
+      expect(rig.node(nodeB).argsFor('set-player-conversation-metadata'),
+          {'meetingId': 'm2', 'clusterId': 'c2'});
+    });
+
+    test('a denial on it re-joins the node before re-requesting, even while the '
+        'room already has sound', () {
+      fakeAsync((clock) {
+        rig.session.setAllowed({them, other});
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        // One peer on our node, consumed: the room is receiving, so the partial
+        // heal (not the full rebuild) is what runs.
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+        rig.announce(them, {'audio': 'p-audio'});
+        clock.flushMicrotasks();
+        expect(rig.session.remotes, isNotEmpty);
+
+        // Another peer on a second node, denied.
+        rig.addresses[other] = nodeB;
+        rig.session.subscribe(other).ignore();
+        clock.flushMicrotasks();
+        rig.node(nodeB).push(
+            'consume-not-allowed', {'srcId': other, 'srcStreamId': spaceId});
+        clock.flushMicrotasks();
+
+        rig.node(nodeB).drain();
+
+        // Grace window passes; the heal re-joins nodeB, then re-asks.
+        clock.elapse(const Duration(seconds: 6));
+        clock.flushMicrotasks();
+
+        final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+        final request = order.indexOf('consume-request');
+        expect(request, greaterThan(-1),
+            reason: 'the denied peer should be re-requested');
+        expect(order.contains('set-player-conversation-metadata'), isTrue,
+            reason: 'a denial means the node never authorised us — re-join it');
+        expect(order.indexOf('set-player-conversation-metadata'),
+            lessThan(request),
+            reason: 're-sending the consume alone loops forever');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('two peers sharing a slow node both wait for its join before consuming',
+        () async {
+      rig.session.setAllowed({them, other});
+      rig.session.setConversation(clusterId: 'c1', meetingId: 'm1');
+      await rig.session.start();
+
+      // Both colleagues' media is on the same secondary node, and that node is
+      // slow to connect — the window in which it sits in the pool connected to
+      // nothing but a token-authed socket, un-joined.
+      rig.addresses[them] = nodeB;
+      rig.addresses[other] = nodeB;
+      rig.slowToConnect.add(nodeB);
+
+      final first = rig.session.subscribe(them);
+      final second = rig.session.subscribe(other);
+      await settle();
+      await settle();
+
+      expect(rig.sockets.containsKey(nodeB), isTrue,
+          reason: 'the first caller opened the node');
+      expect(rig.node(nodeB).has('consume-request'), isFalse,
+          reason: 'neither caller may consume a node that is still connecting '
+              'and has not been joined');
+
+      rig.releaseConnect(nodeB);
+      await Future.wait([first, second]);
+      await settle();
+
+      // The second caller reused the pooled node rather than opening its own, so
+      // it is the one that would have raced past the join. Every consume-request
+      // on nodeB — both callers' — still lands after the join (issue #74).
+      final order = rig.node(nodeB).sent.map((f) => f.method).toList();
+      final metadata = order.indexOf('set-player-conversation-metadata');
+      final firstRequest = order.indexOf('consume-request');
+      final requests =
+          order.where((m) => m == 'consume-request').length;
+      expect(metadata, greaterThan(-1));
+      expect(firstRequest, greaterThan(-1));
+      expect(requests, 2, reason: 'both peers were requested');
+      expect(metadata, lessThan(firstRequest),
+          reason: 'a caller that reused the pooled node must await its join, '
+              'not race past it onto an unauthorised socket');
+    });
   });
 
   group('publishing', () {
@@ -364,6 +805,25 @@ void main() {
         rig.session.publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio),
         throwsA(isA<SfuException>()),
       );
+    });
+
+    test('clearDisplaced lets publishing resume — the reclaim button (#67)',
+        () async {
+      await rig.session.start();
+      await rig.session.publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      for (var i = 0; i < 3; i++) {
+        rig.node().push('double-connected', const {});
+      }
+      await settle();
+      expect(rig.session.displaced, isTrue);
+
+      // The deliberate "new session" the person asks for by tapping Pull session
+      // over: the stand-down lifts and the next publish is no longer refused.
+      rig.session.clearDisplaced();
+      expect(rig.session.displaced, isFalse);
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      expect(rig.session.publishing(SfuTag.audio), isTrue);
     });
 
     test('the server steering our quality is debounced, and applied once',
@@ -804,6 +1264,196 @@ void main() {
         clock.elapse(const Duration(seconds: 1));
       });
     });
+
+    int consumesFor(FakeSignalling node, String srcId, String tag) => node.sent
+        .where((f) =>
+            f.method == 'consume' &&
+            f.args['srcId'] == srcId &&
+            f.args['tag'] == tag)
+        .length;
+
+    test('re-announces an audio tag refused "no such producer", leaving video',
+        () {
+      // Issue #61: across a reconnect the peer republishes audio, so the id the
+      // client holds goes stale and the audio `consume` is refused `no such
+      // producer`. Video is unaffected. The old code only logged the refusal, so
+      // the peer stayed audible-dead-but-visible for the whole call. The per-tag
+      // heal must re-announce the peer to re-resolve the live producer, without
+      // tearing down the working video consumer.
+      fakeAsync((clock) {
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+
+        // Refuse audio with a stale-producer error while video consumes fine.
+        var refuseAudio = true;
+        rig.node().answer('consume', (args) {
+          if (args['tag'] == 'audio' && refuseAudio) {
+            throw const SfuException('consume refused: no such producer');
+          }
+          return {
+            'id': 'consumer-${args['srcId']}-${args['tag']}',
+            'producerId': rig.producerIds['${args['srcId']}|${args['tag']}'],
+            'producerPaused': false,
+            'rtpParameters': Rig.rtpParameters,
+          };
+        });
+
+        rig.announce(them, {'audio': 'p-audio', 'video': 'p-video'});
+        clock.flushMicrotasks();
+
+        // Visible but audible-dead: video consumes, audio does not.
+        expect(rig.session.remotes.single.streams.keys, [SfuTag.video],
+            reason: 'audio was refused no-such-producer, video is fine');
+        expect(consumesFor(rig.node(), them, 'audio'), 1);
+        expect(consumesFor(rig.node(), them, 'video'), 1);
+
+        // The grace window passes. Despite the live video consumer, the watchdog
+        // must re-request this peer to force a fresh announce. The initial
+        // subscribe already sent one consume-request, so count that baseline and
+        // assert the watchdog drives a *further* request — else the test would
+        // pass without the fix.
+        final requestedBefore = consumeRequestsFor(rig.node(), them);
+        clock.elapse(const Duration(seconds: 5));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), them),
+            greaterThan(requestedBefore),
+            reason: 'the stale audio tag must be re-announced');
+
+        // The fresh announce carries a live audio producer; audio now consumes.
+        refuseAudio = false;
+        rig.announce(them, {'audio': 'p-audio-2', 'video': 'p-video'});
+        clock.flushMicrotasks();
+
+        expect(rig.session.remotes.single.streams.keys,
+            containsAll(<SfuTag>[SfuTag.audio, SfuTag.video]),
+            reason: 'audio recovered against the fresh producer id');
+
+        // Video never glitched: its producer id did not change, so it was never
+        // re-consumed.
+        expect(consumesFor(rig.node(), them, 'video'), 1,
+            reason: 'the working video consumer must be left untouched');
+
+        // Stand-down: nothing stale left, so no further re-requests fire.
+        final asked = consumeRequestsFor(rig.node(), them);
+        clock.elapse(const Duration(seconds: 40));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), them), asked,
+            reason: 'a recovered audio tag stops the watchdog');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('resubscribes a stale audio tag when a bare re-announce is a no-op', () {
+      // Issue #61 hardening. The soft re-announce only heals if the SFU answers
+      // the repeat `consume-request` with a fresh `consume-try`. A server that
+      // treats the duplicate as a no-op — the rig's default, since it only
+      // re-announces when the test tells it to — would leave the stale id in
+      // place and the watchdog climbing against it forever. After a couple of
+      // fruitless soft tries the heal must escalate to a full
+      // unsubscribe/resubscribe (a `requested:false`→`true` toggle the server
+      // must answer), which re-consumes video once but recovers audio.
+      fakeAsync((clock) {
+        rig.session.start().ignore();
+        clock.flushMicrotasks();
+
+        rig.session.subscribe(them).ignore();
+        clock.flushMicrotasks();
+
+        // Refuse audio with a stale-producer error while video consumes fine.
+        var refuseAudio = true;
+        rig.node().answer('consume', (args) {
+          if (args['tag'] == 'audio' && refuseAudio) {
+            throw const SfuException('consume refused: no such producer');
+          }
+          return {
+            'id': 'consumer-${args['srcId']}-${args['tag']}',
+            'producerId': rig.producerIds['${args['srcId']}|${args['tag']}'],
+            'producerPaused': false,
+            'rtpParameters': Rig.rtpParameters,
+          };
+        });
+
+        rig.announce(them, {'audio': 'p-audio', 'video': 'p-video'});
+        clock.flushMicrotasks();
+
+        // Visible but audible-dead to start.
+        expect(rig.session.remotes.single.streams.keys, [SfuTag.video]);
+        expect(consumesFor(rig.node(), them, 'video'), 1);
+
+        // First watchdog tick: a soft re-announce, no resubscribe. Crucially we
+        // inject no fresh `consume-try`, so the soft re-announce resolves
+        // nothing — the no-op-SFU case — and audio stays dead.
+        clock.elapse(const Duration(seconds: 5));
+        clock.flushMicrotasks();
+        expect(rig.session.remotes.single.streams.keys, [SfuTag.video],
+            reason: 'a bare re-announce the server ignores heals nothing');
+        expect(
+            rig.node().sent.any((f) =>
+                f.method == 'consume-request' &&
+                f.args['srcId'] == them &&
+                f.args['requested'] == false),
+            isFalse,
+            reason: 'the soft try must not resubscribe yet');
+
+        // Next tick escalates: the peer is unsubscribed (a `requested:false`
+        // toggle, tearing the working video down) and then resubscribed. Assert
+        // both halves in order — a `requested:false` *followed by* a fresh
+        // `requested:true` — rather than just the teardown. The teardown alone
+        // is not recovery: `rig.announce` injects a fresh `consume-try`
+        // regardless of subscription state, so a resubscribe that dropped the
+        // closing `requested:true` would still let the assertions below pass.
+        // Pinning the toggle order is what protects the re-request that the
+        // audio recovery actually depends on.
+        clock.elapse(const Duration(seconds: 10));
+        clock.flushMicrotasks();
+        final toggles = rig
+            .node()
+            .sent
+            .where((f) =>
+                f.method == 'consume-request' && f.args['srcId'] == them)
+            .toList();
+        final lastOff =
+            toggles.lastIndexWhere((f) => f.args['requested'] == false);
+        expect(lastOff, isNonNegative,
+            reason: 'a stale tag the soft re-announce could not clear must '
+                'tear the subscription down with a `requested:false` toggle');
+        expect(
+            toggles
+                .skip(lastOff + 1)
+                .any((f) => f.args['requested'] == true),
+            isTrue,
+            reason: 'the resubscribe must follow the teardown with a fresh '
+                '`requested:true` — the re-request audio recovery depends on');
+
+        // The resubscribe is a genuinely fresh subscription the server answers
+        // with a live audio producer; audio now consumes, and video is
+        // re-consumed once as the cost of the toggle.
+        refuseAudio = false;
+        rig.announce(them, {'audio': 'p-audio-2', 'video': 'p-video'});
+        clock.flushMicrotasks();
+
+        expect(rig.session.remotes.single.streams.keys,
+            containsAll(<SfuTag>[SfuTag.audio, SfuTag.video]),
+            reason: 'audio recovered against the resubscribed producer id');
+        expect(consumesFor(rig.node(), them, 'video'), 2,
+            reason: 'the resubscribe re-consumes video exactly once');
+
+        // Stand-down: the recovered peer stops the watchdog.
+        final asked = consumeRequestsFor(rig.node(), them);
+        clock.elapse(const Duration(seconds: 40));
+        clock.flushMicrotasks();
+        expect(consumeRequestsFor(rig.node(), them), asked,
+            reason: 'a recovered audio tag stops the watchdog');
+
+        rig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
   });
 
   group('send-side stall', () {
@@ -972,6 +1622,78 @@ void main() {
         rig.close().ignore();
         clock.elapse(const Duration(seconds: 1));
       });
+    });
+  });
+
+  group('a silent SFU node change (issue #67)', () {
+    test('a send transport built on the old node is rebuilt on the new one',
+        () async {
+      await rig.session.start();
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+      expect(rig.session.sfuAddr, nodeA);
+      final old = rig.node(nodeA);
+      expect(old.has('transport-create'), isTrue);
+
+      // The server silently starts answering with nodeB — no cordon, no socket
+      // drop — so `_sfuAddr` moves while the nodeA send transport survives.
+      rig.addresses[me] = nodeB;
+      await rig.session.debugSilentMove(nodeB);
+
+      // The next publish must not reuse the drifted transport: it tears the old
+      // one down and builds a fresh one on nodeB, where the next produce lands.
+      await rig.session
+          .publish(FakeTrack('video'), FakeStream(), tag: SfuTag.video);
+
+      final sendOnA = rig.device.transports
+          .firstWhere((t) => t.producerCallback != null);
+      expect(sendOnA.closed, isTrue,
+          reason: 'the transport bound to nodeA is torn down, not reused');
+      expect(rig.node(nodeB).has('transport-create'), isTrue,
+          reason: 'a fresh send transport is created on the node we moved to');
+      expect(rig.node(nodeB).has('produce'), isTrue,
+          reason: 'the produce lands on the current node');
+    });
+
+    test(
+        'a produce refused "no such transport" drops the send path and asks to '
+        'republish, exactly once', () async {
+      await rig.session.start();
+      // The node refuses the first produce the way it does after a silent move:
+      // the transport the server built is on a node it no longer owns.
+      rig.node(nodeA).failingWith['produce'] =
+          'produce refused: no such transport';
+      final before = rig.republishes;
+
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio)
+          .catchError((_) {});
+      // The forced rebuild is deferred to a microtask, past the produce task.
+      await Future<void>.delayed(Duration.zero);
+
+      expect(rig.session.publishing(SfuTag.audio), isFalse,
+          reason: 'the refused producer is not held');
+      expect(rig.republishes, before + 1,
+          reason: 'the owner is asked to put its tracks back, once — the stale '
+              'transport does not also fire the never-connected watchdog');
+      final firstSend = rig.device.transports
+          .firstWhere((t) => t.producerCallback != null);
+      expect(firstSend.closed, isTrue,
+          reason: 'the stale send transport is torn down');
+
+      // The move has settled: the node stops refusing, and the republish (which
+      // in production comes from LiveCall) now lands a fresh transport + produce.
+      rig.node(nodeA).failingWith.remove('produce');
+      await rig.session
+          .publish(FakeTrack('audio'), FakeStream(), tag: SfuTag.audio);
+
+      expect(rig.session.publishing(SfuTag.audio), isTrue,
+          reason: 'the rebuilt send path publishes on the current node');
+      final creates = rig.node(nodeA).sent
+          .where((f) => f.method == 'transport-create')
+          .length;
+      expect(creates, greaterThanOrEqualTo(2),
+          reason: 'a second, fresh send transport was created after the drop');
     });
   });
 }

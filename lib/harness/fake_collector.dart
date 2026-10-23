@@ -75,7 +75,7 @@ class FakeCollector implements Collector {
   @override
   String? get selfAccountId => kSelfAccountId;
   @override
-  bool get healthy => true;
+  bool healthy = true;
   @override
   bool get hasState => true;
 
@@ -291,13 +291,13 @@ class FakeCollector implements Collector {
     return (ok: true, detail: null);
   }
 
-  /// Every area id we have been asked to be let into, in order — so a test can
-  /// assert a locked meeting link turned into a `requestToAccess` for the right room.
+  /// Every area stableId we have been asked to knock on, in order — so a test can
+  /// assert the right room was requested.
   final List<String> accessRequests = [];
   @override
-  ({bool ok, String? detail}) requestToAccess(String areaId) {
+  ({bool ok, String? detail}) requestToAccess(String areaStableId) {
     if (failSends) return (ok: false, detail: 'not connected to Gather');
-    accessRequests.add(areaId);
+    accessRequests.add(areaStableId);
     return (ok: true, detail: null);
   }
 
@@ -344,4 +344,16 @@ class FakeCollector implements Collector {
 
   @override
   void setReachable(bool reachable) => reachablesSet.add(reachable);
+
+  /// How many times the resume path poked the deaf-socket watchdog, and whether that
+  /// poke should report it acted — the simulator has no socket, so a test sets this to
+  /// stand in for one that went deaf while suspended.
+  int pokeLivenesses = 0;
+  bool pokeLivenessActs = false;
+
+  @override
+  bool pokeLiveness() {
+    pokeLivenesses++;
+    return pokeLivenessActs;
+  }
 }

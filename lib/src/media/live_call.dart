@@ -54,7 +54,8 @@ class LiveCall implements Call {
     SfuSession Function()? buildSfu,
     VoiceActivity? voice,
     void Function(String)? log,
-  })  : _voice = voice ?? VoiceActivity(),
+  })  : _auth = auth,
+        _voice = voice ?? VoiceActivity(),
         _log = log ?? _noop,
         _engine = engine ?? WebrtcMediaEngine(log: log),
         _buildSfu = buildSfu ??
@@ -88,6 +89,10 @@ class LiveCall implements Call {
 
   static void _noop(String _) {}
 
+  /// Held so the bad-auth heal can force a fresh ID token before a rebuild — the
+  /// `_buildSfu` closure captures it too, but a reconnect with the *same* cached
+  /// token the SFU just refused loops forever (#84).
+  final GatherAuth _auth;
   final void Function(String) _log;
   final CaptureEngine _engine;
   final SfuSession Function() _buildSfu;
@@ -154,6 +159,13 @@ class LiveCall implements Call {
   /// still bad after the rebuild would rebuild-and-retry forever (#57).
   bool _authHealing = false;
 
+  /// Watches for a wanted track that has not reached the room for 5s, after
+  /// which it sets [CallState.needsHandoff] and the "Pull session over" banner
+  /// appears (issue #67). A single-device takeover does not latch `displaced`
+  /// until the third flapping notice, so this timer is what catches the ordinary
+  /// one-takeover case — and any other stall — before the sticky flag ever sets.
+  Timer? _handoffTimer;
+
   /// Serialises the whole thing. Two taps in quick succession would otherwise
   /// interleave a capture restart with a publish and produce on a dead track.
   Future<void> _work = Future.value();
@@ -183,6 +195,9 @@ class LiveCall implements Call {
           // rather than after a round trip to the SFU.
           await _engine.setAudioEnabled(false);
           _sfu?.pause(SfuTag.audio);
+          // A mute is not a stuck publish: drop any pending watch so it cannot
+          // raise the banner over a microphone the person turned off themselves.
+          _maybeClearHandoffWatch();
           _emit(_state.copyWith(publishingAudio: false, clearDetail: true));
           return null;
         }
@@ -209,6 +224,7 @@ class LiveCall implements Call {
         if (!on) {
           await _engine.setVideoEnabled(false);
           _sfu?.pause(SfuTag.video);
+          _maybeClearHandoffWatch();
           _emit(_state.copyWith(publishingVideo: false, clearDetail: true));
           return null;
         }
@@ -229,6 +245,7 @@ class LiveCall implements Call {
           // sender onto a track that is being torn down underneath it.
           await _sfu?.unpublish(SfuTag.screen);
           await _engine.stopScreenCapture();
+          _maybeClearHandoffWatch();
           _emit(_state.copyWith(publishingScreen: false, clearDetail: true));
           return null;
         }
@@ -267,13 +284,16 @@ class LiveCall implements Call {
       }
     } on Object catch (error) {
       _log('call: publishing the screen failed: $error');
+      if (_sfu?.displaced ?? false) _emit(_state.copyWith(needsHandoff: true));
       // The broadcast is live and only the wire failed, so the button stays on
       // and the sentence says the room cannot see it yet — same stance as a
       // camera that captured but did not reach the SFU.
+      _armHandoffWatch();
       return _fail(SfuTag.screen,
           'You are sharing, but Gather has not picked up the screen yet.');
     }
 
+    _maybeClearHandoffWatch();
     _emit(_state.copyWith(publishingScreen: true, clearDetail: true));
     return null;
   }
@@ -379,12 +399,18 @@ class LiveCall implements Call {
     } on Object catch (error) {
       _log('call: publishing ${tag.wire} failed: $error');
       if (_sfu?.displaced ?? false) {
+        // Sticky takeover: the banner's immediate trigger. The 5s watch is only
+        // for the case `displaced` has not latched yet.
+        _emit(_state.copyWith(needsHandoff: true));
         return _fail(
           tag,
           'Your Mac keeps taking this call back. Quit Gather there, then turn '
           'your microphone on again here.',
         );
       }
+      // Not displaced, but the wire refused: arm the stuck-watch so a publish
+      // that never recovers raises the banner after the grace window.
+      _armHandoffWatch();
       // A stale SFU token — the socket slept through a transport change and the
       // server now refuses every produce `bad auth / TokenVerificationFailed`,
       // which no restart-free path recovers on its own (#57). Rebuild the
@@ -393,8 +419,14 @@ class LiveCall implements Call {
       // through to the ordinary failure message instead.
       if (_isStaleAuth(error) && !_authHealing) {
         _authHealing = true;
-        _log('call: SFU refused bad-auth — rebuilding to mint a fresh token (#57)');
+        _log('call: SFU refused bad-auth — minting a fresh token and rebuilding (#57/#84)');
         try {
+          // Drop the cached token first. The rebuild re-opens the socket, which
+          // asks `GatherAuth.idToken` for a credential — but that hands back the
+          // *same* cached token until it is near clock-expiry, and the SFU has
+          // just refused it after a suspend. Without this, the rebuild presents
+          // the rejected token again and loops forever (#84).
+          await _auth.invalidateIdToken();
           // `_rebuild`, not the public `rebuild`: we are already inside the
           // serialise job, so taking the lock again would deadlock. It republishes
           // this tag onto the fresh session itself, so we return *that* result —
@@ -412,6 +444,9 @@ class LiveCall implements Call {
           '${tag == SfuTag.audio ? 'audio' : 'video'} yet.');
     }
 
+    // The track reached the room, so there is nothing to hand off: cancel the
+    // watch and take the banner down if it was up.
+    _maybeClearHandoffWatch();
     _emit(_state.copyWith(
       publishingAudio: tag == SfuTag.audio ? true : null,
       publishingVideo: tag == SfuTag.video ? true : null,
@@ -594,9 +629,12 @@ class LiveCall implements Call {
     final sfu = _sfu;
 
     if (sfu?.displaced ?? false) {
+      // Sticky displaced has latched — raise the "Pull session over" banner now,
+      // rather than waiting out the 5s stuck-watch the single-takeover case needs.
       _emit(_state.copyWith(
         publishingAudio: false,
         publishingVideo: false,
+        needsHandoff: true,
         detail: 'Your Mac keeps taking this call back. Quit Gather there, then '
             'turn your microphone on again here. You can still see and hear '
             'everyone in the meantime.',
@@ -604,6 +642,12 @@ class LiveCall implements Call {
       return;
     }
 
+    // The softer, first-notice advisory: Gather is merely also open on the Mac.
+    // Not a handoff prompt — nothing is stuck yet. But a takeover can stop our
+    // send without a produce attempt to re-arm the watch from, so arm it here
+    // too; the 5s re-check reads the live producers, so a duplicate connection
+    // that is still publishing fine stands it straight back down (issue #67).
+    _armHandoffWatch();
     _emit(_state.copyWith(
       detail: 'Gather is open on your Mac too. Quit it there if the sound '
           'starts jumping between them.',
@@ -627,7 +671,59 @@ class LiveCall implements Call {
             sharingScreen: r.streams.containsKey(SfuTag.screen),
           ),
       ],
+      // Peers the router has not placed yet, carried alongside the participants
+      // they are not yet among. The session re-emits `remoteChanges` whenever
+      // this set moves, so a tile flips to "connecting…" and back without ever
+      // holding a stream of its own.
+      connecting: _sfu?.connectingPeers ?? const {},
     ));
+  }
+
+  /// Start the 5s stuck-watch, unless it is already running (issue #67).
+  ///
+  /// Armed from every branch that fails to put a wanted track on the wire. The
+  /// timer re-checks *current* state when it fires rather than the state that
+  /// armed it — the same discipline as `SfuSession._scheduleSendHeal`, because a
+  /// republish can succeed in the window and a snapshot would then raise the
+  /// banner over a call that is already healthy again.
+  void _armHandoffWatch() {
+    if (_handoffTimer != null) return;
+    _handoffTimer = Timer(const Duration(seconds: 5), () {
+      _handoffTimer = null;
+      if (_anyWantedTrackStuck() || (_sfu?.displaced ?? false)) {
+        _emit(_state.copyWith(needsHandoff: true));
+      }
+    });
+  }
+
+  /// A wanted track that is not actually on the wire, read from the live SFU
+  /// producers rather than the UI flags (issue #67).
+  ///
+  /// The `publishing*` flags describe the *last* result: a republish that fails
+  /// leaves `publishingAudio` true from the prior success, so a snapshot of them
+  /// cannot tell a stuck send from a healthy one. The producer map is the truth —
+  /// `publishing(tag)` is only true while a producer is actually up on the node.
+  bool _anyWantedTrackStuck() {
+    final sfu = _sfu;
+    if (sfu == null) return _wantMic || _wantCamera || _wantScreen;
+    return (_wantMic && !sfu.publishing(SfuTag.audio)) ||
+        (_wantCamera && !sfu.publishing(SfuTag.video)) ||
+        (_wantScreen && !sfu.publishing(SfuTag.screen));
+  }
+
+  /// Lower the stuck-watch, but only when every wanted track is really on the
+  /// wire and the session is not displaced (issue #67).
+  ///
+  /// Called from every publish success and every path that puts a wanted track
+  /// down on purpose. A success on one track must not cancel the watch another
+  /// track armed, and a mute/camera-off is a deliberate stand-down for *that*
+  /// track only — so the decision is made against the live producers, not the
+  /// one action that happened to call in.
+  void _maybeClearHandoffWatch() {
+    if (_anyWantedTrackStuck() || (_sfu?.displaced ?? false)) return;
+    _handoffTimer?.cancel();
+    _handoffTimer = null;
+    if (_state.needsHandoff) _emit(_state.copyWith(needsHandoff: false));
   }
 
   String _fail(SfuTag tag, String sentence) {
@@ -640,6 +736,8 @@ class LiveCall implements Call {
     _wantMic = false;
     _wantCamera = false;
     _wantScreen = false;
+    _handoffTimer?.cancel();
+    _handoffTimer = null;
     await _detach();
     await _sfu?.dispose();
     _sfu = null;
@@ -663,6 +761,33 @@ class LiveCall implements Call {
     });
   }
 
+  @override
+  Future<String?> pullSessionOver() => _serialise(() async {
+        // Clear the sticky `displaced` stand-down so `publish` stops refusing,
+        // then rebuild onto the current node and put our tracks back; the fresh
+        // session is the deliberate "new session" the takeover can only be undone
+        // by. The banner stays up throughout: `_publish` lowers it only once the
+        // tracks are actually back (via `_maybeClearHandoffWatch`), so a reclaim
+        // that fails leaves the button on screen to try again rather than a silent
+        // dead call (issue #67).
+        _sfu?.clearDisplaced();
+        try {
+          // On a clean rebuild `_publish` has already lowered the banner; on a
+          // publish refusal it has re-armed the watch. Either way the result is
+          // the sentence to surface (null on success).
+          return await _rebuild();
+        } on Object catch (error) {
+          // `_start` threw before any republish could re-arm the watch — keep the
+          // banner up so the person can try again, and report the failure rather
+          // than letting the UI's `!mounted` check swallow it into a dead call.
+          _log('call: pull-session-over rebuild failed: $error');
+          if (!_state.needsHandoff) {
+            _emit(_state.copyWith(needsHandoff: true));
+          }
+          return 'Could not reconnect to the room. Tap to try again.';
+        }
+      });
+
   /// The rebuild itself, already holding the queue.
   ///
   /// Split out from [rebuild] because the bad-auth heal in [_publish] runs
@@ -674,7 +799,8 @@ class LiveCall implements Call {
   /// bad-auth heal passes the tag it was trying to publish, because the republish
   /// below *is* its single retry: a second `_publish(tag)` on the fresh session
   /// would send a duplicate produce (refused twice on a still-bad token). Returns
-  /// that tag's detail (`null` on success), or `null` when nobody is asking.
+  /// that tag's detail (`null` on success), or — when nobody names a tag (the
+  /// reclaim path) — the first wanted track that could not be put back.
   Future<String?> _rebuild({SfuTag? report}) async {
     // Nothing to rebuild: no session, nobody to hear, nothing to send. The next
     // cluster or tap builds one from scratch, which is the right amount of work.
@@ -689,16 +815,29 @@ class LiveCall implements Call {
     // `_start` disposes the stale session, opens fresh transports, and replays
     // the allow list, the conversation and the subscriptions — but not our
     // producers, since only this class holds the tracks to put back.
-    await _start();
+    //
+    // Published through the single-flight slot (issue #41): a recovery rebuild and
+    // the 1.5s cluster debounce's `setListeningTo` can fire at the same instant, and
+    // `setListeningTo`'s `_sfuOrStart` would otherwise see our not-yet-ready session
+    // and launch a *second* `_start` that disposes the one this rebuild is standing
+    // up — orphaning the producers we are about to republish. Forced (not `??=`)
+    // because a rebuild must discard the stale session, not join an in-flight start
+    // of it; a concurrent `_sfuOrStart` then awaits this start instead of racing one.
+    await (_starting = _start().whenComplete(() => _starting = null));
     String? audioDetail;
     String? videoDetail;
+    String? screenDetail;
     if (_wantMic) audioDetail = await _publish(SfuTag.audio);
     if (_wantCamera) videoDetail = await _publish(SfuTag.video);
-    if (_wantScreen) await _publishScreen();
+    if (_wantScreen) screenDetail = await _publishScreen();
     return switch (report) {
       SfuTag.audio => audioDetail,
-      SfuTag.video || SfuTag.screen => videoDetail,
-      null => null,
+      SfuTag.video => videoDetail,
+      SfuTag.screen => screenDetail,
+      // No tag asked for (the reclaim path): surface the first track that could
+      // not be put back, so a reclaim onto a session that still cannot publish
+      // does not read as success (issue #67).
+      null => audioDetail ?? videoDetail ?? screenDetail,
     };
   }
 
@@ -713,6 +852,8 @@ class LiveCall implements Call {
     await _engine.dispose();
     _voicePoll?.cancel();
     _voicePoll = null;
+    _handoffTimer?.cancel();
+    _handoffTimer = null;
     if (!_states.isClosed) await _states.close();
     if (!_speaking.isClosed) await _speaking.close();
   }

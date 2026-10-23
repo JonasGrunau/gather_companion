@@ -33,6 +33,9 @@ class Rig {
       routerUrl: routerUrl,
       openSignalling: (url, _) => open(url),
       buildDevice: () => device,
+      // Short enough that a test does not wait out the real five seconds, long
+      // enough that an ordinary `settle()` round trip does not trip it (issue #83).
+      nodeDownGrace: const Duration(milliseconds: 20),
     );
     session.needsRepublish.listen((_) => republishes++);
   }
@@ -51,6 +54,14 @@ class Rig {
   /// applied to every media node as it opens. How a test makes a fresh session
   /// carry a stale token: seed `{'produce': '...TokenVerificationFailed...'}`.
   final Map<String, String> nodeRefusals = {};
+
+  /// Node urls whose `start()` should hang until [releaseConnect] is called, so a
+  /// test can keep a node connecting while a second caller races to reuse it.
+  final Set<String> slowToConnect = {};
+  final Map<String, Completer<void>> _connectGates = {};
+
+  /// Let a node held by [slowToConnect] finish connecting.
+  void releaseConnect(String url) => _connectGates[url]?.complete();
 
   int republishes = 0;
   bool _closed = false;
@@ -120,6 +131,9 @@ class Rig {
             ],
           });
     socket.failingWith.addAll(nodeRefusals);
+    if (slowToConnect.contains(url)) {
+      socket.startGate = (_connectGates[url] = Completer<void>()).future;
+    }
     return socket;
   }
 

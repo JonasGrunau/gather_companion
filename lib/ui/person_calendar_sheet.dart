@@ -14,8 +14,10 @@ library;
 import 'package:flutter/material.dart';
 
 import '../src/app_state.dart';
+import '../src/day_timeline_layout.dart';
 import '../src/google_calendar.dart';
 import '../theme/gather_theme.dart';
+import 'day_timeline.dart';
 
 /// Opens the calendar sheet for the person named [label]. A thin wrapper over
 /// `showModalBottomSheet` so both call sites open it identically.
@@ -111,11 +113,9 @@ class _PersonCalendarSheet extends StatelessWidget {
                         text: 'Nothing on $firstName’s calendar for the next week.',
                       );
                     }
-                    return ListView.separated(
+                    return ListView(
                       shrinkWrap: true,
-                      itemCount: upcoming.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 8),
-                      itemBuilder: (context, i) => _PersonEventRow(event: upcoming[i]),
+                      children: _personSections(context, upcoming),
                     );
                   },
                 ),
@@ -128,8 +128,77 @@ class _PersonCalendarSheet extends StatelessWidget {
   }
 }
 
-class _PersonEventRow extends StatelessWidget {
-  const _PersonEventRow({required this.event});
+/// The colleague's week as one [DayTimeline] per day — the same shape the Plans tab
+/// draws for yourself, so "when are they free" reads at a glance. Every day from today
+/// to the last event they have gets a section; a clear day shows "Free for the day".
+List<Widget> _personSections(BuildContext context, List<GoogleEvent> events) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  // Render the queried window, not the span of returned events. `fetchEventsFor` pulls a
+  // seven-day window, so draw exactly that: every day in it shows — a day with nothing
+  // reads as free — and an event stretching past it (a multi-week all-day banner) is
+  // clipped to the window rather than dragging the sheet into days that were never
+  // fetched. Stepping by civil date, not +24h, keeps the headers right across DST.
+  final windowEnd = DateTime(today.year, today.month, today.day + 7);
+
+  final out = <Widget>[];
+  for (var day = today; day.isBefore(windowEnd); day = DateTime(day.year, day.month, day.day + 1)) {
+    final dayStart = day;
+    final dayEnd = DateTime(day.year, day.month, day.day + 1);
+    final timed = <TimelineItem>[];
+    final allDay = <TimelineItem>[];
+    for (var i = 0; i < events.length; i++) {
+      final e = events[i];
+      if (!e.startsAt.isBefore(dayEnd) || !e.endsAt.isAfter(dayStart)) continue;
+      final item = TimelineItem(
+        start: e.startsAt.isBefore(dayStart) ? dayStart : e.startsAt,
+        end: e.endsAt.isAfter(dayEnd) ? dayEnd : e.endsAt,
+        allDay: e.allDay,
+        key: i,
+      );
+      (e.allDay ? allDay : timed).add(item);
+    }
+    out.add(_DayHeader(label: _dayLabel(day)));
+    out.add(DayTimeline(
+      bands: layoutDay(timed, minItemDuration: kTimelineMinSlot),
+      allDay: allDay,
+      blockBuilder: (ctx, item) => _PersonBlock(event: events[item.key as int]),
+    ));
+  }
+  return out;
+}
+
+/// A day label above a colleague's timeline — Today / Tomorrow / a weekday / a date.
+class _DayHeader extends StatelessWidget {
+  const _DayHeader({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 14, 0, 2),
+      child: Text(
+        label.toUpperCase(),
+        style: TextStyle(
+          color: t.mutedForeground,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0.6,
+        ),
+      ),
+    );
+  }
+}
+
+/// A read-only block on a colleague's timeline: their event's title, its time range
+/// where the block is tall enough, and its place where there is more room still. Muted —
+/// you cannot act on someone else's calendar — but every block taps through to [_EventPeek]
+/// for the full detail, which is the only way to read the time off a short event the block
+/// is too small to print it on.
+class _PersonBlock extends StatelessWidget {
+  const _PersonBlock({required this.event});
 
   final GoogleEvent event;
 
@@ -137,56 +206,143 @@ class _PersonEventRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final hasPlace = event.location != null && event.location!.isNotEmpty;
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: t.background,
-        borderRadius: BorderRadius.circular(t.radius),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  event.title,
-                  style: TextStyle(color: t.foreground, fontSize: 15, fontWeight: FontWeight.w600),
-                ),
-                if (hasPlace) ...[
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      Icon(Icons.place_outlined, size: 13, color: t.mutedForeground),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          event.location!,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: t.mutedForeground, fontSize: 12),
-                        ),
-                      ),
-                    ],
+    return Material(
+      color: t.secondary,
+      child: InkWell(
+        onTap: () => _showEventPeek(context, event),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          child: LayoutBuilder(
+            builder: (context, c) {
+              // Title always; the time appears once the block clears a line for it, the
+              // place once there is a line beyond that. A shorter block shows less and the
+              // tap fills in the rest, so nothing overflows the lane.
+              final showTime = c.maxHeight >= 38;
+              final showPlace = c.maxHeight >= 56 && hasPlace;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    event.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: t.foreground, fontSize: 12.5, fontWeight: FontWeight.w600, height: 1.15),
                   ),
+                  if (showTime) ...[
+                    const SizedBox(height: 1),
+                    Text(
+                      _eventTime(event),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: t.mutedForeground,
+                        fontSize: 10.5,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                  if (showPlace) ...[
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        Icon(Icons.place_outlined, size: 11, color: t.mutedForeground),
+                        const SizedBox(width: 2),
+                        Flexible(
+                          child: Text(
+                            event.location!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(color: t.mutedForeground, fontSize: 10.5),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
-              ],
-            ),
+              );
+            },
           ),
-          const SizedBox(width: 12),
-          Text(
-            event.allDay ? 'All day' : '${_dayLabel(event.startsAt)} ${_hm(event.startsAt)}',
-            style: TextStyle(
-              color: t.faint,
-              fontSize: 12,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
 }
+
+/// A read-only detail card for one of a colleague's events, opened by tapping its block.
+/// The block itself may be too short to print the time; this always carries it in full,
+/// plus the place when there is one — so a two-line sliver on the grid is still legible.
+void _showEventPeek(BuildContext context, GoogleEvent event) {
+  final t = context.tokens;
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: t.card,
+    showDragHandle: true,
+    builder: (context) => _EventPeek(event: event),
+  );
+}
+
+class _EventPeek extends StatelessWidget {
+  const _EventPeek({required this.event});
+
+  final GoogleEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    final hasPlace = event.location != null && event.location!.isNotEmpty;
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              event.title,
+              style: TextStyle(color: t.foreground, fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 14),
+            _PeekRow(icon: Icons.schedule, text: '${_dayLabel(event.startsAt)} · ${_eventTime(event)}'),
+            if (hasPlace) ...[
+              const SizedBox(height: 8),
+              _PeekRow(icon: Icons.place_outlined, text: event.location!),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PeekRow extends StatelessWidget {
+  const _PeekRow({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 16, color: t.mutedForeground),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(text, style: TextStyle(color: t.foreground, fontSize: 14)),
+        ),
+      ],
+    );
+  }
+}
+
+/// "09:00 – 10:00", or "All day" for an all-day event.
+String _eventTime(GoogleEvent e) =>
+    e.allDay ? 'All day' : '${_hm(e.startsAt)} – ${_hm(e.endsAt)}';
+
+String _hm(DateTime d) =>
+    '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
 
 class _Hint extends StatelessWidget {
   const _Hint({required this.icon, required this.text});
@@ -213,9 +369,6 @@ class _Hint extends StatelessWidget {
     );
   }
 }
-
-String _hm(DateTime d) =>
-    '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
 
 /// "Today" / "Tomorrow" / a weekday, to put a loose day beside the time without the
 /// sheet needing the Plans tab's full day-headed grouping.

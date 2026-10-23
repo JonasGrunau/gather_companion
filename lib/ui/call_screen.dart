@@ -80,6 +80,8 @@ class CallTile {
     this.speaking = false,
     this.reactions = const [],
     this.handRaised = false,
+    this.handPosition = 0,
+    this.connecting = false,
   });
 
   /// `SpaceUser.id` when we could place them, otherwise the media `srcId`. Only
@@ -106,6 +108,21 @@ class CallTile {
   /// stays until lowered. Ours comes from `AppState.myHandRaised` (local-first);
   /// everybody else's from their `RosterRow.handRaised`.
   final bool handRaised;
+
+  /// This hand's 1-based place in the line of raised hands, or 0 when the hand is
+  /// down or its place is not yet known. Shown as a number on the badge so a person
+  /// can tell when it is their turn — the companion's take on the desktop's line of
+  /// hands (issue #64). Comes from `AppState.handQueuePositions`.
+  final int handPosition;
+
+  /// Whether the SFU is still placing this peer — subscribed, no media yet.
+  ///
+  /// A walk-up colleague whose own client is still registering reads as this,
+  /// not as a silent one: the tile says "connecting…" so the moment is legible
+  /// and nobody restarts the app waiting on a peer the session is already
+  /// chasing. Cleared the instant their media lands and they become a real
+  /// participant. Sourced from `CallState.connecting`.
+  final bool connecting;
 
   /// Whether this tile has a frame to show, as opposed to a face to draw.
   ///
@@ -463,6 +480,17 @@ class _CallScreenState extends State<CallScreen> {
                         sharing: widget.state.call.screenOn,
                         onToggleShare: _toggleShare,
                       ),
+                      // The reclaim banner, below the header so it never covers
+                      // Back or the screen-share control, and in the column so it
+                      // reserves its own space rather than floating over the faces
+                      // — clear of the landscape control rail on the right too
+                      // (issue #67).
+                      if (widget.state.call.needsHandoff)
+                        _HandoffBanner(state: widget.state),
+                      // The tab-surface banner is covered by this opaque route, so
+                      // the interruption notice is repeated here while the desktop
+                      // holds us Offline (issue #41).
+                      if (widget.state.callInterrupted) const _InterruptBar(),
                       Expanded(
                         child: tiles.isEmpty
                             ? const _Nobody()
@@ -581,6 +609,9 @@ List<CallTile> _tiles(AppState state) {
   final call = state.call;
   final handle = state.callHandle;
   final live = handle is LiveCall ? handle : null;
+  // The line of raised hands, numbered once for the whole frame so every tile reads
+  // the same order. Keyed by the same id each tile carries. See `handQueuePositions`.
+  final handPositions = state.handQueuePositions;
 
   final tiles = <CallTile>[
     // Ourselves first, and always — before the camera is ever opened too. The
@@ -608,6 +639,7 @@ List<CallTile> _tiles(AppState state) {
       // Ours, local-first, for the same reason as [speaking] above: the button is
       // under your thumb and should not wait for the roster to echo your own hand.
       handRaised: state.myHandRaised,
+      handPosition: handPositions[state.meId ?? 'self'] ?? 0,
     ),
   ];
 
@@ -633,6 +665,7 @@ List<CallTile> _tiles(AppState state) {
       speaking: row?.speaking ?? false,
       reactions: state.reactions.forPerson(row?.id),
       handRaised: row?.handRaised ?? false,
+      handPosition: row == null ? 0 : handPositions[row.id] ?? 0,
     ));
   }
 
@@ -658,6 +691,13 @@ List<CallTile> _tiles(AppState state) {
       speaking: row.speaking ?? false,
       reactions: state.reactions.forPerson(row.id),
       handRaised: row.handRaised,
+      handPosition: handPositions[row.id] ?? 0,
+      // The one bucket an unplaced peer can land in: subscribed, no media, so
+      // never a participant. Bridged to the media plane's srcId through
+      // `userAccountId`, the same join every other srcId lookup makes. This is
+      // what tells a walk-up colleague apart from somebody sitting silent.
+      connecting: row.userAccountId != null &&
+          call.connecting.contains(row.userAccountId),
     ));
   }
   return tiles;
@@ -1399,9 +1439,12 @@ class _TileFrame extends StatelessWidget {
                 left: 8,
                 // Named, not a bare glyph: the badge is a meeting status, and a
                 // screen reader that only heard the name would miss whose hand is up.
+                // The place in line rides the label too, so it is spoken, not just drawn.
                 child: Semantics(
-                  label: '${tile.label} raised their hand',
-                  child: const _HandBadge(),
+                  label: tile.handPosition > 0
+                      ? '${tile.label} raised their hand, number ${tile.handPosition} in line'
+                      : '${tile.label} raised their hand',
+                  child: _HandBadge(position: tile.handPosition),
                 ),
               ),
             Positioned(
@@ -1411,22 +1454,47 @@ class _TileFrame extends StatelessWidget {
               // One height for the row, set by the name. Each plate used to size
               // itself, so the mute pip — a 13-point glyph — sat a few points
               // shorter than the line of text beside it.
-              child: IntrinsicHeight(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Flexible(child: _Plate(text: tile.label)),
-                    if (tile.muted) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.mic_off, text: ''),
-                    ],
-                    if (tile.sharingScreen) ...[
-                      const SizedBox(width: 6),
-                      const _Plate(icon: Icons.screen_share_outlined, text: ''),
-                    ],
-                  ],
-                ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // A spotlight thumbnail is 72 logical pixels wide, leaving
+                  // ~56 for this row after its insets — too little for the name
+                  // plus a spelt-out "Connecting…", which would overflow and
+                  // clip. Below this width the status drops to its icon alone,
+                  // keeping a screen-reader label; the roomier overview and big
+                  // tiles keep the words.
+                  final compact = constraints.maxWidth < 120;
+                  return IntrinsicHeight(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Flexible(child: _Plate(text: tile.label)),
+                        // Stands in for the mute pip while a peer is mid-connect:
+                        // they have no track yet, so "muted" would be a guess,
+                        // but "connecting…" is the true state and the one that
+                        // tells a person to wait a beat rather than restart.
+                        if (tile.connecting) ...[
+                          const SizedBox(width: 6),
+                          Semantics(
+                            label: 'Connecting…',
+                            child: _Plate(
+                              icon: Icons.sync,
+                              text: compact ? '' : 'Connecting…',
+                            ),
+                          ),
+                        ] else if (tile.muted) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(icon: Icons.mic_off, text: ''),
+                        ],
+                        if (tile.sharingScreen) ...[
+                          const SizedBox(width: 6),
+                          const _Plate(
+                              icon: Icons.screen_share_outlined, text: ''),
+                        ],
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
           ],
@@ -1570,18 +1638,58 @@ class _FlightState extends State<_Flight> with SingleTickerProviderStateMixin {
 /// solid fill carries at the size an overview thumbnail gives it, where a tinted
 /// outline would disappear.
 class _HandBadge extends StatelessWidget {
-  const _HandBadge();
+  const _HandBadge({this.position = 0});
+
+  /// This hand's 1-based place in the line, or 0 when it is not yet known — the
+  /// optimistic window before the roster has numbered our own raise. Zero draws the
+  /// bare hand; a real place draws the number beside it. See [CallTile.handPosition].
+  final int position;
 
   @override
   Widget build(BuildContext context) {
+    const hand = Icon(Icons.front_hand, size: 15, color: Colors.white);
+    // A circle while the place is unknown, a pill once there is a number to carry —
+    // the hand plus its place in line, the companion's line-of-hands count.
+    if (position <= 0) {
+      return Container(
+        padding: const EdgeInsets.all(5),
+        decoration: const BoxDecoration(
+          color: kHandRaised,
+          shape: BoxShape.circle,
+          boxShadow: [BoxShadow(color: Color(0x66000000), blurRadius: 4)],
+        ),
+        child: hand,
+      );
+    }
     return Container(
-      padding: const EdgeInsets.all(5),
-      decoration: const BoxDecoration(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+      decoration: BoxDecoration(
         color: kHandRaised,
-        shape: BoxShape.circle,
-        boxShadow: [BoxShadow(color: Color(0x66000000), blurRadius: 4)],
+        borderRadius: BorderRadius.circular(999),
+        boxShadow: const [BoxShadow(color: Color(0x66000000), blurRadius: 4)],
       ),
-      child: const Icon(Icons.front_hand, size: 15, color: Colors.white),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          hand,
+          const SizedBox(width: 3),
+          // The place is already spoken by the badge's own Semantics label ("number
+          // N in line"), so the glyph is excluded rather than read a second time.
+          // Black, not white: at 13pt the number is small text, and white on this
+          // amber is ~2:1 — under the 4.5:1 WCAG AA floor — where black clears 10:1.
+          ExcludeSemantics(
+            child: Text(
+              '$position',
+              style: const TextStyle(
+                color: Colors.black,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                height: 1,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1644,6 +1752,48 @@ class _Plate extends StatelessWidget {
 /// over the office, and then the selected tab's blue wash, which made it look
 /// selected. Held off the edges by the same gap it leaves under the app bar, so it
 /// sits in an even margin rather than a wide one at the sides and a tight one on top.
+/// The one sentence the desktop-lock interruption shows, in every place it shows
+/// (issue #41): the tab-surface [CallBanner]'s subtitle and, because the opened
+/// faces route covers those surfaces, the [_InterruptBar] on [CallScreen] itself.
+/// Kept in one place so the two never drift apart.
+const _kInterruptedText = 'Paused by your desktop Gather — reconnecting…';
+
+/// The interruption notice on the call screen itself (issue #41).
+///
+/// The tab-surface banner does not follow you onto the opened faces — that route
+/// is opaque and sits over them — so the screen carries its own copy. Danger
+/// toned, the same sentence the banner shows, so the drop is explained wherever
+/// you happen to be looking when the desktop pulls the call out from under us.
+class _InterruptBar extends StatelessWidget {
+  const _InterruptBar();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: t.danger.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(t.radius),
+          border: Border.all(color: t.danger.withValues(alpha: 0.5)),
+        ),
+        child: Text(
+          _kInterruptedText,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: t.danger,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class CallBanner extends StatelessWidget {
   const CallBanner({super.key, required this.state});
 
@@ -1658,16 +1808,28 @@ class CallBanner extends StatelessWidget {
       listenable: state,
       builder: (context, _) {
         final t = context.tokens;
+        // Another device has the call, or the send path is stuck: the pill gives
+        // way to the reclaim banner (issue #67), which opens nothing — its one
+        // button pulls the session here rather than opening the call screen.
+        if (state.call.needsHandoff) return _HandoffBanner(state: state);
         // The call screen's own list, so the banner and the screen it opens can
         // never disagree about who is in the call.
         final (:title, :subtitle) = callBannerTextFor(state);
         final fill = t.card;
+        // Issue #41: the desktop client on this same account locked and forced our
+        // shared user Offline, so the server is tearing the call down under us. Say so
+        // in place of the "Tap to see everyone" line rather than letting the call
+        // blink out unexplained; the self-heal clears this the moment the desktop
+        // releases its hold.
+        final interrupted = state.callInterrupted;
+        final shownSubtitle = interrupted ? _kInterruptedText : subtitle;
+        final subtitleColor = interrupted ? t.danger : t.mutedForeground;
 
         return Padding(
           padding: const EdgeInsets.fromLTRB(_bannerGap, _bannerGap, _bannerGap, 0),
           child: Semantics(
             button: true,
-            label: '$title. $subtitle',
+            label: '$title. $shownSubtitle',
             child: ExcludeSemantics(
               child: Material(
                 color: fill,
@@ -1702,13 +1864,15 @@ class CallBanner extends StatelessWidget {
                                 ),
                               ),
                               Text(
-                                subtitle,
+                                shownSubtitle,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
                                   fontSize: 12,
                                   height: 1.3,
-                                  color: t.mutedForeground,
+                                  color: subtitleColor,
+                                  fontWeight:
+                                      interrupted ? FontWeight.w600 : null,
                                 ),
                               ),
                             ],
@@ -1753,7 +1917,13 @@ class CallBannerHeader extends StatelessWidget {
           alignment: Alignment.topCenter,
           // A zero-height, full-width box when there is no call, so the strip
           // collapses to nothing rather than leaving a gap above the content.
-          child: state.inCall
+          //
+          // Held open while `callInterrupted` even once `inCall` has gone false
+          // (issue #41): a prolonged desktop lock drains the media peers and
+          // releases the roster cluster within ~12s, so `inCall` drops while the
+          // interruption is still live — and the banner that explains it must not
+          // vanish at the very moment it is most needed.
+          child: state.inCall || state.callInterrupted
               ? CallBanner(state: state)
               : const SizedBox(width: double.infinity),
         ),
@@ -1838,6 +2008,124 @@ class _CallMark extends StatelessWidget {
         border: Border.all(color: t.ok.withValues(alpha: 0.3)),
       ),
       child: Icon(Icons.call_rounded, size: 20, color: t.ok),
+    );
+  }
+}
+
+/// The "Connection lost to another device" banner, with the one button that
+/// reclaims the call (issue #67).
+///
+/// Drawn in place of the normal pill on the map and as a top strip inside the
+/// open call screen, whenever [CallState.needsHandoff] is set — a single-device
+/// takeover the stuck-watch caught, a latched `displaced`, or any other stall
+/// that has left the room unable to hear or see us. Tapping the button runs
+/// [AppState.pullSessionOver], which clears the stand-down and rebuilds fresh
+/// transports on the current node; the banner lowers on its own when that
+/// succeeds, because the new call state carries `needsHandoff: false`.
+///
+/// Stateful for the same reason the control bar's `_run` is: a failed reclaim
+/// puts its sentence in the one snack bar the rest of the app uses, and that
+/// needs `mounted` and a `ScaffoldMessenger` from the element.
+class _HandoffBanner extends StatefulWidget {
+  const _HandoffBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_HandoffBanner> createState() => _HandoffBannerState();
+}
+
+class _HandoffBannerState extends State<_HandoffBanner> {
+  /// True while a reclaim is in flight, so a second tap cannot stack a second
+  /// rebuild behind the first.
+  bool _pulling = false;
+
+  Future<void> _pull() async {
+    if (_pulling) return;
+    setState(() => _pulling = true);
+    // Same contract as control_bar's `_run`: null is silent success, a sentence
+    // goes in the shared snack bar.
+    final failed = await widget.state.pullSessionOver();
+    if (!mounted) return;
+    setState(() => _pulling = false);
+    if (failed != null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(failed)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.tokens;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      child: Material(
+        color: t.card,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(t.radius + 10),
+          side: BorderSide(color: t.border),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.phonelink_erase_rounded, size: 20, color: t.warn),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Connection lost to another device',
+                      style: TextStyle(
+                        fontSize: 14,
+                        height: 1.25,
+                        fontWeight: FontWeight.w600,
+                        color: t.foreground,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Material(
+                color: t.brand,
+                borderRadius: BorderRadius.circular(t.radius),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  onTap: _pulling ? null : _pull,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minHeight: 44),
+                    child: Center(
+                      child: _pulling
+                          ? SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation(
+                                    t.primaryForeground),
+                              ),
+                            )
+                          : Text(
+                              'Pull session over to this app',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: t.primaryForeground,
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

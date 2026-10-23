@@ -6,6 +6,7 @@
 /// testing the code and testing the test.
 library;
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gather_client/gather_client.dart';
 import 'package:gather_companion/src/media/live_call.dart';
@@ -512,12 +513,18 @@ void main() {
     /// A call whose sessions come from a fresh [Rig] each build, with the first
     /// [refuseCount] of them refusing `produce` the way the server does when the
     /// token went stale across a network gap. Mirrors the #41 harness above.
-    ({LiveCall call, List<Rig> rigs}) staleTokenCall({required int refuseCount}) {
+    ({LiveCall call, List<Rig> rigs, _CountingAuthHttp authHttp}) staleTokenCall(
+        {required int refuseCount}) {
       final rigs = <Rig>[];
       final localEngine = FakeCaptureEngine();
+      // A fake token endpoint so the heal's `invalidateIdToken` stays offline and
+      // its refreshes can be counted — a bad-auth heal must mint a fresh token,
+      // not re-present the one the SFU just refused (#84).
+      final authHttp = _CountingAuthHttp();
       final localCall = LiveCall(
         auth: GatherAuth(
           credentials: const GatherCredentials(refreshToken: 'unused'),
+          http: authHttp,
         ),
         spaceId: spaceId,
         srcId: me,
@@ -540,17 +547,23 @@ void main() {
           await rig.close();
         }
       });
-      return (call: localCall, rigs: rigs);
+      return (call: localCall, rigs: rigs, authHttp: authHttp);
     }
 
     test('rebuilds to mint a fresh token and republishes the track', () async {
       // The first session carries the stale token and refuses every produce; the
       // rebuilt one does not. Turning the mic on must survive that without a tap
       // being needed to retry.
-      final (:call, :rigs) = staleTokenCall(refuseCount: 1);
+      final (:call, :rigs, :authHttp) = staleTokenCall(refuseCount: 1);
 
       final detail = await call.setMicOn(true);
       await settle();
+
+      // The heal dropped the cached token and minted a fresh one before rebuilding
+      // — without this the rebuild re-presents the token the SFU just refused and
+      // loops forever (#84).
+      expect(authHttp.refreshes, greaterThanOrEqualTo(1),
+          reason: 'the bad-auth heal forced a token refresh');
 
       // The stale session was thrown away and a second stood up in its place —
       // exactly the restart the person used to have to do by hand.
@@ -573,7 +586,7 @@ void main() {
         () async {
       // Every session refuses, so the heal cannot win. It must give up after a
       // single rebuild and surface the ordinary failure, not rebuild forever.
-      final (:call, :rigs) = staleTokenCall(refuseCount: 99);
+      final (:call, :rigs, authHttp: _) = staleTokenCall(refuseCount: 99);
 
       final detail = await call.setMicOn(true);
       await settle();
@@ -597,6 +610,220 @@ void main() {
     });
   });
 
+  group('pulling the session over (issue #67)', () {
+    test('a publish stuck for 5s raises the handoff banner, then clears when it '
+        'recovers', () {
+      fakeAsync((clock) {
+        // A fresh call over a fresh rig, so the whole stuck-then-heal arc runs
+        // inside the virtual clock.
+        final localEngine = FakeCaptureEngine();
+        final localRig = Rig();
+        final localCall = LiveCall(
+          auth: GatherAuth(
+            credentials: const GatherCredentials(refreshToken: 'unused'),
+          ),
+          spaceId: spaceId,
+          srcId: me,
+          engine: localEngine,
+          buildSfu: () => localRig.session,
+          voice: VoiceActivity(hold: Duration.zero),
+        );
+
+        // Connect first, by walking into a conversation — that opens nodeA — so
+        // the refusal can be seeded before the first produce reaches it.
+        localCall.setListeningTo({them}).ignore();
+        clock.flushMicrotasks();
+
+        // The node refuses every produce: the mic is unmuted but the room never
+        // hears it, the ordinary "not picked up yet" stuck state.
+        localRig.node(nodeA).failingWith['produce'] = 'produce refused';
+        localCall.setMicOn(true).ignore();
+        clock.flushMicrotasks();
+
+        expect(localCall.state.micOn, isTrue);
+        expect(localCall.state.publishingAudio, isFalse);
+        expect(localCall.state.needsHandoff, isFalse,
+            reason: 'the 5s grace window has not passed yet');
+
+        clock.elapse(const Duration(seconds: 5));
+        clock.flushMicrotasks();
+        expect(localCall.state.needsHandoff, isTrue,
+            reason: 'a wanted track stuck for 5s raises the banner');
+
+        // The move settles: produce is accepted, the track is republished, and
+        // the banner lowers on the success. The fake builds its producer on the
+        // event queue, so a zero-length elapse is needed past the microtasks.
+        localRig.node(nodeA).failingWith.remove('produce');
+        localCall.setMicOn(true).ignore();
+        clock.elapse(Duration.zero);
+        clock.flushMicrotasks();
+        expect(localCall.state.publishingAudio, isTrue);
+        expect(localCall.state.needsHandoff, isFalse,
+            reason: 'a successful publish takes the banner down');
+
+        localCall.dispose().ignore();
+        localRig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('turning an unrelated track off leaves the banner up while the mic is '
+        'still stuck (#67)', () {
+      fakeAsync((clock) {
+        final localEngine = FakeCaptureEngine();
+        final localRig = Rig();
+        final localCall = LiveCall(
+          auth: GatherAuth(
+            credentials: const GatherCredentials(refreshToken: 'unused'),
+          ),
+          spaceId: spaceId,
+          srcId: me,
+          engine: localEngine,
+          buildSfu: () => localRig.session,
+          voice: VoiceActivity(hold: Duration.zero),
+        );
+
+        localCall.setListeningTo({them}).ignore();
+        clock.flushMicrotasks();
+
+        // The mic is stuck: unmuted, but the node refuses every produce.
+        localRig.node(nodeA).failingWith['produce'] = 'produce refused';
+        localCall.setMicOn(true).ignore();
+        clock.flushMicrotasks();
+        clock.elapse(const Duration(seconds: 5));
+        clock.flushMicrotasks();
+        expect(localCall.state.needsHandoff, isTrue,
+            reason: 'the stuck mic raised the banner');
+
+        // Turning the camera off is a deliberate stand-down for the *camera*, not
+        // a cure for the mic. The old single global clear lowered the banner here;
+        // it must now stay up because a wanted track is still off the wire.
+        localCall.setCameraOn(false).ignore();
+        clock.elapse(Duration.zero);
+        clock.flushMicrotasks();
+        expect(localCall.state.needsHandoff, isTrue,
+            reason: 'the mic is still stuck, so the banner stays up');
+
+        localCall.dispose().ignore();
+        localRig.close().ignore();
+        clock.elapse(const Duration(seconds: 1));
+      });
+    });
+
+    test('a reclaim onto a session that still cannot publish reports the failure '
+        'and keeps the banner (#67)', () async {
+      // Every node this call builds refuses produce, so the reclaim rebuilds a
+      // fresh session that is just as unable to put the mic back.
+      final rigs = <Rig>[];
+      final localEngine = FakeCaptureEngine();
+      final localCall = LiveCall(
+        auth: GatherAuth(
+          credentials: const GatherCredentials(refreshToken: 'unused'),
+        ),
+        spaceId: spaceId,
+        srcId: me,
+        engine: localEngine,
+        buildSfu: () {
+          final r = Rig()..nodeRefusals['produce'] = 'produce refused';
+          rigs.add(r);
+          return r.session;
+        },
+        voice: VoiceActivity(hold: Duration.zero),
+      );
+      addTearDown(() async {
+        await localCall.dispose();
+        for (final r in rigs) {
+          await r.close();
+        }
+      });
+
+      await localCall.setMicOn(true);
+      for (var i = 0; i < 3; i++) {
+        rigs[0].node().push('double-connected', const {});
+      }
+      await settle();
+      await settle();
+      expect(localCall.state.needsHandoff, isTrue);
+
+      final detail = await localCall.pullSessionOver();
+      await settle();
+
+      expect(detail, isNotNull,
+          reason: 'the fresh session still cannot publish, so this is not '
+              'success');
+      expect(localCall.state.needsHandoff, isTrue,
+          reason: 'the banner stays up for another try, not a silent dead call');
+    });
+
+    test('three double-connected notices raise the banner immediately, no wait',
+        () async {
+      await call.setMicOn(true);
+
+      for (var i = 0; i < 3; i++) {
+        rig.node().push('double-connected', const {});
+      }
+      await settle();
+      await settle();
+
+      expect(rig.session.displaced, isTrue);
+      // No 5s wait: the sticky latch sets the flag the moment it fires.
+      expect(call.state.needsHandoff, isTrue);
+    });
+
+    test('pullSessionOver clears displaced and republishes on a fresh session',
+        () async {
+      // Two rigs: the first latches displaced, the pull builds the second.
+      final rigs = <Rig>[];
+      final localEngine = FakeCaptureEngine();
+      final localCall = LiveCall(
+        auth: GatherAuth(
+          credentials: const GatherCredentials(refreshToken: 'unused'),
+        ),
+        spaceId: spaceId,
+        srcId: me,
+        engine: localEngine,
+        buildSfu: () {
+          final r = Rig();
+          rigs.add(r);
+          return r.session;
+        },
+        voice: VoiceActivity(hold: Duration.zero),
+      );
+      addTearDown(() async {
+        await localCall.dispose();
+        for (final r in rigs) {
+          await r.close();
+        }
+      });
+
+      await localCall.setMicOn(true);
+      await localCall.setCameraOn(true);
+      for (var i = 0; i < 3; i++) {
+        rigs[0].node().push('double-connected', const {});
+      }
+      await settle();
+      await settle();
+      expect(rigs[0].session.displaced, isTrue);
+      expect(localCall.state.needsHandoff, isTrue);
+
+      final detail = await localCall.pullSessionOver();
+      await settle();
+
+      expect(detail, isNull, reason: 'the reclaim succeeded');
+      expect(rigs, hasLength(2), reason: 'a fresh session was built');
+      expect(localCall.state.needsHandoff, isFalse,
+          reason: 'the banner is lowered once the session is reclaimed');
+      final produced = rigs[1]
+          .node()
+          .sent
+          .where((f) => f.method == 'produce')
+          .map((f) => f.args['tag'])
+          .toSet();
+      expect(produced, containsAll(<String>['audio', 'video']),
+          reason: 'both wanted tracks are republished onto the fresh node');
+    });
+  });
+
   test('hanging up releases the hardware and the session', () async {
     await call.setMicOn(true);
 
@@ -610,4 +837,43 @@ void main() {
     expect(rig.node().disposed, isTrue);
     expect(call.state.micOn, isFalse);
   });
+}
+
+/// A [GatherHttp] token endpoint that never touches the network and counts how
+/// many times it was asked to mint — so a test can prove the bad-auth heal
+/// forced a refresh rather than re-presenting the refused token (#84).
+class _CountingAuthHttp implements GatherHttp {
+  int refreshes = 0;
+
+  @override
+  Future<({int status, Map<String, Object?> body})> postForm(
+    Uri uri,
+    Map<String, String> fields,
+  ) async {
+    refreshes++;
+    return (
+      status: 200,
+      body: {
+        'id_token': 'tok-$refreshes',
+        'refresh_token': fields['refresh_token'],
+        'user_id': 'uid-1',
+      },
+    );
+  }
+
+  @override
+  Future<({int status, Object? body})> getJson(Uri uri, String bearer) async =>
+      (status: 200, body: null);
+
+  @override
+  Future<({int status, List<int> body})> getBytes(Uri uri, String bearer) async =>
+      (status: 200, body: const <int>[]);
+
+  @override
+  Future<({int status, List<int> body})> postJson(
+    Uri uri,
+    String bearer,
+    Object? body,
+  ) async =>
+      (status: 200, body: const <int>[]);
 }

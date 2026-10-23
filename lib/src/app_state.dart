@@ -97,6 +97,109 @@ Duration? freeInFromEvents(List<GoogleEvent> events, DateTime now) {
   return busyUntil?.difference(now);
 }
 
+/// The planned end of the meeting a cluster is sitting in, inferred from its members'
+/// calendars, or null when nothing links them. Each entry in [memberEvents] is one
+/// co-present member's cached timed events; a shared invite shows up as the same end
+/// time carried by two or more of them.
+///
+/// Why end-time agreement and not an attendee list: the colleague calendars we can read
+/// carry an event's times but not reliably its guest list, and two people sitting in
+/// one room whose calendars both end at 15:45 are, to any useful degree, in the same
+/// meeting. One vote per member per end keeps a single member's own double-booking from
+/// outvoting the room.
+///
+/// Overtime is deliberately in scope. An event whose end has just passed still counts
+/// while it is within [grace] of now, so a meeting that runs long keeps its line (now a
+/// `+Nmin over`) instead of vanishing the instant the invite ends. A still-running
+/// invite always beats a spent one; among running invites the one the most members
+/// share wins, ties to the later end; among only-spent ones, the most recent end.
+/// How long past its end an invite still counts as the live meeting, shown as the
+/// `+Nmin over` overtime line. Shared by [plannedMeetingEnd] (which keeps a just-ended
+/// invite in the running) and the colleague calendar read (which reaches this far back
+/// so a refresh after the end still returns the invite instead of dropping it).
+const _meetingOvertimeGrace = Duration(minutes: 30);
+
+@visibleForTesting
+DateTime? plannedMeetingEnd(
+  List<List<GoogleEvent>> memberEvents,
+  DateTime now, {
+  Duration grace = _meetingOvertimeGrace,
+}) {
+  final floor = now.subtract(grace);
+  final votes = <DateTime, int>{};
+  for (final events in memberEvents) {
+    // A set so a member who has the same end on two calendar rows still votes once.
+    final ends = <DateTime>{};
+    for (final e in events) {
+      if (e.allDay) continue;
+      // Started by now and not yet past the overtime grace: the invite that is either
+      // running or only just over.
+      if (!e.startsAt.isAfter(now) && e.endsAt.isAfter(floor)) ends.add(e.endsAt);
+    }
+    for (final end in ends) {
+      votes.update(end, (n) => n + 1, ifAbsent: () => 1);
+    }
+  }
+
+  DateTime? best;
+  var bestCount = 0;
+  votes.forEach((end, count) {
+    if (count < 2) return;
+    if (best == null) {
+      best = end;
+      bestCount = count;
+      return;
+    }
+    final running = !end.isBefore(now);
+    final bestRunning = !best!.isBefore(now);
+    if (running != bestRunning) {
+      // A running invite outranks a spent one no matter the vote count.
+      if (running) {
+        best = end;
+        bestCount = count;
+      }
+    } else if (running) {
+      // Both still running: the most-shared invite wins, ties to the later end.
+      if (count > bestCount || (count == bestCount && end.isAfter(best!))) {
+        best = end;
+        bestCount = count;
+      }
+    } else if (end.isAfter(best!)) {
+      // Both already spent: the most recent end wins, regardless of vote count, so a
+      // long-ended invite a few more members happen to share can't out-rank the one
+      // that only just finished (what the overtime line is actually about).
+      best = end;
+      bestCount = count;
+    }
+  });
+  return best;
+}
+
+/// The meeting-time line the Warp Dial draws on a live planned meeting, given its
+/// planned [end] and [now]. Adaptive to what is left:
+///   * running, under an hour left -> `free in 35min`, a counting-down remainder;
+///   * running, an hour or more left -> `15:45`, the bare end time, since a long
+///     countdown is noise;
+///   * past the end -> `+5min over`, the overtime counting up.
+/// A sub-minute remainder still reads `free in 1min` rather than `free in 0min`, and
+/// the overtime floor is likewise a minute so the flip from countdown to overtime never
+/// shows `+0min over`.
+@visibleForTesting
+String meetingTimeLabel(DateTime end, DateTime now) {
+  final remaining = end.difference(now);
+  if (remaining.inSeconds > 0) {
+    if (remaining >= const Duration(hours: 1)) {
+      final h = end.hour.toString().padLeft(2, '0');
+      final m = end.minute.toString().padLeft(2, '0');
+      return '$h:$m';
+    }
+    final mins = remaining.inMinutes < 1 ? 1 : remaining.inMinutes;
+    return 'free in ${mins}min';
+  }
+  final over = now.difference(end).inMinutes;
+  return '+${over < 1 ? 1 : over}min over';
+}
+
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -1002,6 +1105,13 @@ class AppState extends ChangeNotifier {
   /// so a Mac that stays asleep cannot keep us in a reconnect loop forever.
   static const _selfHealMaxStrikes = 4;
 
+  /// True while another device on this shared account (the desktop, issue #41) has
+  /// forced us Offline mid-call and the self-heal is fighting it. Drives the in-call
+  /// banner so the drop is explained rather than silent, and clears the moment the
+  /// desktop releases its hold. Set and cleared in [_noteSelfHealth].
+  bool _callInterrupted = false;
+  bool get callInterrupted => _callInterrupted;
+
   /// Wakes the tree when my own availability or status line changes.
   ///
   /// The presence tracker judges everybody else's rows and deliberately not mine, so
@@ -1056,6 +1166,9 @@ class AppState extends ChangeNotifier {
     // availability tells us anything; wait for one.
     if (availability == null) return;
     if (availability != 'Offline') {
+      // Were we fighting an external Offline? If so, this roster is the desktop
+      // releasing its hold.
+      final wasEpisode = _selfHealStrikes > 0 || _selfHealRebuilt;
       // Healthy again: reset the ladder so the next episode starts its count from
       // scratch.
       _selfHealCooldown?.cancel();
@@ -1063,10 +1176,22 @@ class AppState extends ChangeNotifier {
       _selfHealCooling = false;
       _selfHealStrikes = 0;
       _selfHealRebuilt = false;
+      _callInterrupted = false;
+      // The desktop released its hold. Our during-lock rebuild (below) was torn down
+      // again by the server while the lock persisted, so the live session is dead.
+      // Rebuild it now rather than waiting out the ~90s websocket reconnect ladder —
+      // that wait is the ~45s "joined but no call shown" gap in issue #41. rebuild()
+      // no-ops when there is no session, so a recovery we are no longer in a call for
+      // costs nothing.
+      if (wasEpisode) unawaited(_call?.rebuild() ?? Future<void>.value());
       return;
     }
     // Only our own, in-call, foreground presence is ours to defend.
     if (!_active || !inCall) return;
+
+    // Explain the drop while we fight it: the call UI shows a banner rather than
+    // blinking out silently (issue #41).
+    _callInterrupted = true;
 
     // One re-assert per cooldown, so a roster four times a second does not become a
     // re-assert four times a second.
@@ -1445,12 +1570,68 @@ class AppState extends ChangeNotifier {
       }
     }
 
-    if (setEquals(hands, _handsUp) && !ownChanged) return;
+    // The set tells us *who* has a hand up; the positions map tells us the *order*,
+    // which can shift with no change to the set — a hand lowered and re-raised in the
+    // one roster keeps the same ids but a later timestamp, and our own optimistic
+    // raise is renumbered when its timestamp echo lands. The call screen reads the
+    // positions, so an order change has to wake it even when the set stands still.
+    final positions = handQueuePositions;
+    if (setEquals(hands, _handsUp) &&
+        !ownChanged &&
+        mapEquals(positions, _handPositions)) {
+      return;
+    }
     _handsUp = hands;
+    _handPositions = positions;
     notifyListeners();
   }
 
   Set<String> _handsUp = const {};
+  Map<String, int> _handPositions = const {};
+
+  /// The line of raised hands in our conversation, numbered by who went up first.
+  ///
+  /// Maps each raised hand's row id to its 1-based place in the queue, so the call
+  /// screen can put a number on every raised-hand tile — the companion's answer to
+  /// the desktop's line-of-hands count, so a person can tell when it is their turn
+  /// (issue #64). Scoped to our cluster, the same bound [_noteHands] draws, and it
+  /// includes our own hand. Ordered by [RosterRow.handRaisedAt] ascending; a hand
+  /// with no timestamp — our optimistic raise before the roster echoes it onto our
+  /// own row, or a field that arrived in an unexpected shape — sorts to the back,
+  /// tie-broken by id so the order is stable. Empty when we are not in a huddle.
+  Map<String, int> get handQueuePositions {
+    final roster = _roster;
+    final mine = _myRow()?.clusterId;
+    if (roster == null || mine == null) return const {};
+    final selfId = roster.selfId;
+    final entries = <({String id, num? at})>[
+      for (final row in roster.rows)
+        if (row.clusterId == mine && row.handRaised)
+          // Our own row is local-first, the same as the self tile: once we lower
+          // locally the tile drops its badge at once, so the line must stop
+          // counting us at once too, or everyone behind us reads one place too
+          // high until the roster echo catches up. See [_myHandRaised].
+          if (row.id != selfId || _myHandRaised) (id: row.id, at: row.handRaisedAt),
+    ];
+    // Our own optimistic raise, before the roster has echoed handRaised back onto
+    // our row. Added with no timestamp so it sits at the back until the echo lands.
+    if (selfId != null && _myHandRaised && !entries.any((e) => e.id == selfId)) {
+      entries.add((id: selfId, at: null));
+    }
+    if (entries.isEmpty) return const {};
+    // Earliest hand first. A missing timestamp sorts last; ids break any tie so the
+    // same roster always numbers the line the same way.
+    entries.sort((a, b) {
+      final at = a.at;
+      final bt = b.at;
+      if (at == null && bt == null) return a.id.compareTo(b.id);
+      if (at == null) return 1;
+      if (bt == null) return -1;
+      final byTime = at.compareTo(bt);
+      return byTime != 0 ? byTime : a.id.compareTo(b.id);
+    });
+    return {for (var i = 0; i < entries.length; i++) entries[i].id: i + 1};
+  }
 
   /// Our own hand as the last roster had it, to tell a desktop raise or lower from
   /// a roster that only echoes the value this phone already holds. See [_noteHands].
@@ -1577,6 +1758,19 @@ class AppState extends ChangeNotifier {
     final call = _callOrNull();
     if (call == null) return 'Not connected to Gather.';
     final failed = await call.setScreenShareOn(on);
+    notifyListeners();
+    return failed;
+  }
+
+  /// Forcibly reclaim the call onto this device — the "Pull session over to this
+  /// app" button (issue #67). Mirrors [setMicOn]: resolve the call, await the
+  /// reclaim, refresh both banner sites, return the detail sentence (null on
+  /// success). The `call.states.listen` wiring already republishes on the state
+  /// change, so the banner lowers on its own when the reclaim succeeds.
+  Future<String?> pullSessionOver() async {
+    final call = _callOrNull();
+    if (call == null) return 'Not connected to Gather.';
+    final failed = await call.pullSessionOver();
     notifyListeners();
     return failed;
   }
@@ -2568,8 +2762,10 @@ class AppState extends ChangeNotifier {
 
   /// Whether this build can offer a Google connection at all — false when no OAuth
   /// client was compiled in (every test, a placeholder build), so the UI can hide
-  /// the action rather than offer one that cannot work.
-  bool get googleAvailable => _googleCalendar != null;
+  /// the action rather than offer one that cannot work. Seeded colleague calendars
+  /// ([debugPeopleCalendars]) stand in for a real client on the simulator, so the
+  /// Plans affordance on person cards shows there too.
+  bool get googleAvailable => _googleCalendar != null || _debugPeopleCalendars.isNotEmpty;
 
   /// Seeds [googleConnected] from the keychain and, if connected, pulls the first
   /// batch of events. Called from [boot]; best-effort, never fails the launch.
@@ -2675,6 +2871,20 @@ class AppState extends ChangeNotifier {
     _gcalMatchLogged.clear();
   }
 
+  /// Colleague calendars canned by label, for the simulator harness and tests: there is
+  /// no OAuth account on a bare sim, so [calendarForLabel] and [hasCalendarFor] would
+  /// always answer "no calendar" and the person sheet could never be exercised. When
+  /// this is non-empty it short-circuits both, keyed by lowercased label, so tapping a
+  /// seeded colleague opens their timeline. Does not touch the live Google path.
+  Map<String, PersonCalendar> _debugPeopleCalendars = const {};
+  @visibleForTesting
+  set debugPeopleCalendars(Map<String, PersonCalendar> byLabel) {
+    _debugPeopleCalendars = {
+      for (final e in byLabel.entries) e.key.trim().toLowerCase(): e.value,
+    };
+    notifyListeners();
+  }
+
   /// The calendar id for a person shown in Gather as [label], or null when none in the
   /// index is a confident match. The single resolver every calendar lookup goes
   /// through, so the Dial gate, the "free in" countdown and the plans sheet all agree
@@ -2760,6 +2970,9 @@ class AppState extends ChangeNotifier {
   /// read ([CalendarLookup.ok]) whose list may itself be empty. Reached from the map's
   /// person card (label only) and the Dial (which also has the email).
   Future<PersonCalendar> calendarForLabel(String label, {String? email}) async {
+    if (_debugPeopleCalendars.isNotEmpty) {
+      return _debugPeopleCalendars[label.trim().toLowerCase()] ?? PersonCalendar.noCalendar;
+    }
     final google = _googleCalendar;
     if (google == null || !_googleConnected) return PersonCalendar.noCalendar;
     final calendarId = _calendarKeyFor(label, email);
@@ -2774,6 +2987,9 @@ class AppState extends ChangeNotifier {
   /// soon as Gather gave us their [email]; otherwise a name match against a directly
   /// shared calendar. Cheap and synchronous.
   bool hasCalendarFor(String label, {String? email}) {
+    if (_debugPeopleCalendars.isNotEmpty) {
+      return _debugPeopleCalendars.containsKey(label.trim().toLowerCase());
+    }
     final logKey = label.trim().toLowerCase();
     final calendarId = _calendarKeyFor(label, email);
     // Log each distinct colleague once: whether we resolved by email or name (or
@@ -2809,7 +3025,8 @@ class AppState extends ChangeNotifier {
     final gen = _googleSession;
     final future = () async {
       try {
-        final events = await google.fetchEventsFor(calendarId);
+        final events =
+            await google.fetchEventsFor(calendarId, lookback: _meetingOvertimeGrace);
         if (gen != _googleSession) return null;
         _peopleEvents[calendarId] = events;
         _peopleEventsAt[calendarId] = _now();
@@ -2846,6 +3063,15 @@ class AppState extends ChangeNotifier {
   }
 
   Duration? _freeInFor(Contact c) {
+    final events = _cachedEventsFor(c);
+    return events == null ? null : freeInFromEvents(events, _now());
+  }
+
+  /// This contact's cached timed calendar events for right now, or null when we hold no
+  /// calendar for them or the cache is cold. A missing or stale cache is warmed in the
+  /// background and surfaces on the next rebuild — the same fill-in-later contract
+  /// [presenceFor] documents, shared with [meetingTimeLabelFor].
+  List<GoogleEvent>? _cachedEventsFor(Contact c) {
     if (!_googleConnected) return null;
     final calendarId = _calendarKeyFor(c.label, c.calendarEmail);
     if (calendarId == null) return null;
@@ -2858,7 +3084,30 @@ class AppState extends ChangeNotifier {
       return null;
     }
 
-    return freeInFromEvents(cached, _now());
+    return cached;
+  }
+
+  /// The live planned-meeting line for a Warp Dial conversation card — `free in 35min`,
+  /// an end time like `15:45`, or `+5min over` — or null when the cluster is not a
+  /// planned meeting we can date. A meeting qualifies only when two or more of its
+  /// present members' calendars agree on an end (see [plannedMeetingEnd]); a lone
+  /// colleague's block is never enough, matching the issue's "at least two invitees
+  /// co-present" rule. Members whose calendar is cold are warmed in the background by
+  /// [_cachedEventsFor], so the line fills in on a later rebuild rather than blocking.
+  String? meetingTimeLabelFor(Meeting meeting) {
+    if (!_googleConnected) return null;
+    final memberEvents = <List<GoogleEvent>>[];
+    // [Meeting.members] is everyone *but* me, so a meeting of me and one colleague
+    // would otherwise offer a single calendar and never clear the two-vote bar. My own
+    // connected calendar is the second vote whenever the conversation includes me.
+    if (meeting.includesMe) memberEvents.add(_googleEvents);
+    for (final member in meeting.members) {
+      final events = _cachedEventsFor(member);
+      if (events != null) memberEvents.add(events);
+    }
+    if (memberEvents.length < 2) return null;
+    final end = plannedMeetingEnd(memberEvents, _now());
+    return end == null ? null : meetingTimeLabel(end, _now());
   }
 
   /// The live-map room a read-only Google event points at, when its location is a
@@ -3185,6 +3434,10 @@ class AppState extends ChangeNotifier {
   Future<void> verifyLink() async {
     final collector = _collector;
     if (collector == null) return;
+    // A suspended app's health flag is stale: the socket may have gone deaf while the
+    // publish timer was frozen, yet `healthy` still reads true. Evaluate the watchdog
+    // now rather than waiting up to one publish interval for the first tick after thaw.
+    if (collector.pokeLiveness()) return; // deaf: teardown + retry already under way
     if (collector.healthy && collector.hasState) return;
     await collector.resync();
   }
@@ -3321,6 +3574,71 @@ class AppState extends ChangeNotifier {
   Stream<String> get notices => _notices.stream;
   final _notices = StreamController<String>.broadcast();
 
+  /// Locked rooms the office should offer a "Request access" button for — a map tap
+  /// on a shut door, or the server refusing a move into one (issue #69). Broadcast
+  /// for the same reason as [notices]: news with a control to catch it, not a queue.
+  Stream<SpaceRoom> get accessOffers => _accessOffers.stream;
+  final _accessOffers = StreamController<SpaceRoom>.broadcast();
+
+  /// A room we have knocked on and want to walk into the moment the host lets us in.
+  /// Set by [requestAccess], cleared once the door opens (or the request is replaced).
+  SpaceRoom? _pendingAccess;
+
+  /// Knocks on a locked area and arms the auto-walk for when the host accepts.
+  ///
+  /// Fire-and-forget on the wire: `ok` means "asked", not "in". Acceptance arrives as
+  /// an `AreaAccessRequest` patch that flips [canEnter] true, which [_tryEnterPending]
+  /// — pumped off every roster — turns into a walk, mirroring the desktop's
+  /// `moveSpaceUserToMapArea` on accept.
+  ({bool ok, String? detail}) requestAccess(SpaceRoom room) {
+    final stableId = room.stableId;
+    if (stableId == null) return (ok: false, detail: 'cannot ask about this room');
+    final result = _collector?.requestToAccess(stableId) ??
+        (ok: false, detail: 'not connected to Gather');
+    if (result.ok) {
+      _pendingAccess = room;
+      _notices.add('Asked to be let into ${room.name ?? 'the room'}.');
+    }
+    return result;
+  }
+
+  /// Walks into a room we knocked on, the instant the host's acceptance opens it.
+  ///
+  /// Driven off the roster rather than the `AreaAccessRequest` event directly: the
+  /// accepted request is what rebuilds the map's `admits` set, so [canEnter] going
+  /// true is the one signal that the door — not just the request — is open. Clears
+  /// the pending room first so a roster that lands while the walk is being laid does
+  /// not fire a second one.
+  Future<void> _tryEnterPending() async {
+    final pending = _pendingAccess;
+    if (pending == null) return;
+    // Ask the *current* map, not the snapshot taken at knock time. Acceptance
+    // rebuilds the room with a fresh `admits`, and [SpaceMapBuilder] hands back new
+    // [SpaceRoom] objects — the one latched in [_pendingAccess] keeps the shut
+    // `admits` it was born with and would read `canEnter` false forever.
+    final room = _roomByStableId(pending.stableId) ?? pending;
+    if (!canEnter(room)) return;
+    _pendingAccess = null;
+    // Announce on the outcome, not ahead of it. [goToRoom] returns a reason when no
+    // tile is free or the walk cannot start; saying "walking over" into a walk that
+    // never began is the dead end this whole path exists to remove.
+    final failed = await goToRoom(
+      room,
+      toward: (x: room.x + room.width ~/ 2, y: room.y + room.height ~/ 2),
+    );
+    if (_notices.isClosed) return;
+    _notices.add(failed ?? "You're in — walking over.");
+  }
+
+  /// The live room carrying [stableId], or null when the floor plan has not placed it.
+  SpaceRoom? _roomByStableId(String? stableId) {
+    if (stableId == null) return null;
+    for (final room in map?.rooms ?? const <SpaceRoom>[]) {
+      if (room.stableId == stableId) return room;
+    }
+    return null;
+  }
+
   /// A walk the office should keep the camera on until it arrives.
   ///
   /// The desk button lives in the dock and sends you somewhere that is usually off
@@ -3388,9 +3706,12 @@ class AppState extends ChangeNotifier {
   /// })
   /// ```
   ///
-  /// The modal at the end is Gather asking whether to knock. This app has nowhere to
-  /// put that yet, so it says what happened and stops — [Walk] would otherwise
-  /// re-plan into the same shut door four times over.
+  /// The modal at the end is Gather asking whether to knock. A locked *area* this app
+  /// can offer — the refused room goes out on [accessOffers] and the map turns it into
+  /// a "Request access" button (issue #69). A locked *meeting* it cannot: that needs
+  /// `requestToJoin` with a live meetingId the refusal does not carry, so it stays a
+  /// plain notice. Either way [Walk] is released first — it would otherwise re-plan
+  /// into the same shut door four times over.
   void _noteRefusal(BusEvent event) {
     const locked = 'UserIsNotPermittedToEnterLockedArea';
     const meeting = 'UserIsNotPermittedToEnterMeetingArea';
@@ -3414,21 +3735,35 @@ class AppState extends ChangeNotifier {
     _log('move: refused entry — ${event.name} area=${event.payload['areaId'] ?? '?'}');
     _walk?.release();
     notifyListeners();
+
+    // A locked area with a room we can name and a stableId to knock on: offer the
+    // door rather than just reporting it shut. Everything else — a meeting, or an
+    // area the floor plan has not placed — stays a plain sentence.
+    final room = event.name == meeting ? null : _refusalRoom(event);
+    if (room != null && room.stableId != null && !_accessOffers.isClosed) {
+      _accessOffers.add(room);
+      return;
+    }
     _notices.add(_refusalText(event, meeting: event.name == meeting));
   }
 
-  /// What to say about a refusal, naming the room when the floor plan knows it.
+  /// The room a refusal names, or null when the floor plan has not placed it.
   ///
   /// `areaId` is the area's `stableId_USE_THIS_INSTEAD_OF_ID`, which is the id
   /// [SpaceRoom.stableId] carries — matching it against [SpaceRoom.id] finds nothing.
-  String _refusalText(BusEvent event, {required bool meeting}) {
-    if (meeting) return 'That meeting is private.';
+  SpaceRoom? _refusalRoom(BusEvent event) {
     final areaId = event.payload['areaId'];
     for (final room in map?.rooms ?? const <SpaceRoom>[]) {
-      final name = room.name;
-      if (room.stableId == areaId && name != null) return '$name is locked.';
+      if (room.stableId == areaId) return room;
     }
-    return 'That room is locked.';
+    return null;
+  }
+
+  /// What to say about a refusal, naming the room when the floor plan knows it.
+  String _refusalText(BusEvent event, {required bool meeting}) {
+    if (meeting) return 'That meeting is private.';
+    final name = _refusalRoom(event)?.name;
+    return name != null ? '$name is locked.' : 'That room is locked.';
   }
 
   /// Test seam: the event bus without a socket to deliver it.
@@ -3625,6 +3960,10 @@ class AppState extends ChangeNotifier {
           // After the fold, when `inCall` reflects this roster: a hand raised in a
           // meeting we have since walked out of comes down here.
           _lowerHandIfOutOfMeeting();
+          // Last: this roster may carry the `AreaAccessRequest` acceptance that opens
+          // a door we knocked on, and the walk should start on the same roster that
+          // rebuilt the map rather than a beat later (issue #69).
+          unawaited(_tryEnterPending());
         }),
       )
       ..add(
@@ -4012,6 +4351,7 @@ class AppState extends ChangeNotifier {
     _positions.dispose();
     _directoryChanges.dispose();
     unawaited(_notices.close());
+    unawaited(_accessOffers.close());
     unawaited(_followMe.close());
     unawaited(_recentre.close());
     // A face resolved a millisecond before the app closed would otherwise
