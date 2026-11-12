@@ -10,6 +10,7 @@ import 'calendar_mirror.dart';
 import 'calendar_store.dart';
 import 'credentials.dart';
 import 'gather_link.dart';
+import 'gather_web_login.dart';
 import 'google_calendar.dart';
 import 'directory.dart';
 import 'link_status.dart';
@@ -200,6 +201,15 @@ String meetingTimeLabel(DateTime end, DateTime now) {
   return '+${over < 1 ? 1 : over}min over';
 }
 
+/// A recent-spaces lookup's result: the spaces, plus the credentials the lookup
+/// ended on. The second field carries any id-token refresh or refresh-token
+/// rotation the call triggered, so adoption saves the current session rather than
+/// the pre-lookup one.
+typedef RecentSpacesResult = ({
+  List<GatherSpace> spaces,
+  GatherCredentials credentials,
+});
+
 class AppState extends ChangeNotifier {
   // A named parameter cannot be a private initializing formal, so the fields are
   // assigned the long way round.
@@ -239,7 +249,17 @@ class AppState extends ChangeNotifier {
     // client configured (every test, and a placeholder build). Null reads as "not
     // offered": the Plans tab shows local plans only and never tries to connect.
     GoogleCalendar? googleCalendar,
+    // The in-app Gather login (embedded webview + token harvest). Defaulted to the
+    // real method channel; a suite injects a fake that returns canned credentials.
+    GatherWebLogin? webLogin,
+    // The recent-spaces lookup for the just-signed-in session, so login can resolve
+    // a space before adopting rather than handing the collector a null it cannot
+    // fill from an empty `recent-spaces`. Defaulted to a throwaway [GatherAuth] over
+    // the harvested credentials; a suite injects a fake list.
+    Future<RecentSpacesResult> Function(GatherCredentials)? recentSpacesOf,
   }) : _notifier = notifier ?? Notifier(),
+       _webLogin = webLogin ?? const ChannelGatherWebLogin(),
+       _recentSpacesOf = recentSpacesOf ?? _realRecentSpacesOf,
        _connectivityChanges =
            connectivityChanges ?? Connectivity().onConnectivityChanged,
        _connectivityNow = connectivityNow ?? Connectivity().checkConnectivity,
@@ -265,6 +285,22 @@ class AppState extends ChangeNotifier {
 
   static ActivityFeed _realActivityFeed(GatherAuth auth) => ActivityFeed(auth: auth);
 
+  /// The default recent-spaces lookup: a throwaway [GatherAuth] over the harvested
+  /// credentials, asked once for the spaces this account has lately opened.
+  ///
+  /// Carries back whatever credentials the auth ends on, not the ones it started
+  /// with: the lookup may refresh the id token — and, when Google hands one back,
+  /// rotate the refresh token. Adopting the pre-lookup session would drop that
+  /// rotation (stranding the phone on a superseded refresh token) and force another
+  /// token exchange before the collector connects.
+  static Future<RecentSpacesResult> _realRecentSpacesOf(
+    GatherCredentials creds,
+  ) async {
+    final auth = GatherAuth(credentials: creds);
+    final spaces = await auth.recentSpaces();
+    return (spaces: spaces, credentials: auth.credentials);
+  }
+
   final Notifier _notifier;
   Notifier get notifier => _notifier;
 
@@ -274,6 +310,8 @@ class AppState extends ChangeNotifier {
   final CalendarStore _calendarStore;
   final CalendarMirror _calendarMirror;
   final GoogleCalendar? _googleCalendar;
+  final GatherWebLogin _webLogin;
+  final Future<RecentSpacesResult> Function(GatherCredentials) _recentSpacesOf;
   final Collector Function(GatherAuth auth, String? spaceId) _buildCollector;
   final ActivityFeed Function(GatherAuth auth) _buildActivityFeed;
   final void Function(String) _log;
@@ -980,20 +1018,88 @@ class AppState extends ChangeNotifier {
               'what reads the session across.';
         }
 
-        _credentials = gather;
-        _spaceId = spaceId;
-        await _credentialStore.save(gather);
-        await _credentialStore.saveSpaceId(spaceId);
-
-        await _notifier.requestPermission();
-        _snapshot = PresenceSnapshot.empty;
-        // The held office belongs to the space we were in. Pairing into another one
-        // must not flash the old floor plan under the new roster.
-        _clearHeldMap();
-        notifyListeners();
-        _attach();
+        await _adoptCredentials(gather, spaceId: spaceId);
         return null;
     }
+  }
+
+  /// Signs in to Gather in-app, with no bridge and no computer.
+  ///
+  /// Drives the embedded webview ([GatherWebLogin]): the user logs in on Gather's
+  /// own page and the native side hands back the session it persisted. Returns null
+  /// when it took, a sentence to show otherwise, and stays silent on a user cancel
+  /// (null credentials → null return, no error).
+  ///
+  /// The space is resolved *before* adopting, not left to the collector. A freshly
+  /// harvested session has no space on its credentials, and `recent-spaces` can come
+  /// back empty — which stranded the collector with nothing to join and no way to
+  /// say so. So this fetches the account's recent spaces and asks [chooseSpace] (the
+  /// UI) which one to open; only then are the credentials adopted with that id.
+  Future<String?> signInWithGather({
+    required Future<GatherSpace?> Function(List<GatherSpace>) chooseSpace,
+  }) async {
+    final GatherCredentials? session;
+    try {
+      session = await _webLogin.signIn();
+    } on Object catch (e) {
+      return 'Could not sign in to Gather: $e';
+    }
+    if (session == null) return null; // dismissed, or no session to read
+    if (!session.isComplete) {
+      return 'Signed in, but no Gather session came back. Try again.';
+    }
+    // Diagnostic (issue #97): which account the harvest actually landed on, so an
+    // empty recent-spaces can be told apart from a wrong/anonymous session.
+    final harvestedUid = session.uid ?? uidFromIdToken(session.idToken);
+    _log('login: harvested session uid=$harvestedUid '
+        'hasIdToken=${session.idToken != null && session.idToken!.isNotEmpty} '
+        'hasRefresh=${session.refreshToken.isNotEmpty}');
+
+    final List<GatherSpace> spaces;
+    // The credentials the lookup ends on, not the pre-lookup `session`: it may have
+    // refreshed the id token or rotated the refresh token, and that is what must be
+    // adopted (see [_realRecentSpacesOf]).
+    final GatherCredentials resolved;
+    try {
+      final result = await _recentSpacesOf(session);
+      spaces = result.spaces;
+      resolved = result.credentials;
+    } on Object catch (e) {
+      _log('login: recent-spaces lookup failed — $e');
+      return 'Signed in, but could not load your spaces: $e';
+    }
+    _log('login: recent-spaces returned ${spaces.length} '
+        '[${spaces.map((s) => s.name ?? s.id).take(5).join(', ')}]');
+    if (spaces.isEmpty) {
+      return 'Signed in, but you haven\'t opened a space in Gather recently. '
+          'Open your space once in Gather, then sign in again.';
+    }
+
+    final chosen = await chooseSpace(spaces);
+    if (chosen == null) return null; // picker dismissed — a deliberate cancel
+    await _adoptCredentials(resolved, spaceId: chosen.id);
+    return null;
+  }
+
+  /// The shared tail of every way credentials arrive — bridge pairing or in-app
+  /// login. Persists them, resets presence, and brings the socket up. [spaceId] is
+  /// the space to open first, or null to let the collector resolve one.
+  Future<void> _adoptCredentials(
+    GatherCredentials gather, {
+    required String? spaceId,
+  }) async {
+    _credentials = gather;
+    _spaceId = spaceId;
+    await _credentialStore.save(gather);
+    await _credentialStore.saveSpaceId(spaceId);
+
+    await _notifier.requestPermission();
+    _snapshot = PresenceSnapshot.empty;
+    // The held office belongs to the space we were in. Adopting into another one
+    // must not flash the old floor plan under the new roster.
+    _clearHeldMap();
+    notifyListeners();
+    _attach();
   }
 
   Future<void> unpair() async {
